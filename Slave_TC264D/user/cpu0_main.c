@@ -33,6 +33,7 @@
 * 2022-09-15       pudding            first version
 ********************************************************************************************************************/
 #include "zf_common_headfile.h"
+#include "Init.h"
 #pragma section all "cpu0_dsram"
 // 将本语句与#pragma section all restore语句之间的全局变量都放在CPU0的RAM中
 
@@ -45,6 +46,7 @@ int core0_main(void)
 {
     clock_init();                   // 获取时钟频率<务必保留>
     debug_init();                   // 初始化默认调试串口
+    total_init();                   // 当前阶段总初始化
     // 此处编写用户代码 例如外设初始化代码等
 
 
@@ -64,3 +66,4 @@ int core0_main(void)
 
 #pragma section all restore
 // **************************** 代码区域 ****************************
+

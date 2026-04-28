@@ -15,7 +15,7 @@
 
 //====================================================舵机硬件参数定义====================================================
 #define SERVO_PWM_FREQ               (50)                            // 舵机 PWM 频率 常用模拟舵机工作频率为 50Hz
-#define SERVO_PWM_PIN                (ATOM0_CH7_P33_9)              // 当前板级推荐 IO 为 P33_9
+#define SERVO_PWM_PIN                (ATOM0_CH1_P33_9)              // 当前板级推荐 IO 为 P33_9
 
 #define SERVO_DUTY_MAX               (910)                           // 舵机最大占空比 需结合实车限位调试
 #define SERVO_DUTY_MID               (730)                           // 舵机中值占空比 需结合实车回中调试
