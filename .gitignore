@@ -1,0 +1,38 @@
+# OS
+Thumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+
+# Generic temp files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+
+# Build outputs
+build/
+Build/
+Debug/
+Release/
+Listings/
+Objects/
+
+*.o
+*.obj
+*.d
+*.dep
+*.map
+*.lst
+*.elf
+*.hex
+*.bin
+*.axf
+*.out
+
+# Tool-generated cache
+*.tlog
+*.lastbuildstate

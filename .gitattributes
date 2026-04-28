@@ -1,0 +1,10 @@
+* text=auto
+
+*.c text
+*.h text
+*.txt text
+*.md text
+*.project text
+*.cproject text
+*.prefs text
+*.lsl text
