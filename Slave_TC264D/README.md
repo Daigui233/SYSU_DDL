@@ -283,6 +283,13 @@
 本 README 将随着下位机模块推进持续更新。
 
 ## 十五、更新日志
+### 2026-04-28（第二次更新）
+
+- 完成 `Servo` 模块第一版搭建，当前已具备 `servo_init()`、`servo_set_duty()`、`servo_center()` 接口
+- 舵机底层当前固定使用板级推荐 IO `P33_9`，并在逐飞库合法 PWM 通道中选用 `ATOM0_CH1_P33_9`
+- 舵机模块当前仅保留底层输出能力，不提前混入转角换算、PID 或控制逻辑，便于后续单独搭建 `PID` 与 `Control`
+- 完成 `Init` 模块最小骨架，新增 `total_init()`，当前已接入 `motor_init()` 与 `servo_init()`
+- 在 `cpu0_main.c` 中接入 `total_init()`，当前主程序入口已具备最小底层初始化能力
 
 ### 2026-04-28
 
@@ -291,4 +298,5 @@
 - `Motor.c` 与 `Motor.h` 已补齐统一文件头说明和函数 `brief` 注释
 - 修正 `cpu0_main.c`、`isr.c`、`isr.h`、`Motor.c`、`Motor.h` 的源码编码问题，去除 ADS 编译报错相关的 BOM
 - 当前仓库已完成 Git 初始化并同步至 GitHub，支持队员共享开发
+
 
