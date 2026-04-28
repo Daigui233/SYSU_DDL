@@ -1,13 +1,34 @@
-# SYSU_DDL
+﻿# SYSU_DDL 仓库说明
 
-Shared repository for the SYSU DDL team project.
+## 仓库用途
 
-## Layout
+本仓库用于中山大学 DDL_大电流 车队的上下位机协同开发与版本管理。
 
-- `Master_RK3588S/`: upper computer project
-- `Slave_TC264D/`: lower computer project
+当前仓库按照上下位机进行划分，后续队员可围绕各自模块独立开发，再通过 Git 进行合并与审查。
 
-## Notes
+## 目录结构
 
-- TC264 source files in this project are maintained in GBK encoding to match the Seekfree library.
-- Commit small, reviewable changes by module.
+- `Master_RK3588S/`
+  上位机工程目录。当前暂时作为占位目录保留，后续待上位机工程完成后再统一整理接入。
+
+- `Slave_TC264D/`
+  下位机工程目录。当前为主要开发对象，基于逐飞 `TC264D` 开源库进行二次开发。
+
+## 当前协作约定
+
+- 下位机源码保持与逐飞库一致，使用 `GBK` 编码
+- 模块按功能逐个搭建、逐个审查
+- 每次修改尽量只围绕单一模块展开
+- 优先保证代码结构清晰、注释明确、职责边界稳定
+
+## 当前开发重点
+
+当前阶段主要围绕下位机开展工作，目标是：
+
+- 先完成椭圆环赛道稳定巡航
+- 同时为后续 OCR、避障、红绿灯、限速、金币等任务预留接口
+- 建立便于多人协作维护的控制链路和通信框架
+
+详细的下位机规划、控制链路与协议草案说明见：
+
+- `Slave_TC264D/README.md`
