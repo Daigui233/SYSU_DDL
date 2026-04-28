@@ -55,10 +55,8 @@ int core0_main(void)
     cpu_wait_event_ready();         // 等待所有核心初始化完毕
     while (TRUE)
     {
-        // 此处编写需要循环执行的代码
-
-
-
+        communication_poll();      // 轮询接收上位机控制帧
+        control_update();          // 根据当前输入和状态执行控制
 
         // 此处编写需要循环执行的代码
     }
@@ -66,4 +64,7 @@ int core0_main(void)
 
 #pragma section all restore
 // **************************** 代码区域 ****************************
+
+
+
 

@@ -1,90 +1,89 @@
 /*********************************************************************************************************************
-* 文件名称          Ctrl_StateMachine
+* 文件名称          Control
 * 车队名称          中山大学 DDL_大电流
 * 开发平台          TC264D
 *
 * 修改记录
 * 日期              作者                备注
-* 2026-04-28       ljr              初版
+* 2026-04-28       ljr                 初版
+* 2026-04-29       Daigui              基于当前工程结构整理 Control 模块
 *********************************************************************************************************************/
 
-#ifndef __CODE_CTRL_H_
-#define __CODE_CTRL_H_
+#ifndef CODE_CONTROL_H_
+#define CODE_CONTROL_H_
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#include "zf_common_headfile.h"
+#include "State.h"
 #include "Motor.h"
 #include "Servo.h"
 #include "PID.h"
 
 /*********************************************************************************************************************
-*                                                    状态定义
-*********************************************************************************************************************/
-typedef enum
-{
-    STATE_INIT = 0,
-
-    /* 测试 */
-    STATE_TEST_MODE,
-
-    /* 直 左 右 */
-    STATE_GO_STRAIGHT,
-    STATE_TURN_LEFT,
-    STATE_TURN_RIGHT,
-
-    /* 避障 */
-    STATE_OBJ_AVOID,
-
-    /* 吃吃币 */
-    STATE_GET_CORN,
-
-    /* 停 */
-    STATE_STOP
-} CarState_t;
-
-
-/*********************************************************************************************************************
-*                                                 状态机结构体
+*                                               控制输入结构体
 *********************************************************************************************************************/
 typedef struct
 {
-    CarState_t current_state;
-    CarState_t next_state;
-
-    /* 速度参数 */
-    float targ_speed;
-    float curet_speed;
-
-    /* 舵机参数 */
-    float pstn_error;
-
-    /* PID结构体 */
-    pid_incr_struct Motor_PID;
-    pid_pstn_struct Servo_PID;
-
-    /* 可以扩展运行参数 */
-
-} StateMachine_t;
-
+    float target_speed;
+    float track_error;
+    uint8 state_cmd;
+    uint8 flags;
+} control_input_struct;
 
 /*********************************************************************************************************************
-*                                                    接口函数声明
+*                                               状态控制参数结构体
 *********************************************************************************************************************/
+typedef struct
+{
+    float motor_target_speed;
 
+    float motor_kp;
+    float motor_ki;
+    float motor_kd;
+    float motor_output_min;
+    float motor_output_max;
 
+    float servo_kp;
+    float servo_kd;
+    float servo_output_min;
+    float servo_output_max;
+} control_param_struct;
 
 /*********************************************************************************************************************
-*                                                  状态处理函数声明
+*                                               控制上下文结构体
 *********************************************************************************************************************/
+typedef struct
+{
+    car_state_enum current_state;
 
+    control_input_struct input;
+    control_param_struct param;
 
+    float actual_speed;
+    float motor_target;
+    float servo_target;
+
+    int32 motor_output;
+    uint32 servo_output;
+
+    pid_incr_struct motor_pid;
+    pid_pstn_struct servo_pid;
+} control_ctx_struct;
+
+extern control_ctx_struct control_ctx;
+
+void                  control_init              (void);
+void                  control_set_input         (control_input_struct input);
+control_input_struct  control_get_input         (void);
+void                  control_apply_state_param (car_state_enum state);
+void                  control_update            (void);
+control_ctx_struct   *control_get_ctx           (void);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-
-
