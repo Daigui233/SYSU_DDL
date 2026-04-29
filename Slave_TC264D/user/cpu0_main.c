@@ -44,6 +44,8 @@
 // **************************** 代码区域 ****************************
 int core0_main(void)
 {
+    uint32 control_last_time = 0;
+    uint32 now_time = 0;
     clock_init();                   // 获取时钟频率<务必保留>
     debug_init();                   // 初始化默认调试串口
     total_init();                   // 当前阶段总初始化
@@ -56,7 +58,14 @@ int core0_main(void)
     while (TRUE)
     {
         communication_poll();      // 轮询接收上位机控制帧
-        control_update();          // 根据当前输入和状态执行控制
+
+        now_time = system_getval_us();
+        if((uint32)(now_time - control_last_time) >= 10000U)
+        {
+            control_last_time = now_time;
+            control_update();          // 固定 10ms 周期执行控制与测速更新
+            communication_send_feedback(); // 同步回传当前反馈帧 便于上位机联调
+        }
 
         // 此处编写需要循环执行的代码
     }
@@ -64,6 +73,7 @@ int core0_main(void)
 
 #pragma section all restore
 // **************************** 代码区域 ****************************
+
 
 
 

@@ -22,6 +22,9 @@ extern "C" {
 #include "Servo.h"
 #include "PID.h"
 
+#define CONTROL_FLAG_USE_TARGET_SPEED    (0x01U)      // 使用上位机下发目标速度覆盖当前状态默认速度
+#define CONTROL_INPUT_TIMEOUT_US         (3000000U)   // 上位机输入超时阈值 当前按 3s 处理 参考 sasu-intelligentcar-kits/[05] 上下位机通信协议
+
 /*********************************************************************************************************************
 *                                               控制输入结构体
 *********************************************************************************************************************/
@@ -69,6 +72,9 @@ typedef struct
     int32 motor_output;
     uint32 servo_output;
 
+    uint32 last_input_time_us;
+    uint8 input_online;
+
     pid_incr_struct motor_pid;
     pid_pstn_struct servo_pid;
 } control_ctx_struct;
@@ -87,3 +93,4 @@ control_ctx_struct   *control_get_ctx           (void);
 #endif
 
 #endif
+
