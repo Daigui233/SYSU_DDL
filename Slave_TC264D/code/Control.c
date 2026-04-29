@@ -38,6 +38,75 @@ static uint32 control_limit_uint32 (int32 input, uint32 max, uint32 min)
 }
 
 /*********************************************************************************************************************
+* 函数名称          control_allow_speed_override
+* 功能说明          判断当前状态是否允许上位机直接覆盖目标速度
+* 参数说明          state           当前状态
+* 返回参数          uint8           1 表示允许 0 表示不允许
+* 使用示例          if(control_allow_speed_override(state))
+* 备注信息          WAIT_LIGHT SAFE_STOP IDLE 等停车状态下禁止被目标速度覆盖顶掉
+*********************************************************************************************************************/
+static uint8 control_allow_speed_override (car_state_enum state)
+{
+    switch(state)
+    {
+        case STATE_TRACK:
+        case STATE_LIMIT_SPEED:
+        case STATE_AVOID:
+        case STATE_NAV_LEFT:
+        case STATE_NAV_RIGHT:
+            return 1;
+
+        case STATE_WAIT_LIGHT:
+        case STATE_SAFE_STOP:
+        case STATE_IDLE:
+        default:
+            return 0;
+    }
+}
+
+/*********************************************************************************************************************
+* 函数名称          control_reset_input_to_safe
+* 功能说明          将控制输入复位为安全默认值
+* 参数说明          无
+* 返回参数          无
+* 使用示例          control_reset_input_to_safe();
+* 备注信息          输入超时后清空速度覆盖 误差与标志位 避免继续沿用旧输入
+*********************************************************************************************************************/
+static void control_reset_input_to_safe (void)
+{
+    control_ctx.input.target_speed = 0.0f;
+    control_ctx.input.track_error = 0.0f;
+    control_ctx.input.state_cmd = (uint8)STATE_SAFE_STOP;
+    control_ctx.input.flags = 0;
+}
+
+/*********************************************************************************************************************
+* 函数名称          control_handle_input_timeout
+* 功能说明          处理上位机输入心跳超时
+* 参数说明          无
+* 返回参数          无
+* 使用示例          control_handle_input_timeout();
+* 备注信息          超时后自动切换至安全状态 便于后续三圈停车或失联保护
+*********************************************************************************************************************/
+static void control_handle_input_timeout (void)
+{
+    uint32 now_time;
+
+    if(0 == control_ctx.input_online)
+    {
+        return;
+    }
+
+    now_time = system_getval_us();
+    if((uint32)(now_time - control_ctx.last_input_time_us) >= CONTROL_INPUT_TIMEOUT_US)
+    {
+        control_ctx.input_online = 0;
+        control_reset_input_to_safe();
+        state_set(STATE_SAFE_STOP);
+    }
+}
+
+/*********************************************************************************************************************
 * 函数名称          control_init
 * 功能说明          控制上下文初始化函数
 * 参数说明          无
@@ -52,6 +121,9 @@ void control_init (void)
      * control_ctx 为全局变量 上电后默认已完成零初始化
      * 此处不再显式整体清零 避免引入当前工程中不存在的 zf_memset 接口
      */
+    control_reset_input_to_safe();
+    control_ctx.last_input_time_us = 0;
+    control_ctx.input_online = 0;
     control_ctx.current_state = state_get();
     control_apply_state_param(control_ctx.current_state);
 }
@@ -67,6 +139,8 @@ void control_init (void)
 void control_set_input (control_input_struct input)
 {
     control_ctx.input = input;
+    control_ctx.last_input_time_us = system_getval_us();
+    control_ctx.input_online = 1;
 
     if(control_ctx.input.state_cmd < STATE_MAX)
     {
@@ -207,7 +281,8 @@ static void Motor_PID_Control (void)
     control_ctx.actual_speed = (float)motor_get_speed();
 
     control_ctx.motor_target = control_ctx.param.motor_target_speed;
-    if(control_ctx.input.target_speed > 0.0f)
+    if((control_ctx.input.flags & CONTROL_FLAG_USE_TARGET_SPEED)
+    && control_allow_speed_override(control_ctx.current_state))
     {
         control_ctx.motor_target = control_ctx.input.target_speed;
     }
@@ -262,6 +337,8 @@ static void Servo_PID_Control (void)
 *********************************************************************************************************************/
 void control_update (void)
 {
+    control_handle_input_timeout();
+
     if(state_is_changed())
     {
         control_apply_state_param(state_get());
