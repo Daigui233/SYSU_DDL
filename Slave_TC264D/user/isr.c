@@ -52,6 +52,7 @@ IFX_INTERRUPT(cc60_pit_ch0_isr, 0, CCU6_0_CH0_ISR_PRIORITY)
         {
             control_ctx.periodic_interrupt_flag = 1;
             control_ctx.interrupt_count = control_ctx.interrupt_count_hold;
+            gpio_toggle_level(P20_8); // 以P20_8引脚的翻转来指示周期性中断的发生
         }
     }
 }
