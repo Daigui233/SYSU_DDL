@@ -170,6 +170,31 @@ IFX_INTERRUPT(uart1_rx_isr, 0, UART1_RX_INT_PRIO)
 {
     interrupt_global_enable(0); // 开启中断嵌套
     camera_uart_handler();      // 摄像头参数配置统一回调函数
+
+    // 只做简单的串口数据到定义的缓冲区，防止丢失下面的数据
+    uart_query_byte(COMM_UART_INDEX, &communicate_temp); // 读取串口接收数据到临时变量
+    //uart_write_byte(UART_1, 0xA5);
+
+    communication_info.rx_buffer[communication_info.rx_index++] = communicate_temp;
+
+    if (communication_info.rx_index >= COMM_RX_FRAME_LEN)
+    {
+        // 标志位重置
+        communication_info.rx_index = 0;
+        communication_info.rx_ready = 1;
+    }
+
+    if (communication_info.rx_ready)
+    {
+        //uart_write_string(UART_1, "frame received\r\n");
+        if (communication_decode_frame(&input_communication_temp))// 尝试解码控制帧并将结果写入临时输入结构体
+        {
+            //uart_write_string(UART_1, "decode succeed\r\n");
+            control_set_input(input_communication_temp);// 将临时输入结构体写入控制模块
+        }
+
+        communication_info.rx_ready = 0;
+    }
 }
 
 // 串口2默认连接到无线转串口模块
@@ -183,27 +208,7 @@ IFX_INTERRUPT(uart2_rx_isr, 0, UART2_RX_INT_PRIO)
     interrupt_global_enable(0);     // 开启中断嵌套
     wireless_module_uart_handler(); // 无线模块统一回调函数
 
-    // 只做简单的串口数据到定义的缓冲区，防止丢失下面的数据
-    uart_query_byte(COMM_UART_INDEX, &communicate_temp); // 读取串口接收数据到临时变量
-    communication_info.rx_buffer[communication_info.rx_index++] = communicate_temp;
 
-    if (communication_info.rx_index >= COMM_RX_FRAME_LEN - 1)
-    {
-        // 标志位重置
-        communication_info.rx_index = 0;
-        communication_info.rx_ready = 1;
-    }
-
-    if (communication_info.rx_ready)
-    {
-        gpio_toggle_level(P20_9); // 以P20_9引脚的翻转来指示接收到完整控制帧
-        if (communication_decode_frame(&input_communication_temp))// 尝试解码控制帧并将结果写入临时输入结构体
-        {
-            control_set_input(input_communication_temp);// 将临时输入结构体写入控制模块
-        }
-
-        communication_info.rx_ready = 0;
-    }
 }
 // 串口3默认连接到GPS定位模块
 IFX_INTERRUPT(uart3_tx_isr, 0, UART3_TX_INT_PRIO)

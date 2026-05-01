@@ -110,8 +110,12 @@ void communication_poll(void)
  *********************************************************************************************************************/
 void communication_itrpt_init(void)
 {
+    communication_info.rx_index = 0;
+    communication_info.rx_ready = 0;
+
+    uart_init(COMM_UART_INDEX, COMM_UART_BAUD, COMM_UART_TX_PIN, COMM_UART_RX_PIN);
+
     uart_rx_interrupt(COMM_UART_INDEX, 1); // 打开串口接收中断
-    communication_init();
 }
 
 /*********************************************************************************************************************
@@ -158,22 +162,29 @@ uint8 communication_decode_frame(struct control_input_struct *input)
 
     if (COMM_FRAME_HEAD != communication_info.rx_buffer[0])
     {
+        //uart_write_buffer(UART_1, &communication_info.rx_buffer, COMM_RX_FRAME_LEN);
+        //uart_write_string(UART_1, "\r\n head failed\r\n");
         return 0;
     }
 
     if (COMM_RX_ADDR != communication_info.rx_buffer[1])
     {
+        //uart_write_string(UART_1, "addr failed\r\n");
         return 0;
     }
 
     if (COMM_RX_PAYLOAD_LEN != communication_info.rx_buffer[2])
     {
+        //uart_write_buffer(UART_1, &communication_info.rx_buffer[0], COMM_RX_FRAME_LEN);
+        //uart_write_string(UART_1, "len failed\r\n");
         return 0;
     }
 
     checksum = communication_checksum(communication_info.rx_buffer, COMM_RX_FRAME_LEN - 1);
     if (checksum != communication_info.rx_buffer[COMM_RX_FRAME_LEN - 1])
     {
+        //uart_write_buffer(UART_1, &communication_info.rx_buffer[0], COMM_RX_FRAME_LEN);
+        //uart_write_string(UART_1, "checksum failed\r\n");
         return 0;
     }
 
