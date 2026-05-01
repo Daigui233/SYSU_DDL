@@ -26,7 +26,7 @@
 #define COMM_RX_ADDR (0x10)
 #define COMM_TX_ADDR (0x90)
 
-#define COMM_RX_PAYLOAD_LEN (10)
+#define COMM_RX_PAYLOAD_LEN (10) //这是10进制数，对应十六进制 0x0A
 #define COMM_RX_FRAME_LEN (14)
 #define COMM_TX_PAYLOAD_LEN (11)
 #define COMM_TX_FRAME_LEN (15)
