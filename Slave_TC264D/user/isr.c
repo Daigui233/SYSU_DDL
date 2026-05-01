@@ -45,7 +45,7 @@ IFX_INTERRUPT(cc60_pit_ch0_isr, 0, CCU6_0_CH0_ISR_PRIORITY)
     interrupt_global_enable(0); // ¿ªÆôÖĞ¶ÏÇ¶Ì×
     pit_clear_flag(CCU60_CH0);
 
-    while (control_ctx.interrupt_count > 0)
+    if (control_ctx.interrupt_count > 0)
     {
         control_ctx.interrupt_count--;
         if (control_ctx.interrupt_count == 0)

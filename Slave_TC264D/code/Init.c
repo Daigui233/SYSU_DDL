@@ -25,10 +25,16 @@
  *********************************************************************************************************************/
 void total_init(void)
 {
+    gpio_init(P20_8, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+    gpio_init(P20_9, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+    gpio_init(P21_5, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+    gpio_init(P21_4, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+
     motor_init();
     servo_init();
     state_init();
     control_init();
+    pit_set_and_enable(1000);
     // communication_init();
     communication_itrpt_init();
 }

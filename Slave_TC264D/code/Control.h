@@ -103,6 +103,8 @@ extern "C"
     void control_update(void);
     control_ctx_struct *control_get_ctx(void);
 
+    void pit_set_and_enable(uint32 period);
+
 #ifdef __cplusplus
 }
 #endif
