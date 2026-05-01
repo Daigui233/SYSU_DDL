@@ -22,6 +22,7 @@ extern "C"
 #include "Motor.h"
 #include "Servo.h"
 #include "PID.h"
+#include "Communication.h"
 
 #define CONTROL_FLAG_USE_TARGET_SPEED (0x01U) // 使用上位机下发目标速度覆盖当前状态默认速度
 #define CONTROL_INPUT_TIMEOUT_US (3000000U)   // 上位机输入超时阈值 当前按 3s 处理 参考 sasu-intelligentcar-kits/[05] 上下位机通信协议
@@ -29,7 +30,7 @@ extern "C"
     /*********************************************************************************************************************
      *                                               控制输入结构体
      *********************************************************************************************************************/
-    typedef struct
+    typedef struct control_input_struct
     {
         float target_speed;
         float track_error;
@@ -91,6 +92,9 @@ extern "C"
     } control_ctx_struct;
 
     extern control_ctx_struct control_ctx;
+
+    // 通信临时变量
+    extern control_input_struct input_communication_temp;
 
     void control_init(void);
     void control_set_input(control_input_struct input);
