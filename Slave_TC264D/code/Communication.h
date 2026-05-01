@@ -53,5 +53,6 @@ void communication_poll(void);
 void communication_rx_byte(uint8 dat);
 uint8 communication_decode_frame(struct control_input_struct *input);
 void communication_send_feedback(void);
+void communication_itrpt_init(void);
 
 #endif
