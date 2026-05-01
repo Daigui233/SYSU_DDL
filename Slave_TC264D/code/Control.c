@@ -13,6 +13,9 @@
 
 control_ctx_struct control_ctx;
 
+// 通信临时变量
+control_input_struct input_communication_temp;
+
 /*********************************************************************************************************************
  * 函数名称          control_limit_uint32
  * 功能说明          对舵机最终输出占空比进行限幅

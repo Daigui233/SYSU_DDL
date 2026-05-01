@@ -1,0 +1,386 @@
+<!DOCTYPE html><html><head>
+      <title>README</title>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      
+      <link rel="stylesheet" href="file:///c:\Users\HS568\.vscode\extensions\shd101wyy.markdown-preview-enhanced-0.8.24\crossnote\dependencies\katex\katex.min.css">
+      
+      
+      
+      
+      
+      
+      
+      <style>
+      code[class*=language-],pre[class*=language-]{color:#333;background:0 0;font-family:Consolas,"Liberation Mono",Menlo,Courier,monospace;text-align:left;white-space:pre;word-spacing:normal;word-break:normal;word-wrap:normal;line-height:1.4;-moz-tab-size:8;-o-tab-size:8;tab-size:8;-webkit-hyphens:none;-moz-hyphens:none;-ms-hyphens:none;hyphens:none}pre[class*=language-]{padding:.8em;overflow:auto;border-radius:3px;background:#f5f5f5}:not(pre)>code[class*=language-]{padding:.1em;border-radius:.3em;white-space:normal;background:#f5f5f5}.token.blockquote,.token.comment{color:#969896}.token.cdata{color:#183691}.token.doctype,.token.macro.property,.token.punctuation,.token.variable{color:#333}.token.builtin,.token.important,.token.keyword,.token.operator,.token.rule{color:#a71d5d}.token.attr-value,.token.regex,.token.string,.token.url{color:#183691}.token.atrule,.token.boolean,.token.code,.token.command,.token.constant,.token.entity,.token.number,.token.property,.token.symbol{color:#0086b3}.token.prolog,.token.selector,.token.tag{color:#63a35c}.token.attr-name,.token.class,.token.class-name,.token.function,.token.id,.token.namespace,.token.pseudo-class,.token.pseudo-element,.token.url-reference .token.variable{color:#795da3}.token.entity{cursor:help}.token.title,.token.title .token.punctuation{font-weight:700;color:#1d3e81}.token.list{color:#ed6a43}.token.inserted{background-color:#eaffea;color:#55a532}.token.deleted{background-color:#ffecec;color:#bd2c00}.token.bold{font-weight:700}.token.italic{font-style:italic}.language-json .token.property{color:#183691}.language-markup .token.tag .token.punctuation{color:#333}.language-css .token.function,code.language-css{color:#0086b3}.language-yaml .token.atrule{color:#63a35c}code.language-yaml{color:#183691}.language-ruby .token.function{color:#333}.language-markdown .token.url{color:#795da3}.language-makefile .token.symbol{color:#795da3}.language-makefile .token.variable{color:#183691}.language-makefile .token.builtin{color:#0086b3}.language-bash .token.keyword{color:#0086b3}pre[data-line]{position:relative;padding:1em 0 1em 3em}pre[data-line] .line-highlight-wrapper{position:absolute;top:0;left:0;background-color:transparent;display:block;width:100%}pre[data-line] .line-highlight{position:absolute;left:0;right:0;padding:inherit 0;margin-top:1em;background:hsla(24,20%,50%,.08);background:linear-gradient(to right,hsla(24,20%,50%,.1) 70%,hsla(24,20%,50%,0));pointer-events:none;line-height:inherit;white-space:pre}pre[data-line] .line-highlight:before,pre[data-line] .line-highlight[data-end]:after{content:attr(data-start);position:absolute;top:.4em;left:.6em;min-width:1em;padding:0 .5em;background-color:hsla(24,20%,50%,.4);color:#f4f1ef;font:bold 65%/1.5 sans-serif;text-align:center;vertical-align:.3em;border-radius:999px;text-shadow:none;box-shadow:0 1px #fff}pre[data-line] .line-highlight[data-end]:after{content:attr(data-end);top:auto;bottom:.4em}html body{font-family:'Helvetica Neue',Helvetica,'Segoe UI',Arial,freesans,sans-serif;font-size:16px;line-height:1.6;color:#333;background-color:#fff;overflow:initial;box-sizing:border-box;word-wrap:break-word}html body>:first-child{margin-top:0}html body h1,html body h2,html body h3,html body h4,html body h5,html body h6{line-height:1.2;margin-top:1em;margin-bottom:16px;color:#000}html body h1{font-size:2.25em;font-weight:300;padding-bottom:.3em}html body h2{font-size:1.75em;font-weight:400;padding-bottom:.3em}html body h3{font-size:1.5em;font-weight:500}html body h4{font-size:1.25em;font-weight:600}html body h5{font-size:1.1em;font-weight:600}html body h6{font-size:1em;font-weight:600}html body h1,html body h2,html body h3,html body h4,html body h5{font-weight:600}html body h5{font-size:1em}html body h6{color:#5c5c5c}html body strong{color:#000}html body del{color:#5c5c5c}html body a:not([href]){color:inherit;text-decoration:none}html body a{color:#08c;text-decoration:none}html body a:hover{color:#00a3f5;text-decoration:none}html body img{max-width:100%}html body>p{margin-top:0;margin-bottom:16px;word-wrap:break-word}html body>ol,html body>ul{margin-bottom:16px}html body ol,html body ul{padding-left:2em}html body ol.no-list,html body ul.no-list{padding:0;list-style-type:none}html body ol ol,html body ol ul,html body ul ol,html body ul ul{margin-top:0;margin-bottom:0}html body li{margin-bottom:0}html body li.task-list-item{list-style:none}html body li>p{margin-top:0;margin-bottom:0}html body .task-list-item-checkbox{margin:0 .2em .25em -1.8em;vertical-align:middle}html body .task-list-item-checkbox:hover{cursor:pointer}html body blockquote{margin:16px 0;font-size:inherit;padding:0 15px;color:#5c5c5c;background-color:#f0f0f0;border-left:4px solid #d6d6d6}html body blockquote>:first-child{margin-top:0}html body blockquote>:last-child{margin-bottom:0}html body hr{height:4px;margin:32px 0;background-color:#d6d6d6;border:0 none}html body table{margin:10px 0 15px 0;border-collapse:collapse;border-spacing:0;display:block;width:100%;overflow:auto;word-break:normal;word-break:keep-all}html body table th{font-weight:700;color:#000}html body table td,html body table th{border:1px solid #d6d6d6;padding:6px 13px}html body dl{padding:0}html body dl dt{padding:0;margin-top:16px;font-size:1em;font-style:italic;font-weight:700}html body dl dd{padding:0 16px;margin-bottom:16px}html body code{font-family:Menlo,Monaco,Consolas,'Courier New',monospace;font-size:.85em;color:#000;background-color:#f0f0f0;border-radius:3px;padding:.2em 0}html body code::after,html body code::before{letter-spacing:-.2em;content:'\00a0'}html body pre>code{padding:0;margin:0;word-break:normal;white-space:pre;background:0 0;border:0}html body .highlight{margin-bottom:16px}html body .highlight pre,html body pre{padding:1em;overflow:auto;line-height:1.45;border:#d6d6d6;border-radius:3px}html body .highlight pre{margin-bottom:0;word-break:normal}html body pre code,html body pre tt{display:inline;max-width:initial;padding:0;margin:0;overflow:initial;line-height:inherit;word-wrap:normal;background-color:transparent;border:0}html body pre code:after,html body pre code:before,html body pre tt:after,html body pre tt:before{content:normal}html body blockquote,html body dl,html body ol,html body p,html body pre,html body ul{margin-top:0;margin-bottom:16px}html body kbd{color:#000;border:1px solid #d6d6d6;border-bottom:2px solid #c7c7c7;padding:2px 4px;background-color:#f0f0f0;border-radius:3px}@media print{html body{background-color:#fff}html body h1,html body h2,html body h3,html body h4,html body h5,html body h6{color:#000;page-break-after:avoid}html body blockquote{color:#5c5c5c}html body pre{page-break-inside:avoid}html body table{display:table}html body img{display:block;max-width:100%;max-height:100%}html body code,html body pre{word-wrap:break-word;white-space:pre}}.markdown-preview{width:100%;height:100%;box-sizing:border-box}.markdown-preview ul{list-style:disc}.markdown-preview ul ul{list-style:circle}.markdown-preview ul ul ul{list-style:square}.markdown-preview ol{list-style:decimal}.markdown-preview ol ol,.markdown-preview ul ol{list-style-type:lower-roman}.markdown-preview ol ol ol,.markdown-preview ol ul ol,.markdown-preview ul ol ol,.markdown-preview ul ul ol{list-style-type:lower-alpha}.markdown-preview .newpage,.markdown-preview .pagebreak{page-break-before:always}.markdown-preview pre.line-numbers{position:relative;padding-left:3.8em;counter-reset:linenumber}.markdown-preview pre.line-numbers>code{position:relative}.markdown-preview pre.line-numbers .line-numbers-rows{position:absolute;pointer-events:none;top:1em;font-size:100%;left:0;width:3em;letter-spacing:-1px;border-right:1px solid #999;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none}.markdown-preview pre.line-numbers .line-numbers-rows>span{pointer-events:none;display:block;counter-increment:linenumber}.markdown-preview pre.line-numbers .line-numbers-rows>span:before{content:counter(linenumber);color:#999;display:block;padding-right:.8em;text-align:right}.markdown-preview .mathjax-exps .MathJax_Display{text-align:center!important}.markdown-preview:not([data-for=preview]) .code-chunk .code-chunk-btn-group{display:none}.markdown-preview:not([data-for=preview]) .code-chunk .status{display:none}.markdown-preview:not([data-for=preview]) .code-chunk .output-div{margin-bottom:16px}.markdown-preview .md-toc{padding:0}.markdown-preview .md-toc .md-toc-details{margin:0;padding:0;border:none}.markdown-preview .md-toc summary.md-toc-link-wrapper{cursor:pointer;list-style-position:outside}.markdown-preview .md-toc summary.md-toc-link-wrapper::marker{font-size:.85em}.markdown-preview .md-toc .md-toc-link-wrapper .md-toc-link{display:inline;padding:.25rem 0}.markdown-preview .md-toc .md-toc-link-wrapper .md-toc-link div,.markdown-preview .md-toc .md-toc-link-wrapper .md-toc-link p{display:inline}.markdown-preview .md-toc .md-toc-link-wrapper.highlighted .md-toc-link{font-weight:800}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='0']{margin-left:12px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='1']{margin-left:28px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='2']{margin-left:44px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='3']{margin-left:60px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='4']{margin-left:76px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='5']{margin-left:80px}.scrollbar-style::-webkit-scrollbar{width:8px}.scrollbar-style::-webkit-scrollbar-track{border-radius:10px;background-color:transparent}.scrollbar-style::-webkit-scrollbar-thumb{border-radius:5px;background-color:rgba(150,150,150,.66);border:4px solid rgba(150,150,150,.66);background-clip:content-box}html body[for=html-export]:not([data-presentation-mode]){position:relative;width:100%;height:100%;top:0;left:0;margin:0;padding:0;overflow:auto}html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{position:relative;top:0;min-height:100vh}@media screen and (min-width:914px){html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{padding:2em calc(50% - 457px + 2em)}}@media screen and (max-width:914px){html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{padding:2em}}@media screen and (max-width:450px){html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{font-size:14px!important;padding:1em}}@media print{html body[for=html-export]:not([data-presentation-mode]) #sidebar-toc-btn{display:none}}html body[for=html-export]:not([data-presentation-mode]) #sidebar-toc-btn{position:fixed;bottom:8px;left:8px;font-size:28px;cursor:pointer;color:inherit;z-index:99;width:32px;text-align:center;opacity:.4}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] #sidebar-toc-btn{opacity:1}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc{position:fixed;top:0;left:0;width:300px;height:100%;padding:32px 0 48px 0;font-size:14px;box-shadow:0 0 4px rgba(150,150,150,.33);box-sizing:border-box;overflow:auto;background-color:inherit}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc::-webkit-scrollbar{width:8px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc::-webkit-scrollbar-track{border-radius:10px;background-color:transparent}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc::-webkit-scrollbar-thumb{border-radius:5px;background-color:rgba(150,150,150,.66);border:4px solid rgba(150,150,150,.66);background-clip:content-box}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc a{text-decoration:none}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc{padding:0 16px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-details{margin:0;padding:0;border:none}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper .md-toc-link{display:inline;padding:.25rem 0}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper .md-toc-link div,html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper .md-toc-link p{display:inline}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper.highlighted .md-toc-link{font-weight:800}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='0']{padding-left:0}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='1']{padding-left:16px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='2']{padding-left:32px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='3']{padding-left:48px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='4']{padding-left:64px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='5']{padding-left:80px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .markdown-preview{left:300px;width:calc(100% - 300px);padding:2em calc(50% - 457px - 300px / 2);margin:0;box-sizing:border-box}@media screen and (max-width:1274px){html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .markdown-preview{padding:2em}}@media screen and (max-width:450px){html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .markdown-preview{width:100%}}html body[for=html-export]:not([data-presentation-mode]):not([html-show-sidebar-toc]) .markdown-preview{left:50%;transform:translateX(-50%)}html body[for=html-export]:not([data-presentation-mode]):not([html-show-sidebar-toc]) .md-sidebar-toc{display:none}
+/* Please visit the URL below for more information: */
+/*   https://shd101wyy.github.io/markdown-preview-enhanced/#/customize-css */
+
+      </style>
+      <script type="text/javascript">
+  document.addEventListener("DOMContentLoaded", function () {
+    // your code here
+  });
+</script>
+    </head>
+    <body for="html-export">
+      <div class="crossnote markdown-preview  ">
+      
+<p># SYSU_DDL 仓库说明</p>
+<h2 id="仓库用途">仓库用途 </h2>
+<p>本仓库用于中山大学 DDL_大电流 车队的上下位机协同开发与版本管理。</p>
+<p>当前仓库按照上下位机进行划分，后续队员可围绕各自模块独立开发，再通过 Git 进行合并与审查。</p>
+<h2 id="目录结构">目录结构 </h2>
+<ul>
+<li>
+<p><code>Master_RK3588S/</code><br>
+上位机工程目录。当前将逐步接入基于 Linux / RK3588S 平台的通信、感知与决策代码。</p>
+</li>
+<li>
+<p><code>Slave_TC264D/</code><br>
+下位机工程目录。当前为主要开发对象，基于逐飞 <code>TC264D</code> 开源库进行二次开发。</p>
+</li>
+</ul>
+<h2 id="当前协作约定">当前协作约定 </h2>
+<ul>
+<li>下位机源码保持与逐飞库一致，使用 <code>GBK</code> 编码</li>
+<li>模块按功能逐个搭建、逐个审查</li>
+<li>每次修改尽量只围绕单一模块展开</li>
+<li>优先保证代码结构清晰、注释明确、职责边界稳定</li>
+</ul>
+<h2 id="当前开发重点">当前开发重点 </h2>
+<p>当前阶段主要围绕下位机开展工作，目标是：</p>
+<ul>
+<li>先完成椭圆环赛道稳定巡航</li>
+<li>同时为后续 OCR、避障、红绿灯、限速、金币等任务预留接口</li>
+<li>建立便于多人协作维护的控制链路和通信框架</li>
+</ul>
+<h2 id="当前方案审查">当前方案审查 </h2>
+<p>结合当前上下位机第一版代码，现阶段方案已经能够支撑“先打通链路、先准备椭圆巡线”的目标，但后续仍有若干必要或推荐改进项，建议在后续迭代中重点关注。</p>
+<h3 id="必要改进">必要改进 </h3>
+<ul>
+<li>下位机 <code>Control / Communication / State / PID</code> 当前虽然均已通过 ADS 编译，但仍未完成人工审查与实车验证，后续必须结合实际联调继续收口。</li>
+<li>下位机控制周期当前采用主循环中的固定 <code>10ms</code> 软调度，而非 PIT 定时中断硬周期；当前可用，但后续任务增多后可能出现周期抖动，建议后续升级为定时中断驱动。</li>
+<li>下位机串口接收当前采用轮询固定帧解析，现阶段便于联调，但后续若通信频率、任务复杂度或协议长度继续增长，建议改为串口中断 + 缓冲区方案。</li>
+<li>下位机已加入 <code>3s</code> 掉线保护并自动切换到 <code>STATE_SAFE_STOP</code>，但该保护逻辑仍需后续通过实际断链测试验证是否满足安全预期。</li>
+<li>下位机状态切换当前主要信任上位机 <code>state_cmd</code>，本地下位机保护状态仲裁仍不充分；后续如加入急停、异常保护、任务接管，建议补本地状态优先级机制。</li>
+<li>上位机当前 <code>main.c</code> 仅为椭圆巡线最小主循环骨架，<code>track_error</code> 仍为占位接口；后续必须在模型、视觉或巡线程序接入后，明确误差定义并正式替换该入口。</li>
+<li>上位机第一版 C 通信代码尚未经过 RK3588S Linux 实机编译与串口联调验证，后续必须在板端实际跑通 <code>make</code>、串口打开、收发和断链场景。</li>
+</ul>
+<h3 id="推荐改进">推荐改进 </h3>
+<ul>
+<li>当前固定帧协议适合第一版联调，但扩展性一般；后续若 OCR、红绿灯、限速、避障、金币等字段显著增多，建议升级为更清晰、可扩展的协议格式。</li>
+<li>下位机 <code>Control</code> 模块中各状态参数当前直接写在 <code>switch</code> 内，现阶段直观但不利于长期维护；后续可考虑整理成独立参数表。</li>
+<li>下位机反馈帧当前已能回传速度、电机输出、舵机输出、状态值；后续可视调试需要补充圈数、错误码、掉线状态、任务状态等信息。</li>
+<li>上位机当前采用 C 完成通信层是合理的，但后续若视觉/模型主流程以 Python 为主，可再决定采用“Python 直接发串口”还是“Python 提供误差，C 负责串口发送”的最终架构。</li>
+<li>当前上下位机 README 已补充协议表、编译命令和运行说明；后续每次协议字段、状态语义或超时策略调整后，建议同步更新三份 README，避免代码与文档脱节。</li>
+</ul>
+<p>详细的下位机规划、控制链路与协议草案说明见：</p>
+<ul>
+<li><code>Slave_TC264D/README.md</code></li>
+</ul>
+<p>当前下位机阶段性更新记录也统一维护在：</p>
+<ul>
+<li><code>Slave_TC264D/README.md</code> 的“更新日志”章节</li>
+</ul>
+<h2 id="当前通信协议">当前通信协议 </h2>
+<p>当前上下位机通信协议先采用固定帧方案，目的是先尽快打通 <code>RK3588S &lt;-&gt; TC264D</code> 的控制链路。<br>
+后续随着 OCR、红绿灯、限速、避障、金币等任务接入，协议字段和帧格式仍需要继续迭代。</p>
+<h3 id="串口参数">串口参数 </h3>
+<p>当前上下位机串口参数如下：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>当前值</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>下位机串口模块</td>
+<td><code>UART_1</code></td>
+<td>逐飞库串口1</td>
+</tr>
+<tr>
+<td>波特率</td>
+<td><code>460800</code></td>
+<td>当前固定值</td>
+</tr>
+<tr>
+<td>下位机 <code>TX</code></td>
+<td><code>P20.10</code></td>
+<td>对应 <code>UART1_TX_P20_10</code></td>
+</tr>
+<tr>
+<td>下位机 <code>RX</code></td>
+<td><code>P33.13</code></td>
+<td>对应 <code>UART1_RX_P33_13</code></td>
+</tr>
+<tr>
+<td>供电</td>
+<td><code>3.3V</code></td>
+<td>与板上串口1接口一致</td>
+</tr>
+<tr>
+<td>地线</td>
+<td><code>GND</code></td>
+<td>上下位机必须共地</td>
+</tr>
+</tbody>
+</table>
+<p>实际接线时遵循串口交叉连接原则：</p>
+<ul>
+<li>上位机 <code>TX</code> 接 下位机 <code>RX</code></li>
+<li>上位机 <code>RX</code> 接 下位机 <code>TX</code></li>
+<li><code>GND</code> 共地</li>
+</ul>
+<h3 id="上位机---下位机控制帧">上位机 -&gt; 下位机控制帧 </h3>
+<ul>
+<li>帧头：<code>0x42</code></li>
+<li>地址：<code>0x10</code></li>
+<li>固定总长度：<code>14</code> 字节</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>字节偏移</th>
+<th>字段名</th>
+<th>类型</th>
+<th>长度</th>
+<th>当前值/范围</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0</code></td>
+<td><code>frame_head</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td><code>0x42</code></td>
+<td>固定帧头</td>
+</tr>
+<tr>
+<td><code>1</code></td>
+<td><code>addr</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td><code>0x10</code></td>
+<td>上位机发往下位机地址</td>
+</tr>
+<tr>
+<td><code>2</code></td>
+<td><code>payload_len</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td><code>10</code></td>
+<td>当前数据区长度</td>
+</tr>
+<tr>
+<td><code>3~6</code></td>
+<td><code>track_error</code></td>
+<td><code>float</code></td>
+<td><code>4</code></td>
+<td>-</td>
+<td>赛道误差/路径误差</td>
+</tr>
+<tr>
+<td><code>7~10</code></td>
+<td><code>target_speed</code></td>
+<td><code>float</code></td>
+<td><code>4</code></td>
+<td>-</td>
+<td>目标速度</td>
+</tr>
+<tr>
+<td><code>11</code></td>
+<td><code>state_cmd</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td>状态枚举值</td>
+<td>上位机下发状态</td>
+</tr>
+<tr>
+<td><code>12</code></td>
+<td><code>flags</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td>位标志</td>
+<td>预留给急停、红灯、限速、避障等</td>
+</tr>
+<tr>
+<td><code>13</code></td>
+<td><code>checksum</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td>累加和低 8 位</td>
+<td>对 <code>0~12</code> 字节做校验</td>
+</tr>
+</tbody>
+</table>
+<h3 id="下位机---上位机反馈帧">下位机 -&gt; 上位机反馈帧 </h3>
+<ul>
+<li>帧头：<code>0x42</code></li>
+<li>地址：<code>0x90</code></li>
+<li>固定总长度：<code>15</code> 字节</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>字节偏移</th>
+<th>字段名</th>
+<th>类型</th>
+<th>长度</th>
+<th>当前值/范围</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0</code></td>
+<td><code>frame_head</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td><code>0x42</code></td>
+<td>固定帧头</td>
+</tr>
+<tr>
+<td><code>1</code></td>
+<td><code>addr</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td><code>0x90</code></td>
+<td>下位机发往上位机地址</td>
+</tr>
+<tr>
+<td><code>2</code></td>
+<td><code>payload_len</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td><code>11</code></td>
+<td>当前数据区长度</td>
+</tr>
+<tr>
+<td><code>3~6</code></td>
+<td><code>actual_speed</code></td>
+<td><code>float</code></td>
+<td><code>4</code></td>
+<td>-</td>
+<td>当前实际速度反馈</td>
+</tr>
+<tr>
+<td><code>7~10</code></td>
+<td><code>motor_output</code></td>
+<td><code>int32</code></td>
+<td><code>4</code></td>
+<td>-</td>
+<td>当前电机输出控制量</td>
+</tr>
+<tr>
+<td><code>11~12</code></td>
+<td><code>servo_output</code></td>
+<td><code>uint16</code></td>
+<td><code>2</code></td>
+<td>-</td>
+<td>当前舵机输出占空比</td>
+</tr>
+<tr>
+<td><code>13</code></td>
+<td><code>state_value</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td>状态枚举值</td>
+<td>当前下位机状态</td>
+</tr>
+<tr>
+<td><code>14</code></td>
+<td><code>checksum</code></td>
+<td><code>uint8</code></td>
+<td><code>1</code></td>
+<td>累加和低 8 位</td>
+<td>对 <code>0~13</code> 字节做校验</td>
+</tr>
+</tbody>
+</table>
+<h3 id="协议宏对照">协议宏对照 </h3>
+<table>
+<thead>
+<tr>
+<th>宏名</th>
+<th>当前值</th>
+<th>所在文件</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>COMM_FRAME_HEAD</code></td>
+<td><code>0x42</code></td>
+<td><code>Slave_TC264D/code/Communication.h</code></td>
+<td>固定帧头</td>
+</tr>
+<tr>
+<td><code>COMM_RX_ADDR</code></td>
+<td><code>0x10</code></td>
+<td><code>Slave_TC264D/code/Communication.h</code></td>
+<td>上位机下发地址</td>
+</tr>
+<tr>
+<td><code>COMM_TX_ADDR</code></td>
+<td><code>0x90</code></td>
+<td><code>Slave_TC264D/code/Communication.h</code></td>
+<td>下位机回传地址</td>
+</tr>
+<tr>
+<td><code>COMM_RX_PAYLOAD_LEN</code></td>
+<td><code>10</code></td>
+<td><code>Slave_TC264D/code/Communication.h</code></td>
+<td>控制帧数据区长度</td>
+</tr>
+<tr>
+<td><code>COMM_RX_FRAME_LEN</code></td>
+<td><code>14</code></td>
+<td><code>Slave_TC264D/code/Communication.h</code></td>
+<td>控制帧总长度</td>
+</tr>
+<tr>
+<td><code>COMM_TX_PAYLOAD_LEN</code></td>
+<td><code>11</code></td>
+<td><code>Slave_TC264D/code/Communication.h</code></td>
+<td>反馈帧数据区长度</td>
+</tr>
+<tr>
+<td><code>COMM_TX_FRAME_LEN</code></td>
+<td><code>15</code></td>
+<td><code>Slave_TC264D/code/Communication.h</code></td>
+<td>反馈帧总长度</td>
+</tr>
+</tbody>
+</table>
+<h3 id="当前阶段说明">当前阶段说明 </h3>
+<ul>
+<li>当前协议是第一版，重点是先打通链路，不是最终版协议</li>
+<li>当前采用固定帧而非变长帧，优点是实现简单、联调快，缺点是扩展性一般</li>
+<li>后续如果状态字段、感知字段、调参字段明显增多，建议再升级为更清晰的可扩展协议格式</li>
+</ul>
+<h2 id="近期更新">近期更新 </h2>
+<h3 id="2026-04-29">2026-04-29 </h3>
+<ul>
+<li>完成上下位机第一版固定帧通信骨架：下位机补齐 <code>Communication / Control / State</code> 调用链，上位机补齐 <code>Master_RK3588S</code> 下的 C 版串口通信初版代码</li>
+<li>根目录 <code>README</code> 已整理当前固定帧协议表格，便于上下位机核对字段、长度与偏移</li>
+<li>下位机新增通信掉线保护：当前按 <code>3s</code> 无新输入处理，超时后自动切换到 <code>STATE_SAFE_STOP</code></li>
+<li>上位机当前已形成椭圆巡线最小主循环骨架，但视觉误差入口仍为占位接口，后续需在模型与巡线程序接入后继续完善</li>
+</ul>
+
+      </div>
+      
+      
+    
+    
+    
+    
+    
+    
+  
+    </body></html>

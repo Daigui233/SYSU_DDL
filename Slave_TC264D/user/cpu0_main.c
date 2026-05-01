@@ -72,6 +72,12 @@ int core0_main(void)
         {
             control_ctx.periodic_interrupt_flag = 0;
             // 此处编写需要周期中断执行的代码 例如状态切换时的参数重载等
+
+            if(control_ctx.input.target_speed == 1.0f)
+            {
+                gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
+            }
+
         }
     }
 }
