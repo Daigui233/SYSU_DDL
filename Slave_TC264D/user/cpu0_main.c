@@ -83,15 +83,39 @@ int core0_main(void)
         // 此处编写需要循环执行的代码
         while (control_ctx.periodic_interrupt_flag == 1)
         {
-            gpio_set_level(P21_5, 0);
-            //gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
+
             control_ctx.periodic_interrupt_flag = 0;
             // 此处编写需要周期中断执行的代码 例如状态切换时的参数重载等
+            //uart_write_string(UART_1, "hello world/r/n");
 
-            if(control_ctx.input.target_speed == 1.0f)
+            if(control_ctx.input.track_error == 1.0f)
             {
-
+                uart_write_string(UART_1, "err received\r\n");
+                //gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
+                control_ctx.input.track_error = 0.0f;
             }
+
+            if(control_ctx.input.target_speed == 2.0f)
+            {
+                uart_write_string(UART_1, "target received\r\n");
+                //gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
+                control_ctx.input.target_speed = 0.0f;
+            }
+
+            if(control_ctx.input.state_cmd == 0x01)
+            {
+                uart_write_string(UART_1, "state received\r\n");
+                //gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
+                control_ctx.input.state_cmd = 0x00;
+            }
+
+/*
+            if(communicate_temp == 0x42)
+            {
+                uart_write_byte(UART_1, 0xA5);
+                //gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
+                communicate_temp = 0x00;
+            }*/
 
         }
     }
