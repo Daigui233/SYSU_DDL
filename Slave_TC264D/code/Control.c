@@ -376,6 +376,7 @@ void pit_set_and_enable(uint32 time)
 {
     pit_init(CCU60_CH0, 1000);
     pit_enable(CCU60_CH0);
+    pit_start(CCU60_CH0);
     control_ctx.periodic_interrupt_flag = 0;
     control_ctx.interrupt_count = time;
     control_ctx.interrupt_count_hold = time;

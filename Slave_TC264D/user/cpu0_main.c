@@ -44,18 +44,31 @@
 // **************************** 代码区域 ****************************
 int core0_main(void)
 {
-    uint32 control_last_time = 0;
-    uint32 now_time = 0;
+    //uint32 control_last_time = 0;
+    //uint32 now_time = 0;
     clock_init(); // 获取时钟频率<务必保留>
     debug_init(); // 初始化默认调试串口
-    total_init(); // 当前阶段总初始化
+
+    //total_init(); // 当前阶段总初始化
     // 此处编写用户代码 例如外设初始化代码等
 
+    //motor_set_duty(2000);
     // 此处编写用户代码 例如外设初始化代码等
+
     cpu_wait_event_ready(); // 等待所有核心初始化完毕
+
+    total_init();
+
     while (TRUE)
     {
+        gpio_set_level(P21_4, 0);
+        //motor_set_duty(0);
+
         /*
+         gpio_toggle_level(P20_8);
+         system_delay_ms(1000);
+         gpio_toggle_level(P20_8);
+         *
         communication_poll();      // 轮询接收上位机控制帧
 
         now_time = system_getval_us();
@@ -70,12 +83,14 @@ int core0_main(void)
         // 此处编写需要循环执行的代码
         while (control_ctx.periodic_interrupt_flag == 1)
         {
+            gpio_set_level(P21_5, 0);
+            //gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
             control_ctx.periodic_interrupt_flag = 0;
             // 此处编写需要周期中断执行的代码 例如状态切换时的参数重载等
 
             if(control_ctx.input.target_speed == 1.0f)
             {
-                gpio_toggle_level(P21_5); // 以P21_5引脚的翻转来指示周期中断内的特定事件
+
             }
 
         }
