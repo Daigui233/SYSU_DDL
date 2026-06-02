@@ -1,0 +1,112 @@
+{
+    "match_date": "2026-05-18 19:53:58",
+    "total_events": 10,
+    "events": [
+        {
+            "index": 1,
+            "time_str": "19:53:45.714",
+            "elapsed_seconds": 18.21,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 2,
+            "time_str": "19:53:46.779",
+            "elapsed_seconds": 19.27,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 3,
+            "time_str": "19:53:47.973",
+            "elapsed_seconds": 20.47,
+            "type": "COLLISION",
+            "obj_id": 1001,
+            "message": "收集金币/动态奖励",
+            "data": {
+                "name": "coin.glb"
+            }
+        },
+        {
+            "index": 4,
+            "time_str": "19:53:50.767",
+            "elapsed_seconds": 23.26,
+            "type": "COLLISION",
+            "obj_id": 2169,
+            "message": "撞击障碍",
+            "data": {
+                "name": "car.glb"
+            }
+        },
+        {
+            "index": 5,
+            "time_str": "19:53:51.219",
+            "elapsed_seconds": 23.71,
+            "type": "LAP_CHECKPOINT",
+            "obj_id": 0,
+            "message": "经过 [组0] 记录点 1",
+            "data": {}
+        },
+        {
+            "index": 6,
+            "time_str": "19:53:52.440",
+            "elapsed_seconds": 24.93,
+            "type": "COLLISION",
+            "obj_id": 1002,
+            "message": "收集金币/动态奖励",
+            "data": {
+                "name": "coin.glb"
+            }
+        },
+        {
+            "index": 7,
+            "time_str": "19:53:55.134",
+            "elapsed_seconds": 27.63,
+            "type": "COLLISION",
+            "obj_id": 1003,
+            "message": "收集金币/动态奖励",
+            "data": {
+                "name": "coin.glb"
+            }
+        },
+        {
+            "index": 8,
+            "time_str": "19:53:55.686",
+            "elapsed_seconds": 28.18,
+            "type": "COLLISION",
+            "obj_id": 1006,
+            "message": "收集金币/动态奖励",
+            "data": {
+                "name": "coin.glb"
+            }
+        },
+        {
+            "index": 9,
+            "time_str": "19:53:56.314",
+            "elapsed_seconds": 28.81,
+            "type": "COLLISION",
+            "obj_id": 1008,
+            "message": "收集金币/动态奖励",
+            "data": {
+                "name": "coin.glb"
+            }
+        },
+        {
+            "index": 10,
+            "time_str": "19:53:58.295",
+            "elapsed_seconds": 30.79,
+            "type": "LAP_CHECKPOINT",
+            "obj_id": 0,
+            "message": "经过 [组0] 记录点 2",
+            "data": {}
+        }
+    ]
+}

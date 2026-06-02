@@ -1,0 +1,39 @@
+{
+    "match_date": "2026-05-23 13:56:54",
+    "total_events": 3,
+    "events": [
+        {
+            "index": 1,
+            "time_str": "13:56:54.611",
+            "elapsed_seconds": 30.12,
+            "type": "COLLISION",
+            "obj_id": 1009,
+            "message": "撞击障碍",
+            "data": {
+                "name": "model.glb"
+            }
+        },
+        {
+            "index": 2,
+            "time_str": "13:56:54.949",
+            "elapsed_seconds": 30.46,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 3,
+            "time_str": "13:56:54.979",
+            "elapsed_seconds": 30.49,
+            "type": "COLLISION",
+            "obj_id": 4566,
+            "message": "撞击障碍",
+            "data": {
+                "name": "beginsign.glb"
+            }
+        }
+    ]
+}

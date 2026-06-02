@@ -1,0 +1,81 @@
+{
+    "match_date": "2026-05-18 19:58:13",
+    "total_events": 7,
+    "events": [
+        {
+            "index": 1,
+            "time_str": "19:58:07.141",
+            "elapsed_seconds": 23.3,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 2,
+            "time_str": "19:58:08.140",
+            "elapsed_seconds": 24.3,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 3,
+            "time_str": "19:58:10.103",
+            "elapsed_seconds": 26.27,
+            "type": "COLLISION",
+            "obj_id": 2169,
+            "message": "撞击障碍",
+            "data": {
+                "name": "car.glb"
+            }
+        },
+        {
+            "index": 4,
+            "time_str": "19:58:10.666",
+            "elapsed_seconds": 26.83,
+            "type": "LAP_CHECKPOINT",
+            "obj_id": 0,
+            "message": "经过 [组0] 记录点 1",
+            "data": {}
+        },
+        {
+            "index": 5,
+            "time_str": "19:58:11.102",
+            "elapsed_seconds": 27.26,
+            "type": "COLLISION",
+            "obj_id": 1007,
+            "message": "撞击障碍",
+            "data": {
+                "name": "model.glb"
+            }
+        },
+        {
+            "index": 6,
+            "time_str": "19:58:11.727",
+            "elapsed_seconds": 27.89,
+            "type": "COLLISION",
+            "obj_id": 1002,
+            "message": "收集金币/动态奖励",
+            "data": {
+                "name": "coin.glb"
+            }
+        },
+        {
+            "index": 7,
+            "time_str": "19:58:13.811",
+            "elapsed_seconds": 29.97,
+            "type": "COLLISION",
+            "obj_id": 1003,
+            "message": "收集金币/动态奖励",
+            "data": {
+                "name": "coin.glb"
+            }
+        }
+    ]
+}

@@ -1,0 +1,160 @@
+{
+    "match_date": "2026-05-23 13:55:09",
+    "total_events": 14,
+    "events": [
+        {
+            "index": 1,
+            "time_str": "13:54:50.982",
+            "elapsed_seconds": 21.03,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 2,
+            "time_str": "13:54:50.988",
+            "elapsed_seconds": 21.03,
+            "type": "COLLISION",
+            "obj_id": 4566,
+            "message": "撞击障碍",
+            "data": {
+                "name": "beginsign.glb"
+            }
+        },
+        {
+            "index": 3,
+            "time_str": "13:54:52.804",
+            "elapsed_seconds": 22.85,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 4,
+            "time_str": "13:54:52.847",
+            "elapsed_seconds": 22.89,
+            "type": "COLLISION",
+            "obj_id": 4566,
+            "message": "撞击障碍",
+            "data": {
+                "name": "beginsign.glb"
+            }
+        },
+        {
+            "index": 5,
+            "time_str": "13:54:54.650",
+            "elapsed_seconds": 24.69,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 6,
+            "time_str": "13:54:54.655",
+            "elapsed_seconds": 24.7,
+            "type": "COLLISION",
+            "obj_id": 4566,
+            "message": "撞击障碍",
+            "data": {
+                "name": "beginsign.glb"
+            }
+        },
+        {
+            "index": 7,
+            "time_str": "13:54:54.659",
+            "elapsed_seconds": 24.7,
+            "type": "LAP_CHECKPOINT",
+            "obj_id": 0,
+            "message": "经过 [组0] 记录点 0",
+            "data": {}
+        },
+        {
+            "index": 8,
+            "time_str": "13:54:54.666",
+            "elapsed_seconds": 24.71,
+            "type": "LAP_TIME",
+            "obj_id": 0,
+            "message": "比赛开始，计时启动",
+            "data": {
+                "lap": 0,
+                "lap_time_s": 0.0,
+                "total_time_s": 0.0,
+                "lap_time_str": "00:00.00",
+                "total_time_str": "00:00.00"
+            }
+        },
+        {
+            "index": 9,
+            "time_str": "13:54:54.678",
+            "elapsed_seconds": 24.72,
+            "type": "LAP_UPDATE",
+            "obj_id": 0,
+            "message": "当前进入第 1 圈",
+            "data": {
+                "lap": 1
+            }
+        },
+        {
+            "index": 10,
+            "time_str": "13:54:55.674",
+            "elapsed_seconds": 25.72,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 11,
+            "time_str": "13:54:58.293",
+            "elapsed_seconds": 28.34,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 12,
+            "time_str": "13:55:07.733",
+            "elapsed_seconds": 37.78,
+            "type": "COLLISION",
+            "obj_id": 2169,
+            "message": "撞击障碍",
+            "data": {
+                "name": "car.glb"
+            }
+        },
+        {
+            "index": 13,
+            "time_str": "13:55:08.688",
+            "elapsed_seconds": 38.73,
+            "type": "LAP_CHECKPOINT",
+            "obj_id": 0,
+            "message": "经过 [组0] 记录点 1",
+            "data": {}
+        },
+        {
+            "index": 14,
+            "time_str": "13:55:09.158",
+            "elapsed_seconds": 39.2,
+            "type": "COLLISION",
+            "obj_id": 2169,
+            "message": "撞击障碍",
+            "data": {
+                "name": "car.glb"
+            }
+        }
+    ]
+}

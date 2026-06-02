@@ -1,0 +1,19 @@
+正在初始化 NPU AI...
+W rknn-toolkit-lite2 version: 2.1.0
+I RKNN: [19:09:52.682] RKNN Runtime Information, librknnrt version: 2.3.0 (c949ad889d@2024-11-07T11:35:33)
+I RKNN: [19:09:52.682] RKNN Driver Information, version: 0.9.8
+I RKNN: [19:09:52.682] RKNN Model Information, version: 6, toolkit version: 2.3.2(compiler version: 2.3.2 (e045de294f@2025-04-07T19:48:25)), target: RKNPU v2, target platform: rk3588, framework name: ONNX, framework layout: NCHW, model inference type: static_shape
+W RKNN: [19:09:52.698] query RKNN_QUERY_INPUT_DYNAMIC_RANGE error, rknn model is static shape type, please export rknn with dynamic_shapes
+W Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID. (If it is a static shape RKNN model, please ignore the above warning message.)
+/home/orangepi/Desktop/setupUI1.6/setupUI/infer_wrap/base/model/rknn_lt.rknn	done(core=0)
+W rknn-toolkit-lite2 version: 2.1.0
+I RKNN: [19:09:52.766] RKNN Runtime Information, librknnrt version: 2.3.0 (c949ad889d@2024-11-07T11:35:33)
+I RKNN: [19:09:52.767] RKNN Driver Information, version: 0.9.8
+I RKNN: [19:09:52.767] RKNN Model Information, version: 6, toolkit version: 2.3.2(compiler version: 2.3.2 (e045de294f@2025-04-07T19:48:25)), target: RKNPU v2, target platform: rk3588, framework name: ONNX, framework layout: NCHW, model inference type: static_shape
+W RKNN: [19:09:52.779] query RKNN_QUERY_INPUT_DYNAMIC_RANGE error, rknn model is static shape type, please export rknn with dynamic_shapes
+W Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID. (If it is a static shape RKNN model, please ignore the above warning message.)
+/home/orangepi/Desktop/setupUI1.6/setupUI/infer_wrap/base/model/pp_seg.rknn	done(core=1)
+双 AI 引擎加载完毕！
+serial open failed: [Errno 2] could not open port /dev/ttyS3: [Errno 2] No such file or directory: '/dev/ttyS3'; vision continues
+视觉客户端已就绪，等待底层相机推流 (Server)...
+成功接入相机共享内存池

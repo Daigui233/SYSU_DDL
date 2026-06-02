@@ -13,6 +13,8 @@
 #ifndef CODE_INIT_H_
 #define CODE_INIT_H_
 
+#include <stdio.h>
+
 #include "zf_common_headfile.h"
 
 #include "Motor.h"
@@ -20,6 +22,7 @@
 #include "State.h"
 #include "Control.h"
 #include "Communication.h"
+#include <stdio.h>
 
 void total_init             (void);
 

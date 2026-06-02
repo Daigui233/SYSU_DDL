@@ -1,5 +1,4 @@
 * text=auto
-
 *.c text
 *.h text
 *.txt text
@@ -8,3 +7,4 @@
 *.cproject text
 *.prefs text
 *.lsl text
+Master_RK3588S/setupUI/dist/app filter=lfs diff=lfs merge=lfs -text

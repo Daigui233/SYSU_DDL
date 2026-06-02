@@ -1,4 +1,4 @@
-# OS
+﻿# OS
 Thumbs.db
 Desktop.ini
 
@@ -36,3 +36,18 @@ Objects/
 # Tool-generated cache
 *.tlog
 *.lastbuildstate
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Runtime logs/status
+Master_RK3588S/setupUI/*.log
+Master_RK3588S/setupUI/ar_pose_status.json
+Master_RK3588S/setupUI/xverse_control_live.json
+
+# Local capture/debug data
+Master_RK3588S/setupUI/capture_sessions/
+Master_RK3588S/setupUI/dist/match_record_*.json
+
+# Local license file
+Master_RK3588S/setupUI/license.lic

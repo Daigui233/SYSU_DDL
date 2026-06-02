@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>系统引导设置 - X-Verse™ WebUI</title>
+    <!-- Modern Tech Fonts -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto:wght@300;400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <!-- Background Elements -->
+    <div class="background-grid"></div>
+    <div class="cyber-glow-orb orb-1"></div>
+    <div class="cyber-glow-orb orb-2"></div>
+
+    <div class="container glass-panel">
+        <!-- Header -->
+        <header>
+            <div class="logo">
+                <span class="cyber-text">X-Verse™</span> 系统初始化
+            </div>
+            <div class="ip-info">🌐 {{ ip }}:5000</div>
+        </header>
+
+        <!-- Progress Indicator (Hidden on Step 1) -->
+        <div class="progress-container" id="progress-container" style="display: none;">
+            <div class="progress-bar" id="progress-bar"></div>
+            <div class="steps-indicator">
+                <div class="step-dot active" data-step="1">1</div>
+                <div class="step-dot" data-step="2">2</div>
+                <div class="step-dot" data-step="3">3</div>
+                <div class="step-dot" data-step="4">4</div>
+            </div>
+        </div>
+
+        <!-- Content Area -->
+        <main class="wizard-content" id="wizard-content">
+
+            <!-- Step 1: Welcome -->
+            <div class="step-page active" id="step-1">
+                <h1 class="glitch" data-title="欢迎使用 X-Verse™ 系统">欢迎使用 X-Verse™ 系统</h1>
+                <p class="subtitle">这是一套高性能的AR空间渲染和视觉追踪服务系统。</p>
+                <div class="info-card">
+                    <ul class="feature-list">
+                        <li><span>✓</span> 低延迟网络同步支持</li>
+                        <li><span>✓</span> 实时渲染并发送标记物体</li>
+                        <li><span>✓</span> 跨平台多路UDP控制接口</li>
+                        <li><span>✓</span> 兼容RK3588等边缘计算平台部署</li>
+                    </ul>
+                </div>
+                <!-- 底部新增的“开始配置”大按钮 -->
+                <div style="text-align: center; margin-top: 30px;">
+                    <button class="btn btn-primary btn-hero" id="btn-start-wizard">🚀 开始配置</button>
+                </div>
+            </div>
+
+            <!-- Step 2: Scene Import -->
+            <div class="step-page" id="step-2">
+                <h2>📦 场景导入</h2>
+                <p class="subtitle">选择预制场景或上传您的自定义模型</p>
+
+                <div class="split-layout">
+                    <!-- 左侧：预制场景 -->
+                    <div class="split-left">
+                        <h3>预制场景</h3>
+                        <div class="scene-grid">
+                            <div class="scene-card" id="card-preset-a">
+                                <div class="scene-cover">🏟️</div>
+                                <div class="scene-name">标准赛道 A</div>
+                                <button class="btn-ghost" id="btn-import-preset-a">一键导入</button>
+                            </div>
+                            <div class="scene-card">
+                                <div class="scene-cover">🏙️</div>
+                                <div class="scene-name">城市路口</div>
+                                <button class="btn-ghost" disabled>即将开放</button>
+                            </div>
+                            <div class="scene-card">
+                                <div class="scene-cover">🏁</div>
+                                <div class="scene-name">新手训练场</div>
+                                <button class="btn-ghost" disabled>即将开放</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 右侧：本地上传 -->
+                    <div class="split-right">
+                        <h3>本地上传</h3>
+                        <div class="upload-box" id="scene-upload-box">
+                            <div class="upload-icon">📁</div>
+                            <div class="upload-text">点击上传场景压缩包 (.zip)</div>
+                            <small class="text-muted" style="margin-top:5px">内含 models/ 目录及 objects.json</small>
+                            <input type="file" id="scene-file-input" style="display: none;" accept=".zip" />
+
+                            <!-- 进度显示区域 -->
+                            <div id="upload-progress-container" style="display: none; width: 80%; margin: 15px auto 0;">
+                                <div
+                                    style="width: 100%; background: #333; height: 6px; border-radius: 3px; overflow: hidden;">
+                                    <div id="upload-progress-bar"
+                                        style="width: 0%; height: 100%; background: var(--primary); transition: width 0.3s ease;">
+                                    </div>
+                                </div>
+                                <div id="upload-status-text" style="font-size: 0.8rem; color: #0aa; margin-top: 5px;">0%
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="info-card" style="margin-top: 20px;">
+                    💡 场景文件指定下载地址： <a href="https://www.xsmartcar.com" target="_blank"
+                        style="color:var(--primary)">https://www.xsmartcar.com</a>
+                </div>
+            </div>
+
+            <!-- Step 3: Network Settings + Camera Offset + Engine Upgrade -->
+            <div class="step-page" id="step-3">
+                <h2>📡 网络与相机参数配置</h2>
+                <p class="subtitle">配置外部定位数据的接入参数和相机偏移量</p>
+
+                <form id="config-form" class="cyber-form">
+                    <!-- Network Settings -->
+                    <h3 style="margin-bottom: 10px;">🌐 网络端口</h3>
+                    <div class="form-group row">
+                        <div class="col">
+                            <label for="udp_target_ip">定位数据地址</label>
+                            <input type="text" id="udp_target_ip" name="udp_target_ip" placeholder="192.168.123.5" />
+                        </div>
+                        <div class="col">
+                            <label for="udp_target_port">端口号</label>
+                            <input type="number" id="udp_target_port" name="udp_target_port" placeholder="9000" />
+                        </div>
+                    </div>
+
+                    <div class="form-group row">
+                        <div class="col">
+                            <label for="unity_target_ip">Unity 同步目标 IP</label>
+                            <input type="text" id="unity_target_ip" name="unity_target_ip" placeholder="127.0.0.1" />
+                        </div>
+                        <div class="col">
+                            <label for="unity_sync_port">Unity 同步端口</label>
+                            <input type="number" id="unity_sync_port" name="unity_sync_port" placeholder="9003" />
+                        </div>
+                    </div>
+
+                    <!-- Camera Offset Settings -->
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-top: 20px; margin-bottom: 10px;">
+                        <h3 style="margin: 0;">📷 相机偏移量 (Offset)</h3>
+                        <button type="button" class="btn-ghost" id="btn-offset-default"
+                            style="font-size: 0.8rem; padding: 4px 12px;">⚡ 一键官方默认值</button>
+                    </div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px;">
+                        相机相对于车体前方的位置偏移 (X横向 / Y高度 / Z前后) 和旋转偏移 (Pitch / Yaw / Roll)
+                    </p>
+                    <div class="form-group row">
+                        <div class="col">
+                            <label for="pos_offset_x">位移 X (横向)</label>
+                            <input type="number" id="pos_offset_x" step="0.01" placeholder="0.0" />
+                        </div>
+                        <div class="col">
+                            <label for="pos_offset_y">位移 Y (高度)</label>
+                            <input type="number" id="pos_offset_y" step="0.01" placeholder="0.16" />
+                        </div>
+                        <div class="col">
+                            <label for="pos_offset_z">位移 Z (前后)</label>
+                            <input type="number" id="pos_offset_z" step="0.01" placeholder="0.0" />
+                        </div>
+                    </div>
+                    <div class="form-group row">
+                        <div class="col">
+                            <label for="euler_offset_x">旋转 X (Pitch)</label>
+                            <input type="number" id="euler_offset_x" step="0.1" placeholder="0.0" />
+                        </div>
+                        <div class="col">
+                            <label for="euler_offset_y">旋转 Y (Yaw)</label>
+                            <input type="number" id="euler_offset_y" step="0.1" placeholder="0.0" />
+                        </div>
+                        <div class="col">
+                            <label for="euler_offset_z">旋转 Z (Roll)</label>
+                            <input type="number" id="euler_offset_z" step="0.1" placeholder="0.0" />
+                        </div>
+                    </div>
+                </form>
+
+                <!-- Engine Upgrade Section -->
+                <div class="info-card" style="margin-top: 20px;">
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <div>
+                            <h3 style="margin-bottom: 5px;">⬆️ 裁判系统升级</h3>
+                            <p style="font-size: 0.82rem; color: var(--text-muted); margin: 0;">上传新的 <code>app</code>
+                                引擎文件以远程替换裁判渲染系统</p>
+                        </div>
+                    </div>
+                    <div id="engine-upload-box"
+                        style="border: 2px dashed var(--border-color); border-radius: 10px; padding: 25px; text-align: center; cursor: pointer; transition: border-color 0.3s, background 0.3s;"
+                        onmouseover="this.style.borderColor='var(--primary)';this.style.background='rgba(0,255,170,0.03)'"
+                        onmouseout="this.style.borderColor='var(--border-color)';this.style.background='transparent'">
+                        <div style="font-size: 2rem; margin-bottom: 8px;">🔧</div>
+                        <div style="font-size: 0.9rem; color: #ccc;">点击选择或拖拽 <strong>app</strong> 文件到此处</div>
+                        <small style="color: var(--text-muted);">将替换 dist/app 裁判引擎程序（请确保系统已停止）</small>
+                        <input type="file" id="engine-file-input" style="display: none;" />
+                    </div>
+                    <div id="engine-upload-progress" style="display: none; margin-top: 10px;">
+                        <div style="width: 100%; background: #333; height: 6px; border-radius: 3px; overflow: hidden;">
+                            <div id="engine-progress-bar"
+                                style="width: 0%; height: 100%; background: var(--primary); transition: width 0.3s;">
+                            </div>
+                        </div>
+                        <div id="engine-upload-status" style="font-size: 0.8rem; color: #0aa; margin-top: 5px;">0%</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 4: Device Self-Check -->
+            <div class="step-page" id="step-4">
+                <h2>🔬 启动检查与服务校验</h2>
+                <p class="subtitle">正在检测后端引擎程序的运行健康度...</p>
+
+                <div class="check-list">
+                    <div class="check-item" id="check-camera-connect">
+                        <div>
+                            <span class="check-name">📷 引擎相机流捕捉</span>
+                            <span class="fix-tip" id="fix-camera-connect"></span>
+                        </div>
+                        <span class="check-status status-loading" id="status-camera-connect">尝试连接中...</span>
+                    </div>
+
+                    <div class="check-item" id="check-camera-perm">
+                        <div>
+                            <span class="check-name">📦 场景模型配置解析</span>
+                            <span class="fix-tip" id="fix-camera-perm"></span>
+                        </div>
+                        <span class="check-status status-loading" id="status-camera-perm">等待启动加载...</span>
+                    </div>
+
+                    <div class="check-item" id="check-video-stream">
+                        <div>
+                            <span class="check-name">🌐 通信及端口分配</span>
+                            <span class="fix-tip" id="fix-video-stream"></span>
+                        </div>
+                        <span class="check-status status-loading" id="status-video-stream">注册轮询中...</span>
+                    </div>
+                </div>
+
+                <div style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
+                    <button class="btn-ghost" id="btn-recheck">🔄 重新自检</button>
+                    <button class="btn-ghost" id="btn-stop-system" style="color: #ff4d4f; border-color: #ff4d4f;">⛔
+                        停止运行系统</button>
+                </div>
+
+                <div class="summary-card" id="summary-card" style="margin-top: 20px; display: none;">
+                    <div class="loading-scanner">系统配置已就绪，正在等候系统信号抓取...</div>
+                </div>
+            </div>
+
+            <!-- Step 5: Dashboard (AR Preview) -->
+            <div class="step-page" id="step-5">
+                <h2>🟢 AR 融合视频流与配置监控</h2>
+                <p class="subtitle">✅ 融合流端口已成功生成，系统已就绪。</p>
+
+                <div class="code-snippet-box">
+                    <strong>生成的融合流端口地址：</strong><br><br>
+                    <pre id="stream-address">http://{{ ip }}:8080/video_feed</pre>
+                    <button class="btn-copy" id="btn-copy-stream">复制</button>
+                </div>
+
+                <div>
+                    <h3>本地 AR 融合预览</h3>
+                    <p style="font-size: 0.9rem; color: var(--text-muted)">
+                        点击下方按钮将会在 RK3588 后台唤起 <code>ar_receiver.py</code> 进行本地流预览，若已在运行请勿重复点击。
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <button class="btn btn-glow btn-ar-launch" id="btn-start-preview">🖥️ 打开 RK3588端的AR
+                            融合预览窗口</button>
+                        <button class="btn btn-secondary" id="btn-stop-preview"
+                            style="display: none; border-color: #ff4d4f; color: #ff4d4f;">⏹️ 关闭预览窗口</button>
+                    </div>
+                </div>
+
+                <div class="info-card" style="margin-top: 20px;">
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <div>
+                            <h3 style="margin-bottom: 5px;">🎮 Web 键盘远程遥控 (WASD)</h3>
+                            <p style="font-size: 0.85rem; color: var(--text-muted); margin: 0;">无需终端，直接在网页按 WASD
+                                操控虚拟车体，按 Q 停止</p>
+                        </div>
+                        <button class="btn btn-primary" id="btn-toggle-wasd"
+                            style="background: #28a745; border-color: #28a745;">▶ 激活动态虚拟摇杆</button>
+                    </div>
+
+                    <div id="wasd-hud"
+                        style="display: none; background: rgba(0,0,0,0.3); padding: 15px; border-radius: 8px; border: 1px solid var(--border-color); text-align: center;">
+                        <div class="cyber-text"
+                            style="font-size: 1.2rem; font-weight: bold; margin-bottom: 10px; color: #0f0;">◉ 遥控模式已激活
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                            <label for="wasd-manual-y" style="font-size: 0.9rem; color: #ccc;">↕️ 手动调节高度 (Y): </label>
+                            <input type="number" id="wasd-manual-y" value="0.16" step="0.05"
+                                style="width: 80px; padding: 2px 5px; background: #222; border: 1px solid #444; color: #0f0; border-radius: 4px;">
+                        </div>
+                        <p style="font-family: monospace; font-size: 1.1rem;" id="wasd-status-text">X: 0.00 &nbsp; Y:
+                            0.16 &nbsp; Z: 0.00 &nbsp; YAW: 0.0°</p>
+                        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 10px;">请保持此页面在前台并按下 <kbd
+                                style="background:#444;padding:2px 5px;border-radius:3px;">W</kbd> <kbd
+                                style="background:#444;padding:2px 5px;border-radius:3px;">A</kbd> <kbd
+                                style="background:#444;padding:2px 5px;border-radius:3px;">S</kbd> <kbd
+                                style="background:#444;padding:2px 5px;border-radius:3px;">D</kbd> 进行控制<br>数据将自动由后端转发至
+                            {{ ip }}:<span id="wasd-udp-port">9005</span>
+                        </p>
+                    </div>
+
+                    <div class="info-card warning-card" style="margin-top: 20px; display: flex;">
+                        <div class="card-icon" style="margin-right: 15px; font-size: 1.5rem;">🗂️</div>
+                        <div class="card-text" style="flex: 1;">
+                            <h3 style="margin-bottom: 5px;">外部投递数据规范 (发往 RK3588)</h3>
+                            <p style="font-size: 0.85rem; line-height: 1.5; margin-bottom: 0;">
+                                如果您不使用上述网页键盘，而是通过外部程序投递定位数据到 RK3588，<strong>数据链路必须遵循平台统一的 JSON 通信标准</strong>。<br>
+                                主要用于同步相机/车体的实时位姿供 AR 追踪渲染，数据扁平化，必须直接包含 <code>pos</code> (三维坐标 XYZ) 与 <code>euler</code>
+                                (俯仰/偏航角)
+                                等基础字段，引擎不支持多层嵌套的 JSON 结构。
+                            </p>
+                            <button class="btn-ghost" id="btn-download-json"
+                                style="margin-top: 10px; border-color: rgba(255,255,255,0.2);">⬇️ 下载标准通信 JSON
+                                示例</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ====== Referee Events Section ====== -->
+                <div class="info-card" style="margin-top: 20px;">
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <div>
+                            <h3 style="margin-bottom: 5px;">⚖️ 裁判事件记录</h3>
+                            <p style="font-size: 0.85rem; color: var(--text-muted); margin: 0;">查看比赛中产生的碰撞、红绿灯、圈数等裁判事件
+                            </p>
+                        </div>
+                        <button class="btn-ghost" id="btn-refresh-records" style="font-size: 0.85rem;">🔄 刷新</button>
+                    </div>
+
+                    <!-- Records List -->
+                    <div id="match-records-list"
+                        style="max-height: 250px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; padding: 5px;">
+                        <div style="text-align: center; color: var(--text-muted); padding: 20px;">加载中...</div>
+                    </div>
+                </div>
+
+                <!-- Referee Event Viewer Modal (inline) -->
+                <div id="referee-viewer-modal" style="display: none; margin-top: 15px;">
+                    <div class="info-card" style="border: 1px solid var(--primary); position: relative;">
+                        <button id="btn-close-viewer"
+                            style="position: absolute; top: 10px; right: 15px; background: none; border: none; color: #ff4d4f; font-size: 1.5rem; cursor: pointer;">&times;</button>
+
+                        <h3 id="viewer-title" style="margin-bottom: 5px;">📋 比赛记录详情</h3>
+                        <p id="viewer-subtitle"
+                            style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 15px;"></p>
+
+                        <!-- Stats Summary -->
+                        <div id="viewer-stats" style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 15px;">
+                        </div>
+
+                        <!-- Event Timeline -->
+                        <div id="viewer-events"
+                            style="max-height: 400px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; background: rgba(0,0,0,0.3);">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Removed globally leaked JSON instruction -->
+
+        </main>
+
+        <!-- Footer / Controls (Hidden on Step 1) -->
+        <footer class="controls" id="wizard-controls" style="display: none;">
+            <button class="btn btn-secondary" id="btn-prev" disabled>上一步</button>
+            <div class="status-message" id="status-message"></div>
+
+            <!-- Step 3 特有按钮 -->
+            <button class="btn btn-secondary" id="btn-skip"
+                style="display: none; border: none; font-size: 0.8rem">跳过此步骤</button>
+            <button class="btn btn-primary" id="btn-save-next" style="display: none;">保存并下一步</button>
+
+            <!-- 全局通用下一步 / 以及重置按钮 -->
+            <button class="btn btn-primary" id="btn-next">下一步</button>
+
+            <!-- Step 5 呈现 -->
+            <button class="btn btn-secondary" id="btn-reset"
+                style="display: none; background: #ff4d4f; border: none; color: white;">⛔ 结束运行并返回首页</button>
+        </footer>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+</body>
+
+</html>

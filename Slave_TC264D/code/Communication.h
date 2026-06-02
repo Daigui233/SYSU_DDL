@@ -1,11 +1,11 @@
 /*********************************************************************************************************************
- * ÎÄ¼þÃû³Æ          Communication
- * ³µ¶ÓÃû³Æ          ÖÐÉ½´óÑ§ DDL_´óµçÁ÷
- * ¿ª·¢Æ½Ì¨          TC264D
+ * ï¿½Ä¼ï¿½ï¿½ï¿½ï¿½ï¿½          Communication
+ * ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½          ï¿½ï¿½É½ï¿½ï¿½Ñ§ DDL_ï¿½ï¿½ï¿½ï¿½ï¿½
+ * ï¿½ï¿½ï¿½ï¿½Æ½Ì¨          TC264D
  *
- * ÐÞ¸Ä¼ÇÂ¼
- * ÈÕÆÚ              ×÷Õß                ±¸×¢
- * 2026-04-29       Daigui              ³õ°æ
+ * ï¿½Þ¸Ä¼ï¿½Â¼
+ * ï¿½ï¿½ï¿½ï¿½              ï¿½ï¿½ï¿½ï¿½                ï¿½ï¿½×¢
+ * 2026-04-29       Daigui              ï¿½ï¿½ï¿½ï¿½
  *********************************************************************************************************************/
 
 #ifndef CODE_COMMUNICATION_H_
@@ -16,7 +16,7 @@
 #include "State.h"
 #include "zf_driver_uart.h"
 
-/* µ±Ç°½×¶ÎÍ¨ÐÅ´®¿Ú²ÎÊý°´ÀÏ´úÂëÓëÏÖÓÐ°å¼¶´®¿Ú1Á¬ÏßÉèÖÃ */
+/* ï¿½ï¿½Ç°ï¿½×¶ï¿½Í¨ï¿½Å´ï¿½ï¿½Ú²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð°å¼¶ï¿½ï¿½ï¿½ï¿½1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 #define COMM_UART_INDEX (UART_1)
 #define COMM_UART_BAUD (460800)
 #define COMM_UART_TX_PIN (UART1_TX_P20_10)
@@ -26,10 +26,10 @@
 #define COMM_RX_ADDR (0x10)
 #define COMM_TX_ADDR (0x90)
 
-#define COMM_RX_PAYLOAD_LEN (10) //ÕâÊÇ10½øÖÆÊý£¬¶ÔÓ¦Ê®Áù½øÖÆ 0x0A
+#define COMM_RX_PAYLOAD_LEN (10) //ï¿½ï¿½ï¿½ï¿½10ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó¦Ê®ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 0x0A
 #define COMM_RX_FRAME_LEN (14)
-#define COMM_TX_PAYLOAD_LEN (11)
-#define COMM_TX_FRAME_LEN (15)
+#define COMM_TX_PAYLOAD_LEN (46)
+#define COMM_TX_FRAME_LEN (50)
 
 typedef struct
 {
@@ -42,10 +42,10 @@ typedef struct
 
 extern communication_info_struct communication_info;
 
-// ÌáÇ°ÉùÃ÷º¯Êý½á¹¹Ìå£¬²»È»±àÒë±¨´í
+// ï¿½ï¿½Ç°ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½á¹¹ï¿½å£¬ï¿½ï¿½È»ï¿½ï¿½ï¿½ë±¨ï¿½ï¿½
 struct control_input_struct;
 
-// Í¨ÐÅÁÙÊ±±äÁ¿
+// Í¨ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½
 extern uint8 communicate_temp;
 
 void communication_init(void);

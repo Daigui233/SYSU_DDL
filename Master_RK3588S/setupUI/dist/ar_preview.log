@@ -1,0 +1,23 @@
+W rknn-toolkit-lite2 version: 2.1.0
+I RKNN: [11:55:56.005] RKNN Runtime Information, librknnrt version: 2.3.0 (c949ad889d@2024-11-07T11:35:33)
+I RKNN: [11:55:56.007] RKNN Driver Information, version: 0.9.8
+I RKNN: [11:55:56.014] RKNN Model Information, version: 6, toolkit version: 2.3.2(compiler version: 2.3.2 (e045de294f@2025-04-07T19:48:25)), target: RKNPU v2, target platform: rk3588, framework name: ONNX, framework layout: NCHW, model inference type: static_shape
+W RKNN: [11:55:56.071] query RKNN_QUERY_INPUT_DYNAMIC_RANGE error, rknn model is static shape type, please export rknn with dynamic_shapes
+W Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID. (If it is a static shape RKNN model, please ignore the above warning message.)
+/home/orangepi/Desktop/setupUI/dist/infer_wrap/base/model/rknn_lt.rknn 		done
+W rknn-toolkit-lite2 version: 2.1.0
+I RKNN: [11:55:56.143] RKNN Runtime Information, librknnrt version: 2.3.0 (c949ad889d@2024-11-07T11:35:33)
+I RKNN: [11:55:56.143] RKNN Driver Information, version: 0.9.8
+I RKNN: [11:55:56.144] RKNN Model Information, version: 6, toolkit version: 2.3.2(compiler version: 2.3.2 (e045de294f@2025-04-07T19:48:25)), target: RKNPU v2, target platform: rk3588, framework name: ONNX, framework layout: NCHW, model inference type: static_shape
+W RKNN: [11:55:56.154] query RKNN_QUERY_INPUT_DYNAMIC_RANGE error, rknn model is static shape type, please export rknn with dynamic_shapes
+W Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID. (If it is a static shape RKNN model, please ignore the above warning message.)
+/home/orangepi/Desktop/setupUI/dist/infer_wrap/base/model/rknn_lt.rknn 		done
+W rknn-toolkit-lite2 version: 2.1.0
+I RKNN: [11:55:56.216] RKNN Runtime Information, librknnrt version: 2.3.0 (c949ad889d@2024-11-07T11:35:33)
+I RKNN: [11:55:56.216] RKNN Driver Information, version: 0.9.8
+I RKNN: [11:55:56.217] RKNN Model Information, version: 6, toolkit version: 2.3.2(compiler version: 2.3.2 (e045de294f@2025-04-07T19:48:25)), target: RKNPU v2, target platform: rk3588, framework name: ONNX, framework layout: NCHW, model inference type: static_shape
+W RKNN: [11:55:56.231] query RKNN_QUERY_INPUT_DYNAMIC_RANGE error, rknn model is static shape type, please export rknn with dynamic_shapes
+W Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID. (If it is a static shape RKNN model, please ignore the above warning message.)
+/home/orangepi/Desktop/setupUI/dist/infer_wrap/base/model/rknn_lt.rknn 		done
+?? Client Ready. Waiting for Server...
+? Connected!

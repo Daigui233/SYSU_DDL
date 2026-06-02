@@ -1,0 +1,83 @@
+{
+    "match_date": "2026-05-23 15:29:07",
+    "total_events": 7,
+    "events": [
+        {
+            "index": 1,
+            "time_str": "15:29:01.579",
+            "elapsed_seconds": 24.76,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 2,
+            "time_str": "15:29:02.657",
+            "elapsed_seconds": 25.84,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 3,
+            "time_str": "15:29:03.652",
+            "elapsed_seconds": 26.83,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 4,
+            "time_str": "15:29:04.657",
+            "elapsed_seconds": 27.84,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 5,
+            "time_str": "15:29:05.784",
+            "elapsed_seconds": 28.97,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 6,
+            "time_str": "15:29:06.822",
+            "elapsed_seconds": 30.0,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        },
+        {
+            "index": 7,
+            "time_str": "15:29:07.866",
+            "elapsed_seconds": 31.05,
+            "type": "COLLISION",
+            "obj_id": 5048,
+            "message": "撞击障碍",
+            "data": {
+                "name": "begindoor.glb"
+            }
+        }
+    ]
+}

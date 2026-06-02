@@ -1,200 +1,123 @@
-﻿# Master_RK3588S 上位机说明
+﻿# Master_RK3588S
 
-## 一、目录用途
+RK3588S 上位机工程。当前核心任务是把 ESP32 BLE 定位、官方 AR 融合预览、路径/巡线控制和 TC264D 串口控车串起来，先完成低速跑一圈。
 
-本目录用于存放 `SYSU_DDL` 项目的上位机工程。
+## 当前链路
 
-当前已经补入一版基于 `Linux + C + termios` 的串口通信初版代码，目标是先与 `Slave_TC264D` 下位机当前固定帧协议完成联调。
+```text
+ESP32_BLE_Safe -> BLE notify -> setupUI/ar_receiver.py
+               -> robot_position UDP -> 官方 AR 引擎/WebUI 视频融合
+               -> 路径/巡线控制 -> setupUI/serial_comm.py -> /dev/ttyUSB0 -> TC264D
 
-## 二、当前已接入内容
-
-当前目录包含：
-
-- `communication.h`
-  上位机通信协议定义、串口接口声明
-
-- `communication.c`
-  Linux 串口初始化、固定帧打包、固定帧解包
-
-- `main.c`
-  最小联调示例，周期性发送控制帧并接收反馈帧
-
-- `Makefile`
-  Linux 下直接编译当前通信示例
-
-## 三、当前代码定位
-
-这版上位机代码的定位是：
-
-- 先验证 `RK3588S <-> TC264D` 串口链路
-- 先对齐当前第一版固定帧协议
-- 先提供一个可直接在终端运行的联调入口
-- 先形成椭圆巡线最小主循环骨架
-
-当前还不是最终上位机架构，后续仍需要逐步补入：
-
-- 视觉感知与图像处理
-- OCR 路牌识别
-- 红绿灯与限速标志识别
-- 行人、车辆、障碍物等元素识别
-- 路线规划与行为决策
-- 更完善的通信协议管理
-
-## 四、Linux 串口环境准备
-
-### 1. 查看当前可用串口
-
-```bash
-ls /dev/ttyS* /dev/ttyUSB* /dev/ttyACM*
+TC264D -> 串口反馈 -> serial_comm.py -> ar_receiver.py HUD/状态接口
 ```
 
-如果想看新插入设备对应到了哪个串口，也可以用：
+注意：
 
-```bash
-dmesg | grep tty
+- BLE 是定位链路。
+- `/dev/ttyUSB0` 是 RK3588S 到 TC264D 的控车链路。
+- ESP32 不负责 UDP 控车；UDP 是上位机把定位转给本机 AR 引擎。
+
+## 重点文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `setupUI/ar_receiver.py` | AR 预览主入口，接 BLE 定位，发 AR UDP，生成控车命令 |
+| `setupUI/serial_comm.py` | RK3588S 与 TC264D 的串口收发 |
+| `setupUI/dist/main_config.json` | 官方 WebUI/AR 配置 |
+| `setupUI/path_waypoints.json` | 路径点文件，存在时优先走定位路径控制 |
+| `setupUI/ar_pose_debug.log` | BLE/解析/UDP 分段调试日志 |
+| `setupUI/ar_pose_status.json` | 当前定位、控制、串口反馈状态 |
+| `setupUI/xverse_control_live.json` | 最近一次官方 `robot_position` 包 |
+
+## 定位与 AR
+
+ESP32 蓝牙名：`ESP32_BLE_Safe`
+
+BLE notify UUID：`6E400003-B5A3-F393-E0A9-E50E24DCCA9E`
+
+`ar_receiver.py` 支持无换行坐标 chunk，会解析文本或 JSON，并转成官方格式：
+
+```json
+{
+  "type": "robot_position",
+  "pos": [0.0, 0.16, 0.0],
+  "euler": [0.0, 0.0, 0.0],
+  "seq": 0,
+  "timestamp": 0.0
+}
 ```
 
-### 2. 检查串口权限
+当前约定：
 
-如果当前用户没有串口访问权限，可以先把用户加入 `dialout` 组：
+- `pos[0]`：横向 X。
+- `pos[1]`：高度，默认 `0.16`。
+- `pos[2]`：前后/赛道平面 Z。
+- `euler[2]`：Yaw。
 
-```bash
-sudo usermod -aG dialout $USER
-```
+默认 UDP 目标：`127.0.0.1:9005`，实际端口读取 `dist/main_config.json -> network.control_port`。
 
-执行后重新登录，再检查当前用户组：
+## WebUI 配置建议
 
-```bash
-groups
-```
+| 项 | 值 |
+| --- | --- |
+| 定位数据地址 | `127.0.0.1` |
+| 端口号 | `9005` |
+| UNITY 同步目标 IP | 本机调试可填 `127.0.0.1`，外部 Unity 按实际 IP |
+| UNITY 同步端口 | `9003` |
+| 相机位移 X/Y/Z | `0 / 0.16 / 0.12` |
+| 相机旋转 X/Y/Z | `0 / 0 / 0` |
 
-### 3. 接线说明
+不要把端口拼到“定位数据地址”里；地址和端口分开填。
 
-当前串口链路按照仓库根目录 `README.md` 中的协议约定：
+## 控车状态
 
-- 上位机 `TX` 接 下位机 `RX(P33.13)`
-- 上位机 `RX` 接 下位机 `TX(P20.10)`
-- `GND` 共地
+正常跑车应看到：
 
-如果接反，最常见现象就是：
+- 控制状态：`POSE` 或 `VISION`
+- 下位机状态：`STATE_TRACK`
+- `flags = 0x01`
+- `target_speed > 0`
 
-- 能打开串口但收不到数据
-- 上下位机都在发，但对方没有响应
+只有在定位路径和视觉误差都不可用时，上位机会兜底发：
 
-## 五、编译方式
+- `STATE_SAFE_STOP`
+- `target_speed = 0`
+- `flags = 0`
 
-进入上位机目录：
+当前路径点逻辑是循环路径，不会自动因为跑完一圈停车。
 
-```bash
-cd Master_RK3588S
-```
+## 常用环境变量
 
-直接编译：
-
-```bash
-make
-```
-
-编译成功后会生成：
-
-```bash
-./master_comm
-```
-
-如果要清理编译产物：
-
-```bash
-make clean
-```
-
-## 六、运行方式
-
-运行格式：
-
-```bash
-./master_comm <串口设备> [波特率] [目标速度]
-```
-
-例如：
-
-```bash
-./master_comm /dev/ttyS4 460800 120
-```
-
-如果省略波特率参数，默认使用：
-
-```bash
-460800
-```
-
-如果省略目标速度参数，默认使用：
-
-```bash
-120
-```
-
-程序当前行为是：
-
-- 周期性发送一帧控制帧
-- 默认下发 `TRACK` 状态
-- 默认按固定目标速度发送控制帧
-- 为后续视觉误差接入预留 `track_error` 入口
-- 尝试接收一帧反馈帧
-- 在终端打印当前实际速度、电机输出、舵机输出、状态值
-
-## 七、当前通信协议表
-
-更完整的协议总表已经整理在仓库根目录 [README.md](../README.md) 中，这里保留一份便于上位机开发时快速核对。
-
-### 串口参数
-
-| 参数 | 当前值 | 备注 |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| 波特率 | `460800` | 当前固定值 |
-| 下位机串口模块 | `UART_1` | TC264D 侧串口1 |
-| 下位机 `TX` | `P20.10` | 对应上位机 `RX` |
-| 下位机 `RX` | `P33.13` | 对应上位机 `TX` |
+| `AR_CONTROL_MODE` | `pose` | `pose/path/planner` 优先定位路径；无结果时退回视觉误差 |
+| `AR_WAYPOINT_PATH` | `setupUI/path_waypoints.json` | 路径点文件 |
+| `AR_POSE_CONTROL_SPEED` | `80.0` | 定位路径控制目标速度 |
+| `AR_POSE_FRESH_TTL` | `0.8` | 定位数据新鲜度阈值，单位秒 |
+| `AR_UDP_IP` | `127.0.0.1` | AR UDP 目标 IP |
+| `AR_UDP_PORT` | `9005` | AR UDP 目标端口 |
+| `AR_BLE_DEVICE_NAME` | `ESP32_BLE_Safe` | ESP32 BLE 名称 |
 
-### 上位机 -> 下位机控制帧
+## 调试检查
 
-| 字节偏移 | 字段名 | 类型 | 长度 | 说明 |
-| --- | --- | --- | --- | --- |
-| `0` | `frame_head` | `uint8` | `1` | 固定 `0x42` |
-| `1` | `addr` | `uint8` | `1` | 固定 `0x10` |
-| `2` | `payload_len` | `uint8` | `1` | 固定 `10` |
-| `3~6` | `track_error` | `float` | `4` | 赛道误差/路径误差 |
-| `7~10` | `target_speed` | `float` | `4` | 目标速度 |
-| `11` | `state_cmd` | `uint8` | `1` | 状态命令 |
-| `12` | `flags` | `uint8` | `1` | 扩展标志位 |
-| `13` | `checksum` | `uint8` | `1` | 对 `0~12` 字节求和 |
+WebUI/HUD 或状态接口里优先看：
 
-### 下位机 -> 上位机反馈帧
+- BLE 是否 connected，`ok` 是否增长。
+- POSE 坐标是否随 tag 移动变化。
+- UDP ok 是否增长。
+- control state 是否为 `POSE` 或 `VISION`。
+- TC264D feedback count 是否增长。
+- `flags` 是否为 `0x01`。
+- `motor_target / servo_output` 是否随控制变化。
 
-| 字节偏移 | 字段名 | 类型 | 长度 | 说明 |
-| --- | --- | --- | --- | --- |
-| `0` | `frame_head` | `uint8` | `1` | 固定 `0x42` |
-| `1` | `addr` | `uint8` | `1` | 固定 `0x90` |
-| `2` | `payload_len` | `uint8` | `1` | 固定 `11` |
-| `3~6` | `actual_speed` | `float` | `4` | 实际速度反馈 |
-| `7~10` | `motor_output` | `int32` | `4` | 电机输出控制量 |
-| `11~12` | `servo_output` | `uint16` | `2` | 舵机输出占空比 |
-| `13` | `state_value` | `uint8` | `1` | 当前状态值 |
-| `14` | `checksum` | `uint8` | `1` | 对 `0~13` 字节求和 |
+状态接口：
 
-## 八、当前阶段说明
+- `http://<RK3588S-IP>:9105/pose_status`
+- `http://<RK3588S-IP>:9105/pose_packet`
 
-- 当前协议使用固定帧，不是最终版协议
-- 当前代码重点是先联调串口链路，不是最终上位机框架
-- 当前 `main.c` 已经收成椭圆巡线最小主循环骨架
-- 当前 `track_error` 入口还是占位接口，后续要由视觉输出替换
-- 后续如果协议字段明显增加，建议升级为更清晰的可扩展协议格式
+## 当前状态
 
-
-## 九、更新日志
-### 2026-04-29
-
-- 完成基于 `Linux + C + termios` 的上位机第一版串口通信代码，新增 `communication.h`、`communication.c`、`main.c`、`Makefile`
-- 上位机当前已能按固定帧协议向下位机发送 `track_error / target_speed / state_cmd / flags`，并接收下位机反馈帧
-- `main.c` 已整理为椭圆巡线最小主循环骨架：默认下发 `TRACK` 状态、固定目标速度，并为后续视觉误差接入预留接口
-- `README` 已补充 Linux 下串口设备查询、权限配置、编译命令、运行命令与协议表，便于后续在 RK3588S 平台直接联调
-- 当前上位机通信代码尚未经过 RK3588S 实机编译与联调验证，后续仍需结合板端环境继续审查与修订
+- AR 定位融合已跑通：移动 tag 后视频流会实时变化。
+- 上位机已接入串口控车和 TC264D 反馈显示。
+- 当前目标是先低速跑完一圈，再继续优化模型、路径和任务识别。

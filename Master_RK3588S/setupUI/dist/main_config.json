@@ -1,0 +1,56 @@
+{
+  "device_name": "/dev/video-camera0",
+  "width": 640,
+  "height": 480,
+  "video_flip": {
+    "horizontal": false,
+    "vertical": false
+  },
+  "K": [
+    [
+      316.34668831,
+      0,
+      312.07420652
+    ],
+    [
+      0,
+      318.61308429,
+      211.72834966
+    ],
+    [
+      0,
+      0,
+      1
+    ]
+  ],
+  "D": [
+    -0.01585373,
+    0.04236163,
+    -0.00183995,
+    -0.00313456,
+    -0.03312241
+  ],
+  "network": {
+    "object_update_port": 9002,
+    "stream_port": 8080,
+    "control_port": 9005,
+    "udp_target_ip": "127.0.0.1:9005",
+    "udp_target_port": 9000,
+    "unity_sync_port": 9003,
+    "unity_target_ip": "10.254.237.220",
+    "sync_rate": 30,
+    "imu_send_rate": 50,
+    "pos_offset": [
+      0.0,
+      0.16,
+      0.12
+    ],
+    "euler_offset": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "movement_delay_ms": 0,
+    "video_delay_ms": 0
+  }
+}

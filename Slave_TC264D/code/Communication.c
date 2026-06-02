@@ -1,21 +1,11 @@
-/*********************************************************************************************************************
- * 文件名称          Communication
- * 车队名称          中山大学 DDL_大电流
- * 开发平台          TC264D
- *
- * 修改记录
- * 日期              作者                备注
- * 2026-04-29       Daigui              初版
- *********************************************************************************************************************/
 
 #include "Communication.h"
 
 communication_info_struct communication_info;
 
-// 通信临时变量
 uint8 communicate_temp;
 
-    typedef union
+typedef union
 {
     float data_float;
     uint8 data_byte[4];
@@ -33,15 +23,29 @@ typedef union
     uint8 data_byte[2];
 } comm_uint16_union;
 
-/*********************************************************************************************************************
- * 函数名称          communication_checksum
- * 功能说明          计算通信校验和
- * 参数说明          buff            数据缓冲区
- *                   len             参与校验的数据长度
- * 返回参数          uint8           累加和低 8 位
- * 使用示例          sum = communication_checksum(buff, 13);
- * 备注信息          当前阶段采用逐飞旧工程中常见的累加和形式
- *********************************************************************************************************************/
+static void communication_put_float(uint8 index, float value)
+{
+    comm_float_union data;
+    uint8 i;
+
+    data.data_float = value;
+    for (i = 0; i < 4; i++)
+    {
+        communication_info.tx_buffer[index + i] = data.data_byte[i];
+    }
+}
+
+static void communication_put_int32(uint8 index, int32 value)
+{
+    comm_int32_union data;
+    uint8 i;
+
+    data.data_int32 = value;
+    for (i = 0; i < 4; i++)
+    {
+        communication_info.tx_buffer[index + i] = data.data_byte[i];
+    }
+}
 static uint8 communication_checksum(const uint8 *buff, uint8 len)
 {
     uint8 i;
@@ -55,14 +59,6 @@ static uint8 communication_checksum(const uint8 *buff, uint8 len)
     return sum;
 }
 
-/*********************************************************************************************************************
- * 函数名称          communication_init
- * 功能说明          通信模块初始化函数
- * 参数说明          无
- * 返回参数          无
- * 使用示例          communication_init();
- * 备注信息          当前阶段采用轮询串口方式 后续如需中断接收可继续扩展
- *********************************************************************************************************************/
 void communication_init(void)
 {
     communication_info.rx_index = 0;
@@ -71,14 +67,6 @@ void communication_init(void)
     uart_init(COMM_UART_INDEX, COMM_UART_BAUD, COMM_UART_TX_PIN, COMM_UART_RX_PIN);
 }
 
-/*********************************************************************************************************************
- * 函数名称          communication_poll
- * 功能说明          轮询串口并尝试接收完整控制帧
- * 参数说明          无
- * 返回参数          无
- * 使用示例          communication_poll();
- * 备注信息          当前阶段主循环中周期性调用本接口即可
- *********************************************************************************************************************/
 void communication_poll(void)
 {
     uint8 dat;
@@ -100,14 +88,6 @@ void communication_poll(void)
     }
 }
 
-/*********************************************************************************************************************
- * 函数名称          communication_itrpt_init
- * 功能说明          使用中断接收控制帧并尝试解码
- * 参数说明          无
- * 返回参数          无
- * 使用示例          communication_itrpt_init();
- * 备注信息          只需要初始化一次，之后的程序在中断回调函数里面执行，包含communication_init
- *********************************************************************************************************************/
 void communication_itrpt_init(void)
 {
     communication_info.rx_index = 0;
@@ -115,17 +95,9 @@ void communication_itrpt_init(void)
 
     uart_init(COMM_UART_INDEX, COMM_UART_BAUD, COMM_UART_TX_PIN, COMM_UART_RX_PIN);
 
-    uart_rx_interrupt(COMM_UART_INDEX, 1); // 打开串口接收中断
+    uart_rx_interrupt(COMM_UART_INDEX, 1);
 }
 
-/*********************************************************************************************************************
- * 函数名称          communication_rx_byte
- * 功能说明          按字节接收控制帧
- * 参数说明          dat             接收到的单字节数据
- * 返回参数          无
- * 使用示例          communication_rx_byte(dat);
- * 备注信息          当前阶段使用固定帧长解析
- *********************************************************************************************************************/
 void communication_rx_byte(uint8 dat)
 {
     if (0 == communication_info.rx_index)
@@ -145,14 +117,6 @@ void communication_rx_byte(uint8 dat)
     }
 }
 
-/*********************************************************************************************************************
- * 函数名称          communication_decode_frame
- * 功能说明          解码接收到的控制帧
- * 参数说明          input           输出的控制输入结构体
- * 返回参数          uint8           1 表示解码成功 0 表示失败
- * 使用示例          if(communication_decode_frame(&input))
- * 备注信息          当前协议内容为 track_error target_speed state_cmd flags
- *********************************************************************************************************************/
 uint8 communication_decode_frame(struct control_input_struct *input)
 {
     comm_float_union track_error;
@@ -162,29 +126,22 @@ uint8 communication_decode_frame(struct control_input_struct *input)
 
     if (COMM_FRAME_HEAD != communication_info.rx_buffer[0])
     {
-        //uart_write_buffer(UART_1, &communication_info.rx_buffer, COMM_RX_FRAME_LEN);
-        //uart_write_string(UART_1, "\r\n head failed\r\n");
         return 0;
     }
 
     if (COMM_RX_ADDR != communication_info.rx_buffer[1])
     {
-        //uart_write_string(UART_1, "addr failed\r\n");
         return 0;
     }
 
     if (COMM_RX_PAYLOAD_LEN != communication_info.rx_buffer[2])
     {
-        //uart_write_buffer(UART_1, &communication_info.rx_buffer[0], COMM_RX_FRAME_LEN);
-        //uart_write_string(UART_1, "len failed\r\n");
         return 0;
     }
 
     checksum = communication_checksum(communication_info.rx_buffer, COMM_RX_FRAME_LEN - 1);
     if (checksum != communication_info.rx_buffer[COMM_RX_FRAME_LEN - 1])
     {
-        //uart_write_buffer(UART_1, &communication_info.rx_buffer[0], COMM_RX_FRAME_LEN);
-        //uart_write_string(UART_1, "checksum failed\r\n");
         return 0;
     }
 
@@ -202,42 +159,30 @@ uint8 communication_decode_frame(struct control_input_struct *input)
     return 1;
 }
 
-/*********************************************************************************************************************
- * 函数名称          communication_send_feedback
- * 功能说明          打包并发送下位机反馈数据
- * 参数说明          无
- * 返回参数          无
- * 使用示例          communication_send_feedback();
- * 备注信息          当前阶段回传实际速度 电机输出 舵机输出 当前状态
- *********************************************************************************************************************/
 void communication_send_feedback(void)
 {
     control_ctx_struct *ctx;
-    comm_float_union actual_speed;
-    comm_int32_union motor_output;
-    comm_uint16_union servo_output;
-    uint8 i;
 
     ctx = control_get_ctx();
-
-    actual_speed.data_float = ctx->actual_speed;
-    motor_output.data_int32 = ctx->motor_output;
-    servo_output.data_uint16 = (uint16)ctx->servo_output;
 
     communication_info.tx_buffer[0] = COMM_FRAME_HEAD;
     communication_info.tx_buffer[1] = COMM_TX_ADDR;
     communication_info.tx_buffer[2] = COMM_TX_PAYLOAD_LEN;
 
-    for (i = 0; i < 4; i++)
-    {
-        communication_info.tx_buffer[3 + i] = actual_speed.data_byte[i];
-        communication_info.tx_buffer[7 + i] = motor_output.data_byte[i];
-    }
-
-    communication_info.tx_buffer[11] = servo_output.data_byte[0];
-    communication_info.tx_buffer[12] = servo_output.data_byte[1];
-    communication_info.tx_buffer[13] = (uint8)state_get();
-    communication_info.tx_buffer[14] = communication_checksum(communication_info.tx_buffer, COMM_TX_FRAME_LEN - 1);
+    communication_put_float(3, ctx->actual_speed);
+    communication_put_float(7, ctx->motor_target);
+    communication_put_float(11, ctx->input.target_speed);
+    communication_put_float(15, ctx->input.track_error);
+    communication_put_int32(19, ctx->motor_output);
+    communication_put_int32(23, (int32)ctx->servo_output);
+    communication_put_float(27, ctx->param.motor_kp);
+    communication_put_float(31, ctx->param.motor_ki);
+    communication_put_float(35, ctx->param.motor_kd);
+    communication_put_float(39, ctx->param.servo_kp);
+    communication_put_float(43, ctx->param.servo_kd);
+    communication_info.tx_buffer[47] = (uint8)state_get();
+    communication_info.tx_buffer[48] = ctx->input.flags;
+    communication_info.tx_buffer[49] = communication_checksum(communication_info.tx_buffer, COMM_TX_FRAME_LEN - 1);
 
     uart_write_buffer(COMM_UART_INDEX, communication_info.tx_buffer, COMM_TX_FRAME_LEN);
 }
