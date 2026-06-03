@@ -34,10 +34,10 @@
     "object_update_port": 9002,
     "stream_port": 8080,
     "control_port": 9005,
-    "udp_target_ip": "127.0.0.1:9005",
-    "udp_target_port": 9000,
+    "udp_target_ip": "127.0.0.1",
+    "udp_target_port": 9005,
     "unity_sync_port": 9003,
-    "unity_target_ip": "10.254.237.220",
+    "unity_target_ip": "127.0.0.1",
     "sync_rate": 30,
     "imu_send_rate": 50,
     "pos_offset": [
