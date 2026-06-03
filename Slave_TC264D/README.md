@@ -113,6 +113,10 @@ RK3588S 侧当前使用 `/dev/ttyUSB0`。
 
 当前没有启用心跳超时函数。这样做是为了先把“定位 -> 上位机 -> 下位机 -> 实车跑一圈”排通，避免停车原因不好区分。
 
+## 源码编码
+
+TC264D 工程源码 .c/.h 保持 GBK 编码，以匹配 AURIX Development Studio 默认编码。README 等 Markdown 文档保持 UTF-8。
+
 ## 编译
 
 使用 AURIX Development Studio 打开本工程编译。当前工程已在 ADS 中达到：
