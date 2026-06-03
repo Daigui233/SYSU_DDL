@@ -39,6 +39,7 @@ SEG_RESULT_TTL = 2.0
 DET_RESULT_TTL = 1.0
 CONTROL_SCALE = 0.5
 TRACK_SPEED = 120.0
+TRACK_FALLBACK_SPEED = float(os.environ.get("AR_TRACK_FALLBACK_SPEED", str(TRACK_SPEED)))
 CONTROL_MODE = os.environ.get("AR_CONTROL_MODE", "pose").strip().lower()
 CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", "1"), 0)
 PATH_WAYPOINTS_PATH = os.environ.get("AR_WAYPOINT_PATH", os.path.join(BASE_DIR, "path_waypoints.json"))
@@ -1391,10 +1392,11 @@ def main():
                         control_state_text = "VISION"
                     elif command_error is None:
                         command_error = 0.0
-                        command_speed = 0.0
-                        command_state = STATE_SAFE_STOP
-                        command_flags = 0
-                        control_state_text = "SAFE_STOP"
+                        command_speed = TRACK_FALLBACK_SPEED
+                        command_state = STATE_TRACK
+                        command_flags = CONTROL_FLAG_USE_TARGET_SPEED
+                        control_state_text = "TRACK_FALLBACK"
+                        planner_status = f"{planner_status}; fallback run" if planner_status else "fallback run"
 
                     send_car_cmd(
                         track_error=command_error,
