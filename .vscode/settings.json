@@ -1,3 +1,10 @@
 {
-    "files.encoding": "gbk"
+    "files.encoding": "gbk",
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:system",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
 }

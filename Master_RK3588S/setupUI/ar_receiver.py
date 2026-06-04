@@ -59,7 +59,10 @@ BLE_BOOTSTRAP_WITH_BLUETOOTHCTL = os.environ.get("AR_BLE_BOOTSTRAP", "1") != "0"
 BLE_USE_BLUETOOTHCTL_CACHE = os.environ.get("AR_BLE_USE_CACHE", "0") == "1"
 BLE_SCAN_TIMEOUT = float(os.environ.get("AR_BLE_SCAN_TIMEOUT", "8.0"))
 DEFAULT_AR_UDP_IP = "127.0.0.1"
-DEFAULT_AR_UDP_PORT = 9005
+DEFAULT_AR_UDP_PORT = 9006
+POSE_INPUT_MODE = os.environ.get("AR_POSE_INPUT_MODE", "udp").strip().lower()
+POSE_INPUT_HOST = os.environ.get("AR_POSE_INPUT_HOST", "0.0.0.0")
+POSE_INPUT_PORT = int(os.environ.get("AR_POSE_INPUT_PORT", "9005"))
 POSE_SCALE = float(os.environ.get("AR_POSE_SCALE", "0.01"))
 POSE_HEIGHT = float(os.environ.get("AR_POSE_HEIGHT", "0.16"))
 POSE_X_SIGN = float(os.environ.get("AR_POSE_X_SIGN", "1.0"))
@@ -450,8 +453,8 @@ def read_frame_from_shm(shm):
 
 def load_ar_network_config():
     # The official AR engine consumes robot_position on network.control_port.
-    # The WebUI udp_target_* fields describe the external pose source and are not
-    # the port this local BLE bridge should send to.
+    # WebUI udp_target_* should mirror the board-local AR endpoint
+    # (127.0.0.1:9006), while Windows sends external pose data to board_ip:9005.
     ip = os.environ.get("AR_UDP_IP", DEFAULT_AR_UDP_IP)
     port = DEFAULT_AR_UDP_PORT
     try:
@@ -535,11 +538,11 @@ def make_official_ar_packet(x, z, yaw_deg=0.0, height=None, pitch=0.0, roll=0.0)
             float(y),
             float(z) * POSE_SCALE * POSE_Z_SIGN,
         ],
-        # Match the local WASD/dataset_collector path: yaw is carried in euler[2].
+        # Official robot_position format: yaw is carried in euler[1].
         "euler": [
             float(pitch),
-            float(roll),
             yaw * POSE_YAW_SIGN + POSE_YAW_OFFSET,
+            float(roll),
         ],
     }
 
@@ -661,7 +664,7 @@ def _read_pose_xyz_yaw(packet):
     try:
         x = float(pos[0])
         z = float(pos[2])
-        yaw = float(euler[2])
+        yaw = float(euler[1])
     except (TypeError, ValueError):
         return None
     if not (np.isfinite(x) and np.isfinite(z) and np.isfinite(yaw)):
@@ -768,6 +771,7 @@ class ARPoseBridge:
         self.targets = build_ar_udp_targets(self.target_ip, self.target_port)
         self.target_text = ",".join(f"{ip}:{port}" for ip, port in self.targets)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.input_sock = None
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.thread = None
@@ -788,7 +792,10 @@ class ARPoseBridge:
 
     def start(self):
         write_debug_log("=" * 60)
-        write_debug_log(f"AR pose bridge starting, UDP targets: {self.target_text}")
+        write_debug_log(
+            f"AR pose bridge starting, input={POSE_INPUT_MODE} "
+            f"{POSE_INPUT_HOST}:{POSE_INPUT_PORT}, AR targets: {self.target_text}"
+        )
         write_debug_log(f"pose debug log: {DEBUG_LOG_PATH}")
         write_debug_log(f"pose status json: {DEBUG_STATUS_PATH}")
         write_debug_log(f"live official packet json: {DEBUG_PACKET_PATH}")
@@ -798,6 +805,15 @@ class ARPoseBridge:
             invalid_count=self.invalid_count,
             target=self.target_text,
         )
+        if POSE_INPUT_MODE != "ble":
+            self.set_status(
+                "udp listening",
+                f"Waiting for Windows localization UDP on {POSE_INPUT_HOST}:{POSE_INPUT_PORT}",
+            )
+            self.thread = threading.Thread(target=self._udp_loop, name="ar-pose-udp", daemon=True)
+            self.thread.start()
+            return
+
         if BleakClient is None or BleakScanner is None:
             self.status = "bleak missing"
             write_debug_log("BLE bridge disabled: install bleak on RK3588S to receive ESP32 BLE pose data")
@@ -816,6 +832,11 @@ class ARPoseBridge:
     def stop(self):
         self.stop_event.set()
         try:
+            if self.input_sock is not None:
+                self.input_sock.close()
+        except Exception:
+            pass
+        try:
             self.sock.close()
         except Exception:
             pass
@@ -830,7 +851,9 @@ class ARPoseBridge:
                 "packet_count": self.packet_count,
                 "invalid_count": self.invalid_count,
                 "target": self.target_text,
-                "device": BLE_DEVICE_ADDRESS or BLE_DEVICE_NAME,
+                "input": f"{POSE_INPUT_HOST}:{POSE_INPUT_PORT}",
+                "input_mode": POSE_INPUT_MODE,
+                "device": BLE_DEVICE_ADDRESS or BLE_DEVICE_NAME if POSE_INPUT_MODE == "ble" else None,
                 "seen_devices": self.last_scan_devices,
                 "raw_chunk_count": self.raw_chunk_count,
                 "last_raw_chunk": self.last_raw_chunk,
@@ -872,6 +895,51 @@ class ARPoseBridge:
             asyncio.run(self._ble_loop())
         except Exception as exc:
             self.set_status(f"BLE error: {exc}", f"BLE bridge stopped: {exc}")
+
+    def _udp_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(0.5)
+        self.input_sock = sock
+        try:
+            sock.bind((POSE_INPUT_HOST, POSE_INPUT_PORT))
+            self.set_status(
+                "udp waiting pose",
+                f"Windows localization UDP ready on {POSE_INPUT_HOST}:{POSE_INPUT_PORT}",
+            )
+            while not self.stop_event.is_set():
+                try:
+                    data, source = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self.stop_event.is_set():
+                        break
+                    raise
+
+                chunk = data.decode("utf-8", errors="ignore").strip()
+                now = time.time()
+                with self.lock:
+                    self.raw_chunk_count += 1
+                    self.last_raw_chunk = chunk
+                    self.last_raw_ts = now
+                    raw_count = self.raw_chunk_count
+                pose_path_debug(
+                    "UDP_RAW",
+                    f"#{raw_count} from={source[0]}:{source[1]} bytes={len(data)} text={repr(chunk)}",
+                    count=raw_count,
+                )
+                self.handle_line(chunk)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.set_status(f"udp error: {exc}", f"UDP pose receiver stopped: {exc}")
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            if self.input_sock is sock:
+                self.input_sock = None
 
     async def _ble_loop(self):
         while not self.stop_event.is_set():
@@ -1141,7 +1209,7 @@ class ARPoseBridge:
                 "[AR_POSE_DEBUG] "
                 f"#{count} raw='{line.strip()}' "
                 f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
-                f"yaw={euler[2]:.2f} "
+                f"yaw={euler[1]:.2f} "
                 f"udp={self.target_text} "
                 f"json={payload.decode('utf-8')}"
             )
@@ -1178,6 +1246,10 @@ def short_text(text, max_len=74):
 
 def pose_status_hint(status, packet_count, invalid_count):
     status_l = str(status).lower()
+    if "udp listening" in status_l or "udp waiting pose" in status_l:
+        return f"Waiting for Windows localization on board UDP port {POSE_INPUT_PORT}."
+    if "udp error" in status_l:
+        return f"Cannot receive Windows localization on UDP {POSE_INPUT_PORT}. Check port usage."
     if "bleak missing" in status_l:
         return "Install python bleak first: pip install bleak"
     if "bluetooth init" in status_l:
@@ -1191,12 +1263,12 @@ def pose_status_hint(status, packet_count, invalid_count):
     if "connected" in status_l or "waiting pose" in status_l:
         return "BLE connected. If ok stays 0, check whether ESP32 is notifying pose lines."
     if "invalid" in status_l or invalid_count > 0 and packet_count == 0:
-        return "BLE has data, but parser rejected it. Check raw line format in log."
+        return "Localization data arrived, but the parser rejected it. Check the raw packet in the log."
     if "receiving" in status_l and packet_count > 0:
         return "Pose received and forwarded to official AR engine UDP control port."
-    if "reconnect" in status_l or "error" in status_l:
+    if POSE_INPUT_MODE == "ble" and ("reconnect" in status_l or "error" in status_l):
         return "BLE connection error. Watch log and retry ESP32 power/Bluetooth."
-    return "Waiting for BLE pose pipeline."
+    return "Waiting for localization pose pipeline."
 
 
 def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_state="N/A", planner_status=None):
@@ -1219,14 +1291,15 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
         age_text = f"{age:.1f}s" if age is not None else "N/A"
         pose_line = (
             f"POSE x={pos[0]:.2f} y={pos[1]:.2f} z={pos[2]:.2f} "
-            f"yaw={euler[2]:.1f} age={age_text}"
+            f"yaw={euler[1]:.1f} age={age_text}"
         )
 
-    ble_line = (
-        f"ESP32 {short_text(info['status'], 18)} "
+    source_name = "ESP32" if info.get("input_mode") == "ble" else "WIN-UDP"
+    source_line = (
+        f"{source_name} {short_text(info['status'], 18)} "
         f"ok={info['packet_count']} bad={info['invalid_count']}"
     )
-    udp_line = f"UDP ok={info['udp_send_count']} fail={info['udp_fail_count']}"
+    udp_line = f"AR-FWD ok={info['udp_send_count']} fail={info['udp_fail_count']} -> {info['target']}"
     if track_error is not None and np.isfinite(track_error):
         plan_line = f"PLAN {control_state} err={track_error:.1f}"
     else:
@@ -1259,7 +1332,7 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
     fps_line = f"FPS {fps:.1f}" if fps is not None else "FPS N/A"
 
     lines = [
-        ble_line,
+        source_line,
         pose_line,
         udp_line,
         plan_line,
