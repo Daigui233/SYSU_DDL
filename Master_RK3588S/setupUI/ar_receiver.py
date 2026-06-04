@@ -1,29 +1,21 @@
 import time
 import struct
-import asyncio
 import json
 import math
 import os
-import re
 import socket
 import threading
-import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import cv2
 from multiprocessing import shared_memory, resource_tracker
 
-try:
-    from bleak import BleakClient, BleakScanner
-except ImportError:
-    BleakClient = None
-    BleakScanner = None
 
 from infer_wrap import InferWrap, PPSegInfer
 from infer_wrap.base.func import draw
 from infer_wrap.base.seg_func import extract_centerline
 
-# serial_comm 是 RK3588S -> TC264D 的控车串口，和 ESP32 定位 BLE 链路无关。
+# serial_comm handles the RK3588S -> TC264D control link.
 try:
     import serial_comm as _serial_comm
 except Exception as exc:
@@ -51,28 +43,14 @@ POSE_CROSSTRACK_GAIN = float(os.environ.get("AR_POSE_CROSSTRACK_GAIN", "80.0"))
 POSE_CONTROL_SIGN = float(os.environ.get("AR_POSE_CONTROL_SIGN", "1.0"))
 POSE_CONTROL_LIMIT = float(os.environ.get("AR_POSE_CONTROL_LIMIT", "120.0"))
 
-BLE_DEVICE_NAME = os.environ.get("AR_BLE_DEVICE_NAME", "ESP32_BLE_Safe")
-BLE_DEVICE_ADDRESS = os.environ.get("AR_BLE_ADDRESS")
-UART_SERVICE_UUID = os.environ.get("AR_BLE_SERVICE_UUID", "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-UART_TX_CHAR_UUID = os.environ.get("AR_BLE_TX_UUID", "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
-BLE_BOOTSTRAP_WITH_BLUETOOTHCTL = os.environ.get("AR_BLE_BOOTSTRAP", "1") != "0"
-BLE_USE_BLUETOOTHCTL_CACHE = os.environ.get("AR_BLE_USE_CACHE", "0") == "1"
-BLE_SCAN_TIMEOUT = float(os.environ.get("AR_BLE_SCAN_TIMEOUT", "8.0"))
 DEFAULT_AR_UDP_IP = "127.0.0.1"
 DEFAULT_AR_UDP_PORT = 9006
-POSE_INPUT_MODE = os.environ.get("AR_POSE_INPUT_MODE", "udp").strip().lower()
 POSE_INPUT_HOST = os.environ.get("AR_POSE_INPUT_HOST", "0.0.0.0")
 POSE_INPUT_PORT = int(os.environ.get("AR_POSE_INPUT_PORT", "9005"))
-POSE_SCALE = float(os.environ.get("AR_POSE_SCALE", "0.01"))
-POSE_HEIGHT = float(os.environ.get("AR_POSE_HEIGHT", "0.16"))
-POSE_X_SIGN = float(os.environ.get("AR_POSE_X_SIGN", "1.0"))
-POSE_Z_SIGN = float(os.environ.get("AR_POSE_Z_SIGN", "1.0"))
-POSE_YAW_SIGN = float(os.environ.get("AR_POSE_YAW_SIGN", "1.0"))
-POSE_YAW_OFFSET = float(os.environ.get("AR_POSE_YAW_OFFSET", "0.0"))
 
 # ===== 定位数据终端调试开关 =====
-# 联调 ESP32 -> RK3588S -> 官方 AR 引擎链路时保持 True，会在终端打印原始定位行和转发后的官方 JSON。
-# 稳定后如果嫌终端刷屏，把这里改成 False；也可以注释掉 handle_line() 里的 AR_POSE_DEBUG 打印块。
+# Windows AprilTag localization sends official robot_position JSON over UDP.
+# 稳定后如果嫌终端刷屏，把这里改成 False。
 DEBUG_PRINT_POSE = True
 DEBUG_PRINT_POSE_EVERY_N = 1
 DEBUG_LOG_POSE_TO_FILE = True
@@ -81,14 +59,11 @@ DEBUG_STATUS_PATH = os.environ.get("AR_POSE_STATUS_PATH", os.path.join(BASE_DIR,
 DEBUG_PACKET_PATH = os.environ.get("AR_POSE_PACKET_PATH", os.path.join(BASE_DIR, "xverse_control_live.json"))
 DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEBUG_DRAW_POSE_PANEL = True
-DEBUG_PRINT_RAW_BLE = True
-DEBUG_PRINT_RAW_EVERY_N = 1
 POSE_STATUS_HTTP_HOST = os.environ.get("AR_POSE_STATUS_HOST", "0.0.0.0")
 POSE_STATUS_HTTP_PORT = int(os.environ.get("AR_POSE_STATUS_PORT", "9105"))
-NO_NL_BUFFER_LIMIT = int(os.environ.get("AR_POSE_NO_NL_BUFFER_LIMIT", "256"))
 
 # ===== POSE_PATH_DEBUG_START：定位链路分段验证打印，稳定后可整段删除 =====
-# 作用：在不改 WebUI 的情况下，判断定位数据卡在 BLE、解析、JSON 镜像、UDP 转发还是官方 AR 引擎消费阶段。
+# The staged debug output identifies UDP input, JSON validation, local mirror, and AR forwarding.
 # 删除方法：搜索 POSE_PATH_DEBUG_START 到 POSE_PATH_DEBUG_END，以及代码中的 POSE_PATH_DEBUG 调用点。
 POSE_PATH_DEBUG = True
 POSE_PATH_DEBUG_EVERY_N = 1
@@ -346,98 +321,6 @@ def start_pose_status_http_server():
     return server
 
 
-def parse_bluetoothctl_devices(output):
-    devices = []
-    for line in (output or "").splitlines():
-        parts = line.strip().split(maxsplit=2)
-        if len(parts) >= 2 and parts[0] == "Device":
-            address = parts[1]
-            name = parts[2] if len(parts) >= 3 else ""
-            devices.append((address, name))
-    return devices
-
-
-def is_bluez_connected(address):
-    ok, output = run_bluetoothctl_command(("info", address), timeout=3.0)
-    if not ok:
-        return False
-    return "Connected: yes" in output
-
-
-def find_cached_ble_address():
-    outputs = []
-    ok_connected, connected_output = run_bluetoothctl_command(("devices", "Connected"), timeout=3.0)
-    if ok_connected and connected_output:
-        outputs.append((connected_output, True))
-
-    ok, output = run_bluetoothctl_command(("devices",), timeout=3.0)
-    if ok and output:
-        outputs.append((output, False))
-    elif not outputs:
-        write_debug_log(f"bluetoothctl devices failed: {output}")
-        return None, []
-
-    seen = []
-    seen_addresses = set()
-    target_address = (BLE_DEVICE_ADDRESS or "").lower()
-    for output_text, listed_connected in outputs:
-        for address, name in parse_bluetoothctl_devices(output_text):
-            if address.lower() in seen_addresses:
-                continue
-            seen_addresses.add(address.lower())
-            connected = listed_connected or is_bluez_connected(address)
-            suffix = " [connected]" if connected else ""
-            seen.append(f"{name or '(no name)'}@{address}{suffix}")
-            if target_address and address.lower() == target_address:
-                return address, seen
-            if BLE_DEVICE_NAME and BLE_DEVICE_NAME in name:
-                return address, seen
-    return None, seen
-
-
-def run_bluetoothctl_command(args, timeout=6.0):
-    try:
-        result = subprocess.run(
-            ["bluetoothctl"] + list(args),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
-        )
-        return result.returncode == 0, result.stdout.strip()
-    except FileNotFoundError:
-        return False, "bluetoothctl not found"
-    except subprocess.TimeoutExpired:
-        return False, "bluetoothctl timeout"
-    except Exception as exc:
-        return False, str(exc)
-
-
-def bootstrap_bluetooth_adapter():
-    if not BLE_BOOTSTRAP_WITH_BLUETOOTHCTL:
-        return
-
-    commands = [
-        (("power", "on"), 6.0),
-        (("agent", "on"), 6.0),
-        (("default-agent",), 6.0),
-    ]
-    for args, timeout in commands:
-        ok, output = run_bluetoothctl_command(args, timeout=timeout)
-        label = " ".join(args)
-        if ok:
-            write_debug_log(f"bluetoothctl {label}: ok", echo=False)
-        else:
-            write_debug_log(f"bluetoothctl {label}: {output}")
-
-    ok, output = run_bluetoothctl_command(("scan", "on"), timeout=3.0)
-    write_debug_log(f"bluetoothctl scan on: {'ok' if ok else output}", echo=False)
-    time.sleep(3.0)
-    ok, output = run_bluetoothctl_command(("devices",), timeout=3.0)
-    if ok and output:
-        write_debug_log("bluetoothctl cached devices: " + output.replace("\n", "; "), echo=False)
-    run_bluetoothctl_command(("scan", "off"), timeout=3.0)
-
 
 def read_frame_from_shm(shm):
     header = bytes(shm.buf[:SHM_HEADER_SIZE])
@@ -468,23 +351,6 @@ def load_ar_network_config():
     return ip, port
 
 
-def discover_local_ips():
-    ips = set()
-    try:
-        hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
-            ips.add(info[4][0])
-    except Exception:
-        pass
-    try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe.connect(("8.8.8.8", 80))
-        ips.add(probe.getsockname()[0])
-        probe.close()
-    except Exception:
-        pass
-    return [ip for ip in sorted(ips) if ip and not ip.startswith("127.")]
-
 
 def build_ar_udp_targets(ip, port):
     targets = []
@@ -510,55 +376,30 @@ def build_ar_udp_targets(ip, port):
     return targets
 
 
-def pick_float(data, names, default=None):
-    for name in names:
-        if isinstance(data, dict) and name in data and data[name] is not None:
-            try:
-                return float(data[name])
-            except (TypeError, ValueError):
-                pass
-    return default
-
-
-def normalize_yaw(yaw):
-    if yaw is None:
-        return 0.0
-    if os.environ.get("AR_YAW_UNIT", "deg").lower().startswith("rad"):
-        return float(np.degrees(yaw))
-    return float(yaw)
-
-
-def make_official_ar_packet(x, z, yaw_deg=0.0, height=None, pitch=0.0, roll=0.0):
-    y = POSE_HEIGHT if height is None else height
-    yaw = normalize_yaw(yaw_deg)
-    return {
-        "type": "robot_position",
-        "pos": [
-            float(x) * POSE_SCALE * POSE_X_SIGN,
-            float(y),
-            float(z) * POSE_SCALE * POSE_Z_SIGN,
-        ],
-        # Official robot_position format: yaw is carried in euler[1].
-        "euler": [
-            float(pitch),
-            yaw * POSE_YAW_SIGN + POSE_YAW_OFFSET,
-            float(roll),
-        ],
-    }
-
-
 def coerce_official_packet(data):
+    if not isinstance(data, dict) or data.get("type") != "robot_position":
+        return None
+
     pos = data.get("pos")
-    euler = data.get("euler", [0.0, 0.0, 0.0])
+    euler = data.get("euler")
     if not isinstance(pos, (list, tuple)) or len(pos) < 3:
         return None
-    if not isinstance(euler, (list, tuple)):
-        euler = [0.0, euler, 0.0]
-    euler = list(euler) + [0.0, 0.0, 0.0]
+    if not isinstance(euler, (list, tuple)) or len(euler) < 3:
+        return None
+
+    try:
+        pos_values = [float(pos[0]), float(pos[1]), float(pos[2])]
+        euler_values = [float(euler[0]), float(euler[1]), float(euler[2])]
+    except (TypeError, ValueError):
+        return None
+
+    if not all(np.isfinite(value) for value in pos_values + euler_values):
+        return None
+
     packet = {
         "type": "robot_position",
-        "pos": [float(pos[0]), float(pos[1]), float(pos[2])],
-        "euler": [float(euler[0]), float(euler[1]), float(euler[2])],
+        "pos": pos_values,
+        "euler": euler_values,
     }
     if "seq" in data:
         packet["seq"] = data["seq"]
@@ -567,78 +408,24 @@ def coerce_official_packet(data):
     return packet
 
 
-def packet_from_mapping(data):
-    official = coerce_official_packet(data) if "pos" in data else None
-    if official is not None:
-        return official
+def parse_official_pose_datagram(data):
+    try:
+        raw_text = data.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        return None, "", f"invalid UTF-8: {exc}"
 
-    x = pick_float(data, ("x", "pos_x", "px"))
-    z = pick_float(data, ("z", "pos_z", "pz"))
-    if z is None:
-        z = pick_float(data, ("y", "pos_y", "py"))
-    height = pick_float(data, ("height", "h", "camera_y"), POSE_HEIGHT)
-    yaw = pick_float(data, ("yaw_deg", "yaw", "theta", "heading", "angle"), 0.0)
-    pitch = pick_float(data, ("pitch",), 0.0)
-    roll = pick_float(data, ("roll",), 0.0)
+    if not raw_text:
+        return None, raw_text, "empty datagram"
 
-    if x is None or z is None:
-        return None
-    return make_official_ar_packet(x, z, yaw, height=height, pitch=pitch, roll=roll)
+    try:
+        decoded = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return None, raw_text, f"invalid JSON: {exc.msg}"
 
-
-def packet_from_numbers(nums):
-    if len(nums) >= 4:
-        return make_official_ar_packet(nums[0], nums[2], nums[3], height=nums[1])
-    if len(nums) == 3:
-        return make_official_ar_packet(nums[0], nums[1], nums[2])
-    if len(nums) == 2:
-        return make_official_ar_packet(nums[0], nums[1], 0.0)
-    return None
-
-
-def parse_pose_line(line):
-    text = line.strip()
-    if not text:
-        return None
-
-    if "{" in text and "}" in text:
-        json_text = text[text.find("{"):text.rfind("}") + 1]
-        try:
-            data = json.loads(json_text)
-            if isinstance(data, dict):
-                return packet_from_mapping(data)
-        except json.JSONDecodeError:
-            pass
-
-    pairs = dict(
-        (key.lower(), float(value))
-        for key, value in re.findall(
-            r"([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
-            text,
-        )
-    )
-    if pairs:
-        packet = packet_from_mapping(pairs)
-        if packet is not None:
-            return packet
-
-    nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", text)]
-    return packet_from_numbers(nums)
-
-
-def looks_like_complete_pose_chunk(text):
-    text = text.strip()
-    if not text:
-        return False
-    if text.startswith("{") and text.endswith("}"):
-        return True
-    num = r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
-    sep = r"\s*[,| ]\s*"
-    if re.fullmatch(num + f"(?:{sep}{num})" + r"{1,3}", text):
-        return True
-    return bool(re.search(r"\bx\s*[:=]", text) and re.search(r"\b(y|z)\s*[:=]", text))
-
-
+    packet = coerce_official_packet(decoded)
+    if packet is None:
+        return None, raw_text, "expected official robot_position with finite pos[3] and euler[3]"
+    return packet, raw_text, ""
 
 def clamp(value, low, high):
     return max(low, min(high, value))
@@ -775,15 +562,12 @@ class ARPoseBridge:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.thread = None
-        self.buffer = ""
         self.status = "idle"
-        self.last_line = ""
+        self.last_datagram = ""
+        self.last_source = ""
         self.last_packet = None
         self.last_ts = 0.0
-        self.last_scan_devices = []
-        self.raw_chunk_count = 0
-        self.last_raw_chunk = ""
-        self.last_raw_ts = 0.0
+        self.datagram_count = 0
         self.packet_count = 0
         self.invalid_count = 0
         self.udp_send_count = 0
@@ -793,8 +577,8 @@ class ARPoseBridge:
     def start(self):
         write_debug_log("=" * 60)
         write_debug_log(
-            f"AR pose bridge starting, input={POSE_INPUT_MODE} "
-            f"{POSE_INPUT_HOST}:{POSE_INPUT_PORT}, AR targets: {self.target_text}"
+            f"AR pose bridge starting, Windows UDP input={POSE_INPUT_HOST}:{POSE_INPUT_PORT}, "
+            f"AR targets: {self.target_text}"
         )
         write_debug_log(f"pose debug log: {DEBUG_LOG_PATH}")
         write_debug_log(f"pose status json: {DEBUG_STATUS_PATH}")
@@ -805,28 +589,11 @@ class ARPoseBridge:
             invalid_count=self.invalid_count,
             target=self.target_text,
         )
-        if POSE_INPUT_MODE != "ble":
-            self.set_status(
-                "udp listening",
-                f"Waiting for Windows localization UDP on {POSE_INPUT_HOST}:{POSE_INPUT_PORT}",
-            )
-            self.thread = threading.Thread(target=self._udp_loop, name="ar-pose-udp", daemon=True)
-            self.thread.start()
-            return
-
-        if BleakClient is None or BleakScanner is None:
-            self.status = "bleak missing"
-            write_debug_log("BLE bridge disabled: install bleak on RK3588S to receive ESP32 BLE pose data")
-            write_pose_status(
-                self.status,
-                packet_count=self.packet_count,
-                invalid_count=self.invalid_count,
-                target=self.target_text,
-            )
-            return
-        self.set_status("bluetooth init", "Preparing board Bluetooth adapter before BLE scan")
-        bootstrap_bluetooth_adapter()
-        self.thread = threading.Thread(target=self._thread_main, name="ar-pose-ble", daemon=True)
+        self.set_status(
+            "udp listening",
+            f"Waiting for official robot_position JSON on {POSE_INPUT_HOST}:{POSE_INPUT_PORT}",
+        )
+        self.thread = threading.Thread(target=self._udp_loop, name="ar-pose-udp", daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -845,19 +612,16 @@ class ARPoseBridge:
         with self.lock:
             return {
                 "status": self.status,
-                "last_line": self.last_line,
+                "last_datagram": self.last_datagram,
+                "last_source": self.last_source,
                 "last_packet": self.last_packet,
                 "last_ts": self.last_ts,
+                "datagram_count": self.datagram_count,
                 "packet_count": self.packet_count,
                 "invalid_count": self.invalid_count,
                 "target": self.target_text,
                 "input": f"{POSE_INPUT_HOST}:{POSE_INPUT_PORT}",
-                "input_mode": POSE_INPUT_MODE,
-                "device": BLE_DEVICE_ADDRESS or BLE_DEVICE_NAME if POSE_INPUT_MODE == "ble" else None,
-                "seen_devices": self.last_scan_devices,
-                "raw_chunk_count": self.raw_chunk_count,
-                "last_raw_chunk": self.last_raw_chunk,
-                "line_buffer_len": len(self.buffer),
+                "protocol": "udp/robot_position",
                 "udp_send_count": self.udp_send_count,
                 "udp_fail_count": self.udp_fail_count,
                 "live_json_count": self.live_json_count,
@@ -870,7 +634,7 @@ class ARPoseBridge:
         with self.lock:
             self.status = status
             packet = self.last_packet
-            raw_line = self.last_line
+            raw_line = self.last_datagram
             packet_count = self.packet_count
             invalid_count = self.invalid_count
         if log_message:
@@ -883,18 +647,6 @@ class ARPoseBridge:
             invalid_count=invalid_count,
             target=self.target_text,
         )
-
-    @staticmethod
-    def device_label(device):
-        if isinstance(device, str):
-            return device
-        return f"{device.name or '(no name)'}@{device.address}"
-
-    def _thread_main(self):
-        try:
-            asyncio.run(self._ble_loop())
-        except Exception as exc:
-            self.set_status(f"BLE error: {exc}", f"BLE bridge stopped: {exc}")
 
     def _udp_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -917,19 +669,19 @@ class ARPoseBridge:
                         break
                     raise
 
-                chunk = data.decode("utf-8", errors="ignore").strip()
-                now = time.time()
+                source_text = f"{source[0]}:{source[1]}"
+                packet, raw_text, error = parse_official_pose_datagram(data)
                 with self.lock:
-                    self.raw_chunk_count += 1
-                    self.last_raw_chunk = chunk
-                    self.last_raw_ts = now
-                    raw_count = self.raw_chunk_count
+                    self.datagram_count += 1
+                    self.last_datagram = raw_text
+                    self.last_source = source_text
+                    datagram_count = self.datagram_count
                 pose_path_debug(
                     "UDP_RAW",
-                    f"#{raw_count} from={source[0]}:{source[1]} bytes={len(data)} text={repr(chunk)}",
-                    count=raw_count,
+                    f"#{datagram_count} from={source_text} bytes={len(data)} text={repr(raw_text)}",
+                    count=datagram_count,
                 )
-                self.handle_line(chunk)
+                self.handle_packet(packet, raw_text, source_text, error)
         except Exception as exc:
             if not self.stop_event.is_set():
                 self.set_status(f"udp error: {exc}", f"UDP pose receiver stopped: {exc}")
@@ -941,233 +693,40 @@ class ARPoseBridge:
             if self.input_sock is sock:
                 self.input_sock = None
 
-    async def _ble_loop(self):
-        while not self.stop_event.is_set():
-            try:
-                self.set_status("scanning", f"BLE scanning for {BLE_DEVICE_ADDRESS or BLE_DEVICE_NAME}")
-                device = await self._find_device()
-                if device is None:
-                    self.set_status("scan no device", "BLE scan finished: ESP32 pose device not found")
-                    await asyncio.sleep(2.0)
-                    continue
-
-                self.set_status("connecting", f"BLE pose device found, connecting: {self.device_label(device)}")
-                async with BleakClient(device, timeout=10.0) as client:
-                    self.set_status("connected", f"BLE connected: {self.device_label(device)}")
-                    notify_target = await self._resolve_notify_characteristic(client)
-                    notify_target = await self._start_notify(client, notify_target)
-                    target_label = getattr(notify_target, "uuid", notify_target)
-                    self.set_status("waiting pose", f"BLE notify enabled on {target_label}, waiting pose lines")
-                    while not self.stop_event.is_set() and self._client_connected(client):
-                        await asyncio.sleep(0.2)
-                    try:
-                        await client.stop_notify(notify_target)
-                    except Exception:
-                        pass
-            except Exception as exc:
-                self.set_status(f"reconnect: {exc}", f"BLE reconnect needed: {exc}")
-                await asyncio.sleep(2.0)
-
-    async def _resolve_notify_characteristic(self, client):
-        target_char = None
-        try:
-            services = getattr(client, "services", None)
-            if services is None and hasattr(client, "get_services"):
-                services = await client.get_services()
-
-            lines = []
-            if services is not None:
-                for svc in services:
-                    lines.append(f"service {svc.uuid}")
-                    for ch in svc.characteristics:
-                        props = ",".join(ch.properties)
-                        lines.append(f"  char {ch.uuid} [{props}]")
-                        if ch.uuid.lower() == UART_TX_CHAR_UUID.lower():
-                            target_char = ch
-                if lines:
-                    write_debug_log("BLE services:\n" + "\n".join(lines), echo=False)
-        except Exception as exc:
-            write_debug_log(f"BLE service discovery skip: {exc}")
-
-        if target_char is not None:
-            write_debug_log(f"BLE notify target characteristic found: {target_char.uuid} [{','.join(target_char.properties)}]")
-            return target_char
-        write_debug_log(f"BLE notify target fallback to UUID: {UART_TX_CHAR_UUID}")
-        return UART_TX_CHAR_UUID
-
-    async def _start_notify(self, client, notify_target):
-        try:
-            await client.start_notify(UART_TX_CHAR_UUID, self._on_ble_data)
-            write_debug_log("BLE start_notify succeeded with UUID")
-            return UART_TX_CHAR_UUID
-        except Exception as exc:
-            write_debug_log(f"BLE start_notify failed on UUID: {exc}")
-
-        if notify_target != UART_TX_CHAR_UUID:
-            await client.start_notify(notify_target, self._on_ble_data)
-            write_debug_log("BLE start_notify succeeded with discovered characteristic")
-            return notify_target
-        raise RuntimeError(f"BLE start_notify failed for {UART_TX_CHAR_UUID}")
-
-    async def _find_device(self):
-        seen = []
-        target_address = (BLE_DEVICE_ADDRESS or "").lower()
-        target_service = UART_SERVICE_UUID.lower()
-
-        if not target_address:
-            try:
-                device = await BleakScanner.find_device_by_filter(
-                    lambda d, ad: (
-                        (d.name == BLE_DEVICE_NAME)
-                        or (getattr(ad, "local_name", None) == BLE_DEVICE_NAME)
-                    ),
-                    timeout=BLE_SCAN_TIMEOUT,
-                )
-                if device is not None:
-                    self._update_scan_devices([f"{device.name or BLE_DEVICE_NAME}@{device.address}"])
-                    write_debug_log(f"BLE find_device_by_filter found: {device.name or BLE_DEVICE_NAME}@{device.address}")
-                    return device
-            except Exception as exc:
-                write_debug_log(f"BLE find_device_by_filter skip: {exc}")
-
-        if BLE_USE_BLUETOOTHCTL_CACHE:
-            cached_address, cached_seen = find_cached_ble_address()
-            if cached_seen:
-                self._update_scan_devices(cached_seen)
-                write_debug_log("bluetoothctl cache saw: " + "; ".join(cached_seen), echo=False)
-            if cached_address:
-                write_debug_log(f"Using cached ESP32 BLE address from bluetoothctl: {cached_address}")
-                return cached_address
-
-        try:
-            discovered = await BleakScanner.discover(timeout=BLE_SCAN_TIMEOUT, return_adv=True)
-            items = []
-            for item in discovered.values():
-                if isinstance(item, tuple) and len(item) == 2:
-                    items.append(item)
-            if not items:
-                items = [(device, None) for device in discovered.values()]
-        except TypeError:
-            devices = await BleakScanner.discover(timeout=BLE_SCAN_TIMEOUT)
-            items = [(device, None) for device in devices]
-
-        for device, adv in items:
-            dev_name = device.name or ""
-            adv_name = getattr(adv, "local_name", "") or ""
-            name = adv_name or dev_name
-            address = (device.address or "").lower()
-            service_uuids = [s.lower() for s in (getattr(adv, "service_uuids", None) or [])]
-            display_name = name or "(no name)"
-            seen.append(f"{display_name}@{device.address}")
-
-            if target_address and address == target_address:
-                self._update_scan_devices(seen)
-                return device
-            if BLE_DEVICE_NAME and (BLE_DEVICE_NAME in dev_name or BLE_DEVICE_NAME in adv_name):
-                self._update_scan_devices(seen)
-                return device
-            if not target_address and target_service in service_uuids and len(service_uuids) > 0:
-                self._update_scan_devices(seen)
-                return device
-
-        self._update_scan_devices(seen)
-        if seen:
-            write_debug_log("BLE scan saw: " + "; ".join(seen), echo=False)
-        if BLE_USE_BLUETOOTHCTL_CACHE:
-            cached_address, cached_seen = find_cached_ble_address()
-            if cached_seen:
-                self._update_scan_devices(cached_seen)
-                write_debug_log("bluetoothctl cache saw: " + "; ".join(cached_seen), echo=False)
-            if cached_address:
-                write_debug_log(f"Using cached ESP32 BLE address from bluetoothctl: {cached_address}")
-                return cached_address
-        return None
-
-    def _update_scan_devices(self, seen):
-        with self.lock:
-            self.last_scan_devices = seen[-8:]
-
-    @staticmethod
-    def _client_connected(client):
-        connected = getattr(client, "is_connected", False)
-        return connected() if callable(connected) else bool(connected)
-
-    def _on_ble_data(self, _sender, data):
-        chunk = data.decode("utf-8", errors="ignore")
-        normalized_chunk = chunk.replace("\r\n", "\n").replace("\r", "\n")
-        now = time.time()
-        with self.lock:
-            self.raw_chunk_count += 1
-            self.last_raw_chunk = chunk
-            self.last_raw_ts = now
-            raw_count = self.raw_chunk_count
-            status = self.status
-            packet = self.last_packet
-            packet_count = self.packet_count
-            invalid_count = self.invalid_count
-
-        if DEBUG_PRINT_RAW_BLE and raw_count % max(1, DEBUG_PRINT_RAW_EVERY_N) == 0:
-            write_debug_log(f"[BLE_RAW] #{raw_count} {data.hex()} -> {repr(chunk)}")
-        pose_path_debug("BLE_RAW", f"#{raw_count} bytes={len(data)} text={repr(chunk)}", count=raw_count)
-        if status == "waiting pose":
-            write_pose_status(
-                "raw ble data",
-                packet=packet,
-                raw_line=chunk,
-                packet_count=packet_count,
-                invalid_count=invalid_count,
-                target=self.target_text,
-            )
-
-        self.buffer += normalized_chunk
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
-            pose_path_debug("LINE_READY", f"line={repr(line)} remain_buf={len(self.buffer)}", force=True)
-            self.handle_line(line)
-
-        pending = self.buffer.strip()
-        if pending and looks_like_complete_pose_chunk(pending):
-            self.buffer = ""
-            pose_path_debug("LINE_READY_NO_NL", f"line={repr(pending)}", force=True)
-            self.handle_line(pending)
-        elif len(self.buffer) > NO_NL_BUFFER_LIMIT:
-            overflow = self.buffer.strip()
-            self.buffer = ""
-            pose_path_debug("LINE_READY_NO_NL", f"buffer_overflow line={repr(overflow)}", force=True)
-            self.handle_line(overflow)
-
-    def handle_line(self, line):
-        packet = parse_pose_line(line)
+    def handle_packet(self, packet, raw_text, source_text, error=""):
         now = time.time()
         if packet is None:
             with self.lock:
                 self.invalid_count += 1
-                self.last_line = line.strip()
                 invalid_count = self.invalid_count
                 packet_count = self.packet_count
+                self.status = "invalid pose datagram"
             write_pose_status(
-                "invalid pose line",
-                raw_line=line.strip(),
+                "invalid pose datagram",
+                raw_line=raw_text,
                 packet_count=packet_count,
                 invalid_count=invalid_count,
                 target=self.target_text,
             )
-            pose_path_debug("PARSE_FAIL", f"raw={repr(line.strip())} invalid_count={invalid_count}", force=True)
-            write_debug_log(f"[AR_POSE_BAD] raw='{line.strip()}'")
+            pose_path_debug(
+                "PARSE_FAIL",
+                f"from={source_text} reason={error} raw={repr(raw_text)} invalid_count={invalid_count}",
+                force=True,
+            )
+            write_debug_log(f"[AR_POSE_BAD] from={source_text} reason={error} raw={repr(raw_text)}")
             return
 
         with self.lock:
             self.packet_count += 1
             packet.setdefault("seq", self.packet_count)
             packet.setdefault("timestamp", now)
-            self.last_line = line.strip()
             self.last_packet = packet
             self.last_ts = now
             self.status = "receiving"
             count = self.packet_count
 
         payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-        pose_path_debug("PARSE_OK", f"#{count} packet={payload.decode('utf-8')}", count=count)
+        pose_path_debug("PARSE_OK", f"#{count} from={source_text} packet={payload.decode('utf-8')}", count=count)
         udp_ok, udp_fail = self.send_pose_payload(payload)
         json_ok = write_live_pose_packet(packet)
         with self.lock:
@@ -1178,6 +737,7 @@ class ARPoseBridge:
             live_json_count = self.live_json_count
             udp_send_count = self.udp_send_count
             udp_fail_count = self.udp_fail_count
+            invalid_count = self.invalid_count
         pose_path_debug(
             "LIVE_JSON_OK" if json_ok else "LIVE_JSON_FAIL",
             f"path={DEBUG_PACKET_PATH} live_json_count={live_json_count}",
@@ -1193,29 +753,24 @@ class ARPoseBridge:
         write_pose_status(
             "receiving",
             packet=packet,
-            raw_line=line.strip(),
+            raw_line=raw_text,
             packet_count=count,
-            invalid_count=self.invalid_count,
+            invalid_count=invalid_count,
             target=self.target_text,
         )
 
-        # ===== AR_POSE_DEBUG：定位数据终端调试打印 =====
-        # 需要检查 BLE 是否收到、JSON 是否转换正确、UDP 是否发到 127.0.0.1:9005 时，保留这一段。
-        # 如果后面正式跑车时不想刷屏，可以把这一整个 if 块注释掉，或把文件顶部 DEBUG_PRINT_POSE 改成 False。
         if DEBUG_PRINT_POSE and count % max(1, DEBUG_PRINT_POSE_EVERY_N) == 0:
-            pos = packet.get("pos", [0.0, 0.0, 0.0])
-            euler = packet.get("euler", [0.0, 0.0, 0.0])
+            pos = packet["pos"]
+            euler = packet["euler"]
             write_debug_log(
                 "[AR_POSE_DEBUG] "
-                f"#{count} raw='{line.strip()}' "
+                f"#{count} from={source_text} "
                 f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
                 f"yaw={euler[1]:.2f} "
                 f"udp={self.target_text} "
                 f"json={payload.decode('utf-8')}"
             )
-        # ===== AR_POSE_DEBUG 结束 =====
-
-        if not DEBUG_PRINT_POSE and (count == 1 or count % 10 == 0):
+        elif count == 1 or count % 10 == 0:
             write_debug_log(f"AR pose forwarded #{count}: {payload.decode('utf-8')}")
 
     def send_pose_payload(self, payload):
@@ -1229,7 +784,6 @@ class ARPoseBridge:
                 fail_count += 1
                 write_debug_log(f"UDP pose send failed to {target[0]}:{target[1]}: {exc}")
         return ok_count, fail_count
-
 
 def draw_waiting(frame):
     cv2.putText(frame, "Road seg: waiting", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2)
@@ -1247,29 +801,14 @@ def short_text(text, max_len=74):
 def pose_status_hint(status, packet_count, invalid_count):
     status_l = str(status).lower()
     if "udp listening" in status_l or "udp waiting pose" in status_l:
-        return f"Waiting for Windows localization on board UDP port {POSE_INPUT_PORT}."
+        return f"Waiting for official robot_position JSON on board UDP port {POSE_INPUT_PORT}."
     if "udp error" in status_l:
         return f"Cannot receive Windows localization on UDP {POSE_INPUT_PORT}. Check port usage."
-    if "bleak missing" in status_l:
-        return "Install python bleak first: pip install bleak"
-    if "bluetooth init" in status_l:
-        return "Turning board Bluetooth on with bluetoothctl, then auto scanning ESP32."
-    if "scanning" in status_l:
-        return "Scanning BLE. If stuck here, power ESP32 and check BLE name/adapter."
-    if "connecting" in status_l:
-        return "ESP32 found. Connecting BLE GATT and enabling notify."
-    if "scan no device" in status_l:
-        return "No ESP32_BLE_Safe found. Check ESP32 power, BLE name, and board Bluetooth."
-    if "connected" in status_l or "waiting pose" in status_l:
-        return "BLE connected. If ok stays 0, check whether ESP32 is notifying pose lines."
     if "invalid" in status_l or invalid_count > 0 and packet_count == 0:
-        return "Localization data arrived, but the parser rejected it. Check the raw packet in the log."
+        return "UDP arrived, but it was not valid official robot_position JSON. Check the raw datagram."
     if "receiving" in status_l and packet_count > 0:
         return "Pose received and forwarded to official AR engine UDP control port."
-    if POSE_INPUT_MODE == "ble" and ("reconnect" in status_l or "error" in status_l):
-        return "BLE connection error. Watch log and retry ESP32 power/Bluetooth."
-    return "Waiting for localization pose pipeline."
-
+    return "Waiting for Windows AprilTag localization."
 
 def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_state="N/A", planner_status=None):
     if not DEBUG_DRAW_POSE_PANEL:
@@ -1294,7 +833,7 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
             f"yaw={euler[1]:.1f} age={age_text}"
         )
 
-    source_name = "ESP32" if info.get("input_mode") == "ble" else "WIN-UDP"
+    source_name = "WIN-UDP"
     source_line = (
         f"{source_name} {short_text(info['status'], 18)} "
         f"ok={info['packet_count']} bad={info['invalid_count']}"

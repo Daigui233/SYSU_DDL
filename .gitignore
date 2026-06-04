@@ -48,6 +48,8 @@ Master_RK3588S/setupUI/xverse_control_live.json
 # Local capture/debug data
 Master_RK3588S/setupUI/capture_sessions/
 Master_RK3588S/setupUI/dist/match_record_*.json
+ArucoCalib-master/ArucoCalib-master/dist/runs/
+ArucoCalib-master/ArucoCalib-master/runs/
 
 # Local license file
 Master_RK3588S/setupUI/license.lic

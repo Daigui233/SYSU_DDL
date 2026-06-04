@@ -32,7 +32,7 @@ class Config:
         
         # Convert string to cv2 constant
         self.ARUCO_DICT = getattr(cv2.aruco, dict_type_name)
-        self.MARKER_SIZE = aruco_config.get('marker_size', 0.05)
+        self.MARKER_SIZE = aruco_config.get('marker_size', 0.20)
 
         # Optional: ArUco detector params overrides
         self.ARUCO_PARAMS = config_data.get("aruco_params", {}) or {}

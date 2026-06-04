@@ -2,6 +2,7 @@
 PyQt main interface for ArUco coordinate system
 """
 import sys
+from datetime import datetime
 from pathlib import Path
 import cv2
 import numpy as np
@@ -14,9 +15,13 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
 from PyQt5.QtGui import QImage, QPixmap, QMouseEvent
 from aruco_core import ArUcoDetector, CoordinateTransformer, get_config
-from aruco_core.run_logger import RunLogger, make_run_ts
 from aruco_core.video_recorder import VideoRecorder
 from aruco_core.udp_sender import UdpPoseSender
+
+
+def make_run_ts():
+    now = datetime.now()
+    return now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
 
 
 class ImageLabel(QLabel):
@@ -134,7 +139,6 @@ class MainWindow(QMainWindow):
         self.script_start_ts = make_run_ts()
         app_root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
         self.runs_root_dir = app_root / "runs"
-        self.run_logger = None
 
         # Raw video recording (mp4)
         self.is_recording = False
@@ -339,7 +343,7 @@ class MainWindow(QMainWindow):
             x_m, z_m, yaw_deg = self.last_output_pose
             lines = [
                 f"seq={self.pose_seq} sent={1 if self.last_udp_ok else 0}",
-                f"x={x_m:.3f}m y={z_m:.3f}m yaw={yaw_deg:.2f}deg",
+                f"x={x_m:.3f}m z={z_m:.3f}m yaw={yaw_deg:.2f}deg",
             ]
         else:
             lines = [f"seq={self.pose_seq} sent={1 if self.last_udp_ok else 0}", "pose: waiting"]
@@ -404,13 +408,13 @@ class MainWindow(QMainWindow):
             center = map_point(px, pz)
             length = max(14, inset_w // 16)
             angle = math.radians(yaw)
-            tip = (center[0] + int(math.cos(angle) * length), center[1] - int(math.sin(angle) * length))
+            tip = (center[0] + int(math.sin(angle) * length), center[1] - int(math.cos(angle) * length))
             cv2.circle(image_bgr, center, 4, (0, 80, 255), -1)
             cv2.arrowedLine(image_bgr, center, tip, (0, 80, 255), 2, cv2.LINE_AA, tipLength=0.35)
-            footer = f"seq={self.pose_seq} x={px:.3f} y={pz:.3f} yaw={yaw:.1f}deg"
+            footer = f"seq={self.pose_seq} x={px:.3f} z={pz:.3f} yaw={yaw:.1f}deg"
             cv2.putText(image_bgr, footer, (x0 + 10, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (210, 220, 210), 1, cv2.LINE_AA)
 
-        cv2.putText(image_bgr, "+Y", (x0 + 10, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 165, 155), 1, cv2.LINE_AA)
+        cv2.putText(image_bgr, "+Z", (x0 + 10, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 165, 155), 1, cv2.LINE_AA)
         cv2.putText(image_bgr, "+X", (x1 - 34, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 165, 155), 1, cv2.LINE_AA)
         return image_bgr
 
@@ -747,7 +751,7 @@ class MainWindow(QMainWindow):
                 self.detect_and_calibrate(self.current_image)
             return
 
-        # Camera / video detection mode: ensure capture + run logger.
+        # Camera / video detection mode: ensure capture is running.
         if self.radio_camera.isChecked():
             if self.cap is None:
                 self.start_camera()
@@ -761,10 +765,7 @@ class MainWindow(QMainWindow):
             if self.cap is None:
                 self.start_video(self.video_file_path)
 
-        if self.run_logger is None:
-            self.run_logger = RunLogger(self.script_start_ts, runs_root_dir=self.runs_root_dir)
-
-        self.status_label.setText("Status: Detection started (logging raw frames/timestamps)")
+        self.status_label.setText("Status: Detection started")
 
     def stop_detection(self):
         """Stop detection"""
@@ -791,10 +792,8 @@ class MainWindow(QMainWindow):
                 if self.is_recording and self.video_recorder is not None:
                     self.video_recorder.write_frame(frame)
 
-                # Optional logging + inference.
+                # Run inference without persisting every frame.
                 if self.is_detecting:
-                    if self.run_logger is not None:
-                        self.run_logger.save_frame(frame)
                     self.detect_and_calibrate(frame)
                 else:
                     self.image_label.set_image(frame)
@@ -886,8 +885,9 @@ class MainWindow(QMainWindow):
                         p2w = self.transformer.pixel_to_world(float(c2[0]), float(c2[1]), z=0.0)
                         if center_world is not None and p1w is not None and p2w is not None:
                             dx = float(p2w[0] - p1w[0])
-                            dy = float(p2w[1] - p1w[1])
-                            yaw_deg = math.degrees(math.atan2(dy, dx))
+                            dz = float(p2w[1] - p1w[1])
+                            # AR/Unity convention: yaw=0 points +Z; +90 points +X.
+                            yaw_deg = math.degrees(math.atan2(dx, dz))
                             self.last_vehicle_center_world = center_world
                             self.last_vehicle_yaw_deg = self._norm_angle_deg(yaw_deg)
                 except Exception:
