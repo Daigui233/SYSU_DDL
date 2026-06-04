@@ -46,6 +46,26 @@ static void control_reset_input_to_safe(void)
     control_ctx.input.flags = 0;
 }
 
+static void control_check_input_timeout(void)
+{
+    uint32 now_us;
+
+    if (0 == control_ctx.input_online)
+    {
+        return;
+    }
+
+    now_us = system_getval_us();
+    if ((uint32)(now_us - control_ctx.last_input_time_us) <= CONTROL_INPUT_TIMEOUT_US)
+    {
+        return;
+    }
+
+    control_ctx.input_online = 0;
+    control_reset_input_to_safe();
+    state_set(STATE_SAFE_STOP);
+}
+
 
 void control_init(void)
 {
@@ -207,6 +227,7 @@ static void Servo_PID_Control(void)
 
 void control_update(void)
 {
+    control_check_input_timeout();
 
     if (state_is_changed())
     {

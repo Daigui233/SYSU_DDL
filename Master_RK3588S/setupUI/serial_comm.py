@@ -23,7 +23,7 @@ OLD_FEEDBACK_PAYLOAD_LEN = 11
 
 
 class CarController:
-    def __init__(self, port="/dev/ttyUSB0", baudrate=460800):
+    def __init__(self, port="/dev/ttyUSB0", baudrate=460800, write_timeout=0.05):
         self.ser = None
         self._rx_buffer = bytearray()
         self._lock = threading.Lock()
@@ -35,13 +35,14 @@ class CarController:
         self.last_error = ""
         self.port = port
         self.baudrate = baudrate
+        self.write_timeout = write_timeout
 
         if serial is None:
             self.last_error = "serial module unavailable"
             print("serial module unavailable; vision continues")
             return
         try:
-            self.ser = serial.Serial(port, baudrate, timeout=0.02)
+            self.ser = serial.Serial(port, baudrate, timeout=0.02, write_timeout=write_timeout)
             print(f"serial {port} opened")
             self._reader = threading.Thread(target=self._read_loop, name="tc264-feedback", daemon=True)
             self._reader.start()
@@ -52,7 +53,7 @@ class CarController:
 
     def send_cmd(self, track_error: float, target_speed: float, state_cmd: int = STATE_TRACK, flags: int = CONTROL_FLAG_USE_TARGET_SPEED):
         if self.ser is None or not getattr(self.ser, "is_open", False):
-            return
+            return False
         payload = struct.pack(
             "<BBBffBB",
             FRAME_HEAD,
@@ -65,10 +66,18 @@ class CarController:
         )
         checksum = sum(payload) & 0xFF
         try:
-            self.ser.write(payload + struct.pack("<B", checksum))
+            frame = payload + struct.pack("<B", checksum)
+            with self._lock:
+                written = self.ser.write(frame)
+                if written != len(frame):
+                    self.last_error = f"serial write incomplete: {written}/{len(frame)}"
+                    return False
+                self.last_error = ""
+                return True
         except Exception as exc:
             with self._lock:
                 self.last_error = str(exc)
+            return False
 
     def get_feedback(self):
         with self._lock:

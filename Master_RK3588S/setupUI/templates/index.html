@@ -10,6 +10,121 @@
         href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto:wght@300;400;500&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .ar-debug-layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+            gap: 16px;
+            align-items: start;
+            margin-top: 12px;
+        }
+
+        .ar-debug-panel {
+            padding: 14px;
+            border: 1px solid rgba(0, 255, 170, 0.25);
+            border-radius: 12px;
+            background: rgba(0, 0, 0, 0.24);
+        }
+
+        .ar-debug-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .ar-debug-title {
+            margin: 0;
+            font-size: 1rem;
+        }
+
+        .ar-debug-pill {
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 0.74rem;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            color: #d8fff4;
+            white-space: nowrap;
+        }
+
+        .ar-debug-pill.ok {
+            border-color: rgba(0, 255, 140, 0.45);
+            color: #55ff99;
+        }
+
+        .ar-debug-pill.warn {
+            border-color: rgba(255, 190, 60, 0.55);
+            color: #ffd06a;
+        }
+
+        .ar-debug-pill.bad {
+            border-color: rgba(255, 80, 80, 0.6);
+            color: #ff7474;
+        }
+
+        .ar-debug-row {
+            display: grid;
+            grid-template-columns: 78px minmax(0, 1fr);
+            gap: 8px;
+            padding: 7px 0;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            font-size: 0.82rem;
+        }
+
+        .ar-debug-row:first-of-type {
+            border-top: none;
+        }
+
+        .ar-debug-label {
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .ar-debug-value {
+            color: #eef;
+            font-family: Consolas, Monaco, monospace;
+            overflow-wrap: anywhere;
+        }
+
+        .ar-debug-hint {
+            margin-top: 10px;
+            padding-top: 9px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            line-height: 1.45;
+        }
+
+        .ar-debug-details {
+            margin-top: 8px;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+        }
+
+        .ar-debug-details summary {
+            cursor: pointer;
+            color: #8df7d2;
+        }
+
+        .ar-debug-json {
+            max-height: 160px;
+            overflow: auto;
+            margin-top: 8px;
+            padding: 8px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.28);
+            color: #d9fff2;
+            font-size: 0.72rem;
+            white-space: pre-wrap;
+        }
+
+        @media (max-width: 980px) {
+            .ar-debug-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
 </head>
 
 <body>
@@ -270,16 +385,57 @@
                     <button class="btn-copy" id="btn-copy-stream">复制</button>
                 </div>
 
-                <div>
-                    <h3>本地 AR 融合预览</h3>
-                    <p style="font-size: 0.9rem; color: var(--text-muted)">
-                        点击下方按钮将会在 RK3588 后台唤起 <code>ar_receiver.py</code> 进行本地流预览，若已在运行请勿重复点击。
-                    <div style="display: flex; gap: 10px; align-items: center;">
-                        <button class="btn btn-glow btn-ar-launch" id="btn-start-preview">🖥️ 打开 RK3588端的AR
-                            融合预览窗口</button>
-                        <button class="btn btn-secondary" id="btn-stop-preview"
-                            style="display: none; border-color: #ff4d4f; color: #ff4d4f;">⏹️ 关闭预览窗口</button>
+                <div class="ar-debug-layout">
+                    <div>
+                        <h3>本地 AR 融合预览</h3>
+                        <p style="font-size: 0.9rem; color: var(--text-muted)">
+                            点击下方按钮将会在 RK3588 后台唤起 <code>ar_receiver.py</code> 进行本地流预览，若已在运行请勿重复点击。
+                        </p>
+                        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                            <button class="btn btn-glow btn-ar-launch" id="btn-start-preview">🖥️ 打开 RK3588端的AR
+                                融合预览窗口</button>
+                            <button class="btn btn-secondary" id="btn-stop-preview"
+                                style="display: none; border-color: #ff4d4f; color: #ff4d4f;">⏹️ 关闭预览窗口</button>
+                        </div>
                     </div>
+
+                    <section class="ar-debug-panel" aria-label="AR control debug status">
+                        <div class="ar-debug-head">
+                            <h3 class="ar-debug-title">链路调试状态</h3>
+                            <span class="ar-debug-pill warn" id="debug-overall">等待数据</span>
+                        </div>
+                        <div class="ar-debug-row">
+                            <span class="ar-debug-label">WIN-UDP</span>
+                            <span class="ar-debug-value" id="debug-win-udp">等待 9005</span>
+                        </div>
+                        <div class="ar-debug-row">
+                            <span class="ar-debug-label">AR-FWD</span>
+                            <span class="ar-debug-value" id="debug-ar-fwd">等待 9006</span>
+                        </div>
+                        <div class="ar-debug-row">
+                            <span class="ar-debug-label">POSE</span>
+                            <span class="ar-debug-value" id="debug-pose">N/A</span>
+                        </div>
+                        <div class="ar-debug-row">
+                            <span class="ar-debug-label">CTRL</span>
+                            <span class="ar-debug-value" id="debug-ctrl">等待控制状态</span>
+                        </div>
+                        <div class="ar-debug-row">
+                            <span class="ar-debug-label">SERIAL</span>
+                            <span class="ar-debug-value" id="debug-serial">等待发送</span>
+                        </div>
+                        <div class="ar-debug-row">
+                            <span class="ar-debug-label">TC264D</span>
+                            <span class="ar-debug-value" id="debug-tc264">等待反馈</span>
+                        </div>
+                        <div class="ar-debug-hint" id="debug-hint">
+                            此面板只读取 <code>9105/pose_status</code>，用于判断问题卡在定位、AR 转发、视觉控制、串口或下位机反馈。
+                        </div>
+                        <details class="ar-debug-details">
+                            <summary>查看原始状态 JSON</summary>
+                            <pre class="ar-debug-json" id="debug-json">{}</pre>
+                        </details>
+                    </section>
                 </div>
 
                 <div class="info-card" style="margin-top: 20px;">
@@ -397,6 +553,157 @@
     </div>
 
     <script src="/static/js/main.js"></script>
+    <script>
+        (function () {
+            const DEBUG_POLL_MS = 1000;
+            const poseStatusHost = window.location.hostname || "{{ ip }}";
+            const poseStatusUrl = `http://${poseStatusHost}:9105/pose_status`;
+
+            function byId(id) {
+                return document.getElementById(id);
+            }
+
+            function setText(id, value) {
+                const el = byId(id);
+                if (el) {
+                    el.textContent = value == null || value === "" ? "N/A" : String(value);
+                }
+            }
+
+            function setOverall(text, level) {
+                const el = byId("debug-overall");
+                if (!el) {
+                    return;
+                }
+                el.textContent = text;
+                el.className = `ar-debug-pill ${level || "warn"}`;
+            }
+
+            function fmtNum(value, digits) {
+                const n = Number(value);
+                return Number.isFinite(n) ? n.toFixed(digits) : "N/A";
+            }
+
+            function fmtAge(ts) {
+                const n = Number(ts);
+                if (!Number.isFinite(n) || n <= 0) {
+                    return "N/A";
+                }
+                return `${Math.max(0, Date.now() / 1000 - n).toFixed(1)}s`;
+            }
+
+            function fmtBool(value) {
+                if (value === true) {
+                    return "OK";
+                }
+                if (value === false) {
+                    return "FAIL";
+                }
+                return "N/A";
+            }
+
+            function buildHint(data) {
+                const packetCount = Number(data.packet_count || 0);
+                const udpOk = Number(data.udp_send_count || 0);
+                const udpFail = Number(data.udp_fail_count || 0);
+                const control = data.control || {};
+                const serialSend = control.serial_send || {};
+                const feedback = data.car_feedback || {};
+                const status = String(data.status || "").toLowerCase();
+
+                if (status.includes("udp error")) {
+                    return ["BAD", "9005 监听失败，检查端口占用或 ar_receiver 启动日志。"];
+                }
+                if (packetCount <= 0) {
+                    return ["WARN", "尚未收到 Windows robot_position，优先检查定位程序目标 IP 是否为 RK3588S、端口是否为 9005。"];
+                }
+                if (udpOk <= 0 || udpFail > 0) {
+                    return ["WARN", "定位已进入 RK，但 AR 转发异常，检查 127.0.0.1:9006 和官方 AR 引擎配置。"];
+                }
+                if (!control.state) {
+                    return ["WARN", "定位链路正常，但还没有控制状态，可能尚未接入 shm_ar_video 或视觉主循环未进入发送段。"];
+                }
+                if (control.state === "CONTROL_TIMEOUT_SAFE_STOP" || serialSend.watchdog_active) {
+                    return ["BAD", "控制主循环断流，watchdog 正在重复下发 SAFE_STOP；检查共享内存、推理线程或主循环异常。"];
+                }
+                if (serialSend.ok === false) {
+                    return ["BAD", `串口发送失败：${serialSend.error || "未知错误"}。检查 /dev/ttyUSB0、权限、接线和波特率。`];
+                }
+                if (!feedback.online) {
+                    return ["WARN", "上位机正在发控制帧，但暂未收到 TC264D 反馈；检查下位机供电、TX/RX 交叉、共地和串口。"];
+                }
+                return ["OK", "定位、AR 转发、视觉控制、串口发送和 TC264D 反馈均有状态。"];
+            }
+
+            function renderDebugStatus(data) {
+                const packet = data.packet || {};
+                const pos = Array.isArray(packet.pos) ? packet.pos : [];
+                const euler = Array.isArray(packet.euler) ? packet.euler : [];
+                const control = data.control || {};
+                const serialSend = control.serial_send || {};
+                const feedback = data.car_feedback || {};
+
+                setText(
+                    "debug-win-udp",
+                    `ok=${data.packet_count || 0} bad=${data.invalid_count || 0} status=${data.status || "waiting"}`
+                );
+                setText(
+                    "debug-ar-fwd",
+                    `ok=${data.udp_send_count || 0} fail=${data.udp_fail_count || 0} -> ${data.target || "127.0.0.1:9006"}`
+                );
+                setText(
+                    "debug-pose",
+                    `x=${fmtNum(pos[0], 2)} z=${fmtNum(pos[2], 2)} yaw=${fmtNum(euler[1], 1)} age=${fmtAge(packet.timestamp || data.timestamp)}`
+                );
+                setText(
+                    "debug-ctrl",
+                    `${control.state || "N/A"} err=${fmtNum(control.track_error, 1)} speed=${fmtNum(control.target_speed, 0)} state=${control.state_cmd ?? "N/A"} flags=${control.flags ?? "N/A"}`
+                );
+                setText(
+                    "debug-serial",
+                    `send=${fmtBool(serialSend.ok)} watchdog=${serialSend.watchdog_active ? "ON" : "off"} ${serialSend.error || ""}`.trim()
+                );
+                setText(
+                    "debug-tc264",
+                    feedback.online
+                        ? `fb=${feedback.count || 0} age=${fmtAge((Date.now() / 1000) - Number(feedback.age || 0))} state=${feedback.state_name || feedback.state || "N/A"} motor=${fmtNum(feedback.motor_target, 0)} servo=${feedback.servo_output ?? "N/A"}`
+                        : `offline fb=${feedback.count || 0} bad=${feedback.bad || 0} ${feedback.error || ""}`.trim()
+                );
+                setText("debug-json", JSON.stringify(data, null, 2));
+
+                const [level, hint] = buildHint(data);
+                setText("debug-hint", hint);
+                setOverall(level === "OK" ? "链路正常" : level === "BAD" ? "需要处理" : "等待/警告", level.toLowerCase());
+            }
+
+            async function pollDebugStatus() {
+                if (!byId("debug-overall")) {
+                    return;
+                }
+                try {
+                    const response = await fetch(`${poseStatusUrl}?t=${Date.now()}`, { cache: "no-store" });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    renderDebugStatus(await response.json());
+                } catch (err) {
+                    setOverall("9105 不可达", "bad");
+                    setText("debug-win-udp", "ar_receiver 未运行或 9105 不可访问");
+                    setText("debug-ar-fwd", "N/A");
+                    setText("debug-pose", "N/A");
+                    setText("debug-ctrl", "N/A");
+                    setText("debug-serial", "N/A");
+                    setText("debug-tc264", "N/A");
+                    setText("debug-hint", `无法读取 ${poseStatusUrl}：${err.message}`);
+                }
+            }
+
+            window.addEventListener("DOMContentLoaded", function () {
+                pollDebugStatus();
+                window.setInterval(pollDebugStatus, DEBUG_POLL_MS);
+            });
+        })();
+    </script>
 </body>
 
 </html>

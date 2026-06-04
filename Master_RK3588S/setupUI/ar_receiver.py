@@ -1,7 +1,7 @@
 import time
 import struct
 import json
-import math
+import atexit
 import os
 import socket
 import threading
@@ -29,19 +29,14 @@ CONFIG_PATH = os.path.join(BASE_DIR, "dist", "main_config.json")
 MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", "base", "model"))
 SEG_RESULT_TTL = 2.0
 DET_RESULT_TTL = 1.0
+RUNTIME_STATUS_INTERVAL = 0.5
+CONTROL_WATCHDOG_TIMEOUT = float(os.environ.get("AR_CONTROL_WATCHDOG_TIMEOUT", "2.0"))
+CONTROL_WATCHDOG_INTERVAL = 0.1
+CONTROL_SAFE_STOP_REPEAT_INTERVAL = float(os.environ.get("AR_SAFE_STOP_REPEAT_INTERVAL", "0.2"))
 CONTROL_SCALE = 0.5
-TRACK_SPEED = 120.0
+TRACK_SPEED = float(os.environ.get("AR_TRACK_SPEED", "80.0"))
 TRACK_FALLBACK_SPEED = float(os.environ.get("AR_TRACK_FALLBACK_SPEED", str(TRACK_SPEED)))
-CONTROL_MODE = os.environ.get("AR_CONTROL_MODE", "pose").strip().lower()
 CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", "1"), 0)
-PATH_WAYPOINTS_PATH = os.environ.get("AR_WAYPOINT_PATH", os.path.join(BASE_DIR, "path_waypoints.json"))
-POSE_CONTROL_SPEED = float(os.environ.get("AR_POSE_CONTROL_SPEED", "80.0"))
-POSE_FRESH_TTL = float(os.environ.get("AR_POSE_FRESH_TTL", "0.8"))
-POSE_WAYPOINT_REACH_DIST = float(os.environ.get("AR_POSE_WAYPOINT_REACH_DIST", "0.25"))
-POSE_HEADING_GAIN = float(os.environ.get("AR_POSE_HEADING_GAIN", "1.2"))
-POSE_CROSSTRACK_GAIN = float(os.environ.get("AR_POSE_CROSSTRACK_GAIN", "80.0"))
-POSE_CONTROL_SIGN = float(os.environ.get("AR_POSE_CONTROL_SIGN", "1.0"))
-POSE_CONTROL_LIMIT = float(os.environ.get("AR_POSE_CONTROL_LIMIT", "120.0"))
 
 DEFAULT_AR_UDP_IP = "127.0.0.1"
 DEFAULT_AR_UDP_PORT = 9006
@@ -72,11 +67,20 @@ POSE_PATH_DEBUG_EVERY_N = 1
 STATE_TRACK = getattr(_serial_comm, "STATE_TRACK", 1) if _serial_comm else 1
 STATE_SAFE_STOP = getattr(_serial_comm, "STATE_SAFE_STOP", 7) if _serial_comm else 7
 CarController = getattr(_serial_comm, "CarController", None) if _serial_comm else None
+STATUS_WRITE_LOCK = threading.Lock()
+LATEST_CONTROL_STATUS = None
+CONTROL_COMMAND_LOCK = threading.Lock()
+LAST_CONTROL_ACTIVITY_TS = 0.0
+WATCHDOG_ACTIVE = False
+LAST_WATCHDOG_SAFE_STOP_TS = 0.0
+LAST_CONTROL_SEND_OK = None
+LAST_CONTROL_SEND_ERROR = ""
+LAST_CONTROL_SEND_TS = 0.0
 
 
 class DisabledCarController:
     def send_cmd(self, *args, **kwargs):
-        return None
+        return False
 
 
 def create_car_controller():
@@ -96,12 +100,12 @@ def create_car_controller():
         return DisabledCarController()
 
 
-def send_car_cmd(track_error, target_speed, state_cmd, flags=CONTROL_FLAG_USE_TARGET_SPEED):
+def _send_car_cmd_unlocked(track_error, target_speed, state_cmd, flags):
     send_cmd = getattr(car, "send_cmd", None)
     if send_cmd is None:
-        return
+        return False, "send_cmd unavailable"
     try:
-        send_cmd(
+        result = send_cmd(
             track_error=track_error,
             target_speed=target_speed,
             state_cmd=state_cmd,
@@ -109,16 +113,95 @@ def send_car_cmd(track_error, target_speed, state_cmd, flags=CONTROL_FLAG_USE_TA
         )
     except TypeError:
         try:
-            send_cmd(track_error, target_speed, state_cmd, flags)
+            result = send_cmd(track_error, target_speed, state_cmd, flags)
         except TypeError:
             try:
-                send_cmd(track_error)
+                result = send_cmd(track_error)
             except Exception as exc:
                 print(f"serial send skip: {exc}")
+                return False, str(exc)
         except Exception as exc:
             print(f"serial send skip: {exc}")
+            return False, str(exc)
     except Exception as exc:
         print(f"serial send skip: {exc}")
+        return False, str(exc)
+    ok = True if result is None else bool(result)
+    return ok, "" if ok else "serial send returned false"
+
+
+def send_car_cmd(track_error, target_speed, state_cmd, flags=CONTROL_FLAG_USE_TARGET_SPEED, mark_activity=True):
+    global LAST_CONTROL_ACTIVITY_TS, WATCHDOG_ACTIVE, LAST_WATCHDOG_SAFE_STOP_TS
+    global LAST_CONTROL_SEND_OK, LAST_CONTROL_SEND_ERROR, LAST_CONTROL_SEND_TS
+
+    with CONTROL_COMMAND_LOCK:
+        ok, error = _send_car_cmd_unlocked(track_error, target_speed, state_cmd, flags)
+        LAST_CONTROL_SEND_OK = ok
+        LAST_CONTROL_SEND_ERROR = error
+        LAST_CONTROL_SEND_TS = time.time()
+        if mark_activity:
+            LAST_CONTROL_ACTIVITY_TS = time.monotonic()
+            WATCHDOG_ACTIVE = False
+            LAST_WATCHDOG_SAFE_STOP_TS = 0.0
+        return ok
+
+
+def arm_control_watchdog():
+    global LAST_CONTROL_ACTIVITY_TS, WATCHDOG_ACTIVE, LAST_WATCHDOG_SAFE_STOP_TS
+
+    with CONTROL_COMMAND_LOCK:
+        LAST_CONTROL_ACTIVITY_TS = time.monotonic()
+        WATCHDOG_ACTIVE = False
+        LAST_WATCHDOG_SAFE_STOP_TS = 0.0
+
+
+def control_watchdog_loop(stop_event, pose_bridge):
+    global WATCHDOG_ACTIVE, LAST_WATCHDOG_SAFE_STOP_TS
+    global LAST_CONTROL_SEND_OK, LAST_CONTROL_SEND_ERROR, LAST_CONTROL_SEND_TS
+
+    while not stop_event.wait(CONTROL_WATCHDOG_INTERVAL):
+        send_stop = False
+        first_timeout = False
+        with CONTROL_COMMAND_LOCK:
+            now_mono = time.monotonic()
+            age = now_mono - LAST_CONTROL_ACTIVITY_TS if LAST_CONTROL_ACTIVITY_TS else None
+            repeat_due = (
+                LAST_WATCHDOG_SAFE_STOP_TS <= 0.0
+                or (now_mono - LAST_WATCHDOG_SAFE_STOP_TS) >= CONTROL_SAFE_STOP_REPEAT_INTERVAL
+            )
+            if age is not None and age >= CONTROL_WATCHDOG_TIMEOUT and repeat_due:
+                ok, error = _send_car_cmd_unlocked(0.0, 0.0, STATE_SAFE_STOP, 0)
+                LAST_CONTROL_SEND_OK = ok
+                LAST_CONTROL_SEND_ERROR = error
+                LAST_CONTROL_SEND_TS = time.time()
+                first_timeout = not WATCHDOG_ACTIVE
+                WATCHDOG_ACTIVE = True
+                LAST_WATCHDOG_SAFE_STOP_TS = now_mono
+                send_stop = True
+
+        if send_stop:
+            if first_timeout:
+                write_debug_log(
+                    f"control watchdog safe stop: no main-loop command for {CONTROL_WATCHDOG_TIMEOUT:.1f}s"
+                )
+            write_runtime_status(
+                pose_bridge,
+                "CONTROL_TIMEOUT_SAFE_STOP",
+                0.0,
+                0.0,
+                STATE_SAFE_STOP,
+                0,
+            )
+
+
+def get_control_send_status():
+    with CONTROL_COMMAND_LOCK:
+        return {
+            "ok": LAST_CONTROL_SEND_OK,
+            "error": LAST_CONTROL_SEND_ERROR or None,
+            "timestamp": LAST_CONTROL_SEND_TS or None,
+            "watchdog_active": WATCHDOG_ACTIVE,
+        }
 
 
 def get_car_feedback():
@@ -136,6 +219,16 @@ infer_seg = PPSegInfer(model_dir=MODEL_DIR, TPEs=1, core_ids=[1], max_inflight=1
 print("AI engines loaded")
 
 car = create_car_controller()
+
+
+def stop_car_on_exit():
+    try:
+        send_car_cmd(0.0, 0.0, STATE_SAFE_STOP, flags=0, mark_activity=False)
+    except Exception:
+        pass
+
+
+atexit.register(stop_car_on_exit)
 
 
 def remove_shm_from_resource_tracker():
@@ -195,23 +288,36 @@ def write_pose_status(status, packet=None, raw_line="", packet_count=0, invalid_
         "packet_json": DEBUG_PACKET_PATH,
         "car_feedback": get_car_feedback(),
     }
+    write_status_json(info, "pose status")
+
+
+def write_status_json(info, label, control_info=None):
+    global LATEST_CONTROL_STATUS
+
     try:
-        tmp_path = DEBUG_STATUS_PATH + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(info, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, DEBUG_STATUS_PATH)
+        with STATUS_WRITE_LOCK:
+            if control_info is not None:
+                LATEST_CONTROL_STATUS = dict(control_info)
+            if LATEST_CONTROL_STATUS is not None:
+                info["control"] = dict(LATEST_CONTROL_STATUS)
+
+            tmp_path = DEBUG_STATUS_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(info, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, DEBUG_STATUS_PATH)
     except Exception as exc:
-        print(f"pose status write failed: {exc}")
+        print(f"{label} write failed: {exc}")
 
 
-def write_runtime_status(pose_bridge, control_state, command_error, command_speed, command_flags, planner_status):
+def write_runtime_status(pose_bridge, control_state, command_error, command_speed, command_state, command_flags):
     pose_info = pose_bridge.snapshot()
     control_info = {
         "state": control_state,
         "track_error": float(command_error) if command_error is not None and np.isfinite(command_error) else None,
         "target_speed": float(command_speed),
+        "state_cmd": int(command_state),
         "flags": int(command_flags),
-        "planner": planner_status,
+        "serial_send": get_control_send_status(),
         "timestamp": time.time(),
     }
     info = {
@@ -228,13 +334,7 @@ def write_runtime_status(pose_bridge, control_state, command_error, command_spee
         "debug_log": DEBUG_LOG_PATH,
         "packet_json": DEBUG_PACKET_PATH,
     }
-    try:
-        tmp_path = DEBUG_STATUS_PATH + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(info, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, DEBUG_STATUS_PATH)
-    except Exception as exc:
-        print(f"runtime status write failed: {exc}")
+    write_status_json(info, "runtime status", control_info=control_info)
 
 def write_live_pose_packet(packet):
     if not packet:
@@ -426,131 +526,6 @@ def parse_official_pose_datagram(data):
     if packet is None:
         return None, raw_text, "expected official robot_position with finite pos[3] and euler[3]"
     return packet, raw_text, ""
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def wrap_degrees(angle):
-    while angle > 180.0:
-        angle -= 360.0
-    while angle < -180.0:
-        angle += 360.0
-    return angle
-
-
-def _read_pose_xyz_yaw(packet):
-    if not isinstance(packet, dict):
-        return None
-    pos = packet.get("pos")
-    euler = packet.get("euler")
-    if not isinstance(pos, (list, tuple)) or len(pos) < 3:
-        return None
-    if not isinstance(euler, (list, tuple)) or len(euler) < 3:
-        return None
-    try:
-        x = float(pos[0])
-        z = float(pos[2])
-        yaw = float(euler[1])
-    except (TypeError, ValueError):
-        return None
-    if not (np.isfinite(x) and np.isfinite(z) and np.isfinite(yaw)):
-        return None
-    return x, z, yaw
-
-
-def _normalize_waypoint(item):
-    try:
-        if isinstance(item, dict):
-            if "pos" in item and isinstance(item["pos"], (list, tuple)) and len(item["pos"]) >= 3:
-                return float(item["pos"][0]), float(item["pos"][2])
-            if "x" in item and "z" in item:
-                return float(item["x"]), float(item["z"])
-            if "x" in item and "y" in item:
-                return float(item["x"]), float(item["y"])
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            return float(item[0]), float(item[1])
-    except (TypeError, ValueError):
-        return None
-    return None
-
-
-def load_path_waypoints(path):
-    if not path or not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except Exception as exc:
-        write_debug_log(f"path waypoint load failed: {path} {exc}")
-        return []
-    raw_points = data.get("waypoints", data.get("points", data)) if isinstance(data, dict) else data
-    if not isinstance(raw_points, list):
-        return []
-    points = []
-    for item in raw_points:
-        point = _normalize_waypoint(item)
-        if point is not None and np.isfinite(point[0]) and np.isfinite(point[1]):
-            points.append(point)
-    return points
-
-
-class PosePathPlanner:
-    def __init__(self, waypoint_path):
-        self.waypoint_path = waypoint_path
-        self.waypoints = load_path_waypoints(waypoint_path)
-        self.index = 1 if len(self.waypoints) > 1 else 0
-        if self.waypoints:
-            self.last_status = f"loaded {len(self.waypoints)} pts"
-        else:
-            self.last_status = "no waypoint file"
-
-    @property
-    def enabled(self):
-        return len(self.waypoints) >= 2
-
-    def compute(self, pose_packet):
-        pose = _read_pose_xyz_yaw(pose_packet)
-        if pose is None:
-            self.last_status = "pose invalid"
-            return None
-        if not self.enabled:
-            self.last_status = "path disabled"
-            return None
-
-        x, z, yaw = pose
-        target_x, target_z = self.waypoints[self.index]
-        dx = target_x - x
-        dz = target_z - z
-        dist = math.hypot(dx, dz)
-
-        hops = 0
-        while dist <= POSE_WAYPOINT_REACH_DIST and hops < len(self.waypoints):
-            self.index = (self.index + 1) % len(self.waypoints)
-            target_x, target_z = self.waypoints[self.index]
-            dx = target_x - x
-            dz = target_z - z
-            dist = math.hypot(dx, dz)
-            hops += 1
-
-        prev_x, prev_z = self.waypoints[(self.index - 1) % len(self.waypoints)]
-        seg_x = target_x - prev_x
-        seg_z = target_z - prev_z
-        seg_len = max(1e-6, math.hypot(seg_x, seg_z))
-        lateral = ((x - prev_x) * seg_z - (z - prev_z) * seg_x) / seg_len
-
-        # X/Z plane: x is lateral, z is forward in the official robot_position payload.
-        desired_yaw = math.degrees(math.atan2(dx, dz))
-        heading_error = wrap_degrees(desired_yaw - yaw)
-        control_error = POSE_CONTROL_SIGN * (
-            POSE_HEADING_GAIN * heading_error + POSE_CROSSTRACK_GAIN * lateral
-        )
-        control_error = clamp(control_error, -POSE_CONTROL_LIMIT, POSE_CONTROL_LIMIT)
-        self.last_status = (
-            f"wp {self.index + 1}/{len(self.waypoints)} "
-            f"dist={dist:.2f} head={heading_error:.1f} lat={lateral:.2f}"
-        )
-        return control_error, POSE_CONTROL_SPEED, self.last_status
 
 class ARPoseBridge:
     def __init__(self):
@@ -810,7 +785,7 @@ def pose_status_hint(status, packet_count, invalid_count):
         return "Pose received and forwarded to official AR engine UDP control port."
     return "Waiting for Windows AprilTag localization."
 
-def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_state="N/A", planner_status=None):
+def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_state="N/A"):
     if not DEBUG_DRAW_POSE_PANEL:
         return
 
@@ -840,10 +815,9 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
     )
     udp_line = f"AR-FWD ok={info['udp_send_count']} fail={info['udp_fail_count']} -> {info['target']}"
     if track_error is not None and np.isfinite(track_error):
-        plan_line = f"PLAN {control_state} err={track_error:.1f}"
+        control_line = f"CTRL {control_state} err={track_error:.1f}"
     else:
-        plan_line = f"PLAN {control_state} err=N/A"
-    path_line = f"PATH {short_text(planner_status, 34)}" if planner_status else None
+        control_line = f"CTRL {control_state} err=N/A"
     feedback = get_car_feedback()
     car_lines = []
     if feedback.get("online"):
@@ -874,10 +848,8 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
         source_line,
         pose_line,
         udp_line,
-        plan_line,
+        control_line,
     ]
-    if path_line:
-        lines.append(path_line)
     lines.extend(car_lines)
     lines.append(fps_line)
 
@@ -900,8 +872,15 @@ def main():
     pose_status_server = start_pose_status_http_server()
     pose_bridge = ARPoseBridge()
     pose_bridge.start()
-    pose_planner = PosePathPlanner(PATH_WAYPOINTS_PATH)
-    print(f"control mode: {CONTROL_MODE}, waypoint path: {PATH_WAYPOINTS_PATH}, points: {len(pose_planner.waypoints)}")
+    arm_control_watchdog()
+    control_watchdog_stop = threading.Event()
+    control_watchdog_thread = threading.Thread(
+        target=control_watchdog_loop,
+        args=(control_watchdog_stop, pose_bridge),
+        name="control-watchdog",
+        daemon=True,
+    )
+    control_watchdog_thread.start()
     print("vision client ready, waiting for camera shared memory...")
     last_seg_res = None
     last_seg_ts = 0.0
@@ -972,43 +951,16 @@ def main():
                         except Exception as exc:
                             print(f"det draw skip: {exc}")
 
-                    command_error = None
-                    command_speed = 0.0
-                    command_state = STATE_SAFE_STOP
-                    command_flags = 0
-                    planner_status = pose_planner.last_status
-                    pose_info = pose_bridge.snapshot()
-                    pose_age = now - pose_info["last_ts"] if pose_info["last_ts"] else None
-                    pose_packet = pose_info["last_packet"]
-
-                    if CONTROL_MODE in ("pose", "path", "planner") and pose_planner.enabled:
-                        if pose_packet is not None and pose_age is not None and pose_age <= POSE_FRESH_TTL:
-                            pose_cmd = pose_planner.compute(pose_packet)
-                            planner_status = pose_planner.last_status
-                            if pose_cmd is not None:
-                                command_error, command_speed, planner_status = pose_cmd
-                                command_state = STATE_TRACK
-                                command_flags = CONTROL_FLAG_USE_TARGET_SPEED
-                                control_state_text = "POSE"
-                        else:
-                            if pose_age is None:
-                                planner_status = "pose waiting"
-                            else:
-                                planner_status = f"pose stale {pose_age:.1f}s"
-
-                    if command_error is None and track_error is not None and np.isfinite(track_error):
+                    command_state = STATE_TRACK
+                    command_flags = CONTROL_FLAG_USE_TARGET_SPEED
+                    if track_error is not None and np.isfinite(track_error):
                         command_error = track_error * CONTROL_SCALE
                         command_speed = TRACK_SPEED
-                        command_state = STATE_TRACK
-                        command_flags = CONTROL_FLAG_USE_TARGET_SPEED
                         control_state_text = "VISION"
-                    elif command_error is None:
+                    else:
                         command_error = 0.0
                         command_speed = TRACK_FALLBACK_SPEED
-                        command_state = STATE_TRACK
-                        command_flags = CONTROL_FLAG_USE_TARGET_SPEED
                         control_state_text = "TRACK_FALLBACK"
-                        planner_status = f"{planner_status}; fallback run" if planner_status else "fallback run"
 
                     send_car_cmd(
                         track_error=command_error,
@@ -1017,13 +969,30 @@ def main():
                         flags=command_flags,
                     )
 
+                    if now - last_runtime_status_ts >= RUNTIME_STATUS_INTERVAL:
+                        write_runtime_status(
+                            pose_bridge,
+                            control_state_text,
+                            command_error,
+                            command_speed,
+                            command_state,
+                            command_flags,
+                        )
+                        last_runtime_status_ts = now
+
                     fps_n += 1
                     if now - fps_t >= 1.0:
                         cur_fps = fps_n / max(1e-6, now - fps_t)
                         fps_n = 0
                         fps_t = now
 
-                    draw_pose_status(final_frame, pose_bridge, fps=cur_fps, track_error=command_error, control_state=control_state_text, planner_status=planner_status)
+                    draw_pose_status(
+                        final_frame,
+                        pose_bridge,
+                        fps=cur_fps,
+                        track_error=command_error,
+                        control_state=control_state_text,
+                    )
                     if final_frame is None or final_frame.size == 0:
                         final_frame = frame
                     cv2.imshow("ret", final_frame)
@@ -1052,6 +1021,17 @@ def main():
                 except Exception:
                     pass
 
+    control_watchdog_stop.set()
+    control_watchdog_thread.join(timeout=1.0)
+    send_car_cmd(0.0, 0.0, STATE_SAFE_STOP, flags=0, mark_activity=False)
+    write_runtime_status(
+        pose_bridge,
+        "STOPPED_SAFE_STOP",
+        0.0,
+        0.0,
+        STATE_SAFE_STOP,
+        0,
+    )
     pose_bridge.stop()
     if pose_status_server is not None:
         try:

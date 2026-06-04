@@ -57,7 +57,7 @@ camera:
   hue: 0
   sharpness: 0
 
-# UDP output to RK3588S official AR engine/control port.
+# UDP output to RK3588S ar_receiver external pose input (board_ip:9005).
 udp:
   enabled: false
   target_ip: "127.0.0.1"

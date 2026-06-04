@@ -26,6 +26,7 @@ extern "C"
 #include "Communication.h"
 
 #define CONTROL_FLAG_USE_TARGET_SPEED (0x01U) // 使用上位机下发目标速度
+#define CONTROL_INPUT_TIMEOUT_US (2500000U)   // Valid command timeout, slightly longer than RK watchdog.
 
     /*********************************************************************************************************************
      *                                               控制输入结构体
