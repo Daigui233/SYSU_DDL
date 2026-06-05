@@ -71,6 +71,22 @@ class ArUcoDetector:
             "cornerRefinementWinSize",
             "cornerRefinementMaxIterations",
             "cornerRefinementMinAccuracy",
+            "aprilTagQuadDecimate",
+            "aprilTagQuadSigma",
+            "aprilTagMinClusterPixels",
+            "aprilTagMaxNmaxima",
+            "aprilTagCriticalRad",
+            "aprilTagMaxLineFitMse",
+            "aprilTagMinWhiteBlackDiff",
+            "aprilTagDeglitch",
+            "errorCorrectionRate",
+            "maxErroneousBitsInBorderRate",
+            "minOtsuStdDev",
+            "perspectiveRemovePixelPerCell",
+            "perspectiveRemoveIgnoredMarginPerCell",
+            "minSideLengthCanonicalImg",
+            "detectInvertedMarker",
+            "useAruco3Detection",
         ]
         for k in passthrough_keys:
             if k not in overrides:
@@ -109,10 +125,9 @@ class ArUcoDetector:
                 gray, self.aruco_dict, parameters=self.aruco_params
             )
         
-        # Draw detected markers
+        # Drawing is handled by the UI so locked fixed tags can stay stable
+        # while the vehicle tag remains live.
         image_with_markers = image.copy()
-        if ids is not None and len(ids) > 0:
-            cv2.aruco.drawDetectedMarkers(image_with_markers, corners, ids)
         
         return corners, ids, image_with_markers
     
@@ -156,6 +171,7 @@ class ArUcoDetector:
         
         # Find markers that have known world coordinates
         known_marker_ids = set(cfg.WORLD_COORDINATES.keys())
+        known_marker_ids.discard(int(getattr(cfg, "VEHICLE_ID", 0)))
         detected_ids = set(marker_centers.keys())
         valid_marker_ids = known_marker_ids.intersection(detected_ids)
         

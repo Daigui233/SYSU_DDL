@@ -13,17 +13,22 @@
     <style>
         .ar-debug-layout {
             display: grid;
-            grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
-            gap: 16px;
+            grid-template-columns: minmax(0, 1fr) minmax(270px, 330px);
+            gap: 14px;
             align-items: start;
             margin-top: 12px;
         }
 
         .ar-debug-panel {
-            padding: 14px;
+            min-width: 0;
+            padding: 11px 12px;
             border: 1px solid rgba(0, 255, 170, 0.25);
-            border-radius: 12px;
+            border-radius: 10px;
             background: rgba(0, 0, 0, 0.24);
+        }
+
+        .ar-preview-actions {
+            min-width: 0;
         }
 
         .ar-debug-head {
@@ -31,7 +36,7 @@
             justify-content: space-between;
             gap: 10px;
             align-items: center;
-            margin-bottom: 10px;
+            margin-bottom: 6px;
         }
 
         .ar-debug-title {
@@ -65,11 +70,11 @@
 
         .ar-debug-row {
             display: grid;
-            grid-template-columns: 78px minmax(0, 1fr);
+            grid-template-columns: 64px minmax(0, 1fr);
             gap: 8px;
-            padding: 7px 0;
+            padding: 5px 0;
             border-top: 1px solid rgba(255, 255, 255, 0.08);
-            font-size: 0.82rem;
+            font-size: 0.78rem;
         }
 
         .ar-debug-row:first-of-type {
@@ -88,12 +93,12 @@
         }
 
         .ar-debug-hint {
-            margin-top: 10px;
-            padding-top: 9px;
+            margin-top: 6px;
+            padding-top: 7px;
             border-top: 1px solid rgba(255, 255, 255, 0.08);
             color: var(--text-muted);
-            font-size: 0.8rem;
-            line-height: 1.45;
+            font-size: 0.76rem;
+            line-height: 1.35;
         }
 
         .ar-debug-details {
@@ -105,6 +110,12 @@
         .ar-debug-details summary {
             cursor: pointer;
             color: #8df7d2;
+        }
+
+        .ar-debug-detail-line {
+            margin-top: 7px;
+            font-family: Consolas, Monaco, monospace;
+            overflow-wrap: anywhere;
         }
 
         .ar-debug-json {
@@ -376,8 +387,8 @@
 
             <!-- Step 5: Dashboard (AR Preview) -->
             <div class="step-page" id="step-5">
-                <h2>🟢 AR 融合视频流与配置监控</h2>
-                <p class="subtitle">✅ 融合流端口已成功生成，系统已就绪。</p>
+                <h2>🟢 AR 融合视频与链路监控</h2>
+                <p class="subtitle">预览控制在左侧，运行状态与问题定位在右侧。</p>
 
                 <div class="code-snippet-box">
                     <strong>生成的融合流端口地址：</strong><br><br>
@@ -386,14 +397,13 @@
                 </div>
 
                 <div class="ar-debug-layout">
-                    <div>
-                        <h3>本地 AR 融合预览</h3>
+                    <div class="ar-preview-actions">
+                        <h3>本地预览</h3>
                         <p style="font-size: 0.9rem; color: var(--text-muted)">
-                            点击下方按钮将会在 RK3588 后台唤起 <code>ar_receiver.py</code> 进行本地流预览，若已在运行请勿重复点击。
+                            在 RK3588 上启动或关闭 <code>ar_receiver.py</code> 预览窗口。
                         </p>
                         <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                            <button class="btn btn-glow btn-ar-launch" id="btn-start-preview">🖥️ 打开 RK3588端的AR
-                                融合预览窗口</button>
+                            <button class="btn btn-glow btn-ar-launch" id="btn-start-preview">🖥️ 打开预览窗口</button>
                             <button class="btn btn-secondary" id="btn-stop-preview"
                                 style="display: none; border-color: #ff4d4f; color: #ff4d4f;">⏹️ 关闭预览窗口</button>
                         </div>
@@ -413,10 +423,6 @@
                             <span class="ar-debug-value" id="debug-ar-fwd">等待 9006</span>
                         </div>
                         <div class="ar-debug-row">
-                            <span class="ar-debug-label">POSE</span>
-                            <span class="ar-debug-value" id="debug-pose">N/A</span>
-                        </div>
-                        <div class="ar-debug-row">
                             <span class="ar-debug-label">CTRL</span>
                             <span class="ar-debug-value" id="debug-ctrl">等待控制状态</span>
                         </div>
@@ -429,10 +435,11 @@
                             <span class="ar-debug-value" id="debug-tc264">等待反馈</span>
                         </div>
                         <div class="ar-debug-hint" id="debug-hint">
-                            此面板只读取 <code>9105/pose_status</code>，用于判断问题卡在定位、AR 转发、视觉控制、串口或下位机反馈。
+                            正在读取 <code>9105/pose_status</code> 判断异常环节。
                         </div>
                         <details class="ar-debug-details">
-                            <summary>查看原始状态 JSON</summary>
+                            <summary>坐标与详细状态</summary>
+                            <div class="ar-debug-detail-line" id="debug-pose">POSE N/A</div>
                             <pre class="ar-debug-json" id="debug-json">{}</pre>
                         </details>
                     </section>
@@ -645,29 +652,29 @@
 
                 setText(
                     "debug-win-udp",
-                    `ok=${data.packet_count || 0} bad=${data.invalid_count || 0} status=${data.status || "waiting"}`
+                    `ok ${data.packet_count || 0} · bad ${data.invalid_count || 0}`
                 );
                 setText(
                     "debug-ar-fwd",
-                    `ok=${data.udp_send_count || 0} fail=${data.udp_fail_count || 0} -> ${data.target || "127.0.0.1:9006"}`
+                    `ok ${data.udp_send_count || 0} · fail ${data.udp_fail_count || 0}`
                 );
                 setText(
                     "debug-pose",
-                    `x=${fmtNum(pos[0], 2)} z=${fmtNum(pos[2], 2)} yaw=${fmtNum(euler[1], 1)} age=${fmtAge(packet.timestamp || data.timestamp)}`
+                    `POSE x=${fmtNum(pos[0], 2)} z=${fmtNum(pos[2], 2)} yaw=${fmtNum(euler[1], 1)} age=${fmtAge(packet.timestamp || data.timestamp)} · AR ${data.target || "127.0.0.1:9006"}`
                 );
                 setText(
                     "debug-ctrl",
-                    `${control.state || "N/A"} err=${fmtNum(control.track_error, 1)} speed=${fmtNum(control.target_speed, 0)} state=${control.state_cmd ?? "N/A"} flags=${control.flags ?? "N/A"}`
+                    `${control.state || "N/A"} · err ${fmtNum(control.track_error, 1)} · v ${fmtNum(control.target_speed, 0)}`
                 );
                 setText(
                     "debug-serial",
-                    `send=${fmtBool(serialSend.ok)} watchdog=${serialSend.watchdog_active ? "ON" : "off"} ${serialSend.error || ""}`.trim()
+                    `send ${fmtBool(serialSend.ok)} · WD ${serialSend.watchdog_active ? "ON" : "off"}${serialSend.error ? ` · ${serialSend.error}` : ""}`
                 );
                 setText(
                     "debug-tc264",
                     feedback.online
-                        ? `fb=${feedback.count || 0} age=${fmtAge((Date.now() / 1000) - Number(feedback.age || 0))} state=${feedback.state_name || feedback.state || "N/A"} motor=${fmtNum(feedback.motor_target, 0)} servo=${feedback.servo_output ?? "N/A"}`
-                        : `offline fb=${feedback.count || 0} bad=${feedback.bad || 0} ${feedback.error || ""}`.trim()
+                        ? `${feedback.state_name || feedback.state || "ONLINE"} · fb ${feedback.count || 0} · age ${fmtAge((Date.now() / 1000) - Number(feedback.age || 0))}`
+                        : `offline · fb ${feedback.count || 0} · bad ${feedback.bad || 0}`
                 );
                 setText("debug-json", JSON.stringify(data, null, 2));
 

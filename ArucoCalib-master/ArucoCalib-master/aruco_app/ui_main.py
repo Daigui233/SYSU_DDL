@@ -4,6 +4,7 @@ PyQt main interface for ArUco coordinate system
 import sys
 from datetime import datetime
 from pathlib import Path
+import time
 import cv2
 import numpy as np
 import math
@@ -135,7 +136,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_frame)
         self.is_detecting = False
 
-        # Session-level logging timestamp (created once per app run)
+        # Session-level timestamp for optional MP4 recordings.
         self.script_start_ts = make_run_ts()
         app_root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
         self.runs_root_dir = app_root / "runs"
@@ -166,6 +167,10 @@ class MainWindow(QMainWindow):
         self.last_vehicle_yaw_deg = None  # float deg
         self.last_vehicle_corners_px = None
         self.last_output_pose = None  # (x_m, z_m, yaw_deg)
+        self.last_output_pose_ts = 0.0
+        self.last_pose_live = False
+        self.pose_hold_timeout_s = 0.5
+        self.locked_fixed_marker_corners_px = {}  # fixed marker_id -> (4,2) corners captured at calibration lock
         self.last_udp_ok = False
         self.pose_seq = 0
         self.pose_history = []
@@ -321,10 +326,13 @@ class MainWindow(QMainWindow):
 
     def _send_current_pose(self):
         pose = self._current_output_pose()
-        self.last_output_pose = pose
         if pose is None:
+            self.last_pose_live = False
             self.last_udp_ok = False
             return
+        self.last_output_pose = pose
+        self.last_output_pose_ts = time.monotonic()
+        self.last_pose_live = True
         x_m, z_m, yaw_deg = pose
         self.pose_seq += 1
         self.last_udp_ok = self.pose_sender.send_pose(
@@ -338,15 +346,28 @@ class MainWindow(QMainWindow):
             self.pose_history = self.pose_history[-3000:]
         self._update_udp_status()
 
+    def _display_pose_state(self):
+        if self.last_output_pose is None or self.last_output_pose_ts <= 0.0:
+            return None, "WAIT", None
+        age_s = time.monotonic() - self.last_output_pose_ts
+        if self.last_pose_live:
+            return self.last_output_pose, "LIVE", age_s
+        if age_s <= self.pose_hold_timeout_s:
+            return self.last_output_pose, "HOLD", age_s
+        return None, "WAIT", age_s
+
     def _draw_pose_hud(self, image_bgr):
-        if self.last_output_pose is not None:
-            x_m, z_m, yaw_deg = self.last_output_pose
+        pose, pose_state, age_s = self._display_pose_state()
+        sent_now = bool(self.last_pose_live and self.last_udp_ok)
+        if pose is not None:
+            x_m, z_m, yaw_deg = pose
+            state_text = pose_state if age_s is None else f"{pose_state} {age_s:.2f}s"
             lines = [
-                f"seq={self.pose_seq} sent={1 if self.last_udp_ok else 0}",
+                f"seq={self.pose_seq} sent={1 if sent_now else 0} pose={state_text}",
                 f"x={x_m:.3f}m z={z_m:.3f}m yaw={yaw_deg:.2f}deg",
             ]
         else:
-            lines = [f"seq={self.pose_seq} sent={1 if self.last_udp_ok else 0}", "pose: waiting"]
+            lines = [f"seq={self.pose_seq} sent=0", "pose: waiting"]
 
         if self.pose_sender.last_error:
             lines.append(f"udp error: {self.pose_sender.last_error[:50]}")
@@ -373,57 +394,178 @@ class MainWindow(QMainWindow):
         cv2.putText(image_bgr, "UDP trajectory", (x0 + 10, y0 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 220, 210), 1, cv2.LINE_AA)
 
         world_points = list(getattr(self.cfg, "WORLD_COORDINATES", {}).values())
-        xs = [float(p[0]) * 0.001 for p in world_points]
-        zs = [float(p[1]) * 0.001 for p in world_points]
-        xs.extend(p[0] for p in self.pose_history)
-        zs.extend(p[1] for p in self.pose_history)
-        if not xs or not zs:
+        coord_scale = float(getattr(self.cfg, "OUTPUT_COORD_SCALE", 0.001))
+        x_sign = float(getattr(self.cfg, "OUTPUT_X_SIGN", 1.0))
+        z_sign = float(getattr(self.cfg, "OUTPUT_Z_SIGN", 1.0))
+        field_points = [
+            (float(p[0]) * coord_scale * x_sign, float(p[1]) * coord_scale * z_sign)
+            for p in world_points
+        ]
+        field_points.append((0.0, 0.0))
+        if not field_points:
             return image_bgr
 
-        min_x, max_x = min(xs), max(xs)
-        min_z, max_z = min(zs), max(zs)
+        field_min_x = min(p[0] for p in field_points)
+        field_max_x = max(p[0] for p in field_points)
+        field_min_z = min(p[1] for p in field_points)
+        field_max_z = max(p[1] for p in field_points)
+        min_x, max_x = field_min_x, field_max_x
+        min_z, max_z = field_min_z, field_max_z
         span_x = max(0.5, max_x - min_x)
         span_z = max(0.5, max_z - min_z)
-        pad_x = span_x * 0.08
-        pad_z = span_z * 0.08
-        min_x -= pad_x
-        max_x += pad_x
-        min_z -= pad_z
-        max_z += pad_z
+        margin_m = max(0.15, max(span_x, span_z) * 0.06)
+        min_x -= margin_m
+        max_x += margin_m
+        min_z -= margin_m
+        max_z += margin_m
 
         left, right = x0 + 18, x1 - 18
-        top, bottom = y0 + 38, y1 - 28
+        top, bottom = y0 + 38, y1 - 44
+        avail_w = max(1, right - left)
+        avail_h = max(1, bottom - top)
+        field_aspect = max(1e-9, max_x - min_x) / max(1e-9, max_z - min_z)
+        avail_aspect = avail_w / float(avail_h)
+        if avail_aspect > field_aspect:
+            plot_w = int(round(avail_h * field_aspect))
+            left += (avail_w - plot_w) // 2
+            right = left + plot_w
+        else:
+            plot_h = int(round(avail_w / field_aspect))
+            top += (avail_h - plot_h) // 2
+            bottom = top + plot_h
 
         def map_point(px, pz):
-            sx = left + int((float(px) - min_x) / max(1e-9, max_x - min_x) * (right - left))
+            # Formal AR field view: origin at bottom-right, +X points left, +Z points up.
+            sx = right - int((float(px) - min_x) / max(1e-9, max_x - min_x) * (right - left))
             sy = bottom - int((float(pz) - min_z) / max(1e-9, max_z - min_z) * (bottom - top))
             return sx, sy
+
+        axis_color = (150, 165, 155)
+        field_rect = np.array(
+            [
+                map_point(field_min_x, field_min_z),
+                map_point(field_max_x, field_min_z),
+                map_point(field_max_x, field_max_z),
+                map_point(field_min_x, field_max_z),
+            ],
+            dtype=np.int32,
+        ).reshape(-1, 1, 2)
+        cv2.polylines(image_bgr, [field_rect], True, (80, 95, 85), 1, cv2.LINE_AA)
+
+        grid_color = (55, 70, 62)
+        gx = math.ceil(field_min_x)
+        while gx < field_max_x:
+            cv2.line(image_bgr, map_point(gx, field_min_z), map_point(gx, field_max_z), grid_color, 1, cv2.LINE_AA)
+            gx += 1
+        gz = math.ceil(field_min_z)
+        while gz < field_max_z:
+            cv2.line(image_bgr, map_point(field_min_x, gz), map_point(field_max_x, gz), grid_color, 1, cv2.LINE_AA)
+            gz += 1
+
+        axis_origin = map_point(0.0, 0.0)
+        axis_x_end = map_point(field_max_x, 0.0)
+        axis_z_end = map_point(0.0, field_max_z)
+        cv2.arrowedLine(image_bgr, axis_origin, axis_x_end, axis_color, 1, cv2.LINE_AA, tipLength=0.06)
+        cv2.arrowedLine(image_bgr, axis_origin, axis_z_end, axis_color, 1, cv2.LINE_AA, tipLength=0.08)
+        cv2.circle(image_bgr, axis_origin, 3, axis_color, -1, cv2.LINE_AA)
+        cv2.putText(image_bgr, "+X", (axis_x_end[0] + 2, axis_x_end[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, axis_color, 1, cv2.LINE_AA)
+        cv2.putText(image_bgr, "+Z", (axis_z_end[0] - 30, axis_z_end[1] + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, axis_color, 1, cv2.LINE_AA)
+        cv2.putText(image_bgr, "O", (axis_origin[0] - 5, axis_origin[1] + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.38, axis_color, 1, cv2.LINE_AA)
+        field_label = f"{field_max_x - field_min_x:.1f}m x {field_max_z - field_min_z:.1f}m"
+        cv2.putText(image_bgr, field_label, (x0 + 10, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (170, 185, 175), 1, cv2.LINE_AA)
 
         if len(self.pose_history) >= 2:
             pts = np.array([map_point(px, pz) for px, pz, _ in self.pose_history], dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(image_bgr, [pts], False, (0, 220, 255), 2, cv2.LINE_AA)
 
-        if self.last_output_pose is not None:
-            px, pz, yaw = self.last_output_pose
+        display_pose, pose_state, _age_s = self._display_pose_state()
+        if display_pose is not None:
+            px, pz, yaw = display_pose
             center = map_point(px, pz)
             length = max(14, inset_w // 16)
             angle = math.radians(yaw)
-            tip = (center[0] + int(math.sin(angle) * length), center[1] - int(math.cos(angle) * length))
+            tip = (center[0] - int(math.cos(angle) * length), center[1] - int(math.sin(angle) * length))
             cv2.circle(image_bgr, center, 4, (0, 80, 255), -1)
             cv2.arrowedLine(image_bgr, center, tip, (0, 80, 255), 2, cv2.LINE_AA, tipLength=0.35)
-            footer = f"seq={self.pose_seq} x={px:.3f} z={pz:.3f} yaw={yaw:.1f}deg"
+            footer = f"seq={self.pose_seq} {pose_state} x={px:.3f} z={pz:.3f} yaw={yaw:.1f}deg"
             cv2.putText(image_bgr, footer, (x0 + 10, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (210, 220, 210), 1, cv2.LINE_AA)
 
-        cv2.putText(image_bgr, "+Z", (x0 + 10, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 165, 155), 1, cv2.LINE_AA)
-        cv2.putText(image_bgr, "+X", (x1 - 34, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 165, 155), 1, cv2.LINE_AA)
+        return image_bgr
+
+    @staticmethod
+    def _corner_by_id(corners, ids):
+        corner_by_id = {}
+        if ids is None or corners is None:
+            return corner_by_id
+        for i, marker_id in enumerate(ids.flatten()):
+            corner_by_id[int(marker_id)] = np.array(corners[i][0], dtype=np.float32)
+        return corner_by_id
+
+    @staticmethod
+    def _draw_marker_box(image_bgr, marker_corners, marker_id, color, suffix=""):
+        corners = np.array(marker_corners, dtype=np.float32)
+        if corners.shape != (4, 2):
+            return image_bgr
+        pts = np.round(corners).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(image_bgr, [pts], True, color, 2, cv2.LINE_AA)
+        center = np.mean(corners, axis=0)
+        c0 = corners[0]
+        cv2.circle(image_bgr, (int(round(c0[0])), int(round(c0[1]))), 3, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(image_bgr, (int(round(center[0])), int(round(center[1]))), 3, color, -1, cv2.LINE_AA)
+        label = f"id={int(marker_id)}{suffix}"
+        label_pos = (int(round(center[0])) + 4, int(round(center[1])) - 4)
+        cv2.putText(image_bgr, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        return image_bgr
+
+    def _draw_marker_overlays(self, image_bgr, corners, ids):
+        corner_by_id = self._corner_by_id(corners, ids)
+        fixed_ids = sorted(set(getattr(self.cfg, "WORLD_COORDINATES", {}).keys()) - {int(self.vehicle_id)})
+
+        if self.transformer.get_calibration_status() and self.locked_fixed_marker_corners_px:
+            for marker_id in fixed_ids:
+                marker_corners = self.locked_fixed_marker_corners_px.get(int(marker_id))
+                if marker_corners is not None:
+                    self._draw_marker_box(image_bgr, marker_corners, marker_id, (0, 190, 0), " lock")
+        else:
+            for marker_id in fixed_ids:
+                marker_corners = corner_by_id.get(int(marker_id))
+                if marker_corners is not None:
+                    self._draw_marker_box(image_bgr, marker_corners, marker_id, (0, 190, 0))
+
+        vehicle_corners = corner_by_id.get(int(self.vehicle_id))
+        if vehicle_corners is not None:
+            self._draw_marker_box(image_bgr, vehicle_corners, self.vehicle_id, (255, 120, 0))
+
         return image_bgr
 
     def _draw_vehicle_arrow(self, image_bgr):
         if self.last_vehicle_corners_px is None or self.last_vehicle_center_px is None:
             return image_bgr
-        corners = np.array(self.last_vehicle_corners_px, dtype=np.float32)
         center = np.array(self.last_vehicle_center_px, dtype=np.float32)
-        front = (corners[1] + corners[2]) * 0.5
+        front = None
+        if (
+            self.transformer.get_calibration_status()
+            and self.last_vehicle_center_world is not None
+            and self.last_output_pose is not None
+        ):
+            wx_mm, wy_mm = self.last_vehicle_center_world
+            yaw_deg = float(self.last_output_pose[2])
+            yaw_rad = math.radians(yaw_deg)
+            x_sign = float(getattr(self.cfg, "OUTPUT_X_SIGN", 1.0))
+            z_sign = float(getattr(self.cfg, "OUTPUT_Z_SIGN", 1.0))
+            heading_len_mm = 260.0
+            tip_world = (
+                float(wx_mm) + math.cos(yaw_rad) / max(1e-9, x_sign) * heading_len_mm,
+                float(wy_mm) + math.sin(yaw_rad) / max(1e-9, z_sign) * heading_len_mm,
+            )
+            tip_px = self.transformer.world_to_pixel(tip_world[0], tip_world[1])
+            if tip_px is not None:
+                front = np.array(tip_px, dtype=np.float32)
+
+        if front is None:
+            corners = np.array(self.last_vehicle_corners_px, dtype=np.float32)
+            front = (corners[1] + corners[2]) * 0.5
+
         cv2.circle(image_bgr, (int(center[0]), int(center[1])), 5, (0, 0, 255), -1)
         cv2.arrowedLine(
             image_bgr,
@@ -487,6 +629,9 @@ class MainWindow(QMainWindow):
         self.btn_reset_calibration = QPushButton("Reset Calibration")
         self.btn_reset_calibration.clicked.connect(self.reset_calibration)
         action_row.addWidget(self.btn_reset_calibration)
+        self.btn_clear_trajectory = QPushButton("Clear Trajectory")
+        self.btn_clear_trajectory.clicked.connect(self.clear_trajectory)
+        action_row.addWidget(self.btn_clear_trajectory)
         self.calib_label = QLabel("Calibration: Not calibrated")
         action_row.addWidget(self.calib_label)
         action_row.addStretch()
@@ -520,6 +665,7 @@ class MainWindow(QMainWindow):
         self.tag_status_text = QTextEdit()
         self.chk_lock_calibration = QCheckBox()
         self.chk_lock_calibration.setChecked(True)
+        self.chk_lock_calibration.setEnabled(False)
         self.grid_size_spin = QSpinBox()
         self.grid_size_spin.setRange(1, 5000)
         self.grid_size_spin.setValue(500)
@@ -559,12 +705,30 @@ class MainWindow(QMainWindow):
             self.stop_camera()
 
     def reset_calibration(self):
+        if self.transformer.get_calibration_status():
+            reply = QMessageBox.question(
+                self,
+                "Confirm Recalibration",
+                "Clear the locked calibration and recalibrate when 4 fixed tags are visible again?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self.status_label.setText("Status: Recalibration cancelled")
+                return
+
         self.transformer.reset_calibration()
+        self.locked_fixed_marker_corners_px = {}
         self.last_output_pose = None
         self.pose_seq = 0
         self.pose_history = []
         self.calib_label.setText("Calibration: Not calibrated")
-        self.status_label.setText("Status: Calibration reset")
+        self.status_label.setText("Status: Waiting for 4 fixed tags to recalibrate")
+
+    def clear_trajectory(self):
+        self.pose_history = []
+        self.marker_traces = {}
+        self.status_label.setText("Status: Trajectory cleared")
 
     def on_grid_size_changed(self, value: int):
         """
@@ -819,6 +983,7 @@ class MainWindow(QMainWindow):
         """Detect ArUco markers and calibrate coordinate system"""
         # Detect markers
         corners, ids, image_with_markers = self.detector.detect_markers(image)
+        corner_by_id = self._corner_by_id(corners, ids)
 
         # Marker centers of all currently visible IDs
         all_marker_centers = self.detector.get_marker_centers(corners, ids)
@@ -829,40 +994,39 @@ class MainWindow(QMainWindow):
         # Required marker set for full homography re-calibration
         required_marker_centers = self.detector.get_required_markers(corners, ids)
 
-        if required_marker_centers is not None:
-            # Recalculate until the first successful calibration, then keep it stable when locked.
-            should_recalibrate = (
-                not self.transformer.get_calibration_status()
-                or not self.chk_lock_calibration.isChecked()
-            )
-            success = True if not should_recalibrate else self.transformer.calibrate(required_marker_centers)
+        detected_count = len(ids) if ids is not None else 0
+        if self.transformer.get_calibration_status():
+            self.calib_label.setText("Calibration: Calibrated (locked)")
+            self.status_label.setText("Status: Calibration locked; fixed tags held")
+        elif required_marker_centers is not None:
+            success = self.transformer.calibrate(required_marker_centers)
             if success:
-                lock_text = " (locked)" if self.chk_lock_calibration.isChecked() else ""
-                self.calib_label.setText(f"Calibration: Calibrated{lock_text}")
-                self.status_label.setText("Status: Calibration ready")
+                fixed_ids = sorted(set(required_marker_centers.keys()) - {int(self.vehicle_id)})
+                self.locked_fixed_marker_corners_px = {
+                    int(marker_id): corner_by_id[int(marker_id)].copy()
+                    for marker_id in fixed_ids
+                    if int(marker_id) in corner_by_id
+                }
+                self.calib_label.setText("Calibration: Calibrated (locked)")
+                self.status_label.setText("Status: Calibration locked")
             else:
                 self.calib_label.setText("Calibration: Failed")
                 self.status_label.setText("Status: Calibration failed")
                 self.transformer.reset_calibration()
+                self.locked_fixed_marker_corners_px = {}
         else:
-            detected_count = len(ids) if ids is not None else 0
-            if self.transformer.get_calibration_status() and self.chk_lock_calibration.isChecked():
-                self.calib_label.setText("Calibration: Calibrated (held)")
-                self.status_label.setText(f"Status: {detected_count} markers detected, using locked calibration")
-            else:
-                self.calib_label.setText("Calibration: Not calibrated")
-                self.status_label.setText(
-                    f"Status: {detected_count} markers detected, {self.cfg.MIN_MARKER_COUNT} required for calibration"
-                )
-                self.transformer.reset_calibration()
+            self.calib_label.setText("Calibration: Not calibrated")
+            self.status_label.setText(
+                f"Status: {detected_count} markers detected, {self.cfg.MIN_MARKER_COUNT} required for calibration"
+            )
 
         # Vehicle marker (single ID) pose display (based on current calibration status)
         vehicle_detected = False
+        self.last_pose_live = False
         self.last_vehicle_center_px = None
         self.last_vehicle_center_world = None
         self.last_vehicle_yaw_deg = None
         self.last_vehicle_corners_px = None
-        self.last_output_pose = None
         if ids is not None and corners is not None:
             flat_ids = ids.flatten()
             matches = np.where(flat_ids == int(self.vehicle_id))[0]
@@ -886,8 +1050,8 @@ class MainWindow(QMainWindow):
                         if center_world is not None and p1w is not None and p2w is not None:
                             dx = float(p2w[0] - p1w[0])
                             dz = float(p2w[1] - p1w[1])
-                            # AR/Unity convention: yaw=0 points +Z; +90 points +X.
-                            yaw_deg = math.degrees(math.atan2(dx, dz))
+                            # Official AR convention used here: yaw=0 points +X; +90 points +Z.
+                            yaw_deg = math.degrees(math.atan2(dz, dx))
                             self.last_vehicle_center_world = center_world
                             self.last_vehicle_yaw_deg = self._norm_angle_deg(yaw_deg)
                 except Exception:
@@ -902,6 +1066,8 @@ class MainWindow(QMainWindow):
         if self.enable_trace and all_marker_centers:
             for mid, center in all_marker_centers.items():
                 mid = int(mid)
+                if mid != int(self.vehicle_id):
+                    continue
                 pt = (int(round(float(center[0]))), int(round(float(center[1]))))
                 trace = self.marker_traces.get(mid, [])
                 trace.append(pt)
@@ -919,6 +1085,7 @@ class MainWindow(QMainWindow):
                         thickness=2,
                     )
 
+        image_with_markers = self._draw_marker_overlays(image_with_markers, corners, ids)
         image_with_markers = self._draw_vehicle_arrow(image_with_markers)
         image_with_markers = self._draw_trajectory_inset(image_with_markers)
         image_with_markers = self._draw_pose_hud(image_with_markers)
@@ -960,6 +1127,7 @@ class MainWindow(QMainWindow):
 
         # Re-detect markers to keep them visible
         corners, ids, image_with_markers = self.detector.detect_markers(image_copy)
+        image_with_markers = self._draw_marker_overlays(image_with_markers, corners, ids)
         image_with_markers = self._draw_vehicle_arrow(image_with_markers)
         image_with_markers = self._draw_trajectory_inset(image_with_markers)
         image_with_markers = self._draw_pose_hud(image_with_markers)
