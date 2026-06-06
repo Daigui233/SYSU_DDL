@@ -76,6 +76,12 @@ class Config:
         self.UDP_TARGET_IP = str(udp_config.get("target_ip", "127.0.0.1"))
         self.UDP_TARGET_PORT = int(udp_config.get("target_port", 9005))
 
+        gamepad_config = config_data.get("gamepad_control", {}) or {}
+        self.GAMEPAD_TARGET_PORT = int(gamepad_config.get("target_port", 9010))
+        self.GAMEPAD_MAX_SPEED_MPS = float(gamepad_config.get("max_speed_mps", 0.5))
+        self.GAMEPAD_STEER_ERROR_SCALE = float(gamepad_config.get("steer_error_scale", 210.0))
+        self.GAMEPAD_SAFE_STOP_LT_THRESHOLD = float(gamepad_config.get("safe_stop_lt_threshold", 0.90))
+
         output_config = config_data.get("output", {}) or {}
         self.OUTPUT_COORD_SCALE = float(output_config.get("coord_scale", 0.001))
         self.OUTPUT_HEIGHT_M = float(output_config.get("height_m", 0.16))

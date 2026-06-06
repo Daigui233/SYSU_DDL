@@ -1,6 +1,6 @@
 ﻿# Windows AprilTag 定位程序
 
-Windows 顶置相机定位程序负责检测 AprilTag 36h11，解算小车坐标和 Yaw，并向 RK3588S 发送官方 `robot_position`。
+Windows 顶置相机定位程序负责检测 AprilTag 36h11，解算小车坐标和 Yaw，并向 RK3588S 发送官方 `robot_position`。为了采集分割数据集，程序也内置了可选 `Gamepad Mode`，显式勾选后才会额外发送手柄遥控包。
 
 定位数据只用于官方 AR 融合、坐标显示和记录，不参与小车路线规划或转向控制。
 
@@ -9,6 +9,8 @@ Windows 顶置相机定位程序负责检测 AprilTag 36h11，解算小车坐标
 - 当前小车只使用融合视频上的视觉巡线和 `STATE_TRACK`，分割模型输出的 `track_error` 是唯一转向来源。
 - 当前分割和检测模型效果较差；检测模型只画 `gold / car / human` 检测框。
 - 检测任务决策、OCR/API 和多状态控制均属于后续扩展。
+- 手柄遥控默认关闭；只有前端勾选 `Gamepad Mode` 并持续发出 `gamepad_control` 包时，RK3588S 才临时覆盖视觉控车。
+- 遥控模式下定位 `robot_position` 仍正常发送到 `9005`，不会影响 AR 融合和轨迹显示。
 
 ## 运行
 
@@ -25,10 +27,11 @@ dist/ArucoCalibLocator.exe
 - `Mirror`：修正镜像并保存。
 - `RK3588S IP`：填写板卡局域网 IP。
 - `UDP Enable`、`Apply & Save`：启用并保存 UDP 输出。
+- `Gamepad Mode`：显式启用手柄遥控；默认每次启动都关闭，不写入配置，避免比赛定位模块或普通定位运行时误入遥控。
 - `Start Detection`、`Stop`、`Reset Calibration`：控制检测和重新标定。
 - 程序首次同时读到 4 个固定 Tag 后会自动锁定标定；锁定后固定 Tag 掉点或被碰到不会改变坐标系。需要重新标定时点击 `Reset Calibration` 并确认。
 
-程序固定请求 `1920x1200 / YUY2 / 60 FPS`，UDP 目标端口固定为 `9005`。检测过程不会自动保存逐帧图片；仅在手动录像时保存 MP4。
+程序固定请求 `1920x1200 / YUY2 / 60 FPS`。定位 UDP 目标端口固定为 `9005`；手柄遥控使用独立端口 `9010`。检测过程不会自动保存逐帧图片；仅在手动录像时保存 MP4。
 
 ## 定位配置
 
@@ -57,11 +60,22 @@ EXE 使用 `dist/config.yaml`。源码运行使用根目录 `config.yaml`。
 
 ## UDP 输出
 
+定位包：
+
 ```json
 {"type":"robot_position","pos":[x,0.16,z],"euler":[0.0,yaw,0.0]}
 ```
 
 坐标单位为米，Yaw 单位为度。目标地址应填写 RK3588S 的局域网 IP，不要填写 Windows 自己的 `127.0.0.1`。
+
+手柄遥控包仅在 `Gamepad Mode` 勾选时发送，端口为 `9010`，类型为 `gamepad_control`。映射关系：
+
+- `RT`：`target_speed`，默认最大 `0.5 m/s`。
+- `LX`：`track_error`，默认比例 `210`。
+- `LT >= 90%` 或手柄断连：`STATE_SAFE_STOP`。
+- 取消 `Gamepad Mode` 或停止摄像头时，会发送一次 `gamepad_mode=false`，RK3588S 随后回到视觉控车。
+
+这条遥控链路只覆盖 TC264D 控制帧，不改变定位输出、AR 转发或 WebUI 端口。
 
 ## 待现场确认
 

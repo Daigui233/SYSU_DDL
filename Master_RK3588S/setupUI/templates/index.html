@@ -427,6 +427,10 @@
                             <span class="ar-debug-value" id="debug-ctrl">等待控制状态</span>
                         </div>
                         <div class="ar-debug-row">
+                            <span class="ar-debug-label">GAMEPAD</span>
+                            <span class="ar-debug-value" id="debug-gamepad">默认视觉控车</span>
+                        </div>
+                        <div class="ar-debug-row">
                             <span class="ar-debug-label">SERIAL</span>
                             <span class="ar-debug-value" id="debug-serial">等待发送</span>
                         </div>
@@ -630,8 +634,14 @@
                 if (!control.state) {
                     return ["WARN", "定位链路正常，但还没有控制状态，可能尚未接入 shm_ar_video 或视觉主循环未进入发送段。"];
                 }
-                if (control.state === "CONTROL_TIMEOUT_SAFE_STOP" || serialSend.watchdog_active) {
-                    return ["BAD", "控制主循环断流，watchdog 正在重复下发 SAFE_STOP；检查共享内存、推理线程或主循环异常。"];
+                if (control.state === "LINE_LOSS_SAFE_STOP") {
+                    return ["BAD", "连续未识别到语义分割中线，RK 正在下发 SAFE_STOP；把车放回赛道并重新识别到中线后会恢复 TRACK。"];
+                }
+                if (control.state === "GAMEPAD_SAFE_STOP") {
+                    return ["BAD", "手柄遥控模式正在下发 SAFE_STOP；松开 LT 或关闭定位 EXE 的 Gamepad Mode 后会回到视觉控车。"];
+                }
+                if (control.state === "GAMEPAD_TRACK") {
+                    return ["OK", "手柄遥控模式正在接管控车；定位仍继续进入 RK 并转发给 AR。"];
                 }
                 if (serialSend.ok === false) {
                     return ["BAD", `串口发送失败：${serialSend.error || "未知错误"}。检查 /dev/ttyUSB0、权限、接线和波特率。`];
@@ -650,6 +660,7 @@
                 const euler = Array.isArray(packet.euler) ? packet.euler : [];
                 const control = data.control || {};
                 const serialSend = control.serial_send || {};
+                const gamepad = control.gamepad || {};
                 const feedback = data.car_feedback || {};
 
                 setText(
@@ -669,8 +680,12 @@
                     `${control.state || "N/A"} · err ${fmtNum(control.track_error, 1)} · v ${fmtNum(control.target_speed, 2)}m/s`
                 );
                 setText(
+                    "debug-gamepad",
+                    `${gamepad.active ? "ACTIVE" : "idle"} · ok ${gamepad.packet_count || 0} · bad ${gamepad.invalid_count || 0} · age ${gamepad.age == null ? "N/A" : `${Number(gamepad.age).toFixed(1)}s`}`
+                );
+                setText(
                     "debug-serial",
-                    `send ${fmtBool(serialSend.ok)} · WD ${serialSend.watchdog_active ? "ON" : "off"}${serialSend.error ? ` · ${serialSend.error}` : ""}`
+                    `send ${fmtBool(serialSend.ok)}${serialSend.error ? ` · ${serialSend.error}` : ""}`
                 );
                 setText(
                     "debug-tc264",
@@ -701,6 +716,7 @@
                     setText("debug-ar-fwd", "N/A");
                     setText("debug-pose", "N/A");
                     setText("debug-ctrl", "N/A");
+                    setText("debug-gamepad", "N/A");
                     setText("debug-serial", "N/A");
                     setText("debug-tc264", "N/A");
                     setText("debug-hint", `无法读取 ${poseStatusUrl}：${err.message}`);

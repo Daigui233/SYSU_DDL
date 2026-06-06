@@ -25,7 +25,7 @@ min_marker_count: 4
 ui:
   trace_window_ms: 500
 camera:
-  index: 1
+  index: 0
   backend: DSHOW
   width: 1920
   height: 1200
@@ -44,6 +44,11 @@ udp:
   enabled: true
   target_ip: 192.168.43.196
   target_port: 9005
+gamepad_control:
+  target_port: 9010
+  max_speed_mps: 0.5
+  steer_error_scale: 210.0
+  safe_stop_lt_threshold: 0.9
 output:
   coord_scale: 0.001
   height_m: 0.16

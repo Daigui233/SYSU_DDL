@@ -8,6 +8,7 @@ TC264D 下位机负责接收 RK3588S 控制帧，执行电机/舵机控制，并
 - 当前只使用融合视频上的视觉巡线和 `STATE_TRACK`。
 - 当前分割和检测模型效果较差；检测模型只画 `gold / car / human` 检测框。
 - 检测任务决策、OCR/API 和多状态控制均属于后续扩展。
+- 可选手柄遥控只在 RK3588S 上位机侧接管控制帧；TC264D 不区分视觉来源或手柄来源，只执行收到的 `state_cmd / target_speed / track_error / flags`。
 
 ## 串口
 
@@ -33,7 +34,7 @@ TC264D 下位机负责接收 RK3588S 控制帧，执行电机/舵机控制，并
 - `STATE_TRACK` 电机速度环当前采用约 `1450` duty 启动前馈 + 小 PI 修正：目标速度非零时先越过电机启动死区，PID 只负责稳速微调，最终输出仍受 `±2500` duty 硬限幅保护。
 - 前馈 duty 不是速度标定，只是静摩擦/启动死区补偿；若正转时 `actual_speed` 为负，需要把 `Control.c` 中的 `MOTOR_ENCODER_SIGN` 改为 `-1.0f` 后再调 PID。
 
-`STATE_SAFE_STOP` 当前用于两类断流保护：RK3588S 控制主循环连续 `2 s` 没有命令时，上位机每 `0.2 s` 重复下发停车命令；TC264D 连续 `2.5 s` 没收到有效控制帧时，本地自行进入停车状态。模型输出无效但主循环仍运行时，上位机会继续发送 `STATE_TRACK + TRACK_FALLBACK`，不会触发停车。
+`STATE_SAFE_STOP` 当前用于三类停车来源：RK3588S 连续 `3 s` 没有识别到语义分割中线时，上位机重复下发停车命令；手柄遥控模式下 `LT >= 90%` 或手柄断连时，上位机下发停车命令；TC264D 连续约 `2.5 s` 没收到有效控制帧时，本地自行进入停车状态。模型输出无效但未超过 `3 s` 时，上位机会继续发送 `STATE_TRACK + TRACK_FALLBACK`；再次识别到中线后恢复 `STATE_TRACK + VISION`。
 
 `STATE_LIMIT_SPEED / WAIT_LIGHT / AVOID / NAV_LEFT / NAV_RIGHT` 等枚举和 `state_cmd` 接口作为后续扩展保留，当前没有完整任务切换规则。
 

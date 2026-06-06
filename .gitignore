@@ -51,5 +51,12 @@ Master_RK3588S/setupUI/dist/match_record_*.json
 ArucoCalib-master/ArucoCalib-master/dist/runs/
 ArucoCalib-master/ArucoCalib-master/runs/
 
+# Windows helper tool build outputs
+Tools_Windows/build/
+Tools_Windows/dist/
+Tools_Windows/*.spec
+Tools_Windows/gamepad_mapping.json
+ArucoCalib-master/ArucoCalib-master/*.spec
+
 # Local license file
 Master_RK3588S/setupUI/license.lic

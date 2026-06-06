@@ -2,6 +2,7 @@
 PyQt main interface for ArUco coordinate system
 """
 import sys
+import ctypes
 from datetime import datetime
 from pathlib import Path
 import time
@@ -17,12 +18,103 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
 from PyQt5.QtGui import QImage, QPixmap, QMouseEvent
 from aruco_core import ArUcoDetector, CoordinateTransformer, get_config
 from aruco_core.video_recorder import VideoRecorder
-from aruco_core.udp_sender import UdpPoseSender
+from aruco_core.udp_sender import UdpPoseSender, UdpGamepadControlSender
 
 
 def make_run_ts():
     now = datetime.now()
     return now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
+
+
+class XINPUT_GAMEPAD(ctypes.Structure):
+    _fields_ = [
+        ("wButtons", ctypes.c_ushort),
+        ("bLeftTrigger", ctypes.c_ubyte),
+        ("bRightTrigger", ctypes.c_ubyte),
+        ("sThumbLX", ctypes.c_short),
+        ("sThumbLY", ctypes.c_short),
+        ("sThumbRX", ctypes.c_short),
+        ("sThumbRY", ctypes.c_short),
+    ]
+
+
+class XINPUT_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwPacketNumber", ctypes.c_ulong),
+        ("Gamepad", XINPUT_GAMEPAD),
+    ]
+
+
+class XInputGamepadReader:
+    """Minimal Windows XInput reader for RT/LT/LX manual-control capture."""
+
+    BUTTON_BITS = {
+        "A": 0x1000,
+        "B": 0x2000,
+        "X": 0x4000,
+        "Y": 0x8000,
+        "LB": 0x0100,
+        "RB": 0x0200,
+        "BACK": 0x0020,
+        "START": 0x0010,
+    }
+
+    def __init__(self):
+        self.dll = None
+        self.dll_name = ""
+        self.last_error = ""
+        for name in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+            try:
+                self.dll = ctypes.windll.LoadLibrary(name)  # type: ignore[attr-defined]
+                self.dll_name = name
+                break
+            except Exception as exc:
+                self.last_error = str(exc)
+
+    @staticmethod
+    def _norm_thumb(value):
+        if value >= 0:
+            return max(-1.0, min(1.0, float(value) / 32767.0))
+        return max(-1.0, min(1.0, float(value) / 32768.0))
+
+    def read(self):
+        if self.dll is None:
+            return {
+                "connected": False,
+                "rt": 0.0,
+                "lt": 0.0,
+                "lx": 0.0,
+                "buttons": {},
+                "error": "XInput DLL unavailable",
+            }
+
+        for index in range(4):
+            state = XINPUT_STATE()
+            result = self.dll.XInputGetState(index, ctypes.byref(state))
+            if result == 0:
+                gp = state.Gamepad
+                return {
+                    "connected": True,
+                    "index": index,
+                    "backend": self.dll_name,
+                    "rt": float(gp.bRightTrigger) / 255.0,
+                    "lt": float(gp.bLeftTrigger) / 255.0,
+                    "lx": self._norm_thumb(gp.sThumbLX),
+                    "buttons": {
+                        name: bool(gp.wButtons & bit)
+                        for name, bit in self.BUTTON_BITS.items()
+                    },
+                    "error": "",
+                }
+
+        return {
+            "connected": False,
+            "rt": 0.0,
+            "lt": 0.0,
+            "lx": 0.0,
+            "buttons": {},
+            "error": "No XInput controller",
+        }
 
 
 class ImageLabel(QLabel):
@@ -182,6 +274,14 @@ class MainWindow(QMainWindow):
             target_port=getattr(self.cfg, "UDP_TARGET_PORT", 9005),
             enabled=getattr(self.cfg, "UDP_ENABLED", False),
         )
+        self.gamepad_reader = XInputGamepadReader()
+        self.gamepad_sender = UdpGamepadControlSender(
+            target_ip=getattr(self.cfg, "UDP_TARGET_IP", "127.0.0.1"),
+            target_port=getattr(self.cfg, "GAMEPAD_TARGET_PORT", 9010),
+        )
+        self.last_gamepad_status = "Gamepad: off"
+        self.last_gamepad_ok = False
+        self.last_gamepad_packet_ts = 0.0
 
         # Setup UI
         self.setup_ui()
@@ -234,6 +334,12 @@ class MainWindow(QMainWindow):
                 "target_ip": self.udp_ip_edit.text().strip(),
                 "target_port": 9005,
             }
+            data["gamepad_control"] = {
+                "target_port": int(getattr(self.cfg, "GAMEPAD_TARGET_PORT", 9010)),
+                "max_speed_mps": float(getattr(self.cfg, "GAMEPAD_MAX_SPEED_MPS", 0.5)),
+                "steer_error_scale": float(getattr(self.cfg, "GAMEPAD_STEER_ERROR_SCALE", 210.0)),
+                "safe_stop_lt_threshold": float(getattr(self.cfg, "GAMEPAD_SAFE_STOP_LT_THRESHOLD", 0.90)),
+            }
 
             self.settings_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self.settings_path.with_name(self.settings_path.name + ".tmp")
@@ -281,10 +387,105 @@ class MainWindow(QMainWindow):
             target_port=9005,
             enabled=self.udp_enabled_chk.isChecked(),
         )
+        self.gamepad_sender.configure(
+            target_ip=self.udp_ip_edit.text().strip(),
+            target_port=int(getattr(self.cfg, "GAMEPAD_TARGET_PORT", 9010)),
+        )
         save_message = ""
         if persist:
             _, save_message = self._save_runtime_settings()
         self._update_udp_status(save_message)
+
+    @staticmethod
+    def _apply_deadzone(value, deadzone=0.08):
+        value = max(-1.0, min(1.0, float(value)))
+        deadzone = max(0.0, min(0.95, float(deadzone)))
+        if abs(value) <= deadzone:
+            return 0.0
+        scaled = (abs(value) - deadzone) / (1.0 - deadzone)
+        return math.copysign(scaled, value)
+
+    def _send_gamepad_disabled(self):
+        ok = self.gamepad_sender.send_control(
+            gamepad_mode=False,
+            target_speed=0.0,
+            track_error=0.0,
+            state_cmd=1,
+            flags=0,
+            safe_stop=False,
+            rt=0.0,
+            lt=0.0,
+            lx=0.0,
+            connected=False,
+        )
+        self.last_gamepad_ok = ok
+        self.last_gamepad_status = "Gamepad: disabled -> vision"
+        self.last_gamepad_packet_ts = time.monotonic()
+        self._update_gamepad_status()
+
+    def on_gamepad_mode_changed(self, _state):
+        if not self.gamepad_mode_chk.isChecked():
+            self._send_gamepad_disabled()
+            return
+        self._send_gamepad_control(force=True)
+
+    def _send_gamepad_control(self, force=False):
+        if not hasattr(self, "gamepad_mode_chk") or not self.gamepad_mode_chk.isChecked():
+            return False
+
+        state = self.gamepad_reader.read()
+        connected = bool(state.get("connected"))
+        rt = float(state.get("rt", 0.0))
+        lt = float(state.get("lt", 0.0))
+        lx_raw = float(state.get("lx", 0.0))
+        lx = self._apply_deadzone(lx_raw, 0.08)
+        max_speed = max(0.0, float(getattr(self.cfg, "GAMEPAD_MAX_SPEED_MPS", 0.5)))
+        steer_scale = float(getattr(self.cfg, "GAMEPAD_STEER_ERROR_SCALE", 210.0))
+        safe_threshold = max(0.0, min(1.0, float(getattr(self.cfg, "GAMEPAD_SAFE_STOP_LT_THRESHOLD", 0.90))))
+        safe_stop = (not connected) or lt >= safe_threshold
+
+        if safe_stop:
+            target_speed = 0.0
+            track_error = 0.0
+            state_cmd = 7
+            flags = 0
+        else:
+            target_speed = max(0.0, min(1.0, rt)) * max_speed
+            track_error = lx * steer_scale
+            state_cmd = 1
+            flags = 0x01
+
+        ok = self.gamepad_sender.send_control(
+            gamepad_mode=True,
+            target_speed=target_speed,
+            track_error=track_error,
+            state_cmd=state_cmd,
+            flags=flags,
+            safe_stop=safe_stop,
+            rt=rt,
+            lt=lt,
+            lx=lx,
+            connected=connected,
+        )
+        self.last_gamepad_ok = ok
+        if not connected:
+            self.last_gamepad_status = f"Gamepad: ON no controller -> SAFE_STOP fail={self.gamepad_sender.fail_count}"
+        elif safe_stop:
+            self.last_gamepad_status = f"Gamepad: SAFE_STOP LT={lt:.2f} sent={self.gamepad_sender.sent_count}"
+        else:
+            self.last_gamepad_status = (
+                f"Gamepad: TRACK v={target_speed:.2f} err={track_error:.0f} "
+                f"RT={rt:.2f} LX={lx:.2f} sent={self.gamepad_sender.sent_count}"
+            )
+        if self.gamepad_sender.last_error:
+            self.last_gamepad_status += f" err={self.gamepad_sender.last_error[:40]}"
+        self.last_gamepad_packet_ts = time.monotonic()
+        self._update_gamepad_status()
+        return ok
+
+    def _update_gamepad_status(self):
+        if hasattr(self, "gamepad_status_label"):
+            self.gamepad_status_label.setText(self.last_gamepad_status)
 
     def apply_camera_settings(self, persist=False):
         save_message = ""
@@ -418,6 +619,8 @@ class MainWindow(QMainWindow):
 
         if self.pose_sender.last_error:
             lines.append(f"udp error: {self.pose_sender.last_error[:50]}")
+        if hasattr(self, "gamepad_mode_chk") and self.gamepad_mode_chk.isChecked():
+            lines.append(self.last_gamepad_status[:58])
 
         y = 30
         for line in lines:
@@ -659,6 +862,11 @@ class MainWindow(QMainWindow):
         self.udp_enabled_chk = QCheckBox("UDP Enable")
         self.udp_enabled_chk.setChecked(bool(getattr(self.cfg, "UDP_ENABLED", False)))
         source_row.addWidget(self.udp_enabled_chk)
+        self.gamepad_mode_chk = QCheckBox("Gamepad Mode")
+        self.gamepad_mode_chk.setChecked(False)
+        self.gamepad_mode_chk.stateChanged.connect(self.on_gamepad_mode_changed)
+        self.gamepad_mode_chk.setToolTip("Explicit manual-control override. Localization UDP still goes to 9005; gamepad control uses 9010.")
+        source_row.addWidget(self.gamepad_mode_chk)
         self.btn_apply_udp = QPushButton("Apply & Save")
         self.btn_apply_udp.clicked.connect(lambda _checked=False: self.apply_udp_settings(persist=True))
         source_row.addWidget(self.btn_apply_udp)
@@ -692,6 +900,9 @@ class MainWindow(QMainWindow):
         state_row.addSpacing(18)
         self.udp_status_label = QLabel("UDP: idle")
         state_row.addWidget(self.udp_status_label)
+        state_row.addSpacing(18)
+        self.gamepad_status_label = QLabel("Gamepad: off")
+        state_row.addWidget(self.gamepad_status_label)
         state_row.addStretch()
         main_layout.addLayout(state_row)
 
@@ -855,6 +1066,8 @@ class MainWindow(QMainWindow):
 
     def stop_camera(self):
         """Stop current capture (camera/video)."""
+        if hasattr(self, "gamepad_mode_chk") and self.gamepad_mode_chk.isChecked():
+            self._send_gamepad_disabled()
         if self.cap is not None:
             self.timer.stop()
             self.cap.release()
@@ -999,6 +1212,7 @@ class MainWindow(QMainWindow):
                 if self.camera_mirror_chk.isChecked():
                     frame = cv2.flip(frame, 1)
                 self.current_image = frame
+                self._send_gamepad_control()
 
                 # Optional raw frame recording (mp4), independent from inference.
                 if self.is_recording and self.video_recorder is not None:

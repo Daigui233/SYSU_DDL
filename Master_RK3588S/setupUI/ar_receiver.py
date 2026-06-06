@@ -30,13 +30,17 @@ MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", 
 SEG_RESULT_TTL = 2.0
 DET_RESULT_TTL = 1.0
 RUNTIME_STATUS_INTERVAL = 0.5
-CONTROL_WATCHDOG_TIMEOUT = float(os.environ.get("AR_CONTROL_WATCHDOG_TIMEOUT", "2.0"))
-CONTROL_WATCHDOG_INTERVAL = 0.1
-CONTROL_SAFE_STOP_REPEAT_INTERVAL = float(os.environ.get("AR_SAFE_STOP_REPEAT_INTERVAL", "0.2"))
+LINE_LOSS_SAFE_STOP_TIMEOUT = float(os.environ.get("AR_LINE_LOSS_SAFE_STOP_TIMEOUT", "3.0"))
+LINE_LOSS_COMMAND_REPEAT_INTERVAL = float(os.environ.get("AR_LINE_LOSS_COMMAND_REPEAT_INTERVAL", "0.2"))
 CONTROL_SCALE = 0.5
 TRACK_SPEED = float(os.environ.get("AR_TRACK_SPEED", "0.5"))
 TRACK_FALLBACK_SPEED = float(os.environ.get("AR_TRACK_FALLBACK_SPEED", str(TRACK_SPEED)))
 CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", "1"), 0)
+GAMEPAD_CONTROL_HOST = os.environ.get("AR_GAMEPAD_CONTROL_HOST", "0.0.0.0")
+GAMEPAD_CONTROL_PORT = int(os.environ.get("AR_GAMEPAD_CONTROL_PORT", "9010"))
+GAMEPAD_CONTROL_TTL = float(os.environ.get("AR_GAMEPAD_CONTROL_TTL", "0.45"))
+GAMEPAD_MAX_SPEED_MPS = float(os.environ.get("AR_GAMEPAD_MAX_SPEED_MPS", "0.8"))
+GAMEPAD_MAX_TRACK_ERROR = float(os.environ.get("AR_GAMEPAD_MAX_TRACK_ERROR", "240.0"))
 
 DEFAULT_AR_UDP_IP = "127.0.0.1"
 DEFAULT_AR_UDP_PORT = 9006
@@ -85,9 +89,6 @@ CarController = getattr(_serial_comm, "CarController", None) if _serial_comm els
 STATUS_WRITE_LOCK = threading.Lock()
 LATEST_CONTROL_STATUS = None
 CONTROL_COMMAND_LOCK = threading.Lock()
-LAST_CONTROL_ACTIVITY_TS = 0.0
-WATCHDOG_ACTIVE = False
-LAST_WATCHDOG_SAFE_STOP_TS = 0.0
 LAST_CONTROL_SEND_OK = None
 LAST_CONTROL_SEND_ERROR = ""
 LAST_CONTROL_SEND_TS = 0.0
@@ -146,7 +147,6 @@ def _send_car_cmd_unlocked(track_error, target_speed, state_cmd, flags):
 
 
 def send_car_cmd(track_error, target_speed, state_cmd, flags=CONTROL_FLAG_USE_TARGET_SPEED, mark_activity=True):
-    global LAST_CONTROL_ACTIVITY_TS, WATCHDOG_ACTIVE, LAST_WATCHDOG_SAFE_STOP_TS
     global LAST_CONTROL_SEND_OK, LAST_CONTROL_SEND_ERROR, LAST_CONTROL_SEND_TS
 
     with CONTROL_COMMAND_LOCK:
@@ -154,59 +154,7 @@ def send_car_cmd(track_error, target_speed, state_cmd, flags=CONTROL_FLAG_USE_TA
         LAST_CONTROL_SEND_OK = ok
         LAST_CONTROL_SEND_ERROR = error
         LAST_CONTROL_SEND_TS = time.time()
-        if mark_activity:
-            LAST_CONTROL_ACTIVITY_TS = time.monotonic()
-            WATCHDOG_ACTIVE = False
-            LAST_WATCHDOG_SAFE_STOP_TS = 0.0
         return ok
-
-
-def arm_control_watchdog():
-    global LAST_CONTROL_ACTIVITY_TS, WATCHDOG_ACTIVE, LAST_WATCHDOG_SAFE_STOP_TS
-
-    with CONTROL_COMMAND_LOCK:
-        LAST_CONTROL_ACTIVITY_TS = time.monotonic()
-        WATCHDOG_ACTIVE = False
-        LAST_WATCHDOG_SAFE_STOP_TS = 0.0
-
-
-def control_watchdog_loop(stop_event, pose_bridge):
-    global WATCHDOG_ACTIVE, LAST_WATCHDOG_SAFE_STOP_TS
-    global LAST_CONTROL_SEND_OK, LAST_CONTROL_SEND_ERROR, LAST_CONTROL_SEND_TS
-
-    while not stop_event.wait(CONTROL_WATCHDOG_INTERVAL):
-        send_stop = False
-        first_timeout = False
-        with CONTROL_COMMAND_LOCK:
-            now_mono = time.monotonic()
-            age = now_mono - LAST_CONTROL_ACTIVITY_TS if LAST_CONTROL_ACTIVITY_TS else None
-            repeat_due = (
-                LAST_WATCHDOG_SAFE_STOP_TS <= 0.0
-                or (now_mono - LAST_WATCHDOG_SAFE_STOP_TS) >= CONTROL_SAFE_STOP_REPEAT_INTERVAL
-            )
-            if age is not None and age >= CONTROL_WATCHDOG_TIMEOUT and repeat_due:
-                ok, error = _send_car_cmd_unlocked(0.0, 0.0, STATE_SAFE_STOP, 0)
-                LAST_CONTROL_SEND_OK = ok
-                LAST_CONTROL_SEND_ERROR = error
-                LAST_CONTROL_SEND_TS = time.time()
-                first_timeout = not WATCHDOG_ACTIVE
-                WATCHDOG_ACTIVE = True
-                LAST_WATCHDOG_SAFE_STOP_TS = now_mono
-                send_stop = True
-
-        if send_stop:
-            if first_timeout:
-                write_debug_log(
-                    f"control watchdog safe stop: no main-loop command for {CONTROL_WATCHDOG_TIMEOUT:.1f}s"
-                )
-            write_runtime_status(
-                pose_bridge,
-                "CONTROL_TIMEOUT_SAFE_STOP",
-                0.0,
-                0.0,
-                STATE_SAFE_STOP,
-                0,
-            )
 
 
 def get_control_send_status():
@@ -215,7 +163,6 @@ def get_control_send_status():
             "ok": LAST_CONTROL_SEND_OK,
             "error": LAST_CONTROL_SEND_ERROR or None,
             "timestamp": LAST_CONTROL_SEND_TS or None,
-            "watchdog_active": WATCHDOG_ACTIVE,
         }
 
 
@@ -227,6 +174,19 @@ def get_car_feedback():
         return getter()
     except Exception as exc:
         return {"online": False, "error": str(exc)}
+
+
+def finite_float(value, default=0.0):
+    try:
+        result = float(value)
+    except Exception:
+        return default
+    return result if np.isfinite(result) else default
+
+
+def clamp_float(value, low, high):
+    value = finite_float(value, 0.0)
+    return max(float(low), min(float(high), value))
 
 print("initializing NPU AI...")
 infer_det = InferWrap(model_dir=MODEL_DIR, TPEs=1, core_ids=[0], max_inflight=1)
@@ -328,7 +288,7 @@ def write_status_json(info, label, control_info=None):
         print(f"{label} write failed: {exc}")
 
 
-def write_runtime_status(pose_bridge, control_state, command_error, command_speed, command_state, command_flags):
+def write_runtime_status(pose_bridge, control_state, command_error, command_speed, command_state, command_flags, gamepad_status=None):
     pose_info = pose_bridge.snapshot()
     control_info = {
         "state": control_state,
@@ -339,6 +299,8 @@ def write_runtime_status(pose_bridge, control_state, command_error, command_spee
         "serial_send": get_control_send_status(),
         "timestamp": time.time(),
     }
+    if gamepad_status is not None:
+        control_info["gamepad"] = gamepad_status
     info = {
         "status": pose_info.get("status", "ar_receiver running"),
         "timestamp": time.time(),
@@ -567,6 +529,176 @@ def parse_official_pose_datagram(data):
     if packet is None:
         return None, raw_text, "expected official robot_position with finite pos[3] and euler[3]"
     return packet, raw_text, ""
+
+
+class GamepadControlReceiver:
+    """Receive optional manual gamepad control packets on a separate UDP port."""
+
+    def __init__(self, host=GAMEPAD_CONTROL_HOST, port=GAMEPAD_CONTROL_PORT, ttl=GAMEPAD_CONTROL_TTL):
+        self.host = host
+        self.port = int(port)
+        self.ttl = float(ttl)
+        self.sock = None
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.packet_count = 0
+        self.invalid_count = 0
+        self.last_ts = 0.0
+        self.last_packet = None
+        self.last_error = ""
+        self.status = "gamepad waiting"
+
+    def start(self):
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+    def run(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind((self.host, self.port))
+            self.sock.settimeout(0.2)
+            self.set_status(f"gamepad listening {self.host}:{self.port}")
+            write_debug_log(f"Gamepad UDP ready on {self.host}:{self.port}")
+            while not self.stop_event.is_set():
+                try:
+                    data, addr = self.sock.recvfrom(8192)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                self.handle_datagram(data, addr)
+        except Exception as exc:
+            self.set_status(f"gamepad error: {exc}")
+            write_debug_log(f"Gamepad UDP receiver stopped: {exc}")
+
+    def set_status(self, status):
+        with self.lock:
+            self.status = status
+            self.last_error = status if "error" in str(status).lower() else ""
+
+    def handle_datagram(self, data, addr):
+        now = time.time()
+        try:
+            raw = data.decode("utf-8", errors="replace").strip()
+            packet = json.loads(raw)
+            if not isinstance(packet, dict):
+                raise ValueError("packet is not an object")
+            if packet.get("type") != "gamepad_control":
+                raise ValueError("type is not gamepad_control")
+
+            gamepad_mode = bool(packet.get("gamepad_mode", False))
+            safe_stop = bool(packet.get("safe_stop", False))
+            state_cmd = int(packet.get("state_cmd", STATE_SAFE_STOP if safe_stop else STATE_TRACK))
+            if state_cmd not in (STATE_TRACK, STATE_SAFE_STOP):
+                state_cmd = STATE_SAFE_STOP if safe_stop else STATE_TRACK
+
+            if not gamepad_mode:
+                command = {
+                    "gamepad_mode": False,
+                    "active": False,
+                    "state_cmd": STATE_TRACK,
+                    "target_speed": 0.0,
+                    "track_error": 0.0,
+                    "flags": 0,
+                    "safe_stop": False,
+                    "source": packet.get("source", "unknown"),
+                    "seq": packet.get("seq"),
+                    "inputs": packet.get("inputs", {}),
+                }
+                status = "gamepad disabled by sender"
+            else:
+                if safe_stop or state_cmd == STATE_SAFE_STOP:
+                    state_cmd = STATE_SAFE_STOP
+                    target_speed = 0.0
+                    track_error = 0.0
+                    flags = 0
+                    status = "gamepad safe_stop"
+                else:
+                    state_cmd = STATE_TRACK
+                    target_speed = clamp_float(packet.get("target_speed", 0.0), 0.0, GAMEPAD_MAX_SPEED_MPS)
+                    track_error = clamp_float(packet.get("track_error", 0.0), -GAMEPAD_MAX_TRACK_ERROR, GAMEPAD_MAX_TRACK_ERROR)
+                    flags = int(packet.get("flags", CONTROL_FLAG_USE_TARGET_SPEED)) | CONTROL_FLAG_USE_TARGET_SPEED
+                    status = "gamepad manual track"
+
+                command = {
+                    "gamepad_mode": True,
+                    "active": True,
+                    "state_cmd": state_cmd,
+                    "target_speed": target_speed,
+                    "track_error": track_error,
+                    "flags": flags,
+                    "safe_stop": state_cmd == STATE_SAFE_STOP,
+                    "source": packet.get("source", "unknown"),
+                    "seq": packet.get("seq"),
+                    "inputs": packet.get("inputs", {}),
+                }
+
+            with self.lock:
+                self.packet_count += 1
+                self.last_ts = now
+                self.last_packet = command
+                self.status = status
+                self.last_error = ""
+        except Exception as exc:
+            with self.lock:
+                self.invalid_count += 1
+                self.last_error = str(exc)
+                self.status = f"gamepad invalid: {exc}"
+            write_debug_log(f"Bad gamepad UDP from {addr}: {exc}")
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            packet = dict(self.last_packet) if isinstance(self.last_packet, dict) else None
+            age = now - self.last_ts if self.last_ts else None
+            active = bool(packet and packet.get("gamepad_mode") and age is not None and age <= self.ttl)
+            snap = {
+                "status": self.status,
+                "active": active,
+                "age": age,
+                "ttl": self.ttl,
+                "packet_count": self.packet_count,
+                "invalid_count": self.invalid_count,
+                "last_error": self.last_error,
+                "last_packet": packet,
+                "target": f"{self.host}:{self.port}",
+            }
+            if packet is not None:
+                snap.update({
+                    "state_cmd": int(packet.get("state_cmd", STATE_TRACK)),
+                    "target_speed": float(packet.get("target_speed", 0.0)),
+                    "track_error": float(packet.get("track_error", 0.0)),
+                    "flags": int(packet.get("flags", 0)),
+                    "safe_stop": bool(packet.get("safe_stop", False)),
+                    "seq": packet.get("seq"),
+                    "inputs": packet.get("inputs", {}),
+                })
+            return snap
+
+    def active_command(self):
+        snap = self.snapshot()
+        if not snap.get("active"):
+            return None, snap
+        return {
+            "track_error": snap.get("track_error", 0.0),
+            "target_speed": snap.get("target_speed", 0.0),
+            "state_cmd": snap.get("state_cmd", STATE_TRACK),
+            "flags": snap.get("flags", CONTROL_FLAG_USE_TARGET_SPEED),
+            "safe_stop": snap.get("safe_stop", False),
+        }, snap
+
 
 class ARPoseBridge:
     def __init__(self):
@@ -849,9 +981,9 @@ def pose_status_hint(status, packet_count, invalid_count):
         return "Pose received and forwarded to official AR engine UDP control port."
     return "Waiting for Windows AprilTag localization."
 
-def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_state="N/A"):
+def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_state="N/A", gamepad_status=None):
     if not DEBUG_DRAW_POSE_PANEL:
-        return
+        return frame
 
     info = pose_bridge.snapshot()
     age = time.time() - info["last_ts"] if info["last_ts"] else None
@@ -872,16 +1004,33 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
             f"yaw={euler[1]:.1f} age={age_text}"
         )
 
-    source_name = "WIN-UDP"
     source_line = (
-        f"{source_name} {short_text(info['status'], 18)} "
+        f"WIN-UDP {short_text(info['status'], 18)} "
         f"ok={info['packet_count']} bad={info['invalid_count']}"
     )
-    udp_line = f"AR-FWD ok={info['udp_send_count']} fail={info['udp_fail_count']} -> {info['target']}"
+    udp_line = f"AR-FWD ok={info['udp_send_count']} fail={info['udp_fail_count']}"
     if track_error is not None and np.isfinite(track_error):
         control_line = f"CTRL {control_state} err={track_error:.1f}"
     else:
         control_line = f"CTRL {control_state} err=N/A"
+
+    gamepad_lines = []
+    if gamepad_status is not None:
+        gp_age = gamepad_status.get("age")
+        gp_age_text = f"{gp_age:.1f}s" if gp_age is not None else "N/A"
+        gp_state = "ACTIVE" if gamepad_status.get("active") else "idle"
+        gamepad_lines.append(
+            f"GAMEPAD {gp_state} ok={gamepad_status.get('packet_count', 0)} "
+            f"bad={gamepad_status.get('invalid_count', 0)} age={gp_age_text}"
+        )
+        if gamepad_status.get("last_packet"):
+            inputs = gamepad_status.get("inputs") or {}
+            gamepad_lines.append(
+                f"GP v={gamepad_status.get('target_speed', 0.0):.2f} "
+                f"err={gamepad_status.get('track_error', 0.0):.0f} "
+                f"RT={inputs.get('rt', 0.0):.2f} LT={inputs.get('lt', 0.0):.2f}"
+            )
+
     feedback = get_car_feedback()
     car_lines = []
     if feedback.get("online"):
@@ -899,57 +1048,60 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
             f"act={feedback.get('actual_speed', 0.0):.2f}m/s"
         )
         car_lines.append(
-            f"OUT m={feedback.get('motor_output', 0)} s={feedback.get('servo_output', 0)} "
+            f"OUT m={feedback.get('motor_output', 0)} s={feedback.get('servo_output', 0)}"
+        )
+        car_lines.append(
             f"PID {feedback.get('motor_kp', 0.0):.1f}/{feedback.get('motor_ki', 0.0):.1f}/{feedback.get('motor_kd', 0.0):.1f} "
             f"SV {feedback.get('servo_kp', 0.0):.1f}/{feedback.get('servo_kd', 0.0):.1f}"
         )
     else:
         err = short_text(feedback.get("error", "waiting"), 28)
-        car_lines.append(f"TC264 waiting fb={feedback.get('count', 0)} bad={feedback.get('bad', 0)} {err}")
+        car_lines.append(f"TC264 waiting fb={feedback.get('count', 0)} bad={feedback.get('bad', 0)}")
+        car_lines.append(err)
     fps_line = f"FPS {fps:.1f}" if fps is not None else "FPS N/A"
 
     lines = [
+        "DEBUG STATUS",
         source_line,
         pose_line,
         udp_line,
         control_line,
     ]
+    lines.extend(gamepad_lines)
     lines.extend(car_lines)
     lines.append(fps_line)
 
-    x0, y0 = 8, 8
-    line_h = 16
-    panel_w = min(frame.shape[1] - 16, 470)
-    panel_h = 10 + line_h * len(lines)
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.38, frame, 0.62, 0, frame)
-    cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), color, 1)
+    h = frame.shape[0]
+    panel_w = 430
+    panel = np.zeros((h, panel_w, 3), dtype=frame.dtype)
+    panel[:, :] = (12, 16, 16)
+    cv2.rectangle(panel, (0, 0), (panel_w - 1, h - 1), color, 1)
 
+    line_h = 22
+    y = 28
     for i, line in enumerate(lines):
-        y = y0 + 15 + i * line_h
         text_color = color if i == 0 else (230, 245, 245)
-        cv2.putText(frame, line, (x0 + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, text_color, 1, cv2.LINE_AA)
+        cv2.putText(panel, short_text(line, 58), (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, text_color, 1, cv2.LINE_AA)
+        y += line_h
+        if i in (0, 4):
+            cv2.line(panel, (10, y - 8), (panel_w - 12, y - 8), (55, 70, 70), 1, cv2.LINE_AA)
+
+    return np.hstack([frame, panel])
 
 
 def main():
     pose_status_server = start_pose_status_http_server()
     pose_bridge = ARPoseBridge()
     pose_bridge.start()
-    arm_control_watchdog()
-    control_watchdog_stop = threading.Event()
-    control_watchdog_thread = threading.Thread(
-        target=control_watchdog_loop,
-        args=(control_watchdog_stop, pose_bridge),
-        name="control-watchdog",
-        daemon=True,
-    )
-    control_watchdog_thread.start()
+    gamepad_receiver = GamepadControlReceiver()
+    gamepad_receiver.start()
     print("vision client ready, waiting for camera shared memory...")
     last_seg_res = None
     last_seg_ts = 0.0
     last_det_res = None
     last_det_ts = 0.0
+    line_missing_since_ts = None
+    last_line_loss_command_ts = 0.0
 
     while True:
         shm = None
@@ -963,6 +1115,7 @@ def main():
                 continue
 
             last_fid = 0
+            have_frame = False
             fps_t = time.time()
             fps_n = 0
             cur_fps = 0.0
@@ -972,11 +1125,55 @@ def main():
                 try:
                     fid, frame = read_frame_from_shm(shm)
                     if fid == last_fid:
+                        now = time.time()
+                        if have_frame and now - last_line_loss_command_ts >= LINE_LOSS_COMMAND_REPEAT_INTERVAL:
+                            if line_missing_since_ts is None:
+                                line_missing_since_ts = now
+                            line_loss_age = now - line_missing_since_ts
+                            if line_loss_age >= LINE_LOSS_SAFE_STOP_TIMEOUT:
+                                command_error = 0.0
+                                command_speed = 0.0
+                                command_state = STATE_SAFE_STOP
+                                command_flags = 0
+                                control_state_text = "LINE_LOSS_SAFE_STOP"
+                            else:
+                                command_error = 0.0
+                                command_speed = TRACK_FALLBACK_SPEED
+                                command_state = STATE_TRACK
+                                command_flags = CONTROL_FLAG_USE_TARGET_SPEED
+                                control_state_text = "TRACK_FALLBACK"
+                            gamepad_cmd, gamepad_status = gamepad_receiver.active_command()
+                            if gamepad_cmd is not None:
+                                command_error = gamepad_cmd["track_error"]
+                                command_speed = gamepad_cmd["target_speed"]
+                                command_state = gamepad_cmd["state_cmd"]
+                                command_flags = gamepad_cmd["flags"]
+                                control_state_text = "GAMEPAD_SAFE_STOP" if gamepad_cmd.get("safe_stop") else "GAMEPAD_TRACK"
+
+                            send_car_cmd(
+                                track_error=command_error,
+                                target_speed=command_speed,
+                                state_cmd=command_state,
+                                flags=command_flags,
+                            )
+                            if now - last_runtime_status_ts >= RUNTIME_STATUS_INTERVAL:
+                                write_runtime_status(
+                                    pose_bridge,
+                                    control_state_text,
+                                    command_error,
+                                    command_speed,
+                                    command_state,
+                                    command_flags,
+                                    gamepad_status=gamepad_status,
+                                )
+                                last_runtime_status_ts = now
+                            last_line_loss_command_ts = now
                         time.sleep(0.002)
                         if cv2.waitKey(1) == 27:
                             raise KeyboardInterrupt
                         continue
                     last_fid = fid
+                    have_frame = True
 
                     now = time.time()
                     final_frame = frame.copy()
@@ -1021,10 +1218,28 @@ def main():
                         command_error = track_error * CONTROL_SCALE
                         command_speed = TRACK_SPEED
                         control_state_text = "VISION"
+                        line_missing_since_ts = None
                     else:
+                        if line_missing_since_ts is None:
+                            line_missing_since_ts = now
+                        line_loss_age = now - line_missing_since_ts
                         command_error = 0.0
-                        command_speed = TRACK_FALLBACK_SPEED
-                        control_state_text = "TRACK_FALLBACK"
+                        if line_loss_age >= LINE_LOSS_SAFE_STOP_TIMEOUT:
+                            command_speed = 0.0
+                            command_state = STATE_SAFE_STOP
+                            command_flags = 0
+                            control_state_text = "LINE_LOSS_SAFE_STOP"
+                        else:
+                            command_speed = TRACK_FALLBACK_SPEED
+                            control_state_text = "TRACK_FALLBACK"
+
+                    gamepad_cmd, gamepad_status = gamepad_receiver.active_command()
+                    if gamepad_cmd is not None:
+                        command_error = gamepad_cmd["track_error"]
+                        command_speed = gamepad_cmd["target_speed"]
+                        command_state = gamepad_cmd["state_cmd"]
+                        command_flags = gamepad_cmd["flags"]
+                        control_state_text = "GAMEPAD_SAFE_STOP" if gamepad_cmd.get("safe_stop") else "GAMEPAD_TRACK"
 
                     send_car_cmd(
                         track_error=command_error,
@@ -1032,6 +1247,7 @@ def main():
                         state_cmd=command_state,
                         flags=command_flags,
                     )
+                    last_line_loss_command_ts = now
 
                     if now - last_runtime_status_ts >= RUNTIME_STATUS_INTERVAL:
                         write_runtime_status(
@@ -1041,6 +1257,7 @@ def main():
                             command_speed,
                             command_state,
                             command_flags,
+                            gamepad_status=gamepad_status,
                         )
                         last_runtime_status_ts = now
 
@@ -1050,12 +1267,13 @@ def main():
                         fps_n = 0
                         fps_t = now
 
-                    draw_pose_status(
+                    final_frame = draw_pose_status(
                         final_frame,
                         pose_bridge,
                         fps=cur_fps,
                         track_error=command_error,
                         control_state=control_state_text,
+                        gamepad_status=gamepad_status,
                     )
                     if final_frame is None or final_frame.size == 0:
                         final_frame = frame
@@ -1085,8 +1303,6 @@ def main():
                 except Exception:
                     pass
 
-    control_watchdog_stop.set()
-    control_watchdog_thread.join(timeout=1.0)
     send_car_cmd(0.0, 0.0, STATE_SAFE_STOP, flags=0, mark_activity=False)
     write_runtime_status(
         pose_bridge,
@@ -1097,6 +1313,7 @@ def main():
         0,
     )
     pose_bridge.stop()
+    gamepad_receiver.stop()
     if pose_status_server is not None:
         try:
             pose_status_server.shutdown()

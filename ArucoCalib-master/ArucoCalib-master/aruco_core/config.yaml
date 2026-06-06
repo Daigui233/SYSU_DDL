@@ -63,6 +63,15 @@ udp:
   target_ip: "127.0.0.1"
   target_port: 9005
 
+# Optional Windows gamepad manual control output.
+# This does not replace localization UDP. It only sends packets when the UI
+# Gamepad Mode checkbox is explicitly enabled.
+gamepad_control:
+  target_port: 9010
+  max_speed_mps: 0.5
+  steer_error_scale: 210.0
+  safe_stop_lt_threshold: 0.90
+
 # Output coordinate conversion.
 # This project stores world coordinates in millimeters; UI and UDP use meters.
 output:

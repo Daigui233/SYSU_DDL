@@ -8,9 +8,10 @@ RK3588S 上位机负责转发定位给官方 AR、读取融合视频、运行视
 Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006 -> 官方 AR
 官方 AR 融合视频 -> shm_ar_video -> 分割模型 -> track_error -> STATE_TRACK -> /dev/ttyUSB0 -> TC264D
 官方 AR 融合视频 -> shm_ar_video -> 检测模型 -> 仅画 gold/car/human 检测框
+可选手柄遥控 -> UDP 板卡IP:9010 -> ar_receiver.py 临时覆盖视觉控制 -> /dev/ttyUSB0 -> TC264D
 ```
 
-定位只驱动 AR 融合和坐标显示，不直接参与转向控制。控车输入来自融合视频上的视觉处理结果。
+定位只驱动 AR 融合和坐标显示，不直接参与转向控制。默认控车输入来自融合视频上的视觉处理结果；只有 Windows 定位 EXE 显式勾选 `Gamepad Mode` 且 `9010` 收到新鲜遥控包时，手柄才临时覆盖视觉控制。
 
 ## 重点文件
 
@@ -35,10 +36,21 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 - 检测模型当前识别 `gold / car / human`，但只用于画框，不参与状态切换。
 - OCR/API 尚未接入。
 - 当前分割和检测模型效果较差，仍需继续训练和优化。
-- 无有效分割误差时，当前进入 `TRACK_FALLBACK`，误差 `0`、默认速度 `0.5 m/s`，不会因为模型效果差而停车。
-- 控制主循环连续 `2 s` 不再发送任何命令时，独立看门狗每 `0.2 s` 重复下发 `STATE_SAFE_STOP`；正常视觉控制仍只下发 `STATE_TRACK`。
-- 现场若推理周期可能超过 `2 s`，可通过 `AR_CONTROL_WATCHDOG_TIMEOUT` 调整看门狗阈值。
+- 无有效分割误差但未超过 `3 s` 时，当前进入 `TRACK_FALLBACK`，误差 `0`、默认速度 `0.5 m/s`。
+- 连续 `3 s` 没有有效 `track_error` 时，RK3588S 进入 `LINE_LOSS_SAFE_STOP` 并重复下发 `STATE_SAFE_STOP`。
+- 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + VISION`，不会锁死在 `STATE_SAFE_STOP`。
+- 中线丢失阈值可通过 `AR_LINE_LOSS_SAFE_STOP_TIMEOUT` 调整；丢线状态下命令重复间隔可通过 `AR_LINE_LOSS_COMMAND_REPEAT_INTERVAL` 调整。
 - 默认巡线速度为 `0.5 m/s`，可通过 `AR_TRACK_SPEED` 调整；`TRACK_FALLBACK` 可通过 `AR_TRACK_FALLBACK_SPEED` 单独覆盖。
+
+## 可选手柄遥控
+
+手柄链路用于低速遥控和采集分割数据集，不是比赛默认控制链路：
+
+- RK3588S 监听 `0.0.0.0:9010`，只接收 `type=gamepad_control`。
+- 未收到遥控包、遥控包超过 `0.45 s`、或定位 EXE 取消 `Gamepad Mode` 时，控制源自动回到视觉巡线。
+- 遥控有效时，`RT` 映射 `target_speed`，`LX` 映射 `track_error`，`LT >= 90%` 或手柄断连映射 `STATE_SAFE_STOP`。
+- 遥控接管只覆盖最终发给 TC264D 的控制帧，不影响 `9005 -> 9006` 定位转发，也不修改 AR 融合链路。
+- RK 侧对遥控速度和误差再次限幅：默认最大速度 `0.8 m/s`，最大 `track_error` 绝对值 `240`，可通过 `AR_GAMEPAD_MAX_SPEED_MPS` / `AR_GAMEPAD_MAX_TRACK_ERROR` 调整。
 
 ## 后续扩展接口
 
@@ -65,6 +77,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 - 官方 AR 转发：`127.0.0.1:9006`。
 - WebUI 定位数据地址：`127.0.0.1`。
 - WebUI 端口号：`9006`。
+- 可选手柄遥控入口：`0.0.0.0:9010`。
 - UNITY 同步端口：`9003`。
 - 控车串口：`/dev/ttyUSB0`，`460800` baud，写超时 `0.05 s`。
 
@@ -74,7 +87,8 @@ WebUI/HUD 优先确认：
 
 - `WIN-UDP ok` 和 `AR-FWD ok` 持续增长，AR 画面随定位变化。
 - 分割结果和 `track_error` 是否稳定。
-- HUD 控制来源应为 `CTRL VISION` 或 `CTRL TRACK_FALLBACK`；TC264D 反馈状态应为 `TRACK`。
+- HUD 控制来源正常应为 `CTRL VISION` 或 `CTRL TRACK_FALLBACK`；手柄接管时应为 `CTRL GAMEPAD_TRACK` 或 `CTRL GAMEPAD_SAFE_STOP`。
+- WebUI 右侧调试栏的 `GAMEPAD` 行应显示遥控是否 active、包计数、错误计数和年龄。
 - TC264D feedback 持续增长。
 - `flags=0x01`，电机和舵机输出随误差变化。
 
@@ -83,4 +97,4 @@ WebUI/HUD 优先确认：
 - `http://<RK3588S-IP>:9105/pose_status`
 - `http://<RK3588S-IP>:9105/pose_packet`
 
-`/pose_status` 中的 `control` 字段每 `0.5 s` 刷新，并包含控制来源、`track_error`、目标速度（m/s）、`state_cmd`、flags 和最近一次串口发送结果。
+`/pose_status` 中的 `control` 字段每 `0.5 s` 刷新，并包含控制来源、`track_error`、目标速度（m/s）、`state_cmd`、flags、最近一次串口发送结果和手柄遥控状态。

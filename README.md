@@ -15,29 +15,39 @@ Windows 顶置相机
        - 后续：检测/OCR/API -> 任务决策 -> 其他 state_cmd
   -> /dev/ttyUSB0 -> TC264D
   -> 电机、舵机和状态执行
+
+可选数据采集遥控链路：
+Windows 定位 EXE 勾选 Gamepad Mode
+  -> UDP 板卡IP:9010
+  -> ar_receiver.py 临时覆盖视觉控制
+  -> /dev/ttyUSB0 -> TC264D
 ```
 
-AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划路线，也不直接生成舵机误差。小车最终如何行驶，由融合视频上的视觉结果和上位机决策决定。
+AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划路线，也不直接生成舵机误差。默认情况下小车如何行驶，由融合视频上的视觉结果和上位机决策决定；只有 Windows 定位 EXE 中显式勾选 `Gamepad Mode` 且 RK3588S 收到新鲜遥控包时，才临时进入手柄遥控。
 
 ## 模块职责
 
 | 模块 | 职责 |
 | --- | --- |
-| `ArucoCalib-master/ArucoCalib-master/` | Windows AprilTag 定位，只发送官方 `robot_position` |
+| `ArucoCalib-master/ArucoCalib-master/` | Windows AprilTag 定位，发送官方 `robot_position`；可选发送手柄遥控包 |
 | 官方 AR 引擎/WebUI | 根据定位更新 AR 世界并产生融合视频流 |
 | `Master_RK3588S/setupUI/ar_receiver.py` | 读取融合视频、运行模型、生成控制命令、转发定位给 AR |
 | `Master_RK3588S/setupUI/serial_comm.py` | 向 TC264D 下发控制帧并接收反馈 |
 | `Slave_TC264D/` | 执行上位机给出的状态、速度和转向误差 |
+| `Tools_Windows/gamepad_mapper.py` | 手柄输入和映射测试工具，不直接控车 |
 
 ## 当前阶段
 
-- 正常视觉控制只使用 `STATE_TRACK` 巡线状态；仅当 RK3588S 控制主循环连续 `2 s` 不再发送命令时，看门狗才周期性下发 `STATE_SAFE_STOP`。
+- 正常视觉控制只使用 `STATE_TRACK` 巡线状态；仅当 RK3588S 连续 `3 s` 没有识别到语义分割中线时，才周期性下发 `STATE_SAFE_STOP`。
 - 分割模型从融合视频生成 `track_error`，上位机以 `STATE_TRACK + flags=0x01` 下发给 TC264D。
 - 当前分割和检测模型效果较差，仍需优化；检测模型的 `gold / car / human` 结果只用于画框。
 - OCR 和外部 API 尚未接入，当前不进行金币、避车、红绿灯等任务状态切换。
 - 控制协议中的 `state_cmd / target_speed / track_error / flags` 与下位机预留状态继续保留，供后续扩展，不在当前阶段写死任务规则。
-- 无有效分割误差时，当前 `TRACK_FALLBACK` 会以误差 `0`、默认速度 `0.5 m/s` 继续直行，不会因为模型效果差而进入 `STATE_SAFE_STOP`。
-- 控制主循环看门狗只监测命令流是否停止；主循环或共享内存连续 `2 s` 无控制命令时，每 `0.2 s` 重复下发 `STATE_SAFE_STOP`，直到主循环恢复 `STATE_TRACK`。
+- 无有效分割误差但未超过 `3 s` 时，当前 `TRACK_FALLBACK` 会以误差 `0`、默认速度 `0.5 m/s` 继续直行。
+- 连续 `3 s` 没有有效 `track_error` 时，RK3588S 进入 `LINE_LOSS_SAFE_STOP` 并重复下发 `STATE_SAFE_STOP`；再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + VISION`。
+- 手柄遥控仅用于调试和采集数据：默认关闭，只有定位 EXE 勾选 `Gamepad Mode` 后才通过 UDP `9010` 接管；关闭、丢包超时或赛方定位模块没有遥控包时，一律回到视觉控车。
+- 遥控模式下定位 UDP `9005` 仍正常发送并被 RK3588S 转发到 `9006`，不会因为手柄接管而停止 AR 融合。
+- 遥控映射：右扳机 `RT` 控制 `target_speed`，左摇杆横轴 `LX` 控制 `track_error`，左扳机 `LT >= 90%` 或手柄断连时发送 `STATE_SAFE_STOP`。
 - TC264D 保留现有串口协议，同时增加 `2.5 s` 本地输入超时；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。
 
 ## 定位与端口
@@ -51,6 +61,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - Windows 定位程序发送到板卡局域网 IP 的 UDP `9005`。
 - `ar_receiver.py` 转发到板卡本机 `127.0.0.1:9006`；转发给官方 AR 时只交换平移轴为 `pos=[z,0.16,x]`，`yaw=euler[1]` 保持不变。
 - WebUI 定位数据地址填写 `127.0.0.1`，端口填写 `9006`。
+- 手柄遥控输入为独立 UDP `9010`，只接收 `type=gamepad_control`，不复用定位包。
 - UNITY 同步端口为 `9003`。
 - 控车串口为 `/dev/ttyUSB0`，`460800` baud，上位机串口写入带 `write_timeout=0.05 s`。
 
@@ -64,6 +75,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 2. 架空车轮验证误差方向、舵机方向、PID、速度、`flags=0x01` 和反馈帧。
 3. 首次落地前使用默认 `0.5 m/s` 验证巡线和 `TRACK_FALLBACK`；需要更慢或更快时通过环境变量 `AR_TRACK_SPEED` / `AR_TRACK_FALLBACK_SPEED` 调整。
 4. 当前 `target_speed` 已按同款 CarDo 车模参数粗换算为 `m/s`，TC264D 的 `actual_speed` 由编码器计数换算得到；后续仍需确认编码器正负号，并用实测速度修正轮径、周期或比例误差。
+5. 若用手柄采集数据，先确认 `Gamepad Mode` 勾选、WebUI `GAMEPAD` 状态、TC264D 反馈和现场急停手段，再低速落地。
 
 ### 定位与 AR
 
