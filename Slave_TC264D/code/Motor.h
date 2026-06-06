@@ -15,7 +15,7 @@
 
 //====================================================电机硬件参数定义====================================================
 #define MOTOR_PWM_FREQ               (10000)                         // 电机 PWM 频率
-#define MOTOR_PWM_DUTY_LIMIT         (10000)                         // 电机 PWM 占空比上限
+#define MOTOR_PWM_DUTY_LIMIT         (2500)                         // 电机 PWM 占空比上限
 
 #define MOTOR_FORWARD_PWM            (ATOM0_CH4_P02_4)              // 电机正转 PWM 引脚
 #define MOTOR_REVERSE_PWM            (ATOM0_CH5_P02_5)              // 电机反转 PWM 引脚

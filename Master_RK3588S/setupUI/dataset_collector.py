@@ -141,11 +141,28 @@ class DatasetCollector:
 
         self.sender = NetworkPacketSender(target_ip=target_ip, udp_port=udp_port)
 
-        self.position = [0.0, 0.0, 0.0]
+        # Official robot_position convention: pos=[x, height, z], euler=[0, yaw, 0].
+        # yaw=0 points +X, yaw=+90 points +Z.
+        self.position = [0.0, 0.16, 0.0]
         self.euler = [0.0, 0.0, 0.0]
 
         self.move_step = 0.1
         self.rotate_step = 5.0
+
+    @staticmethod
+    def _norm_angle_deg(angle):
+        value = (float(angle) + 180.0) % 360.0 - 180.0
+        if value <= -180.0:
+            value += 360.0
+        return value
+
+    @property
+    def yaw_deg(self):
+        return float(self.euler[1])
+
+    @yaw_deg.setter
+    def yaw_deg(self, value):
+        self.euler[1] = self._norm_angle_deg(value)
 
     def create_new_session(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -176,38 +193,38 @@ class DatasetCollector:
             print(
                 f"已发送 -> 位置: x={self.position[0]:.2f}, "
                 f"y={self.position[1]:.2f}, z={self.position[2]:.2f}, "
-                f"欧拉角: roll={self.euler[0]:.1f}, pitch={self.euler[1]:.1f}, "
-                f"yaw={self.euler[2]:.1f}"
+                f"欧拉角: pitch={self.euler[0]:.1f}, yaw={self.euler[1]:.1f}, "
+                f"roll={self.euler[2]:.1f}"
             )
         else:
             print("发送失败")
 
     def control_forward(self):
-        yaw_rad = math.radians(self.euler[2])
-        dx = self.move_step * math.sin(yaw_rad)
-        dz = self.move_step * math.cos(yaw_rad)
+        yaw_rad = math.radians(self.yaw_deg)
+        dx = self.move_step * math.cos(yaw_rad)
+        dz = self.move_step * math.sin(yaw_rad)
         self.position[0] += dx
         self.position[2] += dz
         print(f"向前移动 -> 新位置: ({self.position[0]:.2f}, {self.position[2]:.2f})")
         self._send_current_state()
 
     def control_back(self):
-        yaw_rad = math.radians(self.euler[2])
-        dx = -self.move_step * math.sin(yaw_rad)
-        dz = -self.move_step * math.cos(yaw_rad)
+        yaw_rad = math.radians(self.yaw_deg)
+        dx = -self.move_step * math.cos(yaw_rad)
+        dz = -self.move_step * math.sin(yaw_rad)
         self.position[0] += dx
         self.position[2] += dz
         print(f"向后移动 -> 新位置: ({self.position[0]:.2f}, {self.position[2]:.2f})")
         self._send_current_state()
 
     def control_left(self):
-        self.euler[2] = (self.euler[2] + self.rotate_step) % 360
-        print(f"向左转 {self.rotate_step}° -> 当前Yaw: {self.euler[2]:.1f}°")
+        self.yaw_deg = self.yaw_deg + self.rotate_step
+        print(f"向左转 {self.rotate_step}° -> 当前Yaw: {self.yaw_deg:.1f}°")
         self._send_current_state()
 
     def control_right(self):
-        self.euler[2] = (self.euler[2] - self.rotate_step) % 360
-        print(f"向右转 {self.rotate_step}° -> 当前Yaw: {self.euler[2]:.1f}°")
+        self.yaw_deg = self.yaw_deg - self.rotate_step
+        print(f"向右转 {self.rotate_step}° -> 当前Yaw: {self.yaw_deg:.1f}°")
         self._send_current_state()
 
     def run(self):
@@ -243,9 +260,9 @@ class DatasetCollector:
             elif key == ord('s'):
                 self.control_back()
             elif key == ord('a'):
-                self.control_right()
-            elif key == ord('d'):
                 self.control_left()
+            elif key == ord('d'):
+                self.control_right()
 
         self.cap.release()
         cv2.destroyAllWindows()

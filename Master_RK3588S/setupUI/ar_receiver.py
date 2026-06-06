@@ -56,6 +56,16 @@ DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEBUG_DRAW_POSE_PANEL = True
 POSE_STATUS_HTTP_HOST = os.environ.get("AR_POSE_STATUS_HOST", "0.0.0.0")
 POSE_STATUS_HTTP_PORT = int(os.environ.get("AR_POSE_STATUS_PORT", "9105"))
+POSE_CONVENTION = {
+    "field_m": [4.0, 3.0],
+    "origin": "bottom-right",
+    "positive_x": "left",
+    "positive_z": "up",
+    "yaw_index": 1,
+    "yaw_zero": "+X",
+    "yaw_positive_90": "+Z",
+    "source": "Windows AprilTag locator filtered robot_position",
+}
 
 # ===== POSE_PATH_DEBUG_START：定位链路分段验证打印，稳定后可整段删除 =====
 # The staged debug output identifies UDP input, JSON validation, local mirror, and AR forwarding.
@@ -286,6 +296,7 @@ def write_pose_status(status, packet=None, raw_line="", packet_count=0, invalid_
         "target": target,
         "debug_log": DEBUG_LOG_PATH,
         "packet_json": DEBUG_PACKET_PATH,
+        "pose_convention": POSE_CONVENTION,
         "car_feedback": get_car_feedback(),
     }
     write_status_json(info, "pose status")
@@ -329,6 +340,7 @@ def write_runtime_status(pose_bridge, control_state, command_error, command_spee
         "target": pose_info.get("target", f"{DEFAULT_AR_UDP_IP}:{DEFAULT_AR_UDP_PORT}"),
         "udp_send_count": pose_info.get("udp_send_count", 0),
         "udp_fail_count": pose_info.get("udp_fail_count", 0),
+        "pose_convention": POSE_CONVENTION,
         "control": control_info,
         "car_feedback": get_car_feedback(),
         "debug_log": DEBUG_LOG_PATH,
@@ -369,6 +381,7 @@ def current_pose_http_payload():
     status.setdefault("debug_log", DEBUG_LOG_PATH)
     status.setdefault("packet_json", DEBUG_PACKET_PATH)
     status.setdefault("target", f"{DEFAULT_AR_UDP_IP}:{DEFAULT_AR_UDP_PORT}")
+    status.setdefault("pose_convention", POSE_CONVENTION)
     status["http_port"] = POSE_STATUS_HTTP_PORT
     status["car_feedback"] = get_car_feedback()
     return status

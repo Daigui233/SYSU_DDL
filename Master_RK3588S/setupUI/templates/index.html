@@ -254,11 +254,11 @@
                     <div class="form-group row">
                         <div class="col">
                             <label for="udp_target_ip">定位数据地址</label>
-                            <input type="text" id="udp_target_ip" name="udp_target_ip" placeholder="192.168.123.5" />
+                            <input type="text" id="udp_target_ip" name="udp_target_ip" placeholder="127.0.0.1" />
                         </div>
                         <div class="col">
                             <label for="udp_target_port">端口号</label>
-                            <input type="number" id="udp_target_port" name="udp_target_port" placeholder="9000" />
+                            <input type="number" id="udp_target_port" name="udp_target_port" placeholder="9006" />
                         </div>
                     </div>
 
@@ -484,9 +484,9 @@
                             <h3 style="margin-bottom: 5px;">外部投递数据规范 (发往 RK3588)</h3>
                             <p style="font-size: 0.85rem; line-height: 1.5; margin-bottom: 0;">
                                 如果您不使用上述网页键盘，而是通过外部程序投递定位数据到 RK3588，<strong>数据链路必须遵循平台统一的 JSON 通信标准</strong>。<br>
-                                主要用于同步相机/车体的实时位姿供 AR 追踪渲染，数据扁平化，必须直接包含 <code>pos</code> (三维坐标 XYZ) 与 <code>euler</code>
-                                (俯仰/偏航角)
-                                等基础字段，引擎不支持多层嵌套的 JSON 结构。
+                                当前定位以 Windows AprilTag 程序为准：场地 4m × 3m，原点右下角，+X 向左，+Z 向上。定位包必须直接包含
+                                <code>pos=[x,0.16,z]</code> 与 <code>euler=[0,yaw,0]</code>，其中 <code>yaw=euler[1]</code>，
+                                <code>0° -> +X</code>、<code>+90° -> +Z</code>。Windows 端会先做轻量滤波，再发送官方 <code>robot_position</code>。
                             </p>
                             <button class="btn-ghost" id="btn-download-json"
                                 style="margin-top: 10px; border-color: rgba(255,255,255,0.2);">⬇️ 下载标准通信 JSON
@@ -660,7 +660,7 @@
                 );
                 setText(
                     "debug-pose",
-                    `POSE x=${fmtNum(pos[0], 2)} z=${fmtNum(pos[2], 2)} yaw=${fmtNum(euler[1], 1)} age=${fmtAge(packet.timestamp || data.timestamp)} · AR ${data.target || "127.0.0.1:9006"}`
+                    `POSE x=${fmtNum(pos[0], 2)} z=${fmtNum(pos[2], 2)} yaw(euler[1])=${fmtNum(euler[1], 1)} age=${fmtAge(packet.timestamp || data.timestamp)} · AR ${data.target || "127.0.0.1:9006"}`
                 );
                 setText(
                     "debug-ctrl",

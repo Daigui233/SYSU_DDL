@@ -57,6 +57,9 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 {"type":"robot_position","pos":[x,0.16,z],"euler":[0.0,yaw,0.0]}
 ```
 
+- 坐标使用当前 Windows 定位端输出：场地 `4 m × 3 m`，原点在右下角，`+X` 向左、`+Z` 向上。
+- Yaw 位于 `euler[1]`，约定为 `0° -> +X`、`+90° -> +Z`；RK3588S 只校验并转发，不重新计算定位。
+- Windows 定位端已对输出位姿做轻量滤波；RK3588S/WebUI/HUD 看到的是同一份官方 `robot_position`。
 - 外部定位入口：`0.0.0.0:9005`。
 - 官方 AR 转发：`127.0.0.1:9006`。
 - WebUI 定位数据地址：`127.0.0.1`。

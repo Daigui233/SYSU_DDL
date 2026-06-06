@@ -73,3 +73,11 @@ output:
   yaw_sign: 1.0
   yaw_offset_deg: 0.0
 
+# Lightweight output smoothing for EXE HUD/trajectory/UDP.
+# Higher alpha follows raw detections faster; lower alpha is smoother but more delayed.
+pose_filter:
+  enabled: true
+  position_alpha: 0.35
+  yaw_alpha: 0.35
+  reset_gap_s: 0.35
+

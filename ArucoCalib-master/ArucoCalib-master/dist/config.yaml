@@ -51,3 +51,8 @@ output:
   z_sign: 1.0
   yaw_sign: 1.0
   yaw_offset_deg: 0.0
+pose_filter:
+  enabled: true
+  position_alpha: 0.35
+  yaw_alpha: 0.35
+  reset_gap_s: 0.35

@@ -42,7 +42,7 @@ EXE 使用 `dist/config.yaml`。源码运行使用根目录 `config.yaml`。
 - Yaw：`0° -> +X`，`+90° -> +Z`。
 - 在场地图俯视方向：
   `0°` 向左、`+90°` 向上、`-90°` 向下、`±180°` 向右。
-- 右上角 `UDP trajectory` 按同一方向显示，仅用于预览实际发送的定位和 Yaw。
+- `pose_filter` 对输出坐标和 Yaw 做轻量滤波；左上角 HUD、右上角 `UDP trajectory` 和 UDP 发送使用同一份滤波后的定位。
 
 当前固定 Tag 临时中心坐标：
 

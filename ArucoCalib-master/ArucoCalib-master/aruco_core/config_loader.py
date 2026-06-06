@@ -84,6 +84,12 @@ class Config:
         self.OUTPUT_YAW_SIGN = float(output_config.get("yaw_sign", 1.0))
         self.OUTPUT_YAW_OFFSET_DEG = float(output_config.get("yaw_offset_deg", 0.0))
 
+        pose_filter_config = config_data.get("pose_filter", {}) or {}
+        self.POSE_FILTER_ENABLED = bool(pose_filter_config.get("enabled", True))
+        self.POSE_FILTER_POSITION_ALPHA = float(pose_filter_config.get("position_alpha", 0.35))
+        self.POSE_FILTER_YAW_ALPHA = float(pose_filter_config.get("yaw_alpha", 0.35))
+        self.POSE_FILTER_RESET_GAP_S = float(pose_filter_config.get("reset_gap_s", 0.35))
+
     @staticmethod
     def _resolve_config_path(config_file: str) -> Path:
         """

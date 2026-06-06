@@ -101,13 +101,13 @@ void control_apply_state_param(car_state_enum state)
     {
     case STATE_TRACK:
         control_ctx.param.motor_target_speed = 100.0f;
-        control_ctx.param.motor_kp = 2.0f;
-        control_ctx.param.motor_ki = 1.0f;
+        control_ctx.param.motor_kp = 1.4f;
+        control_ctx.param.motor_ki = 0.45f;
         control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -10000.0f;
-        control_ctx.param.motor_output_max = 10000.0f;
-        control_ctx.param.servo_kp = 1.0f;
-        control_ctx.param.servo_kd = 1.0f;
+        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
+        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
+        control_ctx.param.servo_kp = 0.85f;
+        control_ctx.param.servo_kd = 0.55f;
         control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
         control_ctx.param.servo_output_max = (float)(SERVO_DUTY_MAX - SERVO_DUTY_MID);
         break;
@@ -117,8 +117,8 @@ void control_apply_state_param(car_state_enum state)
         control_ctx.param.motor_kp = 0.0f;
         control_ctx.param.motor_ki = 0.0f;
         control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -10000.0f;
-        control_ctx.param.motor_output_max = 10000.0f;
+        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
+        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
         control_ctx.param.servo_kp = 0.0f;
         control_ctx.param.servo_kd = 0.0f;
         control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
@@ -131,8 +131,8 @@ void control_apply_state_param(car_state_enum state)
         control_ctx.param.motor_kp = 0.0f;
         control_ctx.param.motor_ki = 0.0f;
         control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -10000.0f;
-        control_ctx.param.motor_output_max = 10000.0f;
+        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
+        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
         control_ctx.param.servo_kp = 0.0f;
         control_ctx.param.servo_kd = 0.0f;
         control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
@@ -146,8 +146,8 @@ void control_apply_state_param(car_state_enum state)
         control_ctx.param.motor_kp = 0.0f;
         control_ctx.param.motor_ki = 0.0f;
         control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -10000.0f;
-        control_ctx.param.motor_output_max = 10000.0f;
+        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
+        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
         control_ctx.param.servo_kp = 0.0f;
         control_ctx.param.servo_kd = 0.0f;
         control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
@@ -161,8 +161,8 @@ void control_apply_state_param(car_state_enum state)
         control_ctx.param.motor_kp = 2.0f;
         control_ctx.param.motor_ki = 1.0f;
         control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -10000.0f;
-        control_ctx.param.motor_output_max = 10000.0f;
+        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
+        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
         control_ctx.param.servo_kp = 1.0f;
         control_ctx.param.servo_kd = 1.0f;
         control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);

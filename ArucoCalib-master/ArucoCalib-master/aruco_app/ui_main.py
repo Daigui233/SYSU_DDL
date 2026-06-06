@@ -170,6 +170,8 @@ class MainWindow(QMainWindow):
         self.last_output_pose_ts = 0.0
         self.last_pose_live = False
         self.pose_hold_timeout_s = 0.5
+        self.filtered_output_pose = None  # (x_m, z_m, yaw_deg)
+        self.filtered_output_pose_ts = 0.0
         self.locked_fixed_marker_corners_px = {}  # fixed marker_id -> (4,2) corners captured at calibration lock
         self.last_udp_ok = False
         self.pose_seq = 0
@@ -191,6 +193,14 @@ class MainWindow(QMainWindow):
         if x <= -180.0:
             x += 360.0
         return x
+
+    @staticmethod
+    def _clamp_float(value: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, float(value)))
+
+    def _reset_pose_filter(self):
+        self.filtered_output_pose = None
+        self.filtered_output_pose_ts = 0.0
 
     @staticmethod
     def _editable_config_path():
@@ -243,13 +253,14 @@ class MainWindow(QMainWindow):
         cx, cy = self.last_vehicle_center_px
         lines = [f"vehicle_id: {vid}", f"center_px: ({cx:.1f}, {cy:.1f})"]
 
-        output_pose = self._current_output_pose()
+        output_pose = self.last_output_pose if self.last_pose_live else None
         if output_pose is None:
             lines.append("center_world(m): Not calibrated")
             lines.append("yaw_deg: Not calibrated")
         else:
             x_m, z_m, yaw_deg = output_pose
-            lines.append(f"center_world(m): ({x_m:.3f}, {z_m:.3f})")
+            pose_label = "filtered_pose(m)" if bool(getattr(self.cfg, "POSE_FILTER_ENABLED", True)) else "output_pose(m)"
+            lines.append(f"{pose_label}: ({x_m:.3f}, {z_m:.3f})")
             lines.append(f"yaw_deg: {yaw_deg:.2f}")
 
         self.vehicle_text.setText("\n".join(lines))
@@ -324,14 +335,49 @@ class MainWindow(QMainWindow):
         )
         return x_m, z_m, yaw_deg
 
+    def _apply_pose_filter(self, raw_pose, now_s: float):
+        if raw_pose is None:
+            return None
+
+        if not bool(getattr(self.cfg, "POSE_FILTER_ENABLED", True)):
+            self.filtered_output_pose = raw_pose
+            self.filtered_output_pose_ts = now_s
+            return raw_pose
+
+        pos_alpha = self._clamp_float(getattr(self.cfg, "POSE_FILTER_POSITION_ALPHA", 0.35), 0.01, 1.0)
+        yaw_alpha = self._clamp_float(getattr(self.cfg, "POSE_FILTER_YAW_ALPHA", 0.35), 0.01, 1.0)
+        reset_gap_s = max(0.0, float(getattr(self.cfg, "POSE_FILTER_RESET_GAP_S", 0.35)))
+
+        if (
+            self.filtered_output_pose is None
+            or self.filtered_output_pose_ts <= 0.0
+            or (reset_gap_s > 0.0 and now_s - self.filtered_output_pose_ts > reset_gap_s)
+        ):
+            self.filtered_output_pose = raw_pose
+            self.filtered_output_pose_ts = now_s
+            return raw_pose
+
+        prev_x, prev_z, prev_yaw = self.filtered_output_pose
+        raw_x, raw_z, raw_yaw = raw_pose
+        x_m = prev_x + pos_alpha * (raw_x - prev_x)
+        z_m = prev_z + pos_alpha * (raw_z - prev_z)
+        yaw_delta = self._norm_angle_deg(raw_yaw - prev_yaw)
+        yaw_deg = self._norm_angle_deg(prev_yaw + yaw_alpha * yaw_delta)
+
+        self.filtered_output_pose = (x_m, z_m, yaw_deg)
+        self.filtered_output_pose_ts = now_s
+        return self.filtered_output_pose
+
     def _send_current_pose(self):
-        pose = self._current_output_pose()
-        if pose is None:
+        raw_pose = self._current_output_pose()
+        if raw_pose is None:
             self.last_pose_live = False
             self.last_udp_ok = False
             return
+        now_s = time.monotonic()
+        pose = self._apply_pose_filter(raw_pose, now_s)
         self.last_output_pose = pose
-        self.last_output_pose_ts = time.monotonic()
+        self.last_output_pose_ts = now_s
         self.last_pose_live = True
         x_m, z_m, yaw_deg = pose
         self.pose_seq += 1
@@ -362,8 +408,9 @@ class MainWindow(QMainWindow):
         if pose is not None:
             x_m, z_m, yaw_deg = pose
             state_text = pose_state if age_s is None else f"{pose_state} {age_s:.2f}s"
+            filter_text = "on" if bool(getattr(self.cfg, "POSE_FILTER_ENABLED", True)) else "off"
             lines = [
-                f"seq={self.pose_seq} sent={1 if sent_now else 0} pose={state_text}",
+                f"seq={self.pose_seq} sent={1 if sent_now else 0} pose={state_text} filt={filter_text}",
                 f"x={x_m:.3f}m z={z_m:.3f}m yaw={yaw_deg:.2f}deg",
             ]
         else:
@@ -720,6 +767,7 @@ class MainWindow(QMainWindow):
         self.transformer.reset_calibration()
         self.locked_fixed_marker_corners_px = {}
         self.last_output_pose = None
+        self._reset_pose_filter()
         self.pose_seq = 0
         self.pose_history = []
         self.calib_label.setText("Calibration: Not calibrated")
@@ -1057,9 +1105,9 @@ class MainWindow(QMainWindow):
                 except Exception:
                     vehicle_detected = False
 
-        self._update_vehicle_panel(vehicle_detected)
         if vehicle_detected and self.transformer.get_calibration_status():
             self._send_current_pose()
+        self._update_vehicle_panel(vehicle_detected)
 
 
         # Trajectory overlay (pixel space). Does not affect H calculation.
