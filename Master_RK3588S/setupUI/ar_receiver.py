@@ -66,6 +66,11 @@ POSE_CONVENTION = {
     "yaw_positive_90": "+Z",
     "source": "Windows AprilTag locator filtered robot_position",
 }
+AR_FORWARD_MAPPING = {
+    "position": "AR pos[0] = input pos[2], AR pos[2] = input pos[0]",
+    "yaw": "unchanged euler[1]",
+    "reason": "Official AR scene axes are X/Z-swapped relative to the Windows locator preview.",
+}
 
 # ===== POSE_PATH_DEBUG_START：定位链路分段验证打印，稳定后可整段删除 =====
 # The staged debug output identifies UDP input, JSON validation, local mirror, and AR forwarding.
@@ -285,18 +290,21 @@ def pose_path_debug(stage, message, count=None, force=False):
 # ===== POSE_PATH_DEBUG_END =====
 
 
-def write_pose_status(status, packet=None, raw_line="", packet_count=0, invalid_count=0, target=None):
+def write_pose_status(status, packet=None, raw_line="", packet_count=0, invalid_count=0, target=None, input_packet=None, ar_packet=None):
     info = {
         "status": status,
         "timestamp": time.time(),
         "packet_count": packet_count,
         "invalid_count": invalid_count,
         "raw_line": raw_line,
+        "input_packet": input_packet,
         "packet": packet,
+        "ar_packet": ar_packet,
         "target": target,
         "debug_log": DEBUG_LOG_PATH,
         "packet_json": DEBUG_PACKET_PATH,
         "pose_convention": POSE_CONVENTION,
+        "ar_forward_mapping": AR_FORWARD_MAPPING,
         "car_feedback": get_car_feedback(),
     }
     write_status_json(info, "pose status")
@@ -336,11 +344,14 @@ def write_runtime_status(pose_bridge, control_state, command_error, command_spee
         "timestamp": time.time(),
         "packet_count": pose_info.get("packet_count", 0),
         "invalid_count": pose_info.get("invalid_count", 0),
+        "input_packet": pose_info.get("last_input_packet"),
         "packet": pose_info.get("last_packet"),
+        "ar_packet": pose_info.get("last_ar_packet"),
         "target": pose_info.get("target", f"{DEFAULT_AR_UDP_IP}:{DEFAULT_AR_UDP_PORT}"),
         "udp_send_count": pose_info.get("udp_send_count", 0),
         "udp_fail_count": pose_info.get("udp_fail_count", 0),
         "pose_convention": POSE_CONVENTION,
+        "ar_forward_mapping": AR_FORWARD_MAPPING,
         "control": control_info,
         "car_feedback": get_car_feedback(),
         "debug_log": DEBUG_LOG_PATH,
@@ -372,9 +383,9 @@ def read_json_file(path, default=None):
 
 def current_pose_http_payload():
     status = read_json_file(DEBUG_STATUS_PATH, {})
-    packet = read_json_file(DEBUG_PACKET_PATH, None)
-    if packet is not None and not status.get("packet"):
-        status["packet"] = packet
+    ar_packet = read_json_file(DEBUG_PACKET_PATH, None)
+    if ar_packet is not None and not status.get("ar_packet"):
+        status["ar_packet"] = ar_packet
     status.setdefault("status", "ar_receiver not ready")
     status.setdefault("packet_count", 0)
     status.setdefault("invalid_count", 0)
@@ -382,6 +393,7 @@ def current_pose_http_payload():
     status.setdefault("packet_json", DEBUG_PACKET_PATH)
     status.setdefault("target", f"{DEFAULT_AR_UDP_IP}:{DEFAULT_AR_UDP_PORT}")
     status.setdefault("pose_convention", POSE_CONVENTION)
+    status.setdefault("ar_forward_mapping", AR_FORWARD_MAPPING)
     status["http_port"] = POSE_STATUS_HTTP_PORT
     status["car_feedback"] = get_car_feedback()
     return status
@@ -521,6 +533,22 @@ def coerce_official_packet(data):
     return packet
 
 
+def map_pose_packet_for_ar(packet):
+    """Map Windows locator preview coordinates to the official AR scene axes."""
+    pos = packet["pos"]
+    euler = packet["euler"]
+    ar_packet = {
+        "type": "robot_position",
+        "pos": [float(pos[2]), float(pos[1]), float(pos[0])],
+        "euler": [float(euler[0]), float(euler[1]), float(euler[2])],
+    }
+    if "seq" in packet:
+        ar_packet["seq"] = packet["seq"]
+    if "timestamp" in packet:
+        ar_packet["timestamp"] = packet["timestamp"]
+    return ar_packet
+
+
 def parse_official_pose_datagram(data):
     try:
         raw_text = data.decode("utf-8").strip()
@@ -553,7 +581,9 @@ class ARPoseBridge:
         self.status = "idle"
         self.last_datagram = ""
         self.last_source = ""
+        self.last_input_packet = None
         self.last_packet = None
+        self.last_ar_packet = None
         self.last_ts = 0.0
         self.datagram_count = 0
         self.packet_count = 0
@@ -602,7 +632,9 @@ class ARPoseBridge:
                 "status": self.status,
                 "last_datagram": self.last_datagram,
                 "last_source": self.last_source,
+                "last_input_packet": self.last_input_packet,
                 "last_packet": self.last_packet,
+                "last_ar_packet": self.last_ar_packet,
                 "last_ts": self.last_ts,
                 "datagram_count": self.datagram_count,
                 "packet_count": self.packet_count,
@@ -616,12 +648,15 @@ class ARPoseBridge:
                 "log_path": DEBUG_LOG_PATH,
                 "status_path": DEBUG_STATUS_PATH,
                 "packet_path": DEBUG_PACKET_PATH,
+                "ar_forward_mapping": AR_FORWARD_MAPPING,
             }
 
     def set_status(self, status, log_message=None):
         with self.lock:
             self.status = status
+            input_packet = self.last_input_packet
             packet = self.last_packet
+            ar_packet = self.last_ar_packet
             raw_line = self.last_datagram
             packet_count = self.packet_count
             invalid_count = self.invalid_count
@@ -634,6 +669,8 @@ class ARPoseBridge:
             packet_count=packet_count,
             invalid_count=invalid_count,
             target=self.target_text,
+            input_packet=input_packet,
+            ar_packet=ar_packet,
         )
 
     def _udp_loop(self):
@@ -704,19 +741,29 @@ class ARPoseBridge:
             write_debug_log(f"[AR_POSE_BAD] from={source_text} reason={error} raw={repr(raw_text)}")
             return
 
+        ar_packet = map_pose_packet_for_ar(packet)
+
         with self.lock:
             self.packet_count += 1
             packet.setdefault("seq", self.packet_count)
             packet.setdefault("timestamp", now)
+            ar_packet.setdefault("seq", packet["seq"])
+            ar_packet.setdefault("timestamp", packet["timestamp"])
+            self.last_input_packet = packet
             self.last_packet = packet
+            self.last_ar_packet = ar_packet
             self.last_ts = now
             self.status = "receiving"
             count = self.packet_count
 
-        payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-        pose_path_debug("PARSE_OK", f"#{count} from={source_text} packet={payload.decode('utf-8')}", count=count)
+        payload = json.dumps(ar_packet, separators=(",", ":")).encode("utf-8")
+        pose_path_debug(
+            "PARSE_OK",
+            f"#{count} from={source_text} input={json.dumps(packet, separators=(',', ':'))} ar={payload.decode('utf-8')}",
+            count=count,
+        )
         udp_ok, udp_fail = self.send_pose_payload(payload)
-        json_ok = write_live_pose_packet(packet)
+        json_ok = write_live_pose_packet(ar_packet)
         with self.lock:
             self.udp_send_count += udp_ok
             self.udp_fail_count += udp_fail
@@ -745,15 +792,19 @@ class ARPoseBridge:
             packet_count=count,
             invalid_count=invalid_count,
             target=self.target_text,
+            input_packet=packet,
+            ar_packet=ar_packet,
         )
 
         if DEBUG_PRINT_POSE and count % max(1, DEBUG_PRINT_POSE_EVERY_N) == 0:
             pos = packet["pos"]
+            ar_pos = ar_packet["pos"]
             euler = packet["euler"]
             write_debug_log(
                 "[AR_POSE_DEBUG] "
                 f"#{count} from={source_text} "
-                f"pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
+                f"input_pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) "
+                f"ar_pos=({ar_pos[0]:.3f},{ar_pos[1]:.3f},{ar_pos[2]:.3f}) "
                 f"yaw={euler[1]:.2f} "
                 f"udp={self.target_text} "
                 f"json={payload.decode('utf-8')}"
