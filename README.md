@@ -36,7 +36,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 当前分割和检测模型效果较差，仍需优化；检测模型的 `gold / car / human` 结果只用于画框。
 - OCR 和外部 API 尚未接入，当前不进行金币、避车、红绿灯等任务状态切换。
 - 控制协议中的 `state_cmd / target_speed / track_error / flags` 与下位机预留状态继续保留，供后续扩展，不在当前阶段写死任务规则。
-- 无有效分割误差时，当前 `TRACK_FALLBACK` 会以误差 `0`、默认速度 `80` 继续直行，不会因为模型效果差而进入 `STATE_SAFE_STOP`。
+- 无有效分割误差时，当前 `TRACK_FALLBACK` 会以误差 `0`、默认速度 `0.5 m/s` 继续直行，不会因为模型效果差而进入 `STATE_SAFE_STOP`。
 - 控制主循环看门狗只监测命令流是否停止；主循环或共享内存连续 `2 s` 无控制命令时，每 `0.2 s` 重复下发 `STATE_SAFE_STOP`，直到主循环恢复 `STATE_TRACK`。
 - TC264D 保留现有串口协议，同时增加 `2.5 s` 本地输入超时；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。
 
@@ -62,7 +62,8 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 
 1. 使用真实融合视频重新训练或优化分割模型，使 `track_error` 足以稳定巡线。
 2. 架空车轮验证误差方向、舵机方向、PID、速度、`flags=0x01` 和反馈帧。
-3. 首次落地前使用默认 `80` 速度验证巡线和 `TRACK_FALLBACK`；需要恢复 `120` 时再通过环境变量 `AR_TRACK_SPEED` / `AR_TRACK_FALLBACK_SPEED` 调整。
+3. 首次落地前使用默认 `0.5 m/s` 验证巡线和 `TRACK_FALLBACK`；需要更慢或更快时通过环境变量 `AR_TRACK_SPEED` / `AR_TRACK_FALLBACK_SPEED` 调整。
+4. 当前 `target_speed` 已按同款 CarDo 车模参数粗换算为 `m/s`，TC264D 的 `actual_speed` 由编码器计数换算得到；后续仍需确认编码器正负号，并用实测速度修正轮径、周期或比例误差。
 
 ### 定位与 AR
 

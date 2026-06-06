@@ -21,8 +21,8 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 ## 当前控制
 
 - 正常视觉控制只启用视觉巡线和 `STATE_TRACK`。
-- 有有效分割误差时，下发 `STATE_TRACK + TRACK_SPEED + flags=0x01`，默认速度 `80`。
-- 无有效分割误差时，保持 `TRACK_FALLBACK`：误差 `0`、默认速度 `80`，不会因为模型效果差而停车。
+- 有有效分割误差时，下发 `STATE_TRACK + TRACK_SPEED + flags=0x01`，默认速度 `0.5 m/s`。
+- 无有效分割误差时，保持 `TRACK_FALLBACK`：误差 `0`、默认速度 `0.5 m/s`，不会因为模型效果差而停车。
 - 控制主循环或共享内存连续 `2 s` 不再产生控制命令时，独立看门狗每 `0.2 s` 重复下发 `STATE_SAFE_STOP`。
 - 看门狗阈值可通过 `AR_CONTROL_WATCHDOG_TIMEOUT` 调整；停车重复间隔可通过 `AR_SAFE_STOP_REPEAT_INTERVAL` 调整。
 - TC264D 本地连续 `2.5 s` 未收到有效控制帧时，自行进入 `STATE_SAFE_STOP`。
@@ -55,8 +55,9 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 
 ## 已知风险
 
-- `TRACK_SPEED` 与 `TRACK_FALLBACK` 默认速度已临时降为 `80`；首次落地前仍应架空车轮确认方向和制动行为。
-- TC264D 电机 PWM 硬限幅已降为 `±2500` duty，避免编码器异常或 PID 过冲时满占空比空转。
+- `TRACK_SPEED` 与 `TRACK_FALLBACK` 默认速度已设为 `0.5 m/s`；首次落地前仍应架空车轮确认方向和制动行为。
+- TC264D 电机 PWM 硬限幅为 `±2500` duty；`STATE_TRACK` 当前使用约 `1500` duty 启动前馈 + 小 PI 修正，先解决电机死区和低速卡顿，PID 只做稳速微调。
+- `target_speed` 当前按同款 CarDo 车模参数粗换算为 `m/s`；TC264D 的 `actual_speed` 由编码器计数换算得到，后续仍需确认编码器正负号并用实测速度修正比例误差。
 - 视觉模型失效时会继续按 `TRACK_FALLBACK` 直行，这是当前为了观察低质量模型完整跑圈而保留的行为。
 - TC264D 本地串口输入超时已补充，但硬件断电、舵机/电机驱动异常和机械风险仍需现场急停手段。
 - Windows 定位程序必须把目标 IP 配成 RK3588S 板卡局域网 IP；`127.0.0.1` 只适用于同机测试。

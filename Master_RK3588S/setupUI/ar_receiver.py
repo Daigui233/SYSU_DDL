@@ -34,7 +34,7 @@ CONTROL_WATCHDOG_TIMEOUT = float(os.environ.get("AR_CONTROL_WATCHDOG_TIMEOUT", "
 CONTROL_WATCHDOG_INTERVAL = 0.1
 CONTROL_SAFE_STOP_REPEAT_INTERVAL = float(os.environ.get("AR_SAFE_STOP_REPEAT_INTERVAL", "0.2"))
 CONTROL_SCALE = 0.5
-TRACK_SPEED = float(os.environ.get("AR_TRACK_SPEED", "80.0"))
+TRACK_SPEED = float(os.environ.get("AR_TRACK_SPEED", "0.5"))
 TRACK_FALLBACK_SPEED = float(os.environ.get("AR_TRACK_FALLBACK_SPEED", str(TRACK_SPEED)))
 CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", "1"), 0)
 
@@ -894,9 +894,9 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
             f"st={feedback.get('state', 'N/A')} flags={flag_text}"
         )
         car_lines.append(
-            f"SPD in={feedback.get('input_target_speed', 0.0):.0f} "
-            f"tgt={feedback.get('motor_target', 0.0):.0f} "
-            f"act={feedback.get('actual_speed', 0.0):.1f}"
+            f"SPD in={feedback.get('input_target_speed', 0.0):.2f} "
+            f"tgt={feedback.get('motor_target', 0.0):.2f} "
+            f"act={feedback.get('actual_speed', 0.0):.2f}m/s"
         )
         car_lines.append(
             f"OUT m={feedback.get('motor_output', 0)} s={feedback.get('servo_output', 0)} "

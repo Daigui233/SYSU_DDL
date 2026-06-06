@@ -1,9 +1,47 @@
 
 #include "Control.h"
 
+#define MOTOR_PI                       (3.1415926f)
+#define MOTOR_CONTROL_PERIOD_S         (0.01f)
+#define MOTOR_WHEEL_DIAMETER_M         (0.064f)
+#define MOTOR_ENCODER_LINES            (512.0f)
+#define MOTOR_ENCODER_QUADRATURE       (4.0f)
+#define MOTOR_REDUCTION_RATIO          (2.7f)
+#define MOTOR_ENCODER_SIGN             (1.0f)  /* Use -1.0f if forward encoder speed is negative. */
+#define MOTOR_ENCODER_COUNT_TO_MPS     ((MOTOR_PI * MOTOR_WHEEL_DIAMETER_M) / (MOTOR_CONTROL_PERIOD_S * MOTOR_ENCODER_LINES * MOTOR_ENCODER_QUADRATURE * MOTOR_REDUCTION_RATIO))
+#define MOTOR_TARGET_DEADBAND_MPS      (0.03f)
+#define MOTOR_FEEDFORWARD_BASE_DUTY    (1450.0f)
+#define MOTOR_FEEDFORWARD_SPEED_GAIN   (250.0f)
+#define MOTOR_FEEDFORWARD_MAX_DUTY     (1800.0f)
+#define MOTOR_PID_CORRECTION_LIMIT     (700.0f)
+
 control_ctx_struct control_ctx;
 
 control_input_struct input_communication_temp;
+
+static float control_abs_float(float input)
+{
+    if(input < 0.0f)
+    {
+        return -input;
+    }
+
+    return input;
+}
+
+static float control_limit_float(float input, float max, float min)
+{
+    if(input > max)
+    {
+        input = max;
+    }
+    else if(input < min)
+    {
+        input = min;
+    }
+
+    return input;
+}
 
 static uint32 control_limit_uint32(int32 input, uint32 max, uint32 min)
 {
@@ -100,12 +138,12 @@ void control_apply_state_param(car_state_enum state)
     switch (state)
     {
     case STATE_TRACK:
-        control_ctx.param.motor_target_speed = 100.0f;
-        control_ctx.param.motor_kp = 1.4f;
-        control_ctx.param.motor_ki = 0.45f;
+        control_ctx.param.motor_target_speed = 0.5f;
+        control_ctx.param.motor_kp = 100.0f;
+        control_ctx.param.motor_ki = 8.0f;
         control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
-        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
+        control_ctx.param.motor_output_min = -MOTOR_PID_CORRECTION_LIMIT;
+        control_ctx.param.motor_output_max = MOTOR_PID_CORRECTION_LIMIT;
         control_ctx.param.servo_kp = 0.85f;
         control_ctx.param.servo_kd = 0.55f;
         control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
@@ -189,9 +227,12 @@ void control_apply_state_param(car_state_enum state)
 static void Motor_PID_Control(void)
 {
     float pid_out;
+    float feedforward;
+    float target_abs;
+    float output;
     int32 duty;
 
-    control_ctx.actual_speed = ((float)motor_get_speed()) / 38.0 * 5.0;
+    control_ctx.actual_speed = MOTOR_ENCODER_SIGN * ((float)motor_get_speed()) * MOTOR_ENCODER_COUNT_TO_MPS;
 
 
     control_ctx.motor_target = control_ctx.param.motor_target_speed;
@@ -200,9 +241,29 @@ static void Motor_PID_Control(void)
         control_ctx.motor_target = control_ctx.input.target_speed;
     }
 
-    pid_out = pid_incr_calc(&control_ctx.motor_pid, control_ctx.motor_target, control_ctx.actual_speed);
+    target_abs = control_abs_float(control_ctx.motor_target);
+    if (target_abs < MOTOR_TARGET_DEADBAND_MPS)
+    {
+        pid_incr_reset(&control_ctx.motor_pid);
+        control_ctx.motor_output = 0;
+        motor_set_duty(0);
+        return;
+    }
 
-    duty = (int32)pid_out;
+    pid_out = pid_incr_calc(&control_ctx.motor_pid, control_ctx.motor_target, control_ctx.actual_speed);
+    pid_out = control_limit_float(pid_out, MOTOR_PID_CORRECTION_LIMIT, -MOTOR_PID_CORRECTION_LIMIT);
+
+    feedforward = MOTOR_FEEDFORWARD_BASE_DUTY + MOTOR_FEEDFORWARD_SPEED_GAIN * target_abs;
+    feedforward = control_limit_float(feedforward, MOTOR_FEEDFORWARD_MAX_DUTY, MOTOR_FEEDFORWARD_BASE_DUTY);
+    if (control_ctx.motor_target < 0.0f)
+    {
+        feedforward = -feedforward;
+    }
+
+    output = feedforward + pid_out;
+    output = control_limit_float(output, (float)MOTOR_PWM_DUTY_LIMIT, -(float)MOTOR_PWM_DUTY_LIMIT);
+
+    duty = (int32)output;
     control_ctx.motor_output = duty;
 
     motor_set_duty(duty);

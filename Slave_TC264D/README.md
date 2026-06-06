@@ -29,6 +29,9 @@ TC264D 下位机负责接收 RK3588S 控制帧，执行电机/舵机控制，并
 - 上位机发送 `STATE_TRACK + target_speed + flags=0x01`。
 - 下位机使用误差控制舵机，并使用上位机目标速度控制电机。
 - 电机 PWM 硬限幅当前为 `±2500` duty，防止编码器异常或 PID 调参不当时直接冲到满占空比。
+- `target_speed` 当前按同款 CarDo 车模参数粗换算为 `m/s`；`actual_speed` 由编码器计数、`64 mm` 轮径、`512` 线编码器、`4` 倍频、`2.7` 减速比和 `10 ms` 控制周期换算得到。
+- `STATE_TRACK` 电机速度环当前采用约 `1450` duty 启动前馈 + 小 PI 修正：目标速度非零时先越过电机启动死区，PID 只负责稳速微调，最终输出仍受 `±2500` duty 硬限幅保护。
+- 前馈 duty 不是速度标定，只是静摩擦/启动死区补偿；若正转时 `actual_speed` 为负，需要把 `Control.c` 中的 `MOTOR_ENCODER_SIGN` 改为 `-1.0f` 后再调 PID。
 
 `STATE_SAFE_STOP` 当前用于两类断流保护：RK3588S 控制主循环连续 `2 s` 没有命令时，上位机每 `0.2 s` 重复下发停车命令；TC264D 连续 `2.5 s` 没收到有效控制帧时，本地自行进入停车状态。模型输出无效但主循环仍运行时，上位机会继续发送 `STATE_TRACK + TRACK_FALLBACK`，不会触发停车。
 
@@ -73,7 +76,8 @@ TC264D 本地输入超时不改变串口协议，只使用已解码控制帧的�
 
 1. feedback 是否持续增长。
 2. `state` 是否为 `TRACK`，`flags` 是否为 `0x01`。
-3. `input_target_speed` 和 `motor_target` 是否大于 `0`。
-4. `motor_output`、`actual_speed` 和 `servo_output` 是否变化。
+3. `input_target_speed` 和 `motor_target` 是否大于 `0`，单位是否为预期的 `m/s`。
+4. `motor_output`、`actual_speed` 和 `servo_output` 是否变化；架空正转时若 `actual_speed` 为负，先修正 `MOTOR_ENCODER_SIGN`。
+5. 若 `motor_output` 长时间接近 `±2500` 但 `actual_speed` 仍接近 `0`，优先检查编码器方向、机械空转和速度换算参数。
 
 源码 `.c/.h` 保持 GBK 编码以匹配 AURIX Development Studio；Markdown 使用 UTF-8。当前工程在 ADS 中可达到 `0 errors, 0 warnings`。

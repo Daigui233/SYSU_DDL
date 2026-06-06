@@ -35,17 +35,17 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 - 检测模型当前识别 `gold / car / human`，但只用于画框，不参与状态切换。
 - OCR/API 尚未接入。
 - 当前分割和检测模型效果较差，仍需继续训练和优化。
-- 无有效分割误差时，当前进入 `TRACK_FALLBACK`，误差 `0`、默认速度 `80`，不会因为模型效果差而停车。
+- 无有效分割误差时，当前进入 `TRACK_FALLBACK`，误差 `0`、默认速度 `0.5 m/s`，不会因为模型效果差而停车。
 - 控制主循环连续 `2 s` 不再发送任何命令时，独立看门狗每 `0.2 s` 重复下发 `STATE_SAFE_STOP`；正常视觉控制仍只下发 `STATE_TRACK`。
 - 现场若推理周期可能超过 `2 s`，可通过 `AR_CONTROL_WATCHDOG_TIMEOUT` 调整看门狗阈值。
-- 默认巡线速度可通过 `AR_TRACK_SPEED` 调整；`TRACK_FALLBACK` 可通过 `AR_TRACK_FALLBACK_SPEED` 单独覆盖。
+- 默认巡线速度为 `0.5 m/s`，可通过 `AR_TRACK_SPEED` 调整；`TRACK_FALLBACK` 可通过 `AR_TRACK_FALLBACK_SPEED` 单独覆盖。
 
 ## 后续扩展接口
 
 串口控制帧已包含：
 
 - `track_error`：当前由分割模型产生的转向误差。
-- `target_speed`：当前状态目标速度。
+- `target_speed`：当前状态目标速度，单位按 TC264D 侧粗换算为 `m/s`。
 - `state_cmd`：上位机任务状态。
 - `flags`：控制选项。
 
@@ -83,4 +83,4 @@ WebUI/HUD 优先确认：
 - `http://<RK3588S-IP>:9105/pose_status`
 - `http://<RK3588S-IP>:9105/pose_packet`
 
-`/pose_status` 中的 `control` 字段每 `0.5 s` 刷新，并包含控制来源、`track_error`、目标速度、`state_cmd`、flags 和最近一次串口发送结果。
+`/pose_status` 中的 `control` 字段每 `0.5 s` 刷新，并包含控制来源、`track_error`、目标速度（m/s）、`state_cmd`、flags 和最近一次串口发送结果。
