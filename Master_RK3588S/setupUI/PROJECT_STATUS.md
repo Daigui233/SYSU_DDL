@@ -34,6 +34,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 
 - 手柄遥控只用于调试和采集分割数据集，默认不启用。
 - Windows 定位 EXE 勾选 `Gamepad Mode` 后，额外向板卡 `9010` 发送 `gamepad_control` 包。
+- `Gamepad Mode` 由 Windows 定位 EXE 内部独立定时器发送，频率与当前相机/视频帧率一致，不依赖 Tag、标定或 `robot_position` 成功发送。
 - RK3588S 只有收到 `gamepad_mode=true` 且未超过 `0.45 s` 的新鲜遥控包时，才临时覆盖视觉控制。
 - 取消勾选、遥控包超时、或使用赛方定位模块时，RK3588S 自动回到视觉巡线。
 - 遥控模式不影响定位：`robot_position` 仍走 `9005`，并继续转发到 `127.0.0.1:9006`。
@@ -49,7 +50,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 | 可选手柄遥控入口 | `0.0.0.0:9010` |
 | 定位状态 HTTP | `0.0.0.0:9105` |
 | 融合视频共享内存 | `shm_ar_video` |
-| TC264D 串口 | 默认 `/dev/ttyUSB0`，`460800` baud，写超时 `0.05 s`；打开失败会自动重试，可用 `AR_CAR_SERIAL_PORT` 覆盖 |
+| TC264D 串口 | `/dev/ttyUSB0`，`460800` baud，写超时 `0.05 s` |
 
 当前定位约定以 Windows AprilTag 程序为准：场地 `4 m x 3 m`，定位预览原点在右下角，`+X` 向左、`+Z` 向上；Yaw 使用 `euler[1]`，`0 deg -> +X`、`+90 deg -> +Z`。Windows 端已对输出位姿做轻量滤波。官方 AR 场景资产的 X/Z 平移轴与 Windows 定位预览互换，因此 RK3588S 仅在转发到 `127.0.0.1:9006` 时交换 `pos[0]` 和 `pos[2]`，Yaw 保持不变；定位仍不转换为控车误差。
 

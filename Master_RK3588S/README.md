@@ -50,6 +50,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 - 未收到遥控包、遥控包超过 `0.45 s`、或定位 EXE 取消 `Gamepad Mode` 时，控制源自动回到视觉巡线。
 - 遥控有效时，`RT` 映射 `target_speed`，`LX` 映射 `track_error`，`LT >= 90%` 或手柄断连映射 `STATE_SAFE_STOP`。
 - 遥控接管只覆盖最终发给 TC264D 的控制帧，不影响 `9005 -> 9006` 定位转发，也不修改 AR 融合链路。
+- Windows 定位 EXE 内部用独立定时器发送 `9010` 遥控包；没有固定 Tag、车载 Tag 或有效 `robot_position` 时，遥控仍可工作。
 - RK 侧对遥控速度和误差再次限幅：默认最大速度 `0.8 m/s`，最大 `track_error` 绝对值 `240`，可通过 `AR_GAMEPAD_MAX_SPEED_MPS` / `AR_GAMEPAD_MAX_TRACK_ERROR` 调整。
 
 ## 后续扩展接口
@@ -79,7 +80,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 - WebUI 端口号：`9006`。
 - 可选手柄遥控入口：`0.0.0.0:9010`。
 - UNITY 同步端口：`9003`。
-- 控车串口默认：`/dev/ttyUSB0`，`460800` baud，写超时 `0.05 s`；启动时打不开会每秒重试。若现场枚举成其他设备，可用 `AR_CAR_SERIAL_PORT=/dev/ttyUSB1` 或 `AR_CAR_SERIAL_PORT=/dev/ttyACM0` 临时覆盖。
+- 控车串口：`/dev/ttyUSB0`，`460800` baud。
 
 ## 调试重点
 

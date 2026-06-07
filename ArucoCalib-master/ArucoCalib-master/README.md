@@ -10,6 +10,7 @@ Windows 顶置相机定位程序负责检测 AprilTag 36h11，解算小车坐标
 - 当前分割和检测模型效果较差；检测模型只画 `gold / car / human` 检测框。
 - 检测任务决策、OCR/API 和多状态控制均属于后续扩展。
 - 手柄遥控默认关闭；只有前端勾选 `Gamepad Mode` 并持续发出 `gamepad_control` 包时，RK3588S 才临时覆盖视觉控车。
+- `Gamepad Mode` 使用定位 EXE 内部独立定时器发送，频率与当前相机/视频帧率一致；它不依赖固定 Tag、车载 Tag、标定状态或 `robot_position` 是否成功发送。
 - 遥控模式下定位 `robot_position` 仍正常发送到 `9005`，不会影响 AR 融合和轨迹显示。
 
 ## 运行
@@ -68,12 +69,12 @@ EXE 使用 `dist/config.yaml`。源码运行使用根目录 `config.yaml`。
 
 坐标单位为米，Yaw 单位为度。目标地址应填写 RK3588S 的局域网 IP，不要填写 Windows 自己的 `127.0.0.1`。
 
-手柄遥控包仅在 `Gamepad Mode` 勾选时发送，端口为 `9010`，类型为 `gamepad_control`。映射关系：
+手柄遥控包仅在 `Gamepad Mode` 勾选时发送，端口为 `9010`，类型为 `gamepad_control`。它与定位包 `9005` 是独立链路；没有定位数据时仍可控车。映射关系：
 
 - `RT`：`target_speed`，默认最大 `0.5 m/s`。
 - `LX`：`track_error`，默认比例 `210`。
 - `LT >= 90%` 或手柄断连：`STATE_SAFE_STOP`。
-- 取消 `Gamepad Mode` 或停止摄像头时，会发送一次 `gamepad_mode=false`，RK3588S 随后回到视觉控车。
+- 取消 `Gamepad Mode` 或关闭程序时，会发送一次 `gamepad_mode=false`，RK3588S 随后回到视觉控车。
 
 这条遥控链路只覆盖 TC264D 控制帧，不改变定位输出、AR 转发或 WebUI 端口。
 

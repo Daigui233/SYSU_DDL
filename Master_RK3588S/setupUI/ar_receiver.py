@@ -36,8 +36,6 @@ CONTROL_SCALE = 0.5
 TRACK_SPEED = float(os.environ.get("AR_TRACK_SPEED", "0.5"))
 TRACK_FALLBACK_SPEED = float(os.environ.get("AR_TRACK_FALLBACK_SPEED", str(TRACK_SPEED)))
 CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", "1"), 0)
-CAR_SERIAL_PORT = os.environ.get("AR_CAR_SERIAL_PORT", "/dev/ttyUSB0")
-CAR_SERIAL_BAUD = int(os.environ.get("AR_CAR_SERIAL_BAUD", "460800"))
 GAMEPAD_CONTROL_HOST = os.environ.get("AR_GAMEPAD_CONTROL_HOST", "0.0.0.0")
 GAMEPAD_CONTROL_PORT = int(os.environ.get("AR_GAMEPAD_CONTROL_PORT", "9010"))
 GAMEPAD_CONTROL_TTL = float(os.environ.get("AR_GAMEPAD_CONTROL_TTL", "0.45"))
@@ -106,10 +104,10 @@ def create_car_controller():
         print("CarController unavailable; car serial control disabled")
         return DisabledCarController()
     try:
-        return CarController(port=CAR_SERIAL_PORT, baudrate=CAR_SERIAL_BAUD)
+        return CarController(port="/dev/ttyUSB0", baudrate=460800)
     except TypeError:
         try:
-            return CarController(CAR_SERIAL_PORT, CAR_SERIAL_BAUD)
+            return CarController("/dev/ttyUSB0", 460800)
         except Exception as exc:
             print(f"CarController init failed: {exc}; car serial control disabled")
             return DisabledCarController()

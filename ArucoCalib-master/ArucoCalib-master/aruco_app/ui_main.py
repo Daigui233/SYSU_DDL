@@ -226,6 +226,8 @@ class MainWindow(QMainWindow):
         self.cap = None
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
+        self.gamepad_timer = QTimer()
+        self.gamepad_timer.timeout.connect(self._send_gamepad_control)
         self.is_detecting = False
 
         # Session-level timestamp for optional MP4 recordings.
@@ -425,9 +427,23 @@ class MainWindow(QMainWindow):
 
     def on_gamepad_mode_changed(self, _state):
         if not self.gamepad_mode_chk.isChecked():
+            self.gamepad_timer.stop()
             self._send_gamepad_disabled()
             return
+        self._sync_gamepad_timer()
         self._send_gamepad_control(force=True)
+        self.gamepad_timer.start()
+
+    def _gamepad_interval_ms(self):
+        fps = float(self.source_fps) if self.source_fps else float(getattr(self.cfg, "CAMERA_FPS", 60.0))
+        if fps <= 0.0:
+            fps = 60.0
+        return max(1, int(round(1000.0 / fps)))
+
+    def _sync_gamepad_timer(self):
+        interval_ms = self._gamepad_interval_ms()
+        if self.gamepad_timer.interval() != interval_ms:
+            self.gamepad_timer.setInterval(interval_ms)
 
     def _send_gamepad_control(self, force=False):
         if not hasattr(self, "gamepad_mode_chk") or not self.gamepad_mode_chk.isChecked():
@@ -1057,6 +1073,7 @@ class MainWindow(QMainWindow):
 
         interval_ms = max(1, int(round(1000.0 / self.source_fps)))
         self.timer.start(interval_ms)
+        self._sync_gamepad_timer()
         actual_w = int(round(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
         actual_h = int(round(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         self.camera_status_label.setText(
@@ -1066,8 +1083,6 @@ class MainWindow(QMainWindow):
 
     def stop_camera(self):
         """Stop current capture (camera/video)."""
-        if hasattr(self, "gamepad_mode_chk") and self.gamepad_mode_chk.isChecked():
-            self._send_gamepad_disabled()
         if self.cap is not None:
             self.timer.stop()
             self.cap.release()
@@ -1104,6 +1119,7 @@ class MainWindow(QMainWindow):
 
         interval_ms = max(1, int(round(1000.0 / self.source_fps)))
         self.timer.start(interval_ms)
+        self._sync_gamepad_timer()
         self.status_label.setText(f"Status: Video started - {file_path} (FPS={self.source_fps:.1f})")
 
     def _update_trace_max_len(self):
@@ -1212,7 +1228,6 @@ class MainWindow(QMainWindow):
                 if self.camera_mirror_chk.isChecked():
                     frame = cv2.flip(frame, 1)
                 self.current_image = frame
-                self._send_gamepad_control()
 
                 # Optional raw frame recording (mp4), independent from inference.
                 if self.is_recording and self.video_recorder is not None:
@@ -1606,6 +1621,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event"""
+        if hasattr(self, "gamepad_mode_chk") and self.gamepad_mode_chk.isChecked():
+            self.gamepad_timer.stop()
+            self._send_gamepad_disabled()
         self.stop_camera()
         event.accept()
 

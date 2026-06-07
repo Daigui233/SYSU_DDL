@@ -46,6 +46,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 无有效分割误差但未超过 `3 s` 时，当前 `TRACK_FALLBACK` 会以误差 `0`、默认速度 `0.5 m/s` 继续直行。
 - 连续 `3 s` 没有有效 `track_error` 时，RK3588S 进入 `LINE_LOSS_SAFE_STOP` 并重复下发 `STATE_SAFE_STOP`；再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + VISION`。
 - 手柄遥控仅用于调试和采集数据：默认关闭，只有定位 EXE 勾选 `Gamepad Mode` 后才通过 UDP `9010` 接管；关闭、丢包超时或赛方定位模块没有遥控包时，一律回到视觉控车。
+- `Gamepad Mode` 在定位 EXE 内部用独立定时器发送，频率与当前相机/视频帧率一致；它不依赖固定 Tag、车载 Tag、标定状态或 `robot_position` 是否成功发送。
 - 遥控模式下定位 UDP `9005` 仍正常发送并被 RK3588S 转发到 `9006`，不会因为手柄接管而停止 AR 融合。
 - 遥控映射：右扳机 `RT` 控制 `target_speed`，左摇杆横轴 `LX` 控制 `track_error`，左扳机 `LT >= 90%` 或手柄断连时发送 `STATE_SAFE_STOP`。
 - TC264D 保留现有串口协议，同时增加 `2.5 s` 本地输入超时；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。
@@ -63,7 +64,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - WebUI 定位数据地址填写 `127.0.0.1`，端口填写 `9006`。
 - 手柄遥控输入为独立 UDP `9010`，只接收 `type=gamepad_control`，不复用定位包。
 - UNITY 同步端口为 `9003`。
-- 控车串口默认 `/dev/ttyUSB0`、`460800` baud，上位机串口写入带 `write_timeout=0.05 s`；启动时打不开会自动重试，现场可用 `AR_CAR_SERIAL_PORT` 临时指定实际设备。
+- 控车串口为 `/dev/ttyUSB0`，`460800` baud。
 
 场地为 `4 m × 3 m`，Windows 定位预览原点在右下角，`+X` 向左、`+Z` 向上；Yaw 使用 `euler[1]`，`0° -> +X`、`+90° -> +Z`。固定标定 Tag 1～4 均为 `20 cm × 20 cm`，Windows 定位端会对输出坐标和 Yaw 做轻量滤波。由于官方 AR 场景资产的 X/Z 平移轴与定位预览互换，RK3588S 仅在转发到 `9006` 时交换 `pos[0]` 和 `pos[2]`，不改变 Yaw。这些坐标只用于 AR 定位与融合，不用于直接控车。
 
