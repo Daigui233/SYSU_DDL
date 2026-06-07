@@ -23,10 +23,12 @@ OLD_FEEDBACK_PAYLOAD_LEN = 11
 
 
 class CarController:
-    def __init__(self, port="/dev/ttyUSB0", baudrate=460800):
+    def __init__(self, port="/dev/ttyUSB0", baudrate=460800, reconnect_interval=1.0):
         self.ser = None
         self._rx_buffer = bytearray()
         self._lock = threading.Lock()
+        self._rx_lock = threading.Lock()
+        self._open_lock = threading.Lock()
         self._stop = False
         self.feedback_count = 0
         self.feedback_bad_count = 0
@@ -35,23 +37,21 @@ class CarController:
         self.last_error = ""
         self.port = port
         self.baudrate = baudrate
+        self.reconnect_interval = float(reconnect_interval)
+        self._last_open_attempt = 0.0
+        self._last_open_error = ""
 
         if serial is None:
             self.last_error = "serial module unavailable"
             print("serial module unavailable; vision continues")
             return
-        try:
-            self.ser = serial.Serial(port, baudrate, timeout=0.02)
-            print(f"serial {port} opened")
-            self._reader = threading.Thread(target=self._read_loop, name="tc264-feedback", daemon=True)
-            self._reader.start()
-        except Exception as exc:
-            self.last_error = str(exc)
-            print(f"serial open failed: {exc}; vision continues")
-            self.ser = None
+
+        self._ensure_open(force=True)
+        self._reader = threading.Thread(target=self._read_loop, name="tc264-feedback", daemon=True)
+        self._reader.start()
 
     def send_cmd(self, track_error: float, target_speed: float, state_cmd: int = STATE_TRACK, flags: int = CONTROL_FLAG_USE_TARGET_SPEED):
-        if self.ser is None or not getattr(self.ser, "is_open", False):
+        if not self._ensure_open():
             return False
         payload = struct.pack(
             "<BBBffBB",
@@ -67,15 +67,18 @@ class CarController:
         try:
             frame = payload + struct.pack("<B", checksum)
             with self._lock:
-                written = self.ser.write(frame)
+                ser = self.ser
+                if ser is None or not getattr(ser, "is_open", False):
+                    return False
+                written = ser.write(frame)
                 if written != len(frame):
                     self.last_error = f"serial write incomplete: {written}/{len(frame)}"
+                    self._drop_serial_locked()
                     return False
                 self.last_error = ""
                 return True
         except Exception as exc:
-            with self._lock:
-                self.last_error = str(exc)
+            self._drop_serial(exc)
             return False
 
     def get_feedback(self):
@@ -104,21 +107,81 @@ class CarController:
 
     def _read_loop(self):
         while not self._stop:
+            if not self._ensure_open():
+                time.sleep(0.05)
+                continue
             try:
-                if self.ser is None or not getattr(self.ser, "is_open", False):
+                with self._lock:
+                    ser = self.ser
+                if ser is None or not getattr(ser, "is_open", False):
                     time.sleep(0.05)
                     continue
-                waiting = getattr(self.ser, "in_waiting", 0)
-                data = self.ser.read(waiting or 1)
+                waiting = getattr(ser, "in_waiting", 0)
+                data = ser.read(waiting or 1)
                 if data:
-                    self._rx_buffer.extend(data)
-                    self._parse_feedback_buffer()
+                    with self._rx_lock:
+                        self._rx_buffer.extend(data)
+                        self._parse_feedback_buffer()
                 else:
                     time.sleep(0.005)
             except Exception as exc:
-                with self._lock:
-                    self.last_error = str(exc)
+                self._drop_serial(exc)
                 time.sleep(0.05)
+
+    def _ensure_open(self, force=False):
+        if serial is None:
+            return False
+        now = time.time()
+        with self._lock:
+            ser = self.ser
+            if ser is not None and getattr(ser, "is_open", False):
+                return True
+            if not force and now - self._last_open_attempt < self.reconnect_interval:
+                return False
+            self._last_open_attempt = now
+        if not self._open_lock.acquire(blocking=False):
+            return False
+        try:
+            with self._lock:
+                ser = self.ser
+                if ser is not None and getattr(ser, "is_open", False):
+                    return True
+            new_ser = serial.Serial(self.port, self.baudrate, timeout=0.02)
+            with self._rx_lock:
+                self._rx_buffer.clear()
+            with self._lock:
+                self.ser = new_ser
+                self.last_error = ""
+                self._last_open_error = ""
+            print(f"serial {self.port} opened")
+            return True
+        except Exception as exc:
+            msg = str(exc)
+            should_print = False
+            with self._lock:
+                self.last_error = msg
+                if msg != self._last_open_error:
+                    self._last_open_error = msg
+                    should_print = True
+            if should_print:
+                print(f"serial open failed: {msg}; retrying")
+            return False
+        finally:
+            self._open_lock.release()
+
+    def _drop_serial_locked(self):
+        ser = self.ser
+        self.ser = None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _drop_serial(self, exc):
+        with self._lock:
+            self.last_error = str(exc)
+            self._drop_serial_locked()
 
     def _parse_feedback_buffer(self):
         while self._rx_buffer:

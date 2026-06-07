@@ -50,16 +50,16 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 | 可选手柄遥控入口 | `0.0.0.0:9010` |
 | 定位状态 HTTP | `0.0.0.0:9105` |
 | 融合视频共享内存 | `shm_ar_video` |
-| TC264D 串口 | `/dev/ttyUSB0`，`460800` baud，写超时 `0.05 s` |
+| TC264D 串口 | 固定 `/dev/ttyUSB0`，`460800` baud；打开失败或读写异常时约每 `1 s` 自动重连 |
 
-当前定位约定以 Windows AprilTag 程序为准：场地 `4 m x 3 m`，定位预览原点在右下角，`+X` 向左、`+Z` 向上；Yaw 使用 `euler[1]`，`0 deg -> +X`、`+90 deg -> +Z`。Windows 端已对输出位姿做轻量滤波。官方 AR 场景资产的 X/Z 平移轴与 Windows 定位预览互换，因此 RK3588S 仅在转发到 `127.0.0.1:9006` 时交换 `pos[0]` 和 `pos[2]`，Yaw 保持不变；定位仍不转换为控车误差。
+当前定位约定以 Windows AprilTag 程序为准：场地 `4 m x 3 m`，定位预览原点在右下角，`+X` 向左、`+Z` 向上，Yaw 使用 `euler[1]`，`0 deg -> +X`、`+90 deg -> +Z`。Windows 端已对输出位姿做轻量滤波。官方 AR 场景资产的 X/Z 平移轴与 Windows 定位预览互换，因此 RK3588S 仅在转发到 `127.0.0.1:9006` 时交换 `pos[0]` 和 `pos[2]`，Yaw 保持不变；定位仍不转换为控车误差。
 
 ## 重点文件
 
 | 文件 | 作用 |
 | --- | --- |
 | `ar_receiver.py` | 定位接收/转发、融合视频读取、双模型推理、视觉巡线控制、可选手柄接管和 HUD |
-| `serial_comm.py` | TC264D 控制帧和反馈帧串口通信 |
+| `serial_comm.py` | TC264D 控制帧和反馈帧串口通信，包含固定串口自动重连 |
 | `infer_wrap/base/seg_func.py` | 分割后处理、中线提取和 `track_error` 计算 |
 | `infer_wrap/base/func.py` | 检测模型后处理与画框 |
 | `templates/index.html` | WebUI 页面和右侧链路调试状态栏 |
