@@ -82,13 +82,13 @@ extern "C"
         pid_pstn_struct servo_pid;
 
         // 控制周期标志。
-        uint8 periodic_interrupt_flag;
+        volatile uint8 periodic_interrupt_flag;
 
         // 周期计数。
-        uint32 interrupt_count;
+        volatile uint32 interrupt_count;
 
         // 周期计数保持值。
-        uint32 interrupt_count_hold;
+        volatile uint32 interrupt_count_hold;
 
     } control_ctx_struct;
 

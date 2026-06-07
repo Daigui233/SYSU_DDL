@@ -38,7 +38,7 @@ TRACK_FALLBACK_SPEED = float(os.environ.get("AR_TRACK_FALLBACK_SPEED", str(TRACK
 CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", "1"), 0)
 GAMEPAD_CONTROL_HOST = os.environ.get("AR_GAMEPAD_CONTROL_HOST", "0.0.0.0")
 GAMEPAD_CONTROL_PORT = int(os.environ.get("AR_GAMEPAD_CONTROL_PORT", "9010"))
-GAMEPAD_CONTROL_TTL = float(os.environ.get("AR_GAMEPAD_CONTROL_TTL", "0.45"))
+GAMEPAD_CONTROL_TTL = float(os.environ.get("AR_GAMEPAD_CONTROL_TTL", "3.0"))
 GAMEPAD_MAX_SPEED_MPS = float(os.environ.get("AR_GAMEPAD_MAX_SPEED_MPS", "0.8"))
 GAMEPAD_MAX_TRACK_ERROR = float(os.environ.get("AR_GAMEPAD_MAX_TRACK_ERROR", "240.0"))
 
@@ -1043,6 +1043,10 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
             f"st={feedback.get('state', 'N/A')} flags={flag_text}"
         )
         car_lines.append(
+            f"RX raw={feedback.get('raw_rx', 0)} drop={feedback.get('raw_drop', 0)} "
+            f"bad={feedback.get('bad', 0)}"
+        )
+        car_lines.append(
             f"SPD in={feedback.get('input_target_speed', 0.0):.2f} "
             f"tgt={feedback.get('motor_target', 0.0):.2f} "
             f"act={feedback.get('actual_speed', 0.0):.2f}m/s"
@@ -1056,7 +1060,12 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
         )
     else:
         err = short_text(feedback.get("error", "waiting"), 28)
-        car_lines.append(f"TC264 waiting fb={feedback.get('count', 0)} bad={feedback.get('bad', 0)}")
+        car_lines.append(
+            f"TC264 waiting fb={feedback.get('count', 0)} raw={feedback.get('raw_rx', 0)} "
+            f"drop={feedback.get('raw_drop', 0)} bad={feedback.get('bad', 0)}"
+        )
+        if feedback.get("last_rx"):
+            car_lines.append(f"last rx {short_text(feedback.get('last_rx', ''), 28)}")
         car_lines.append(err)
     fps_line = f"FPS {fps:.1f}" if fps is not None else "FPS N/A"
 

@@ -47,7 +47,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 手柄链路用于低速遥控和采集分割数据集，不是比赛默认控制链路：
 
 - RK3588S 监听 `0.0.0.0:9010`，只接收 `type=gamepad_control`。
-- 未收到遥控包、遥控包超过 `0.45 s`、或定位 EXE 取消 `Gamepad Mode` 时，控制源自动回到视觉巡线。
+- 未收到遥控包、遥控包超过 `3.0 s`、或定位 EXE 取消 `Gamepad Mode` 时，控制源自动回到视觉巡线；取消勾选会主动发送关闭包，正常关闭不需要等待超时。
 - 遥控有效时，`RT` 映射 `target_speed`，`LX` 映射 `track_error`，`LT >= 90%` 或手柄断连映射 `STATE_SAFE_STOP`。
 - 遥控接管只覆盖最终发给 TC264D 的控制帧，不影响 `9005 -> 9006` 定位转发，也不修改 AR 融合链路。
 - Windows 定位 EXE 内部用独立定时器发送 `9010` 遥控包；没有固定 Tag、车载 Tag 或有效 `robot_position` 时，遥控仍可工作。

@@ -32,6 +32,9 @@ class CarController:
         self._stop = False
         self.feedback_count = 0
         self.feedback_bad_count = 0
+        self.raw_rx_count = 0
+        self.raw_drop_count = 0
+        self.last_rx_hex = ""
         self.last_feedback = None
         self.last_feedback_ts = 0.0
         self.last_error = ""
@@ -87,6 +90,9 @@ class CarController:
             ts = self.last_feedback_ts
             count = self.feedback_count
             bad = self.feedback_bad_count
+            raw_rx = self.raw_rx_count
+            raw_drop = self.raw_drop_count
+            last_rx = self.last_rx_hex
             err = self.last_error
         if data is None:
             return {
@@ -94,6 +100,9 @@ class CarController:
                 "port": self.port,
                 "count": count,
                 "bad": bad,
+                "raw_rx": raw_rx,
+                "raw_drop": raw_drop,
+                "last_rx": last_rx,
                 "age": None,
                 "error": err,
             }
@@ -101,6 +110,9 @@ class CarController:
         data["port"] = self.port
         data["count"] = count
         data["bad"] = bad
+        data["raw_rx"] = raw_rx
+        data["raw_drop"] = raw_drop
+        data["last_rx"] = last_rx
         data["age"] = time.time() - ts if ts else None
         data["error"] = err
         return data
@@ -119,6 +131,9 @@ class CarController:
                 waiting = getattr(ser, "in_waiting", 0)
                 data = ser.read(waiting or 1)
                 if data:
+                    with self._lock:
+                        self.raw_rx_count += len(data)
+                        self.last_rx_hex = data[-12:].hex(" ")
                     with self._rx_lock:
                         self._rx_buffer.extend(data)
                         self._parse_feedback_buffer()
@@ -187,13 +202,19 @@ class CarController:
         while self._rx_buffer:
             head_index = self._rx_buffer.find(bytes([FRAME_HEAD]))
             if head_index < 0:
+                with self._lock:
+                    self.raw_drop_count += len(self._rx_buffer)
                 del self._rx_buffer[:]
                 return
             if head_index > 0:
+                with self._lock:
+                    self.raw_drop_count += head_index
                 del self._rx_buffer[:head_index]
             if len(self._rx_buffer) < 4:
                 return
             if self._rx_buffer[1] != TX_ADDR:
+                with self._lock:
+                    self.raw_drop_count += 1
                 del self._rx_buffer[0]
                 continue
             payload_len = self._rx_buffer[2]

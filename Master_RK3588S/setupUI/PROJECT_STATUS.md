@@ -35,7 +35,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 - 手柄遥控只用于调试和采集分割数据集，默认不启用。
 - Windows 定位 EXE 勾选 `Gamepad Mode` 后，额外向板卡 `9010` 发送 `gamepad_control` 包。
 - `Gamepad Mode` 由 Windows 定位 EXE 内部独立定时器发送，频率与当前相机/视频帧率一致，不依赖 Tag、标定或 `robot_position` 成功发送。
-- RK3588S 只有收到 `gamepad_mode=true` 且未超过 `0.45 s` 的新鲜遥控包时，才临时覆盖视觉控制。
+- RK3588S 只有收到 `gamepad_mode=true` 且未超过 `3.0 s` 的新鲜遥控包时，才临时覆盖视觉控制；取消勾选会主动发送关闭包，正常关闭不需要等待超时。
 - 取消勾选、遥控包超时、或使用赛方定位模块时，RK3588S 自动回到视觉巡线。
 - 遥控模式不影响定位：`robot_position` 仍走 `9005`，并继续转发到 `127.0.0.1:9006`。
 - 默认映射：`RT -> target_speed`，`LX -> track_error`，`LT >= 90%` 或手柄断连 -> `STATE_SAFE_STOP`。
