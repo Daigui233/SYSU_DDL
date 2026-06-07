@@ -9,14 +9,19 @@ import numpy as np
 OBJ_THRESH, NMS_THRESH = 0.5, 0.45
 IMG_SIZE = (640, 640)
 
-_DEFAULT_CLASSES = ("person", "bicycle", "car", "motorbike ", "aeroplane ", "bus ", "train", "truck ", "boat", "traffic light",
-            "fire hydrant", "stop sign ", "parking meter", "bench", "bird", "cat", "dog ", "horse ", "sheep", "cow", "elephant",
-           "bear", "zebra ", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-           "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass",
-            "cup", "fork", "knife ", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza ",
-            "donut", "cake", "chair", "sofa", "pottedplant", "bed", "diningtable", "toilet ", "tvmonitor", "laptop", "mouse",
-            "remote ", "keyboard ", "cell phone", "microwave ", "oven ", "toaster", "sink", "refrigerator ", "book", "clock", "vase",
-            "scissors ", "teddy bear ", "hair drier", "toothbrush ")
+_DEFAULT_CLASSES = (
+    "Door",
+    "SpeedSign",
+    "TurnSign",
+    "Stone",
+    "BeginSign",
+    "EndSign",
+    "Crosswalk",
+    "TrafficLight",
+    "Coin",
+    "Human",
+    "Car",
+)
 
 def _load_classes():
     names_path = Path(__file__).resolve().parent / "model" / "coco.names"
@@ -32,6 +37,7 @@ def _load_classes():
 
 
 CLASSES = _load_classes()
+NUM_CLASSES = len(CLASSES)
 
 
 # 
@@ -188,8 +194,14 @@ def post_process(input_data, img_shape=(640, 640)):
     # 解析每个分支的输出
     for i in range(defualt_branch):
         boxes.append(box_process(input_data[pair_per_branch * i], img_shape))
-        classes_conf.append(input_data[pair_per_branch * i + 1])
-        scores.append(np.ones_like(input_data[pair_per_branch * i + 1][:, :1, :, :], dtype=np.float32))
+        class_output = input_data[pair_per_branch * i + 1]
+        if class_output.shape[1] != NUM_CLASSES:
+            raise ValueError(
+                f"detection model outputs {class_output.shape[1]} classes, "
+                f"but {NUM_CLASSES} labels are configured"
+            )
+        classes_conf.append(class_output)
+        scores.append(np.ones_like(class_output[:, :1, :, :], dtype=np.float32))
 
     # 展平特征图
     def sp_flatten(_in):
