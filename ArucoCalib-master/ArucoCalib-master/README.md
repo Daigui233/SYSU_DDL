@@ -71,9 +71,10 @@ EXE 使用 `dist/config.yaml`。源码运行使用根目录 `config.yaml`。
 
 手柄遥控包仅在 `Gamepad Mode` 勾选时发送，端口为 `9010`，类型为 `gamepad_control`。它与定位包 `9005` 是独立链路；没有定位数据时仍可控车。映射关系：
 
-- `RT`：`target_speed`，默认最大 `0.5 m/s`。
+- `RT` 前进、`LT` 倒车：`target_speed=(RT-LT)*1.0 m/s`。
 - `LX`：`track_error`，默认比例 `210`。
-- `LT >= 90%` 或手柄断连：`STATE_SAFE_STOP`。
+- `B` 键或手柄断连：`STATE_SAFE_STOP`。
+- 手柄读取优先使用 XInput；蓝牙手柄若不是 XInput，会尝试 pygame/DirectInput 兜底。
 - 取消 `Gamepad Mode` 或关闭程序时，会发送一次 `gamepad_mode=false`，RK3588S 随后回到视觉控车。
 
 这条遥控链路只覆盖 TC264D 控制帧，不改变定位输出、AR 转发或 WebUI 端口。

@@ -38,7 +38,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 - RK3588S 只有收到 `gamepad_mode=true` 且未超过 `3.0 s` 的新鲜遥控包时，才临时覆盖视觉控制；取消勾选会主动发送关闭包，正常关闭不需要等待超时。
 - 取消勾选、遥控包超时、或使用赛方定位模块时，RK3588S 自动回到视觉巡线。
 - 遥控模式不影响定位：`robot_position` 仍走 `9005`，并继续转发到 `127.0.0.1:9006`。
-- 默认映射：`RT -> target_speed`，`LX -> track_error`，`LT >= 90%` 或手柄断连 -> `STATE_SAFE_STOP`。
+- 默认映射：`RT` 前进、`LT` 倒车，合成为 `target_speed=(RT-LT)*1.0 m/s`；`LX -> track_error`；`B` 键或手柄断连 -> `STATE_SAFE_STOP`。
 
 ## 端口与设备
 

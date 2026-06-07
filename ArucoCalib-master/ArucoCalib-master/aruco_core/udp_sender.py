@@ -87,6 +87,7 @@ class UdpGamepadControlSender:
         rt=0.0,
         lt=0.0,
         lx=0.0,
+        b=False,
         connected=False,
     ):
         return {
@@ -104,6 +105,7 @@ class UdpGamepadControlSender:
                 "rt": float(rt),
                 "lt": float(lt),
                 "lx": float(lx),
+                "b": bool(b),
                 "connected": bool(connected),
             },
         }

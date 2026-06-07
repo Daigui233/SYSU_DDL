@@ -30,14 +30,14 @@ DEFAULT_MAPPING = {
     "version": MAPPING_VERSION,
     "steer_axis": "LX",
     "steer_invert": False,
-    "throttle_source": "RT",
+    "throttle_source": "RT-LT",
     "throttle_invert": False,
-    "safe_stop_axis": "LT",
-    "safe_stop_threshold": 0.90,
+    "safe_stop_axis": "NONE",
+    "safe_stop_threshold": 1.00,
     "deadzone": 0.08,
     "enable_button": "RB",
     "stop_button": "B",
-    "max_speed_mps": 0.50,
+    "max_speed_mps": 1.00,
     "steer_error_scale": 210.0,
 }
 
@@ -413,9 +413,9 @@ class MapperApp:
         frame.pack(fill=tk.X)
         self.steer_combo = self._combo(frame, 0, "转向轴", "steer_axis", ["LX", "RX", "AXIS_0", "AXIS_2"])
         ttk.Checkbutton(frame, text="转向反向", variable=self.vars["steer_invert"]).grid(row=1, column=1, sticky="w", pady=3)
-        self.throttle_combo = self._combo(frame, 2, "速度扳机", "throttle_source", ["RT", "AXIS_5", "AXIS_2"])
+        self.throttle_combo = self._combo(frame, 2, "速度扳机", "throttle_source", ["RT-LT", "RT", "AXIS_5", "AXIS_2"])
         ttk.Checkbutton(frame, text="油门反向", variable=self.vars["throttle_invert"]).grid(row=3, column=1, sticky="w", pady=3)
-        self.safe_stop_combo = self._combo(frame, 4, "停车扳机", "safe_stop_axis", ["LT", "AXIS_4", "AXIS_2"])
+        self.safe_stop_combo = self._combo(frame, 4, "停车扳机", "safe_stop_axis", ["NONE", "LT", "AXIS_4", "AXIS_2"])
         ttk.Label(frame, text="停车阈值").grid(row=5, column=0, sticky="w", pady=3)
         ttk.Spinbox(
             frame,
@@ -508,8 +508,8 @@ class MapperApp:
         axis_names = list(state.axes.keys())
         button_names = list(state.buttons.keys())
 
-        throttle_values = list(dict.fromkeys(["RT", *axis_names]))
-        safe_stop_values = list(dict.fromkeys(["LT", *axis_names]))
+        throttle_values = list(dict.fromkeys(["RT-LT", "RT", *axis_names]))
+        safe_stop_values = list(dict.fromkeys(["NONE", "LT", *axis_names]))
         for combo, current, values in (
             (self.steer_combo, self.vars["steer_axis"].get(), axis_names),
             (self.throttle_combo, self.vars["throttle_source"].get(), throttle_values),
@@ -532,7 +532,12 @@ class MapperApp:
 
     def _trigger_opening(self, axes: Dict[str, float], source: str, deadzone: float) -> tuple[float, float]:
         raw = self._axis_value(axes, source)
-        if source in ("LT", "RT"):
+        if source in ("RT-LT", "LT-RT"):
+            opening = apply_deadzone(raw, deadzone)
+            return raw, clamp(opening, -1.0, 1.0)
+        if source == "NONE":
+            opening = 0.0
+        elif source in ("LT", "RT"):
             opening = clamp(raw, 0.0, 1.0)
         elif source.startswith("AXIS_"):
             opening = clamp((raw + 1.0) * 0.5, 0.0, 1.0)
@@ -553,7 +558,10 @@ class MapperApp:
         if self.vars["steer_invert"].get():
             steer = -steer
         if self.vars["throttle_invert"].get():
-            throttle = 1.0 - throttle
+            if self.vars["throttle_source"].get() in ("RT-LT", "LT-RT"):
+                throttle = -throttle
+            else:
+                throttle = 1.0 - throttle
 
         enable_button = self.vars["enable_button"].get()
         stop_button = self.vars["stop_button"].get()
@@ -628,8 +636,8 @@ class MapperApp:
                 "effective_target_speed_mps": round(effective_speed, 3),
                 "effective_track_error": round(effective_error, 1),
             },
-            "default_mapping": "右扳机 RT 控制 target_speed，左摇杆 LX 控制 track_error，左扳机 LT >= 90% 进入 SAFE_STOP。",
-            "future_logic": "按住使能键才允许 STATE_TRACK；LT 急停、备用急停键或断联应停车。",
+            "default_mapping": "RT 前进、LT 倒车，左摇杆 LX 控制 track_error，B 键进入 SAFE_STOP。",
+            "future_logic": "按住使能键才允许 STATE_TRACK；B 急停、备用急停键或断联应停车。",
         }
         text = json.dumps(preview, ensure_ascii=False, indent=2)
         self.preview_text.configure(state=tk.NORMAL)

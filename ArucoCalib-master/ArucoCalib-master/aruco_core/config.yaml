@@ -68,9 +68,8 @@ udp:
 # Gamepad Mode checkbox is explicitly enabled.
 gamepad_control:
   target_port: 9010
-  max_speed_mps: 0.5
+  max_speed_mps: 1.0
   steer_error_scale: 210.0
-  safe_stop_lt_threshold: 0.90
 
 # Output coordinate conversion.
 # This project stores world coordinates in millimeters; UI and UDP use meters.

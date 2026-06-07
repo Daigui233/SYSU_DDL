@@ -117,6 +117,149 @@ class XInputGamepadReader:
         }
 
 
+class PygameGamepadReader:
+    """Optional DirectInput/HID fallback for Bluetooth controllers."""
+
+    BUTTON_NAMES = {
+        0: "A",
+        1: "B",
+        2: "X",
+        3: "Y",
+        4: "LB",
+        5: "RB",
+        6: "BACK",
+        7: "START",
+    }
+
+    def __init__(self):
+        self.pg = None
+        self.joystick = None
+        self.last_error = ""
+        try:
+            import pygame  # type: ignore
+
+            self.pg = pygame
+            pygame.init()
+            pygame.joystick.init()
+        except Exception as exc:
+            self.last_error = str(exc)
+
+    @staticmethod
+    def _clamp(value, lo=-1.0, hi=1.0):
+        return max(lo, min(hi, float(value)))
+
+    @staticmethod
+    def _trigger_from_axis(value):
+        value = PygameGamepadReader._clamp(value)
+        return max(0.0, min(1.0, (value + 1.0) * 0.5))
+
+    def refresh(self):
+        self.joystick = None
+        if self.pg is None:
+            return
+        try:
+            self.pg.joystick.quit()
+            self.pg.joystick.init()
+            if self.pg.joystick.get_count() > 0:
+                self.joystick = self.pg.joystick.Joystick(0)
+                self.joystick.init()
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.joystick = None
+
+    def read(self):
+        if self.pg is None:
+            return {
+                "connected": False,
+                "rt": 0.0,
+                "lt": 0.0,
+                "lx": 0.0,
+                "buttons": {},
+                "error": f"pygame unavailable: {self.last_error}",
+            }
+        try:
+            self.pg.event.pump()
+            if self.joystick is None:
+                self.refresh()
+            if self.joystick is None:
+                return {
+                    "connected": False,
+                    "rt": 0.0,
+                    "lt": 0.0,
+                    "lx": 0.0,
+                    "buttons": {},
+                    "error": "No pygame controller",
+                }
+
+            axes = [
+                self._clamp(self.joystick.get_axis(i))
+                for i in range(self.joystick.get_numaxes())
+            ]
+            lx = axes[0] if len(axes) > 0 else 0.0
+            lt = 0.0
+            rt = 0.0
+            if len(axes) > 5:
+                lt = self._trigger_from_axis(axes[4])
+                rt = self._trigger_from_axis(axes[5])
+            elif len(axes) > 4:
+                lt = self._trigger_from_axis(axes[2])
+                rt = self._trigger_from_axis(axes[4])
+            elif len(axes) > 2:
+                combined = axes[2]
+                rt = max(0.0, combined)
+                lt = max(0.0, -combined)
+
+            buttons = {}
+            for i in range(self.joystick.get_numbuttons()):
+                pressed = bool(self.joystick.get_button(i))
+                buttons[f"BTN_{i}"] = pressed
+                name = self.BUTTON_NAMES.get(i)
+                if name:
+                    buttons[name] = pressed
+            return {
+                "connected": True,
+                "index": 0,
+                "backend": "pygame",
+                "name": self.joystick.get_name(),
+                "rt": rt,
+                "lt": lt,
+                "lx": lx,
+                "buttons": buttons,
+                "error": "",
+            }
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.joystick = None
+            return {
+                "connected": False,
+                "rt": 0.0,
+                "lt": 0.0,
+                "lx": 0.0,
+                "buttons": {},
+                "error": f"pygame error: {exc}",
+            }
+
+
+class GamepadReader:
+    """Read XInput first, then pygame for Bluetooth/DirectInput controllers."""
+
+    def __init__(self):
+        self.xinput = XInputGamepadReader()
+        self.pygame = PygameGamepadReader()
+
+    def read(self):
+        x_state = self.xinput.read()
+        if x_state.get("connected"):
+            x_state["reader"] = "xinput"
+            return x_state
+        p_state = self.pygame.read()
+        if p_state.get("connected"):
+            p_state["reader"] = "pygame"
+            return p_state
+        p_state["error"] = f"{x_state.get('error', '')}; {p_state.get('error', '')}"
+        return p_state
+
+
 class ImageLabel(QLabel):
     """Custom QLabel for image display with mouse click handling"""
 
@@ -276,7 +419,7 @@ class MainWindow(QMainWindow):
             target_port=getattr(self.cfg, "UDP_TARGET_PORT", 9005),
             enabled=getattr(self.cfg, "UDP_ENABLED", False),
         )
-        self.gamepad_reader = XInputGamepadReader()
+        self.gamepad_reader = GamepadReader()
         self.gamepad_sender = UdpGamepadControlSender(
             target_ip=getattr(self.cfg, "UDP_TARGET_IP", "127.0.0.1"),
             target_port=getattr(self.cfg, "GAMEPAD_TARGET_PORT", 9010),
@@ -338,9 +481,8 @@ class MainWindow(QMainWindow):
             }
             data["gamepad_control"] = {
                 "target_port": int(getattr(self.cfg, "GAMEPAD_TARGET_PORT", 9010)),
-                "max_speed_mps": float(getattr(self.cfg, "GAMEPAD_MAX_SPEED_MPS", 0.5)),
+                "max_speed_mps": float(getattr(self.cfg, "GAMEPAD_MAX_SPEED_MPS", 1.0)),
                 "steer_error_scale": float(getattr(self.cfg, "GAMEPAD_STEER_ERROR_SCALE", 210.0)),
-                "safe_stop_lt_threshold": float(getattr(self.cfg, "GAMEPAD_SAFE_STOP_LT_THRESHOLD", 0.90)),
             }
 
             self.settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -455,10 +597,11 @@ class MainWindow(QMainWindow):
         lt = float(state.get("lt", 0.0))
         lx_raw = float(state.get("lx", 0.0))
         lx = self._apply_deadzone(lx_raw, 0.08)
-        max_speed = max(0.0, float(getattr(self.cfg, "GAMEPAD_MAX_SPEED_MPS", 0.5)))
+        buttons = state.get("buttons", {}) or {}
+        b_stop = bool(buttons.get("B", False))
+        max_speed = max(0.0, float(getattr(self.cfg, "GAMEPAD_MAX_SPEED_MPS", 1.0)))
         steer_scale = float(getattr(self.cfg, "GAMEPAD_STEER_ERROR_SCALE", 210.0))
-        safe_threshold = max(0.0, min(1.0, float(getattr(self.cfg, "GAMEPAD_SAFE_STOP_LT_THRESHOLD", 0.90))))
-        safe_stop = (not connected) or lt >= safe_threshold
+        safe_stop = (not connected) or b_stop
 
         if safe_stop:
             target_speed = 0.0
@@ -466,7 +609,7 @@ class MainWindow(QMainWindow):
             state_cmd = 7
             flags = 0
         else:
-            target_speed = max(0.0, min(1.0, rt)) * max_speed
+            target_speed = (max(0.0, min(1.0, rt)) - max(0.0, min(1.0, lt))) * max_speed
             track_error = lx * steer_scale
             state_cmd = 1
             flags = 0x01
@@ -481,17 +624,21 @@ class MainWindow(QMainWindow):
             rt=rt,
             lt=lt,
             lx=lx,
+            b=b_stop,
             connected=connected,
         )
         self.last_gamepad_ok = ok
         if not connected:
-            self.last_gamepad_status = f"Gamepad: ON no controller -> SAFE_STOP fail={self.gamepad_sender.fail_count}"
+            error_text = str(state.get("error", ""))[:36]
+            self.last_gamepad_status = f"Gamepad: ON no controller -> SAFE_STOP fail={self.gamepad_sender.fail_count} {error_text}"
         elif safe_stop:
-            self.last_gamepad_status = f"Gamepad: SAFE_STOP LT={lt:.2f} sent={self.gamepad_sender.sent_count}"
+            backend = state.get("reader") or state.get("backend", "?")
+            self.last_gamepad_status = f"Gamepad: SAFE_STOP {backend} B={int(b_stop)} sent={self.gamepad_sender.sent_count}"
         else:
+            backend = state.get("reader") or state.get("backend", "?")
             self.last_gamepad_status = (
-                f"Gamepad: TRACK v={target_speed:.2f} err={track_error:.0f} "
-                f"RT={rt:.2f} LX={lx:.2f} sent={self.gamepad_sender.sent_count}"
+                f"Gamepad: TRACK {backend} v={target_speed:.2f} err={track_error:.0f} "
+                f"RT={rt:.2f} LT={lt:.2f} LX={lx:.2f} sent={self.gamepad_sender.sent_count}"
             )
         if self.gamepad_sender.last_error:
             self.last_gamepad_status += f" err={self.gamepad_sender.last_error[:40]}"

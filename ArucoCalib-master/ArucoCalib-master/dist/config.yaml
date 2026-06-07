@@ -46,9 +46,8 @@ udp:
   target_port: 9005
 gamepad_control:
   target_port: 9010
-  max_speed_mps: 0.5
+  max_speed_mps: 1.0
   steer_error_scale: 210.0
-  safe_stop_lt_threshold: 0.9
 output:
   coord_scale: 0.001
   height_m: 0.16

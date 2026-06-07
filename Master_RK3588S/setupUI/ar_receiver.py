@@ -39,7 +39,7 @@ CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", "1")
 GAMEPAD_CONTROL_HOST = os.environ.get("AR_GAMEPAD_CONTROL_HOST", "0.0.0.0")
 GAMEPAD_CONTROL_PORT = int(os.environ.get("AR_GAMEPAD_CONTROL_PORT", "9010"))
 GAMEPAD_CONTROL_TTL = float(os.environ.get("AR_GAMEPAD_CONTROL_TTL", "3.0"))
-GAMEPAD_MAX_SPEED_MPS = float(os.environ.get("AR_GAMEPAD_MAX_SPEED_MPS", "0.8"))
+GAMEPAD_MAX_SPEED_MPS = float(os.environ.get("AR_GAMEPAD_MAX_SPEED_MPS", "1.0"))
 GAMEPAD_MAX_TRACK_ERROR = float(os.environ.get("AR_GAMEPAD_MAX_TRACK_ERROR", "240.0"))
 
 DEFAULT_AR_UDP_IP = "127.0.0.1"
@@ -627,7 +627,7 @@ class GamepadControlReceiver:
                     status = "gamepad safe_stop"
                 else:
                     state_cmd = STATE_TRACK
-                    target_speed = clamp_float(packet.get("target_speed", 0.0), 0.0, GAMEPAD_MAX_SPEED_MPS)
+                    target_speed = clamp_float(packet.get("target_speed", 0.0), -GAMEPAD_MAX_SPEED_MPS, GAMEPAD_MAX_SPEED_MPS)
                     track_error = clamp_float(packet.get("track_error", 0.0), -GAMEPAD_MAX_TRACK_ERROR, GAMEPAD_MAX_TRACK_ERROR)
                     flags = int(packet.get("flags", CONTROL_FLAG_USE_TARGET_SPEED)) | CONTROL_FLAG_USE_TARGET_SPEED
                     status = "gamepad manual track"
@@ -1028,7 +1028,7 @@ def draw_pose_status(frame, pose_bridge, fps=None, track_error=None, control_sta
             gamepad_lines.append(
                 f"GP v={gamepad_status.get('target_speed', 0.0):.2f} "
                 f"err={gamepad_status.get('track_error', 0.0):.0f} "
-                f"RT={inputs.get('rt', 0.0):.2f} LT={inputs.get('lt', 0.0):.2f}"
+                f"RT={inputs.get('rt', 0.0):.2f} LT={inputs.get('lt', 0.0):.2f} B={int(bool(inputs.get('b', False)))}"
             )
 
     feedback = get_car_feedback()
