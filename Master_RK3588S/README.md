@@ -79,7 +79,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 - WebUI 端口号：`9006`。
 - 可选手柄遥控入口：`0.0.0.0:9010`。
 - UNITY 同步端口：`9003`。
-- 控车串口：`/dev/ttyUSB0`，`460800` baud，写超时 `0.05 s`。
+- 控车串口默认：`/dev/ttyUSB0`，`460800` baud，写超时 `0.05 s`；启动时打不开会每秒重试。若现场枚举成其他设备，可用 `AR_CAR_SERIAL_PORT=/dev/ttyUSB1` 或 `AR_CAR_SERIAL_PORT=/dev/ttyACM0` 临时覆盖。
 
 ## 调试重点
 
