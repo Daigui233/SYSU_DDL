@@ -3,8 +3,8 @@
   "width": 640,
   "height": 480,
   "video_flip": {
-    "horizontal": false,
-    "vertical": false
+    "horizontal": true,
+    "vertical": true
   },
   "K": [
     [
@@ -42,7 +42,7 @@
     "imu_send_rate": 50,
     "pos_offset": [
       0.0,
-      0.16,
+      0.1,
       0.12
     ],
     "euler_offset": [

@@ -5,10 +5,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统引导设置 - X-Verse™ WebUI</title>
-    <!-- Modern Tech Fonts -->
-    <link
-        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto:wght@300;400;500&display=swap"
-        rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
     <style>
         .ar-debug-layout {
@@ -150,7 +146,7 @@
             <div class="logo">
                 <span class="cyber-text">X-Verse™</span> 系统初始化
             </div>
-            <div class="ip-info">🌐 {{ ip }}:5000</div>
+            <div class="ip-info">🌐 {{ ip }}:{{ http_port }}</div>
         </header>
 
         <!-- Progress Indicator (Hidden on Step 1) -->

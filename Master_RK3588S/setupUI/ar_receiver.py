@@ -5,6 +5,8 @@ import atexit
 import os
 import socket
 import threading
+import mimetypes
+from urllib.parse import unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import cv2
@@ -26,6 +28,8 @@ SHM_NAME = "shm_ar_video"
 SHM_HEADER_SIZE = 16
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "dist", "main_config.json")
+TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", "base", "model"))
 SEG_RESULT_TTL = 2.0
 DET_RESULT_TTL = 1.0
@@ -92,6 +96,12 @@ CONTROL_COMMAND_LOCK = threading.Lock()
 LAST_CONTROL_SEND_OK = None
 LAST_CONTROL_SEND_ERROR = ""
 LAST_CONTROL_SEND_TS = 0.0
+AI_STATUS = {
+    "ok": False,
+    "detector": "not initialized",
+    "segmenter": "not initialized",
+    "error": None,
+}
 
 
 class DisabledCarController:
@@ -188,10 +198,32 @@ def clamp_float(value, low, high):
     value = finite_float(value, 0.0)
     return max(float(low), min(float(high), value))
 
-print("initializing NPU AI...")
-infer_det = InferWrap(model_dir=MODEL_DIR, TPEs=1, core_ids=[0], max_inflight=1)
-infer_seg = PPSegInfer(model_dir=MODEL_DIR, TPEs=1, core_ids=[1], max_inflight=1)
-print("AI engines loaded")
+
+def create_ai_engines():
+    global AI_STATUS
+
+    print("initializing NPU AI...")
+    try:
+        infer_det = InferWrap(model_dir=MODEL_DIR, TPEs=1, core_ids=[0], max_inflight=1)
+        infer_seg = PPSegInfer(model_dir=MODEL_DIR, TPEs=1, core_ids=[1], max_inflight=1)
+    except Exception as exc:
+        AI_STATUS = {
+            "ok": False,
+            "detector": "disabled",
+            "segmenter": "disabled",
+            "error": str(exc),
+        }
+        print(f"NPU AI init failed: {exc}; WebUI and pose forwarding continue without vision inference")
+        return None, None
+
+    AI_STATUS = {
+        "ok": True,
+        "detector": "ready",
+        "segmenter": "ready",
+        "error": None,
+    }
+    print("AI engines loaded")
+    return infer_det, infer_seg
 
 car = create_car_controller()
 
@@ -357,8 +389,70 @@ def current_pose_http_payload():
     status.setdefault("pose_convention", POSE_CONVENTION)
     status.setdefault("ar_forward_mapping", AR_FORWARD_MAPPING)
     status["http_port"] = POSE_STATUS_HTTP_PORT
+    status["ai"] = AI_STATUS
     status["car_feedback"] = get_car_feedback()
     return status
+
+
+def get_webui_ip():
+    override = os.environ.get("AR_WEBUI_IP", "").strip()
+    if override:
+        return override
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+        finally:
+            sock.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "127.0.0.1"
+
+
+def render_index_html():
+    try:
+        with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
+            body = f.read()
+    except Exception as exc:
+        return f"WebUI template missing: {exc}".encode("utf-8"), "text/plain; charset=utf-8"
+
+    body = body.replace("{{ ip }}", get_webui_ip())
+    body = body.replace("{{ http_port }}", str(POSE_STATUS_HTTP_PORT))
+    return body.encode("utf-8"), "text/html; charset=utf-8"
+
+
+def resolve_static_path(request_path):
+    rel_path = unquote(request_path.split("?", 1)[0].removeprefix("/static/"))
+    rel_path = os.path.normpath(rel_path).lstrip(os.sep)
+    candidate = os.path.abspath(os.path.join(STATIC_DIR, rel_path))
+    static_root = os.path.abspath(STATIC_DIR)
+    if candidate == static_root or not candidate.startswith(static_root + os.sep):
+        return None
+    return candidate
+
+
+def write_json_atomic(path, payload):
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+def send_local_udp_json(port, payload):
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(data, ("127.0.0.1", int(port)))
+    finally:
+        sock.close()
+    return len(data)
 
 
 class PoseStatusHandler(BaseHTTPRequestHandler):
@@ -367,33 +461,166 @@ class PoseStatusHandler(BaseHTTPRequestHandler):
         self._send_common_headers()
         self.end_headers()
 
-    def do_GET(self):
-        if self.path.split("?", 1)[0] not in ("/", "/pose_status", "/pose_packet"):
-            self.send_response(404)
-            self._send_common_headers()
-            self.end_headers()
+    def do_HEAD(self):
+        path = self.path.split("?", 1)[0]
+
+        if path in ("/", "/index.html"):
+            body, content_type = render_index_html()
+            self._send_headers_only(200, len(body), content_type)
             return
 
-        payload = current_pose_http_payload()
-        if self.path.split("?", 1)[0] == "/pose_packet":
-            payload = payload.get("packet") or {}
+        if path.startswith("/static/"):
+            local_path = resolve_static_path(path)
+            if not local_path or not os.path.isfile(local_path):
+                self._send_headers_only(404, 0, "application/json; charset=utf-8")
+                return
+            content_type = self._static_content_type(local_path)
+            self._send_headers_only(200, os.path.getsize(local_path), content_type)
+            return
 
+        if path in ("/pose_status", "/pose_packet", "/health", "/main_config.json", "/api/config", "/objects.json"):
+            self._send_headers_only(200, 0, "application/json; charset=utf-8")
+            return
+
+        self._send_headers_only(404, 0, "application/json; charset=utf-8")
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        try:
+            payload = self._read_json_body()
+        except Exception as exc:
+            self._send_json({"error": f"invalid JSON body: {exc}"}, status=400)
+            return
+
+        if path == "/api/config":
+            if not isinstance(payload, dict):
+                self._send_json({"error": "config payload must be an object"}, status=400)
+                return
+            try:
+                write_json_atomic(CONFIG_PATH, payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+                return
+            self._send_json({"ok": True, "path": CONFIG_PATH})
+            return
+
+        if path == "/api/manual_pose":
+            try:
+                packet = {
+                    "type": "robot_position",
+                    "pos": [
+                        float(payload.get("x", 0.0)),
+                        float(payload.get("y", 0.16)),
+                        float(payload.get("z", 0.0)),
+                    ],
+                    "euler": [0.0, float(payload.get("yaw", 0.0)), 0.0],
+                    "timestamp": time.time(),
+                    "source": "webui_wasd",
+                }
+                byte_count = send_local_udp_json(POSE_INPUT_PORT, packet)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+                return
+            self._send_json({"ok": True, "bytes": byte_count, "target": f"127.0.0.1:{POSE_INPUT_PORT}"})
+            return
+
+        if path == "/api/gamepad_control":
+            try:
+                packet = dict(payload)
+                packet.setdefault("type", "gamepad_control")
+                packet.setdefault("source", "webui")
+                byte_count = send_local_udp_json(GAMEPAD_CONTROL_PORT, packet)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+                return
+            self._send_json({"ok": True, "bytes": byte_count, "target": f"127.0.0.1:{GAMEPAD_CONTROL_PORT}"})
+            return
+
+        self._send_json({"error": "not found", "path": path}, status=404)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+
+        if path in ("/", "/index.html"):
+            body, content_type = render_index_html()
+            self._send_body(200, body, content_type)
+            return
+
+        if path.startswith("/static/"):
+            self._send_static(path)
+            return
+
+        if path in ("/pose_status", "/pose_packet", "/health"):
+            payload = current_pose_http_payload()
+            if path == "/pose_packet":
+                payload = payload.get("packet") or {}
+            self._send_json(payload)
+            return
+
+        if path in ("/main_config.json", "/api/config"):
+            self._send_json(read_json_file(CONFIG_PATH, {}))
+            return
+
+        if path == "/objects.json":
+            self._send_json(read_json_file(os.path.join(BASE_DIR, "dist", "objects.json"), []))
+            return
+
+        self._send_json({"error": "not found", "path": path}, status=404)
+
+    def _send_json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self.send_response(200)
+        self._send_body(status, body, "application/json; charset=utf-8")
+
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def _send_static(self, path):
+        local_path = resolve_static_path(path)
+        if not local_path or not os.path.isfile(local_path):
+            self._send_json({"error": "static file not found", "path": path}, status=404)
+            return
+
+        try:
+            with open(local_path, "rb") as f:
+                body = f.read()
+        except Exception as exc:
+            self._send_json({"error": str(exc), "path": path}, status=500)
+            return
+
+        self._send_body(200, body, self._static_content_type(local_path))
+
+    def _static_content_type(self, local_path):
+        content_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in ("application/javascript", "application/json"):
+            content_type += "; charset=utf-8"
+        return content_type
+
+    def _send_body(self, status, body, content_type):
+        self.send_response(status)
         self._send_common_headers()
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_headers_only(self, status, content_length, content_type):
+        self.send_response(status)
+        self._send_common_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(content_length))
+        self.end_headers()
 
     def log_message(self, _format, *args):
         return
 
     def _send_common_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
-
 
 def start_pose_status_http_server():
     try:
@@ -404,7 +631,10 @@ def start_pose_status_http_server():
 
     thread = threading.Thread(target=server.serve_forever, name="pose-status-http", daemon=True)
     thread.start()
-    write_debug_log(f"pose status HTTP server: http://{POSE_STATUS_HTTP_HOST}:{POSE_STATUS_HTTP_PORT}/pose_status")
+    write_debug_log(
+        f"WebUI/status HTTP server: http://{POSE_STATUS_HTTP_HOST}:{POSE_STATUS_HTTP_PORT}/ "
+        f"(status: /pose_status)"
+    )
     return server
 
 
@@ -1104,6 +1334,7 @@ def main():
     pose_bridge.start()
     gamepad_receiver = GamepadControlReceiver()
     gamepad_receiver.start()
+    infer_det, infer_seg = create_ai_engines()
     print("vision client ready, waiting for camera shared memory...")
     last_seg_res = None
     last_seg_ts = 0.0
@@ -1189,21 +1420,23 @@ def main():
                     track_error = None
                     control_state_text = "WAIT"
 
-                    try:
-                        seg_res, seg_flag = infer_seg.infer(frame.copy())
-                        if seg_flag and seg_res is not None:
-                            last_seg_res = seg_res
-                            last_seg_ts = now
-                    except Exception as exc:
-                        print(f"seg infer skip: {exc}")
+                    if infer_seg is not None:
+                        try:
+                            seg_res, seg_flag = infer_seg.infer(frame.copy())
+                            if seg_flag and seg_res is not None:
+                                last_seg_res = seg_res
+                                last_seg_ts = now
+                        except Exception as exc:
+                            print(f"seg infer skip: {exc}")
 
-                    try:
-                        det_res, det_flag = infer_det.infer(frame.copy())
-                        if det_flag and det_res is not None:
-                            last_det_res = det_res
-                            last_det_ts = now
-                    except Exception as exc:
-                        print(f"det infer skip: {exc}")
+                    if infer_det is not None:
+                        try:
+                            det_res, det_flag = infer_det.infer(frame.copy())
+                            if det_flag and det_res is not None:
+                                last_det_res = det_res
+                                last_det_ts = now
+                        except Exception as exc:
+                            print(f"det infer skip: {exc}")
 
                     if last_seg_res is not None and (now - last_seg_ts) <= SEG_RESULT_TTL:
                         try:
@@ -1329,13 +1562,12 @@ def main():
             pose_status_server.server_close()
         except Exception:
             pass
-    infer_seg.release()
-    infer_det.release()
+    if infer_seg is not None:
+        infer_seg.release()
+    if infer_det is not None:
+        infer_det.release()
     cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
     main()
-
-
-
