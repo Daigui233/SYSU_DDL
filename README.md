@@ -43,6 +43,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Master_RK3588S/setupUI/control_arbitrator.py` | 最终控制仲裁：合成状态机/局部规划结果和可选手柄覆盖，生成串口控制帧 |
 | `Master_RK3588S/setupUI/control_car_link.py` | 封装 RK3588S 到 TC264D 的串口控制链路 |
 | `Master_RK3588S/setupUI/status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
+| `Master_RK3588S/setupUI/performance_monitor.py` | 运行时性能探针：统计 AR 帧率、主循环耗时、HUD/显示耗时、NPU/温度信息，并写入 CSV |
 | `Master_RK3588S/setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
 | `Master_RK3588S/setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
 | `Master_RK3588S/setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
@@ -52,7 +53,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Slave_TC264D/` | 执行上位机给出的状态、速度和转向误差 |
 | `Tools_Windows/gamepad_mapper.py` | 手柄输入和映射测试工具，不直接控车 |
 
-命名前缀用于表达大模块归属：`control_*` 属于控车、状态机、串口和手柄接管；`vision_*` 属于视频帧和模型感知；`pose_*` 属于定位与 AR 桥接；`ui_* / webui_* / status_*` 属于显示和状态服务；`debug_*` 属于调试辅助。`ar_receiver.py` 保持主入口名称不变，只负责调度这些模块。
+命名前缀用于表达大模块归属：`control_*` 属于控车、状态机、串口和手柄接管；`vision_*` 属于视频帧和模型感知；`pose_*` 属于定位与 AR 桥接；`ui_* / webui_* / status_*` 属于显示和状态服务；`performance_*` 属于性能监控与事后分析；`debug_*` 属于调试辅助。`ar_receiver.py` 保持主入口名称不变，只负责调度这些模块。
 
 ## 当前阶段
 
@@ -70,6 +71,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 遥控映射：`RT` 前进、`LT` 倒车，合成为 `target_speed=(RT-LT)*1.0 m/s`；左摇杆横轴 `LX` 控制 `track_error`；`B` 键或手柄断连时发送 `STATE_SAFE_STOP`。Windows 定位 EXE 优先读取 XInput，读不到时会用 pygame/DirectInput 兜底，便于蓝牙手柄调试。
 - 如果采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要定位转发和手柄控车，可在 RK3588S 手动运行 `python3 Master_RK3588S/setupUI/standalone_control_bridge.py`；该备用脚本不要和 `ar_receiver.py` 同时运行。
 - TC264D 保留现有串口协议，同时增加 `2.5 s` 本地输入超时；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。
+- `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、HUD 绘制、窗口显示还是硬件降频。
 
 ## 架构改进记录
 

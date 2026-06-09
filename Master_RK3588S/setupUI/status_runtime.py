@@ -103,6 +103,7 @@ class RuntimeStatusStore:
         command_state,
         command_flags,
         gamepad_status=None,
+        performance_status=None,
     ):
         pose_info = pose_bridge.snapshot()
         control_info = {
@@ -134,6 +135,8 @@ class RuntimeStatusStore:
             "debug_log": self.debug_log_path,
             "packet_json": self.packet_path,
         }
+        if performance_status is not None:
+            info["performance"] = performance_status
         self.write_status_json(info, "runtime status", control_info=control_info)
 
     def current_payload(self):

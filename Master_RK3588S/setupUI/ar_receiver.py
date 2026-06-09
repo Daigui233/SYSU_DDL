@@ -27,6 +27,7 @@ from ui_hud_renderer import draw_pose_status
 from control_local_planner import LocalPlanner
 from status_runtime import RuntimeStatusStore
 from control_task_state_machine import TaskStateMachine
+from performance_monitor import PerformanceMonitor
 from vision_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
 from vision_pipeline import VisionPipeline
 from webui_status_server import WebUIStatusServer
@@ -157,6 +158,7 @@ def main():
     vision_pipeline = VisionPipeline(
         log_func=write_debug_log,
     )
+    performance_monitor = PerformanceMonitor(log_func=write_debug_log)
 
     def build_autonomy_command(now, perception):
         task_decision = task_state_machine.update(perception, now)
@@ -203,7 +205,9 @@ def main():
 
             while True:
                 try:
+                    perf_token = performance_monitor.start()
                     fid, frame = read_frame_from_shm(shm, SHM_HEADER_SIZE)
+                    performance_monitor.stop("read_ms", perf_token)
                     if fid == last_fid:
                         now = time.time()
                         if have_frame and control_arbitrator.should_repeat_command(now, last_line_loss_command_ts):
@@ -229,6 +233,7 @@ def main():
                                     command_state,
                                     command_flags,
                                     gamepad_status=gamepad_status,
+                                    performance_status=performance_monitor.snapshot(),
                                 )
                                 last_runtime_status_ts = now
                             last_line_loss_command_ts = now
@@ -240,24 +245,34 @@ def main():
                     have_frame = True
 
                     now = time.time()
+                    performance_monitor.begin_frame(fid, now)
+                    perf_token = performance_monitor.start()
                     final_frame, perception = vision_pipeline.process(frame, now)
+                    performance_monitor.stop("vision_ms", perf_token)
+                    perf_token = performance_monitor.start()
                     command, gamepad_status, task_decision, plan_result = build_autonomy_command(now, perception)
+                    performance_monitor.stop("command_ms", perf_token)
+                    perf_token = performance_monitor.start()
                     final_frame = local_planner.draw_debug(final_frame, task_decision, plan_result)
+                    performance_monitor.stop("planner_draw_ms", perf_token)
                     command_error = command["track_error"]
                     command_speed = command["target_speed"]
                     command_state = command["state_cmd"]
                     command_flags = command["flags"]
                     control_state_text = command["state_text"]
 
+                    perf_token = performance_monitor.start()
                     send_car_cmd(
                         track_error=command_error,
                         target_speed=command_speed,
                         state_cmd=command_state,
                         flags=command_flags,
                     )
+                    performance_monitor.stop("serial_ms", perf_token)
                     last_line_loss_command_ts = now
 
                     if now - last_runtime_status_ts >= RUNTIME_STATUS_INTERVAL:
+                        perf_token = performance_monitor.start()
                         runtime_status.write_runtime_status(
                             pose_bridge,
                             control_state_text,
@@ -266,7 +281,9 @@ def main():
                             command_state,
                             command_flags,
                             gamepad_status=gamepad_status,
+                            performance_status=performance_monitor.snapshot(),
                         )
+                        performance_monitor.stop("runtime_status_ms", perf_token)
                         last_runtime_status_ts = now
 
                     fps_n += 1
@@ -275,6 +292,7 @@ def main():
                         fps_n = 0
                         fps_t = now
 
+                    perf_token = performance_monitor.start()
                     final_frame = draw_pose_status(
                         final_frame,
                         pose_bridge,
@@ -284,12 +302,18 @@ def main():
                         gamepad_status=gamepad_status,
                         get_car_feedback=get_car_feedback,
                         pose_input_port=POSE_INPUT_PORT,
+                        performance_status=performance_monitor.hud_snapshot(),
                         enabled=DEBUG_DRAW_POSE_PANEL,
                     )
+                    performance_monitor.stop("hud_ms", perf_token)
                     if final_frame is None or final_frame.size == 0:
                         final_frame = frame
+                    perf_token = performance_monitor.start()
                     cv2.imshow("ret", final_frame)
-                    if cv2.waitKey(1) == 27:
+                    key = cv2.waitKey(1)
+                    performance_monitor.stop("display_ms", perf_token)
+                    performance_monitor.finish_frame(time.time())
+                    if key == 27:
                         raise KeyboardInterrupt
 
                 except (ValueError, StructError, BufferError):
@@ -322,6 +346,7 @@ def main():
         0.0,
         STATE_SAFE_STOP,
         0,
+        performance_status=performance_monitor.snapshot(),
     )
     pose_bridge.stop()
     gamepad_receiver.stop()
@@ -329,6 +354,7 @@ def main():
         pose_status_server.stop()
     if vision_pipeline is not None:
         vision_pipeline.release()
+    performance_monitor.close()
     cv2.destroyAllWindows()
 
 

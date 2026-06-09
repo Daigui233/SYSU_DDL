@@ -187,6 +187,47 @@ def _referee_summary(now, records_dir=REFEREE_RECORDS_DIR, params=None):
     return _referee_cache["summary"] or {}
 
 
+def _format_perf_lines(performance_status):
+    if not performance_status or not performance_status.get("enabled"):
+        return []
+
+    stages = performance_status.get("stages_ms") or {}
+    system = performance_status.get("system") or {}
+    raw_fps = _safe_float(performance_status.get("raw_fps"))
+    loop_fps = _safe_float(performance_status.get("loop_fps"))
+    total_ms = _safe_float(performance_status.get("total_ms"))
+
+    def ms_text(name):
+        value = _safe_float(stages.get(name))
+        return "N/A" if value is None else f"{value:.1f}"
+
+    raw_text = "N/A" if raw_fps is None else f"{raw_fps:.1f}"
+    loop_text = "N/A" if loop_fps is None else f"{loop_fps:.1f}"
+    total_text = "N/A" if total_ms is None else f"{total_ms:.1f}"
+    lines = [
+        f"PERF raw={raw_text} loop={loop_text}",
+        f"MS rd={ms_text('read_ms')} ai={ms_text('vision_ms')} cmd={ms_text('command_ms')}",
+        f"MS hud={ms_text('hud_ms')} disp={ms_text('display_ms')} tot={total_text}",
+    ]
+
+    npu_load = system.get("npu_load")
+    if isinstance(npu_load, (list, tuple)) and npu_load:
+        load_text = "/".join(f"{_safe_float(v, 0.0):.0f}" for v in npu_load)
+    else:
+        load_text = "N/A"
+    npu_freq = _safe_float(system.get("npu_freq_mhz"))
+    freq_text = "N/A" if npu_freq is None else f"{npu_freq:.0f}MHz"
+    lines.append(f"NPU load={load_text} freq={freq_text}")
+
+    temp_c = _safe_float(system.get("cpu_temp_c"))
+    loadavg = _safe_float(system.get("loadavg_1m"))
+    if temp_c is not None or loadavg is not None:
+        temp_text = "N/A" if temp_c is None else f"{temp_c:.1f}C"
+        load_text = "N/A" if loadavg is None else f"{loadavg:.2f}"
+        lines.append(f"SYS temp={temp_text} load={load_text}")
+    return lines
+
+
 def draw_pose_status(
     frame,
     pose_bridge,
@@ -196,6 +237,7 @@ def draw_pose_status(
     gamepad_status=None,
     get_car_feedback=None,
     pose_input_port=9005,
+    performance_status=None,
     enabled=True,
 ):
     if not enabled:
@@ -296,6 +338,7 @@ def draw_pose_status(
     lines.extend(gamepad_lines)
     lines.extend(car_lines)
     lines.append(fps_line)
+    lines.extend(_format_perf_lines(performance_status))
 
     h = frame.shape[0]
     left_panel = _draw_referee_panel(h, frame.dtype, now)
