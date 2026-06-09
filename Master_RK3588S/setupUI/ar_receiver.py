@@ -28,6 +28,7 @@ from control_local_planner import LocalPlanner
 from status_runtime import RuntimeStatusStore
 from control_task_state_machine import TaskStateMachine
 from performance_monitor import PerformanceMonitor
+from ui_debug_stream_server import DebugStreamServer
 from vision_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
 from vision_pipeline import VisionPipeline
 from webui_status_server import WebUIStatusServer
@@ -159,6 +160,7 @@ def main():
         log_func=write_debug_log,
     )
     performance_monitor = PerformanceMonitor(log_func=write_debug_log)
+    debug_stream_server = DebugStreamServer(log_func=write_debug_log).start()
 
     def build_autonomy_command(now, perception):
         task_decision = task_state_machine.update(perception, now)
@@ -308,6 +310,7 @@ def main():
                     performance_monitor.stop("hud_ms", perf_token)
                     if final_frame is None or final_frame.size == 0:
                         final_frame = frame
+                    debug_stream_server.publish(final_frame)
                     perf_token = performance_monitor.start()
                     cv2.imshow("ret", final_frame)
                     key = cv2.waitKey(1)
@@ -352,6 +355,7 @@ def main():
     gamepad_receiver.stop()
     if pose_status_server is not None:
         pose_status_server.stop()
+    debug_stream_server.stop()
     if vision_pipeline is not None:
         vision_pipeline.release()
     performance_monitor.close()

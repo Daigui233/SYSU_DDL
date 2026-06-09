@@ -46,6 +46,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Master_RK3588S/setupUI/performance_monitor.py` | 运行时性能探针：统计 AR 帧率、主循环耗时、HUD/显示耗时、NPU/温度信息，并写入 CSV |
 | `Master_RK3588S/setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
 | `Master_RK3588S/setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
+| `Master_RK3588S/setupUI/ui_debug_stream_server.py` | 独立调试视频流服务，把完整 HUD 调试画面发布到浏览器可访问的 MJPEG 端口 |
 | `Master_RK3588S/setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
 | `Master_RK3588S/setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
 | `Master_RK3588S/setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
@@ -72,6 +73,20 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 如果采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要定位转发和手柄控车，可在 RK3588S 手动运行 `python3 Master_RK3588S/setupUI/standalone_control_bridge.py`；该备用脚本不要和 `ar_receiver.py` 同时运行。
 - TC264D 保留现有串口协议，同时增加 `2.5 s` 本地输入超时；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。
 - `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、HUD 绘制、窗口显示还是硬件降频。
+- `ui_debug_stream_server.py` 已接入 `ar_receiver.py`：发布的是完整调试画面，即分割/检测/局部规划目标线 + 左侧裁判事件 + 右侧调试 HUD；网络慢时浏览器端丢帧，不阻塞控车主循环。
+
+## Windows 访问地址
+
+当前板卡 IP 为 `192.168.43.196` 时：
+
+| 用途 | 地址 |
+| --- | --- |
+| 官方纯 AR 融合视频流，用于录制干净数据集 | `http://192.168.43.196:8080/video_feed` |
+| RK 上位机完整调试视频流，包含分割、路径规划和 HUD | `http://192.168.43.196:8090/debug_feed` |
+| RK 上位机调试视频流首页 | `http://192.168.43.196:8090/` |
+| RK 状态 JSON / WebUI 调试 API | `http://192.168.43.196:9105/pose_status` |
+
+如果板卡 IP 变化，把上面地址中的 `192.168.43.196` 替换为新的局域网 IP。
 
 ## 架构改进记录
 
