@@ -5,10 +5,9 @@ RK3588S 上位机负责转发定位给官方 AR、读取融合视频、运行视
 ## 正确链路
 
 ```text
-Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_pose_bridge.py -> 127.0.0.1:9006 -> 官方 AR
-官方 AR 融合视频 -> shm_ar_video -> 分割模型 -> track_error -> STATE_TRACK -> /dev/ttyUSB0 -> TC264D
-官方 AR 融合视频 -> shm_ar_video -> 检测模型 -> 仅画 gold/car/human 检测框
-可选手柄遥控 -> UDP 板卡IP:9010 -> gamepad_control_receiver.py -> ar_receiver.py 临时覆盖视觉控制 -> /dev/ttyUSB0 -> TC264D
+Windows AprilTag 定位 -> UDP 板卡IP:9005 -> pose_ar_bridge.py -> 127.0.0.1:9006 -> 官方 AR
+官方 AR 融合视频 -> shm_ar_video -> 分割/检测 -> control_task_state_machine.py -> control_local_planner.py -> /dev/ttyUSB0 -> TC264D
+可选手柄遥控 -> UDP 板卡IP:9010 -> control_gamepad_receiver.py -> ar_receiver.py 临时覆盖视觉控制 -> /dev/ttyUSB0 -> TC264D
 ```
 
 定位只驱动 AR 融合和坐标显示，不直接参与转向控制。默认控车输入来自融合视频上的视觉处理结果；只有 Windows 定位 EXE 显式勾选 `Gamepad Mode` 且 `9010` 收到新鲜遥控包时，手柄才临时覆盖视觉控制。
@@ -18,40 +17,65 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_pose_bridge.py -> 127.0.0.1:9
 | 文件 | 作用 |
 | --- | --- |
 | `setupUI/ar_receiver.py` | 上位机主入口：启动模块、读取帧、调度视觉/仲裁/发送/显示 |
-| `setupUI/ar_pose_bridge.py` | 独立接收 Windows `robot_position`，校验、记录并转发给官方 AR |
-| `setupUI/gamepad_control_receiver.py` | 独立接收 `9010` 手柄遥控包，供 `ar_receiver.py` 临时覆盖视觉控制 |
-| `setupUI/vision_pipeline.py` | 分割/检测模型初始化、推理、后处理、画中线和检测框 |
-| `setupUI/control_arbitrator.py` | 根据视觉中线、丢线计时和可选手柄命令生成最终控制帧 |
-| `setupUI/car_control_link.py` | 封装 `/dev/ttyUSB0` 串口控车链路，供主入口或备用桥复用 |
-| `setupUI/runtime_status.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
+| `setupUI/pose_ar_bridge.py` | 独立接收 Windows `robot_position`，校验、记录并转发给官方 AR |
+| `setupUI/control_gamepad_receiver.py` | 独立接收 `9010` 手柄遥控包，供 `ar_receiver.py` 临时覆盖视觉控制 |
+| `setupUI/vision_pipeline.py` | 分割/检测模型初始化、推理、后处理，输出结构化 `segmentation + detections` 并绘制基础视觉结果 |
+| `setupUI/control_states.py` | 状态契约：定义 RK 任务状态、TC264D 状态码、局部规划模式和映射关系 |
+| `setupUI/control_task_state_machine.py` | 上位机任务状态机：判断 `NORMAL_TRACK / AVOID_* / COLLECT_GOLD / RECOVER_LINE / LINE_LOSS_SAFE_STOP`，维护状态速度表和掉线/滞回参数 |
+| `setupUI/control_local_planner.py` | 图像坐标局部规划：根据状态机意图输出最终 `final_track_error`，并绘制最终目标线 |
+| `setupUI/control_arbitrator.py` | 最终控制仲裁：合成状态机/局部规划结果和可选手柄覆盖，生成串口控制帧 |
+| `setupUI/control_car_link.py` | 封装 `/dev/ttyUSB0` 串口控车链路，供主入口或备用桥复用 |
+| `setupUI/status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
 | `setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
-| `setupUI/hud_renderer.py` | OpenCV 预览窗口右侧调试栏绘制 |
-| `setupUI/video_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
+| `setupUI/ui_hud_renderer.py` | OpenCV 预览窗口右侧调试栏绘制 |
+| `setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
 | `setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
 | `setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
 | `setupUI/infer_wrap/base/seg_func.py` | 从分割结果提取路线中心和 `track_error` |
 | `setupUI/infer_wrap/base/func.py` | 检测模型后处理与画框 |
-| `setupUI/serial_comm.py` | TC264D 串口收发 |
+| `setupUI/control_serial_comm.py` | TC264D 串口收发 |
 | `setupUI/dist/main_config.json` | 官方 AR/WebUI 配置 |
 | `setupUI/ar_pose_status.json` | 定位、控制和 TC264D 反馈状态 |
 
+命名前缀按大模块划分：
+
+- `control_*`：控车链路、状态机、局部规划、串口、手柄接管和上下位机状态契约。
+- `vision_*`：视频帧来源、模型推理和结构化感知输出。
+- `pose_*`：Windows 定位包接收、校验、记录和 AR 转发。
+- `ui_* / webui_* / status_*`：HUD、WebUI 和运行状态缓存。
+- `debug_*`：日志轮转、定位链路分段打印等调试辅助。
+
+调车时最常看的文件：
+
+- 改不同状态的 `target_speed`、人/车/金币状态触发和丢线 `3 s` 超时：看 `setupUI/control_task_state_machine.py` 开头的调车参数区。
+- 改避障绕行偏置、金币靠近偏置、最终虚线目标线：看 `setupUI/control_local_planner.py`。
+- 改上位机图像误差到 TC264D 输入的比例、重复下发间隔：看 `setupUI/control_arbitrator.py`。
+- 改模型输出、检测类别归一化、分割中线提取：看 `setupUI/vision_pipeline.py` 和 `setupUI/infer_wrap/base/seg_func.py`。
+- 改下位机 PID、限幅、保护和兜底速度：看 `../Slave_TC264D/code/Control.c`。
+
+`control_states.py` 和 `control_task_state_machine.py` 的区别：
+
+- `control_states.py` 是“字典/契约文件”，只定义有哪些状态、状态码是多少、RK 任务状态如何映射到 TC264D 状态。它不看图像、不计时、不做判断，适合在新增状态或对齐上下位机枚举时修改。
+- `control_task_state_machine.py` 是“决策文件”，每一帧读取结构化感知结果，按优先级和滞回规则决定当前任务状态、目标速度和局部规划意图。它负责 `human` TTL、丢线恢复、`3 s` safe stop、`gold/car/human` 触发逻辑，适合调实际状态行为和速度参数。
+
 ## 当前控制
 
-当前只启用巡线状态：
+当前以 RK 上位机状态机为准：
 
 ```text
-融合视频 -> 分割模型 -> track_error -> STATE_TRACK + target_speed + flags=0x01 -> TC264D
+融合视频 -> 结构化感知 -> task_state + desired_speed + planner_intent
+       -> final_track_error + state_cmd + target_speed + flags=0x01 -> TC264D
 ```
 
-- 分割模型负责生成路线误差。
-- 检测模型当前识别 `gold / car / human`，但只用于画框，不参与状态切换。
+- 分割模型负责生成基础路线误差。
+- 检测模型当前识别 `gold / car / human`，作为状态机感知输入。
 - OCR/API 尚未接入。
 - 当前分割和检测模型效果较差，仍需继续训练和优化。
-- 无有效分割误差但未超过 `3 s` 时，当前进入 `TRACK_FALLBACK`，误差 `0`、默认速度 `0.5 m/s`。
-- 连续 `3 s` 没有有效 `track_error` 时，RK3588S 进入 `LINE_LOSS_SAFE_STOP` 并重复下发 `STATE_SAFE_STOP`。
-- 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + VISION`，不会锁死在 `STATE_SAFE_STOP`。
-- 中线丢失阈值可通过 `AR_LINE_LOSS_SAFE_STOP_TIMEOUT` 调整；丢线状态下命令重复间隔可通过 `AR_LINE_LOSS_COMMAND_REPEAT_INTERVAL` 调整。
-- 默认巡线速度为 `0.5 m/s`，可通过 `AR_TRACK_SPEED` 调整；`TRACK_FALLBACK` 可通过 `AR_TRACK_FALLBACK_SPEED` 单独覆盖。
+- 无有效分割误差但未超过 `3 s` 时，当前进入 `RECOVER_LINE`，短暂保持/衰减上一帧有效目标线。
+- 连续 `3 s` 没有有效 `track_error` 时，RK3588S 进入 `LINE_LOSS_SAFE_STOP`。
+- 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`，不会锁死在停机状态。
+- 中线丢失阈值和状态速度表归 `control_task_state_machine.py` 管理，直接修改文件开头的调车参数区，重启 `ar_receiver.py` 后生效。
+- 默认巡线速度为 `0.3 m/s`；`RECOVER_LINE`、避车、避人和金币状态速度都在 `control_task_state_machine.py` 的速度表中统一维护。
 
 ## 可选手柄遥控
 
@@ -66,18 +90,18 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_pose_bridge.py -> 127.0.0.1:9
 
 ## 后续扩展接口
 
-上位机新增功能应保持模块化：先新建可复用模块，再由 `ar_receiver.py` 调度。`ar_receiver.py` 不再直接承载大块新增业务逻辑，后续状态机、路径规划、OCR/API、任务记录和调参工具都应独立成文件，避免视频接收、模型推理、控制仲裁和调试界面互相缠在一起。后续任务状态机建议独立为 `task_state_machine.py`，输入分割/检测/OCR/API/定位状态，输出 `state_cmd / target_speed / track_error / flags`。
+上位机新增功能应保持模块化：先新建可复用模块，再由 `ar_receiver.py` 调度。`ar_receiver.py` 不再直接承载大块新增业务逻辑，后续状态机、路径规划、OCR/API、任务记录和调参工具都应独立成文件，避免视频接收、模型推理、控制仲裁和调试界面互相缠在一起。核心调车参数、阈值和速度表由对应模块维护，`ar_receiver.py` 只负责实例化和连接模块。
 
 `setupUI/standalone_control_bridge.py` 是手动备用入口，适合采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要 `9005` 定位转发和 `9010` 手柄控车的情况。它不是默认入口，不要和 `ar_receiver.py` 同时运行，以免争用 `9005/9010` 端口或形成双控制源。
 
 串口控制帧已包含：
 
-- `track_error`：当前由分割模型产生的转向误差。
+- `track_error`：最终下发给 TC264D 的转向误差，当前由分割中线经 `control_local_planner.py` 偏置/保持后得到。
 - `target_speed`：当前状态目标速度，单位按 TC264D 侧粗换算为 `m/s`。
 - `state_cmd`：上位机任务状态。
 - `flags`：控制选项。
 
-后续模型和 OCR/API 可通过独立任务决策层生成这些字段。新增状态时应分别定义进入、保持、退出和失效规则，不修改定位链路，也尽量保持串口协议兼容。
+后续 OCR/API 可作为新的感知输入接入 `control_task_state_machine.py`，并由局部规划器生成必要的误差修正。新增状态时应分别定义进入、保持、退出和失效规则，不修改定位链路，也尽量保持串口协议兼容。
 
 ## 定位与端口
 
@@ -103,7 +127,7 @@ WebUI/HUD 优先确认：
 
 - `WIN-UDP ok` 和 `AR-FWD ok` 持续增长，AR 画面随定位变化。
 - 分割结果和 `track_error` 是否稳定。
-- HUD 控制来源正常应为 `CTRL VISION` 或 `CTRL TRACK_FALLBACK`；手柄接管时应为 `CTRL GAMEPAD_TRACK` 或 `CTRL GAMEPAD_SAFE_STOP`。
+- HUD 控制来源正常应显示状态机状态，例如 `CTRL NORMAL_TRACK`、`CTRL RECOVER_LINE`、`CTRL AVOID_HUMAN` 或 `CTRL LINE_LOSS_SAFE_STOP`；手柄接管时应为 `CTRL GAMEPAD_TRACK` 或 `CTRL GAMEPAD_SAFE_STOP`。
 - WebUI 右侧调试栏的 `GAMEPAD` 行应显示遥控是否 active、包计数、错误计数和年龄。
 - TC264D feedback 持续增长。
 - `flags=0x01`，电机和舵机输出随误差变化。

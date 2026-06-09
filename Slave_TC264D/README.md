@@ -4,10 +4,10 @@ TC264D 下位机负责接收 RK3588S 控制帧，执行电机/舵机控制，并
 
 ## 系统边界
 
-- AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `track_error` 或下位机状态控制。
-- 当前只使用融合视频上的视觉巡线和 `STATE_TRACK`。
-- 当前分割和检测模型效果较差；检测模型只画 `gold / car / human` 检测框。
-- 检测任务决策、OCR/API 和多状态控制均属于后续扩展。
+- AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `track_error`、路径规划或下位机状态控制。
+- 当前以 RK3588S 上位机状态机为准，下位机只执行收到的 `state_cmd / target_speed / track_error / flags`。
+- 分割模型提供基础中线，检测模型提供 `gold / car / human` 等结构化感知输入；状态判断和局部规划都在 RK3588S 侧完成，检测结果不直接控车。
+- OCR/API 尚未接入；后续新增任务状态时需要同步 `Master_RK3588S/setupUI/control_states.py` 和 `Slave_TC264D/code/State.h`。
 - 可选手柄遥控只在 RK3588S 上位机侧接管控制帧；TC264D 不区分视觉来源或手柄来源，只执行收到的 `state_cmd / target_speed / track_error / flags`。
 
 ## 串口
@@ -24,19 +24,32 @@ TC264D 下位机负责接收 RK3588S 控制帧，执行电机/舵机控制，并
 
 ## 当前状态
 
-正常视觉控制只使用 `STATE_TRACK`：
+当前状态契约以上位机为标准：
 
-- 上位机根据融合视频生成 `track_error`。
-- 上位机发送 `STATE_TRACK + target_speed + flags=0x01`。
+| 状态 | 用途 | 下位机行为 |
+| --- | --- | --- |
+| `STATE_IDLE = 0` | 本地启动/空闲 | 停车 |
+| `STATE_TRACK = 1` | 默认视觉巡线 `NORMAL_TRACK` | 复用当前 TRACK 电机/舵机控制 |
+| `STATE_AVOID_CAR = 2` | 上位机避车 | 复用当前 TRACK 电机/舵机控制 |
+| `STATE_AVOID_HUMAN = 3` | 上位机避人，低速 | 复用当前 TRACK 电机/舵机控制 |
+| `STATE_COLLECT_GOLD = 4` | 上位机靠近金币 | 复用当前 TRACK 电机/舵机控制 |
+| `STATE_RECOVER_LINE = 5` | 短时丢线恢复 | 复用当前 TRACK 电机/舵机控制 |
+| `STATE_LINE_LOSS_SAFE_STOP = 6` | 上位机连续丢线超时 | 停车 |
+| `STATE_SAFE_STOP = 7` | 通用急停/退出清零/本地超时 | 停车 |
+
+执行控制时：
+
+- 上位机根据融合视频和状态机生成最终 `track_error`。
+- 上位机发送 `state_cmd + target_speed + track_error + flags=0x01`。
 - 下位机使用误差控制舵机，并使用上位机目标速度控制电机。
 - 电机 PWM 硬限幅当前为 `±2500` duty，防止编码器异常或 PID 调参不当时直接冲到满占空比。
 - `target_speed` 当前按同款 CarDo 车模参数粗换算为 `m/s`；`actual_speed` 由编码器计数、`64 mm` 轮径、`512` 线编码器、`4` 倍频、`2.7` 减速比和 `10 ms` 控制周期换算得到。
 - `STATE_TRACK` 电机速度环当前采用约 `1450` duty 启动前馈 + 小 PI 修正：目标速度非零时先越过电机启动死区，PID 只负责稳速微调，最终输出仍受 `±2500` duty 硬限幅保护。
 - 前馈 duty 不是速度标定，只是静摩擦/启动死区补偿；若正转时 `actual_speed` 为负，需要把 `Control.c` 中的 `MOTOR_ENCODER_SIGN` 改为 `-1.0f` 后再调 PID。
 
-`STATE_SAFE_STOP` 当前用于三类停车来源：RK3588S 连续 `3 s` 没有识别到语义分割中线时，上位机重复下发停车命令；手柄遥控模式下 `LT >= 90%` 或手柄断连时，上位机下发停车命令；TC264D 连续约 `2.5 s` 没收到有效控制帧时，本地自行进入停车状态。模型输出无效但未超过 `3 s` 时，上位机会继续发送 `STATE_TRACK + TRACK_FALLBACK`；再次识别到中线后恢复 `STATE_TRACK + VISION`。
+`STATE_LINE_LOSS_SAFE_STOP` 用于 RK3588S 连续约 `3 s` 没有识别到有效语义分割中线后的上位机停机状态。模型输出无效但未超过超时时，上位机会进入 `STATE_RECOVER_LINE`，短暂保持/衰减上一帧有效目标线；再次识别到中线后恢复 `STATE_TRACK + NORMAL_TRACK`。
 
-`STATE_LIMIT_SPEED / WAIT_LIGHT / AVOID / NAV_LEFT / NAV_RIGHT` 等枚举和 `state_cmd` 接口作为后续扩展保留，当前没有完整任务切换规则。
+`STATE_SAFE_STOP` 是通用硬停来源：手柄急停或断连、程序退出清零、TC264D 本地串口输入超时等。
 
 TC264D 本地输入超时不改变串口协议，只使用已解码控制帧的接收时间。若整个 RK3588S 进程直接崩溃导致串口帧停止，下位机会在约 `2.5 s` 后重置输入并进入 `STATE_SAFE_STOP`。
 
@@ -76,7 +89,7 @@ TC264D 本地输入超时不改变串口协议，只使用已解码控制帧的�
 车不动时先看上位机 HUD/WebUI：
 
 1. feedback 是否持续增长。
-2. `state` 是否为 `TRACK`，`flags` 是否为 `0x01`。
+2. `state` 是否为当前上位机状态对应值，例如 `TRACK / AVOID_HUMAN / RECOVER_LINE`，`flags` 是否为 `0x01`。
 3. `input_target_speed` 和 `motor_target` 是否大于 `0`，单位是否为预期的 `m/s`。
 4. `motor_output`、`actual_speed` 和 `servo_output` 是否变化；架空正转时若 `actual_speed` 为负，先修正 `MOTOR_ENCODER_SIGN`。
 5. 若 `motor_output` 长时间接近 `±2500` 但 `actual_speed` 仍接近 `0`，优先检查编码器方向、机械空转和速度换算参数。

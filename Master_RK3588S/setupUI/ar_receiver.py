@@ -6,7 +6,7 @@ from struct import error as StructError
 from multiprocessing import shared_memory
 
 
-from ar_pose_bridge import (
+from pose_ar_bridge import (
     AR_FORWARD_MAPPING,
     ARPoseBridge,
     DEFAULT_AR_UDP_IP,
@@ -14,18 +14,20 @@ from ar_pose_bridge import (
     POSE_CONVENTION,
     POSE_INPUT_PORT,
 )
-from car_control_link import (
-    CONTROL_FLAG_USE_TARGET_SPEED as DEFAULT_CONTROL_FLAG_USE_TARGET_SPEED,
+from control_car_link import (
+    CONTROL_FLAG_USE_TARGET_SPEED,
     STATE_SAFE_STOP,
-    STATE_TRACK,
     CarControlLink,
 )
 from control_arbitrator import ControlArbitrator
+from control_states import TaskState, task_state_to_tc264_state
 from debug_tools import PosePathDebugPrinter, RotatingDebugLogger
-from gamepad_control_receiver import GAMEPAD_CONTROL_PORT, GamepadControlReceiver
-from hud_renderer import draw_pose_status
-from runtime_status import RuntimeStatusStore
-from video_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
+from control_gamepad_receiver import GAMEPAD_CONTROL_PORT, GamepadControlReceiver
+from ui_hud_renderer import draw_pose_status
+from control_local_planner import LocalPlanner
+from status_runtime import RuntimeStatusStore
+from control_task_state_machine import TaskStateMachine
+from vision_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
 from vision_pipeline import VisionPipeline
 from webui_status_server import WebUIStatusServer
 
@@ -35,16 +37,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "dist", "main_config.json")
 TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", "base", "model"))
-SEG_RESULT_TTL = 2.0
-DET_RESULT_TTL = 1.0
 RUNTIME_STATUS_INTERVAL = 0.5
-LINE_LOSS_SAFE_STOP_TIMEOUT = float(os.environ.get("AR_LINE_LOSS_SAFE_STOP_TIMEOUT", "3.0"))
-LINE_LOSS_COMMAND_REPEAT_INTERVAL = float(os.environ.get("AR_LINE_LOSS_COMMAND_REPEAT_INTERVAL", "0.2"))
-CONTROL_SCALE = 0.5
-TRACK_SPEED = float(os.environ.get("AR_TRACK_SPEED", "0.5"))
-TRACK_FALLBACK_SPEED = float(os.environ.get("AR_TRACK_FALLBACK_SPEED", str(TRACK_SPEED)))
-CONTROL_FLAG_USE_TARGET_SPEED = int(os.environ.get("AR_CONTROL_SPEED_FLAG", str(DEFAULT_CONTROL_FLAG_USE_TARGET_SPEED)), 0)
 
 # ===== 定位数据终端调试开关 =====
 # Windows AprilTag localization sends official robot_position JSON over UDP.
@@ -78,7 +71,7 @@ def get_control_send_status():
 def get_car_feedback():
     return car_link.get_feedback()
 
-car_link = CarControlLink(port="/dev/ttyUSB0", baudrate=460800)
+car_link = CarControlLink()
 vision_pipeline = None
 
 
@@ -155,27 +148,38 @@ def main():
     )
     pose_bridge.start()
     gamepad_receiver = GamepadControlReceiver(
-        state_track=STATE_TRACK,
-        state_safe_stop=STATE_SAFE_STOP,
-        control_flag_use_target_speed=CONTROL_FLAG_USE_TARGET_SPEED,
         log_func=write_debug_log,
     )
     gamepad_receiver.start()
-    control_arbitrator = ControlArbitrator(
-        track_speed=TRACK_SPEED,
-        fallback_speed=TRACK_FALLBACK_SPEED,
-        control_scale=CONTROL_SCALE,
-        line_loss_safe_stop_timeout=LINE_LOSS_SAFE_STOP_TIMEOUT,
-        state_track=STATE_TRACK,
-        state_safe_stop=STATE_SAFE_STOP,
-        control_flag_use_target_speed=CONTROL_FLAG_USE_TARGET_SPEED,
-    )
+    control_arbitrator = ControlArbitrator()
+    task_state_machine = TaskStateMachine()
+    local_planner = LocalPlanner()
     vision_pipeline = VisionPipeline(
-        model_dir=MODEL_DIR,
-        seg_result_ttl=SEG_RESULT_TTL,
-        det_result_ttl=DET_RESULT_TTL,
         log_func=write_debug_log,
     )
+
+    def build_autonomy_command(now, perception):
+        task_decision = task_state_machine.update(perception, now)
+        plan_result = local_planner.plan(perception, task_decision, now)
+        final_track_error = plan_result["final_track_error"]
+        desired_speed = task_decision["desired_speed"]
+        task_state = task_decision["task_state"]
+        task_state_cmd = int(task_state_to_tc264_state(task_state))
+        task_safe_stop = task_state == TaskState.LINE_LOSS_SAFE_STOP.value
+
+        gamepad_cmd, gamepad_status = gamepad_receiver.active_command()
+        command = control_arbitrator.decide(
+            now,
+            final_track_error,
+            gamepad_cmd=gamepad_cmd,
+            desired_speed=desired_speed,
+            state_text=task_state,
+            safe_stop=task_safe_stop,
+            state_cmd=task_state_cmd,
+            line_loss_age=task_decision.get("line_loss_age", 0.0),
+        )
+        return command, gamepad_status, task_decision, plan_result
+
     print("vision client ready, waiting for camera shared memory...")
     last_line_loss_command_ts = 0.0
 
@@ -202,9 +206,8 @@ def main():
                     fid, frame = read_frame_from_shm(shm, SHM_HEADER_SIZE)
                     if fid == last_fid:
                         now = time.time()
-                        if have_frame and now - last_line_loss_command_ts >= LINE_LOSS_COMMAND_REPEAT_INTERVAL:
-                            gamepad_cmd, gamepad_status = gamepad_receiver.active_command()
-                            command = control_arbitrator.decide(now, None, gamepad_cmd=gamepad_cmd)
+                        if have_frame and control_arbitrator.should_repeat_command(now, last_line_loss_command_ts):
+                            command, gamepad_status, _, _ = build_autonomy_command(now, None)
                             command_error = command["track_error"]
                             command_speed = command["target_speed"]
                             command_state = command["state_cmd"]
@@ -237,10 +240,9 @@ def main():
                     have_frame = True
 
                     now = time.time()
-                    final_frame, track_error = vision_pipeline.process(frame, now)
-
-                    gamepad_cmd, gamepad_status = gamepad_receiver.active_command()
-                    command = control_arbitrator.decide(now, track_error, gamepad_cmd=gamepad_cmd)
+                    final_frame, perception = vision_pipeline.process(frame, now)
+                    command, gamepad_status, task_decision, plan_result = build_autonomy_command(now, perception)
+                    final_frame = local_planner.draw_debug(final_frame, task_decision, plan_result)
                     command_error = command["track_error"]
                     command_speed = command["target_speed"]
                     command_state = command["state_cmd"]

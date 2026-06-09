@@ -7,8 +7,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
-from ar_pose_bridge import send_local_udp_json
-from runtime_status import read_json_file
+from pose_ar_bridge import send_local_udp_json
+from status_runtime import read_json_file
 
 
 def write_json_atomic(path, payload):

@@ -62,13 +62,13 @@ static uint8 control_allow_speed_override(car_state_enum state)
     switch (state)
     {
     case STATE_TRACK:
-    case STATE_LIMIT_SPEED:
-    case STATE_AVOID:
-    case STATE_NAV_LEFT:
-    case STATE_NAV_RIGHT:
+    case STATE_AVOID_CAR:
+    case STATE_AVOID_HUMAN:
+    case STATE_COLLECT_GOLD:
+    case STATE_RECOVER_LINE:
         return 1;
 
-    case STATE_WAIT_LIGHT:
+    case STATE_LINE_LOSS_SAFE_STOP:
     case STATE_SAFE_STOP:
     case STATE_IDLE:
     default:
@@ -138,7 +138,11 @@ void control_apply_state_param(car_state_enum state)
     switch (state)
     {
     case STATE_TRACK:
-        control_ctx.param.motor_target_speed = 0.5f;
+    case STATE_AVOID_CAR:
+    case STATE_AVOID_HUMAN:
+    case STATE_COLLECT_GOLD:
+    case STATE_RECOVER_LINE:
+        control_ctx.param.motor_target_speed = 0.3f;
         control_ctx.param.motor_kp = 100.0f;
         control_ctx.param.motor_ki = 8.0f;
         control_ctx.param.motor_kd = 0.0f;
@@ -150,36 +154,8 @@ void control_apply_state_param(car_state_enum state)
         control_ctx.param.servo_output_max = (float)(SERVO_DUTY_MAX - SERVO_DUTY_MID);
         break;
 
-    case STATE_LIMIT_SPEED:
-        control_ctx.param.motor_target_speed = 0.0f;
-        control_ctx.param.motor_kp = 0.0f;
-        control_ctx.param.motor_ki = 0.0f;
-        control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
-        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
-        control_ctx.param.servo_kp = 0.0f;
-        control_ctx.param.servo_kd = 0.0f;
-        control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
-        control_ctx.param.servo_output_max = (float)(SERVO_DUTY_MAX - SERVO_DUTY_MID);
-        break;
-
-    case STATE_WAIT_LIGHT:
+    case STATE_LINE_LOSS_SAFE_STOP:
     case STATE_SAFE_STOP:
-        control_ctx.param.motor_target_speed = 0.0f;
-        control_ctx.param.motor_kp = 0.0f;
-        control_ctx.param.motor_ki = 0.0f;
-        control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -(float)MOTOR_PWM_DUTY_LIMIT;
-        control_ctx.param.motor_output_max = (float)MOTOR_PWM_DUTY_LIMIT;
-        control_ctx.param.servo_kp = 0.0f;
-        control_ctx.param.servo_kd = 0.0f;
-        control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
-        control_ctx.param.servo_output_max = (float)(SERVO_DUTY_MAX - SERVO_DUTY_MID);
-        break;
-
-    case STATE_AVOID:
-    case STATE_NAV_LEFT:
-    case STATE_NAV_RIGHT:
         control_ctx.param.motor_target_speed = 0.0f;
         control_ctx.param.motor_kp = 0.0f;
         control_ctx.param.motor_ki = 0.0f;

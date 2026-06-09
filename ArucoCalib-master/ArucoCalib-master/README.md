@@ -6,9 +6,9 @@ Windows 顶置相机定位程序负责检测 AprilTag 36h11，解算小车坐标
 
 ## 系统当前状态
 
-- 当前小车只使用融合视频上的视觉巡线和 `STATE_TRACK`，分割模型输出的 `track_error` 是唯一转向来源。
-- 当前分割和检测模型效果较差；检测模型只画 `gold / car / human` 检测框。
-- 检测任务决策、OCR/API 和多状态控制均属于后续扩展。
+- 当前小车默认使用 RK3588S 上位机状态机中的 `NORMAL_TRACK` 低速视觉巡线。
+- 分割模型提供基础中线，检测模型提供 `gold / car / human` 等结构化感知输入；RK3588S 状态机再决定避人、避车、金币和丢线恢复等状态。
+- 检测结果不直接控车，AprilTag 定位也不参与 `track_error` 或路径规划；OCR/API 尚未接入。
 - 手柄遥控默认关闭；只有前端勾选 `Gamepad Mode` 并持续发出 `gamepad_control` 包时，RK3588S 才临时覆盖视觉控车。
 - `Gamepad Mode` 使用定位 EXE 内部独立定时器发送，频率与当前相机/视频帧率一致；它不依赖固定 Tag、车载 Tag、标定状态或 `robot_position` 是否成功发送。
 - 遥控模式下定位 `robot_position` 仍正常发送到 `9005`，不会影响 AR 融合和轨迹显示。

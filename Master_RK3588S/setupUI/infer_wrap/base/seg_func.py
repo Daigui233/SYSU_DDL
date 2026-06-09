@@ -294,7 +294,27 @@ def _draw_midline(frame, mask, points):
     return tx
 
 
-def extract_centerline(seg_map, frame):
+def _empty_centerline_info(frame, reason="lost"):
+    h, w = frame.shape[:2]
+    return {
+        "line_valid": False,
+        "track_error": None,
+        "road_valid": False,
+        "road_held": False,
+        "road_state": "LOST",
+        "midline_valid": False,
+        "midline_state": "LOST",
+        "road_ratio": 0.0,
+        "reason": reason,
+        "branch_count": 0,
+        "center_x": w // 2,
+        "target_x": None,
+        "road_mask": None,
+        "mid_points": [],
+    }
+
+
+def extract_centerline_info(seg_map, frame):
     global _prev_mask, _prev_track_error, _prev_valid_ts, _prev_stable_error
     global _mask_history
 
@@ -304,7 +324,7 @@ def extract_centerline(seg_map, frame):
         out = frame.copy()
         cv2.putText(out, "SEG MAP ERROR", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
         cv2.putText(out, str(exc), (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
-        return out, None
+        return out, _empty_centerline_info(frame, reason=str(exc))
 
     raw_mask = _make_raw_mask(class_map)
     raw_ratio = float((class_map == ROAD_CLASS_ID).sum()) / float(class_map.size) if class_map.size else 0.0
@@ -358,7 +378,29 @@ def extract_centerline(seg_map, frame):
     err_text = f"Track err: {track_error:.1f}" if track_error is not None else "Track err: N/A"
     cv2.putText(out, err_text, (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
     cv2.putText(out, f"Branches: {_prev_branch_count}", (10, 144), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-    return out, track_error
+
+    info = {
+        "line_valid": track_error is not None,
+        "track_error": float(track_error) if track_error is not None else None,
+        "road_valid": bool(road_valid),
+        "road_held": bool(held),
+        "road_state": road_state,
+        "midline_valid": bool(mid_ok or (held and draw_points)),
+        "midline_state": mid_state,
+        "road_ratio": float(ratio),
+        "reason": reason,
+        "branch_count": int(_prev_branch_count),
+        "center_x": int(center_x),
+        "target_x": int(target_x) if target_x is not None else None,
+        "road_mask": road_mask,
+        "mid_points": [(int(x), int(y)) for x, y in draw_points],
+    }
+    return out, info
+
+
+def extract_centerline(seg_map, frame):
+    out, info = extract_centerline_info(seg_map, frame)
+    return out, info.get("track_error")
 
 
 def myFunc(rknn_lite, img_bgr):

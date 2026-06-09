@@ -3,13 +3,18 @@ import time
 
 
 try:
-    import serial_comm as _serial_comm
+    import control_serial_comm as _serial_comm
 except Exception as exc:
     _serial_comm = None
     print(f"serial_comm unavailable: {exc}; car serial control disabled")
 
 
 STATE_TRACK = getattr(_serial_comm, "STATE_TRACK", 1) if _serial_comm else 1
+STATE_AVOID_CAR = getattr(_serial_comm, "STATE_AVOID_CAR", 2) if _serial_comm else 2
+STATE_AVOID_HUMAN = getattr(_serial_comm, "STATE_AVOID_HUMAN", 3) if _serial_comm else 3
+STATE_COLLECT_GOLD = getattr(_serial_comm, "STATE_COLLECT_GOLD", 4) if _serial_comm else 4
+STATE_RECOVER_LINE = getattr(_serial_comm, "STATE_RECOVER_LINE", 5) if _serial_comm else 5
+STATE_LINE_LOSS_SAFE_STOP = getattr(_serial_comm, "STATE_LINE_LOSS_SAFE_STOP", 6) if _serial_comm else 6
 STATE_SAFE_STOP = getattr(_serial_comm, "STATE_SAFE_STOP", 7) if _serial_comm else 7
 CONTROL_FLAG_USE_TARGET_SPEED = (
     getattr(_serial_comm, "CONTROL_FLAG_USE_TARGET_SPEED", 0x01) if _serial_comm else 0x01

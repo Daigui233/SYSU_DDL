@@ -3,7 +3,7 @@ import signal
 import threading
 import time
 
-from ar_pose_bridge import (
+from pose_ar_bridge import (
     AR_FORWARD_MAPPING,
     ARPoseBridge,
     DEFAULT_AR_UDP_IP,
@@ -12,13 +12,13 @@ from ar_pose_bridge import (
     POSE_CONVENTION,
     write_json_atomic,
 )
-from car_control_link import (
+from control_car_link import (
     CONTROL_FLAG_USE_TARGET_SPEED,
     STATE_SAFE_STOP,
     STATE_TRACK,
     CarControlLink,
 )
-from gamepad_control_receiver import GamepadControlReceiver
+from control_gamepad_receiver import GamepadControlReceiver
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
