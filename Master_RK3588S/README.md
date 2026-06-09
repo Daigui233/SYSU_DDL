@@ -27,7 +27,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> pose_ar_bridge.py -> 127.0.0.1:9
 | `setupUI/control_car_link.py` | 封装 `/dev/ttyUSB0` 串口控车链路，供主入口或备用桥复用 |
 | `setupUI/status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
 | `setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
-| `setupUI/ui_hud_renderer.py` | OpenCV 预览窗口右侧调试栏绘制 |
+| `setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
 | `setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
 | `setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
 | `setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
@@ -126,6 +126,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> pose_ar_bridge.py -> 127.0.0.1:9
 WebUI/HUD 优先确认：
 
 - `WIN-UDP ok` 和 `AR-FWD ok` 持续增长，AR 画面随定位变化。
+- OpenCV 预览左侧 `REFEREE EVENTS` 面板优先轮询裁判系统 API `127.0.0.1:5000/api/match_records`，API 不通时回退读取本地 `dist/match_record_*.json`。
 - 分割结果和 `track_error` 是否稳定。
 - HUD 控制来源正常应显示状态机状态，例如 `CTRL NORMAL_TRACK`、`CTRL RECOVER_LINE`、`CTRL AVOID_HUMAN` 或 `CTRL LINE_LOSS_SAFE_STOP`；手柄接管时应为 `CTRL GAMEPAD_TRACK` 或 `CTRL GAMEPAD_SAFE_STOP`。
 - WebUI 右侧调试栏的 `GAMEPAD` 行应显示遥控是否 active、包计数、错误计数和年龄。

@@ -36,7 +36,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 | `control_car_link.py` | 封装 `/dev/ttyUSB0` 串口控车链路，供主入口或备用桥复用 |
 | `status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
 | `webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
-| `ui_hud_renderer.py` | OpenCV 预览窗口右侧调试栏绘制 |
+| `ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
 | `vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
 | `debug_tools.py` | 调试日志轮转和定位链路分段打印 |
 | `standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |

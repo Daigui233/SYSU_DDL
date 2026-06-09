@@ -44,7 +44,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Master_RK3588S/setupUI/control_car_link.py` | 封装 RK3588S 到 TC264D 的串口控制链路 |
 | `Master_RK3588S/setupUI/status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
 | `Master_RK3588S/setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
-| `Master_RK3588S/setupUI/ui_hud_renderer.py` | OpenCV 预览窗口右侧调试栏绘制 |
+| `Master_RK3588S/setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
 | `Master_RK3588S/setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
 | `Master_RK3588S/setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
 | `Master_RK3588S/setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
