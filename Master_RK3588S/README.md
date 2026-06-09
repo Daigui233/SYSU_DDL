@@ -5,10 +5,10 @@ RK3588S 上位机负责转发定位给官方 AR、读取融合视频、运行视
 ## 正确链路
 
 ```text
-Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006 -> 官方 AR
+Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_pose_bridge.py -> 127.0.0.1:9006 -> 官方 AR
 官方 AR 融合视频 -> shm_ar_video -> 分割模型 -> track_error -> STATE_TRACK -> /dev/ttyUSB0 -> TC264D
 官方 AR 融合视频 -> shm_ar_video -> 检测模型 -> 仅画 gold/car/human 检测框
-可选手柄遥控 -> UDP 板卡IP:9010 -> ar_receiver.py 临时覆盖视觉控制 -> /dev/ttyUSB0 -> TC264D
+可选手柄遥控 -> UDP 板卡IP:9010 -> gamepad_control_receiver.py -> ar_receiver.py 临时覆盖视觉控制 -> /dev/ttyUSB0 -> TC264D
 ```
 
 定位只驱动 AR 融合和坐标显示，不直接参与转向控制。默认控车输入来自融合视频上的视觉处理结果；只有 Windows 定位 EXE 显式勾选 `Gamepad Mode` 且 `9010` 收到新鲜遥控包时，手柄才临时覆盖视觉控制。
@@ -17,7 +17,18 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 
 | 文件 | 作用 |
 | --- | --- |
-| `setupUI/ar_receiver.py` | 定位转发、融合视频读取、模型推理、控制命令和 HUD |
+| `setupUI/ar_receiver.py` | 上位机主入口：启动模块、读取帧、调度视觉/仲裁/发送/显示 |
+| `setupUI/ar_pose_bridge.py` | 独立接收 Windows `robot_position`，校验、记录并转发给官方 AR |
+| `setupUI/gamepad_control_receiver.py` | 独立接收 `9010` 手柄遥控包，供 `ar_receiver.py` 临时覆盖视觉控制 |
+| `setupUI/vision_pipeline.py` | 分割/检测模型初始化、推理、后处理、画中线和检测框 |
+| `setupUI/control_arbitrator.py` | 根据视觉中线、丢线计时和可选手柄命令生成最终控制帧 |
+| `setupUI/car_control_link.py` | 封装 `/dev/ttyUSB0` 串口控车链路，供主入口或备用桥复用 |
+| `setupUI/runtime_status.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
+| `setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
+| `setupUI/hud_renderer.py` | OpenCV 预览窗口右侧调试栏绘制 |
+| `setupUI/video_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
+| `setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
+| `setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
 | `setupUI/infer_wrap/base/seg_func.py` | 从分割结果提取路线中心和 `track_error` |
 | `setupUI/infer_wrap/base/func.py` | 检测模型后处理与画框 |
 | `setupUI/serial_comm.py` | TC264D 串口收发 |
@@ -54,6 +65,10 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
 - RK 侧对遥控速度和误差再次限幅：默认最大速度 `±1.0 m/s`，最大 `track_error` 绝对值 `240`，可通过 `AR_GAMEPAD_MAX_SPEED_MPS` / `AR_GAMEPAD_MAX_TRACK_ERROR` 调整。
 
 ## 后续扩展接口
+
+上位机新增功能应保持模块化：先新建可复用模块，再由 `ar_receiver.py` 调度。`ar_receiver.py` 不再直接承载大块新增业务逻辑，后续状态机、路径规划、OCR/API、任务记录和调参工具都应独立成文件，避免视频接收、模型推理、控制仲裁和调试界面互相缠在一起。后续任务状态机建议独立为 `task_state_machine.py`，输入分割/检测/OCR/API/定位状态，输出 `state_cmd / target_speed / track_error / flags`。
+
+`setupUI/standalone_control_bridge.py` 是手动备用入口，适合采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要 `9005` 定位转发和 `9010` 手柄控车的情况。它不是默认入口，不要和 `ar_receiver.py` 同时运行，以免争用 `9005/9010` 端口或形成双控制源。
 
 串口控制帧已包含：
 

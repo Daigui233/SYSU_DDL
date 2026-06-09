@@ -7,7 +7,7 @@ RK3588S 上位机 + TC264D 下位机智能车工程。当前阶段只先打通�
 ```text
 Windows 顶置相机
   -> AprilTag 定位 robot_position
-  -> UDP 板卡IP:9005 -> ar_receiver.py -> 127.0.0.1:9006
+  -> UDP 板卡IP:9005 -> ar_pose_bridge.py -> 127.0.0.1:9006
   -> 官方 AR 引擎根据定位更新融合画面
   -> 融合视频流 shm_ar_video
   -> RK3588S 视觉模型与上位机决策
@@ -19,7 +19,7 @@ Windows 顶置相机
 可选数据采集遥控链路：
 Windows 定位 EXE 勾选 Gamepad Mode
   -> UDP 板卡IP:9010
-  -> ar_receiver.py 临时覆盖视觉控制
+  -> gamepad_control_receiver.py -> ar_receiver.py 临时覆盖视觉控制
   -> /dev/ttyUSB0 -> TC264D
 ```
 
@@ -31,13 +31,25 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | --- | --- |
 | `ArucoCalib-master/ArucoCalib-master/` | Windows AprilTag 定位，发送官方 `robot_position`；可选发送手柄遥控包 |
 | 官方 AR 引擎/WebUI | 根据定位更新 AR 世界并产生融合视频流 |
-| `Master_RK3588S/setupUI/ar_receiver.py` | 读取融合视频、运行模型、生成控制命令、转发定位给 AR |
+| `Master_RK3588S/setupUI/ar_receiver.py` | 上位机主入口：启动模块、读取帧、调度视觉/仲裁/发送/显示 |
+| `Master_RK3588S/setupUI/ar_pose_bridge.py` | 接收 Windows `robot_position`，校验、记录并转发到官方 AR `127.0.0.1:9006` |
+| `Master_RK3588S/setupUI/gamepad_control_receiver.py` | 接收可选 `9010` 手柄遥控包，提供给 `ar_receiver.py` 做控制源仲裁 |
+| `Master_RK3588S/setupUI/vision_pipeline.py` | 分割/检测模型初始化、推理、后处理、画中线和检测框 |
+| `Master_RK3588S/setupUI/control_arbitrator.py` | 根据视觉中线、丢线计时和可选手柄命令生成最终控制帧 |
+| `Master_RK3588S/setupUI/car_control_link.py` | 封装 RK3588S 到 TC264D 的串口控制链路 |
+| `Master_RK3588S/setupUI/runtime_status.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
+| `Master_RK3588S/setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
+| `Master_RK3588S/setupUI/hud_renderer.py` | OpenCV 预览窗口右侧调试栏绘制 |
+| `Master_RK3588S/setupUI/video_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
+| `Master_RK3588S/setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
+| `Master_RK3588S/setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
 | `Master_RK3588S/setupUI/serial_comm.py` | 向 TC264D 下发控制帧并接收反馈 |
 | `Slave_TC264D/` | 执行上位机给出的状态、速度和转向误差 |
 | `Tools_Windows/gamepad_mapper.py` | 手柄输入和映射测试工具，不直接控车 |
 
 ## 当前阶段
 
+- 工程约定：后续新增上位机功能时，优先新建可复用模块文件，再由 `ar_receiver.py` 调度；不要把状态机、路径规划、OCR/API、数据记录等大块逻辑直接堆进 `ar_receiver.py`。后续任务状态机建议独立为 `task_state_machine.py`，输入分割/检测/OCR/API/定位状态，输出 `state_cmd / target_speed / track_error / flags`。
 - 正常视觉控制只使用 `STATE_TRACK` 巡线状态；仅当 RK3588S 连续 `3 s` 没有识别到语义分割中线时，才周期性下发 `STATE_SAFE_STOP`。
 - 分割模型从融合视频生成 `track_error`，上位机以 `STATE_TRACK + flags=0x01` 下发给 TC264D。
 - 当前分割和检测模型效果较差，仍需优化；检测模型的 `gold / car / human` 结果只用于画框。
@@ -49,6 +61,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - `Gamepad Mode` 在定位 EXE 内部用独立定时器发送，频率与当前相机/视频帧率一致；它不依赖固定 Tag、车载 Tag、标定状态或 `robot_position` 是否成功发送。
 - 遥控模式下定位 UDP `9005` 仍正常发送并被 RK3588S 转发到 `9006`，不会因为手柄接管而停止 AR 融合。
 - 遥控映射：`RT` 前进、`LT` 倒车，合成为 `target_speed=(RT-LT)*1.0 m/s`；左摇杆横轴 `LX` 控制 `track_error`；`B` 键或手柄断连时发送 `STATE_SAFE_STOP`。Windows 定位 EXE 优先读取 XInput，读不到时会用 pygame/DirectInput 兜底，便于蓝牙手柄调试。
+- 如果采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要定位转发和手柄控车，可在 RK3588S 手动运行 `python3 Master_RK3588S/setupUI/standalone_control_bridge.py`；该备用脚本不要和 `ar_receiver.py` 同时运行。
 - TC264D 保留现有串口协议，同时增加 `2.5 s` 本地输入超时；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。
 
 ## 定位与端口
