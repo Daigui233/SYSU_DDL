@@ -5,7 +5,7 @@ from control_car_link import CONTROL_FLAG_USE_TARGET_SPEED, STATE_SAFE_STOP, STA
 
 # ===== 控制下发参数区：修改这里后需要重启 ar_receiver.py 生效 =====
 # control_scale 用于把上位机图像误差换算成 TC264D 舵机误差输入。
-CONTROL_SCALE = 0.5
+CONTROL_SCALE = 1.0
 
 # 没有新视频帧时，重复发送上一次状态机决策的最小间隔，单位 s。
 CONTROL_COMMAND_REPEAT_INTERVAL = 0.2

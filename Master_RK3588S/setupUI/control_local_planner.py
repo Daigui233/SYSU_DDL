@@ -32,22 +32,26 @@ PLANNER_DEFAULTS = {
 
     # 检测触发状态容易逐帧抖动；该系数决定 final_track_error 朝新目标移动的速度。
     # 调大反应更快，调小目标线更稳。
-    "FINAL_ERROR_SMOOTH_ALPHA": 0.30,
+    "FINAL_ERROR_SMOOTH_ALPHA": 0.45,
 
     # 每一帧 final_track_error 最大允许变化量，单位 px；用于防止目标线左右瞬移。
-    "MAX_ERROR_STEP_PER_FRAME": 14.0,
+    "MAX_ERROR_STEP_PER_FRAME": 28.0,
 
     # 绘制偏移目标路径时，尽量让路径点留在 road_mask 边界内侧这么多像素。
     "TARGET_PATH_ROAD_MARGIN": 8.0,
 
-    # 最终控制误差从紫色规划线的这个 y 位置读取；0.62 表示画面高度 62% 处。
-    "CONTROL_LOOKAHEAD_Y_RATIO": 0.62,
+    # 最终控制误差从紫色规划线的这个 y 位置读取；数值越小越偏向画面远处，转向会更提前。
+    "CONTROL_LOOKAHEAD_Y_RATIO": 0.58,
 
-    # 紫色规划线从近处开始保持贴近红线；y 大于该比例时偏移接近 0。
-    "PATH_NEAR_ANCHOR_Y_RATIO": 0.86,
+    # 紫色规划线近处过渡起点；配合 PATH_NEAR_BIAS_GAIN，近处不再完全贴死红线。
+    "PATH_NEAR_ANCHOR_Y_RATIO": 0.94,
 
     # 紫色规划线到较远处逐渐达到完整避障偏移；y 小于该比例时偏移接近完整值。
-    "PATH_FULL_BIAS_Y_RATIO": 0.50,
+    "PATH_FULL_BIAS_Y_RATIO": 0.46,
+
+    # Minimum offset gain near the bottom of the image. This avoids a path that
+    # visually stays glued to the red midline until it is too late to steer.
+    "PATH_NEAR_BIAS_GAIN": 0.28,
 
     # 紫色规划线最多使用的点数；减少 road_mask 扫描和绘制开销，避免 RK 上帧率被拖低。
     "TARGET_PATH_MAX_POINTS": 28,
@@ -125,6 +129,7 @@ class LocalPlanner:
         self.control_lookahead_y_ratio = float(self.params["CONTROL_LOOKAHEAD_Y_RATIO"])
         self.path_near_anchor_y_ratio = float(self.params["PATH_NEAR_ANCHOR_Y_RATIO"])
         self.path_full_bias_y_ratio = float(self.params["PATH_FULL_BIAS_Y_RATIO"])
+        self.path_near_bias_gain = float(self.params["PATH_NEAR_BIAS_GAIN"])
         self.target_path_max_points = int(self.params["TARGET_PATH_MAX_POINTS"])
         self.avoid_side_hold_seconds = float(self.params["AVOID_SIDE_HOLD_SECONDS"])
         self.avoid_side_switch_margin = float(self.params["AVOID_SIDE_SWITCH_MARGIN"])
@@ -323,7 +328,9 @@ class LocalPlanner:
             near_y, full_y = full_y, near_y
         span = max(1.0, near_y - full_y)
         t = _clamp((near_y - float(y)) / span, 0.0, 1.0)
-        return t * t * (3.0 - 2.0 * t)
+        smooth = t * t * (3.0 - 2.0 * t)
+        near_gain = _clamp(self.path_near_bias_gain, 0.0, 1.0)
+        return near_gain + (1.0 - near_gain) * smooth
 
     def _road_bounds_for_points(self, road_mask, points, frame_w):
         if road_mask is None or not hasattr(road_mask, "shape"):
@@ -478,7 +485,7 @@ class LocalPlanner:
         if len(target_path) >= 2:
             pts = np.array(target_path, np.int32).reshape((-1, 1, 2))
             cv2.polylines(out, [pts], False, (255, 0, 255), 3)
-            lookahead_y = int(h * 0.62)
+            lookahead_y = int(h * self.control_lookahead_y_ratio)
             idx = min(range(len(target_path)), key=lambda i: abs(target_path[i][1] - lookahead_y))
             cv2.circle(out, target_path[idx], 8, (255, 0, 255), -1)
             cv2.circle(out, target_path[0], 5, (255, 0, 255), -1)

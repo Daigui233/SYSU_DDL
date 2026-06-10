@@ -8,20 +8,20 @@ from control_states import PlannerMode, TaskState
 # 不同任务状态下发给 TC264D 的 target_speed，单位 m/s。
 # 当前不使用环境变量覆盖，避免源码默认值和实际运行值不一致。
 TASK_SPEED_DEFAULTS = {
-    # 默认视觉巡线速度；当前第一阶段所有非停车状态先统一 0.20 m/s。
-    TaskState.NORMAL_TRACK: 0.20,
+    # 默认视觉巡线速度；当前新车模低速调车先统一 0.05 m/s。
+    TaskState.NORMAL_TRACK: 0.05,
 
     # 静态车障绕行速度；当前先与巡线统一，后续实车再细分。
-    TaskState.AVOID_CAR: 0.20,
+    TaskState.AVOID_CAR: 0.05,
 
     # 避人速度；当前先与巡线统一，后续实车再细分。
-    TaskState.AVOID_HUMAN: 0.20,
+    TaskState.AVOID_HUMAN: 0.05,
 
     # 靠近金币速度；当前先与巡线统一，后续实车再细分。
-    TaskState.COLLECT_GOLD: 0.20,
+    TaskState.COLLECT_GOLD: 0.05,
 
     # 短时丢线恢复速度；当前先与巡线统一，后续实车再细分。
-    TaskState.RECOVER_LINE: 0.20,
+    TaskState.RECOVER_LINE: 0.05,
 
     # 连续丢线超时后的目标速度，必须保持 0。
     TaskState.LINE_LOSS_SAFE_STOP: 0.0,
