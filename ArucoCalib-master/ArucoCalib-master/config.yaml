@@ -20,14 +20,14 @@ aruco_params:
 # World coordinates for each ArUco marker
 # Format: marker_id: [x, y]
 # Units: millimeters (mm)
-# AR world: origin at field bottom-right, +X points left, +Z points up.
+# AR world: field bottom-right reference is (X=0, Z=300mm), +X points left, +Z points up.
 # The homography's second coordinate is emitted as AR Z.
 # Tag installation: 1=bottom-right, 2=top-right, 3=bottom-left, 4=top-left.
 world_coordinates:
-  1: [0.0, 0.0]
-  2: [0.0, 3000.0]
-  3: [4000.0, 0.0]
-  4: [4000.0, 3000.0]
+  1: [0.0, 300.0]
+  2: [0.0, 3300.0]
+  3: [4000.0, 300.0]
+  4: [4000.0, 3300.0]
 
 # Vehicle marker ID (ArUco marker_id attached on the car)
 vehicle_id: 0

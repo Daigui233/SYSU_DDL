@@ -172,7 +172,7 @@ class WebUIStatusServer:
                             "pos": [
                                 float(payload.get("x", 0.0)),
                                 float(payload.get("y", 0.16)),
-                                float(payload.get("z", 0.0)),
+                                float(payload.get("z", 0.30)),
                             ],
                             "euler": [0.0, float(payload.get("yaw", 0.0)), 0.0],
                             "timestamp": time.time(),

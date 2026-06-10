@@ -142,8 +142,9 @@ class DatasetCollector:
         self.sender = NetworkPacketSender(target_ip=target_ip, udp_port=udp_port)
 
         # Official robot_position convention: pos=[x, height, z], euler=[0, yaw, 0].
+        # Field bottom-right reference is (x=0.0, z=0.30).
         # yaw=0 points +X, yaw=+90 points +Z.
-        self.position = [0.0, 0.16, 0.0]
+        self.position = [0.0, 0.16, 0.30]
         self.euler = [0.0, 0.0, 0.0]
 
         self.move_step = 0.1

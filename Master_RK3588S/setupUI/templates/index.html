@@ -484,7 +484,7 @@
                             <h3 style="margin-bottom: 5px;">外部投递数据规范 (发往 RK3588)</h3>
                             <p style="font-size: 0.85rem; line-height: 1.5; margin-bottom: 0;">
                                 如果您不使用上述网页键盘，而是通过外部程序投递定位数据到 RK3588，<strong>数据链路必须遵循平台统一的 JSON 通信标准</strong>。<br>
-                                当前定位以 Windows AprilTag 程序为准：场地 4m × 3m，定位预览原点右下角，+X 向左，+Z 向上。Windows 输入包包含
+                                当前定位以 Windows AprilTag 程序为准：场地 4m × 3m，定位预览右下角基准点为 (x=0,z=0.30m)，底边 z=0.30m，+X 向左，+Z 向上。Windows 输入包包含
                                 <code>pos=[x,0.16,z]</code> 与 <code>euler=[0,yaw,0]</code>，其中 <code>yaw=euler[1]</code>，
                                 <code>0° -> +X</code>、<code>+90° -> +Z</code>。RK 转发给官方 AR 时只交换平移轴为 <code>pos=[z,0.16,x]</code>，Yaw 保持不变。
                             </p>

@@ -814,9 +814,8 @@ class MainWindow(QMainWindow):
             (float(p[0]) * coord_scale * x_sign, float(p[1]) * coord_scale * z_sign)
             for p in world_points
         ]
-        field_points.append((0.0, 0.0))
         if not field_points:
-            return image_bgr
+            field_points.append((0.0, 0.30))
 
         field_min_x = min(p[0] for p in field_points)
         field_max_x = max(p[0] for p in field_points)
@@ -848,7 +847,7 @@ class MainWindow(QMainWindow):
             bottom = top + plot_h
 
         def map_point(px, pz):
-            # Formal AR field view: origin at bottom-right, +X points left, +Z points up.
+            # Formal AR field view: bottom-right reference is (X=0, Z=field_min_z), +X left, +Z up.
             sx = right - int((float(px) - min_x) / max(1e-9, max_x - min_x) * (right - left))
             sy = bottom - int((float(pz) - min_z) / max(1e-9, max_z - min_z) * (bottom - top))
             return sx, sy
@@ -875,15 +874,15 @@ class MainWindow(QMainWindow):
             cv2.line(image_bgr, map_point(field_min_x, gz), map_point(field_max_x, gz), grid_color, 1, cv2.LINE_AA)
             gz += 1
 
-        axis_origin = map_point(0.0, 0.0)
-        axis_x_end = map_point(field_max_x, 0.0)
+        axis_origin = map_point(0.0, field_min_z)
+        axis_x_end = map_point(field_max_x, field_min_z)
         axis_z_end = map_point(0.0, field_max_z)
         cv2.arrowedLine(image_bgr, axis_origin, axis_x_end, axis_color, 1, cv2.LINE_AA, tipLength=0.06)
         cv2.arrowedLine(image_bgr, axis_origin, axis_z_end, axis_color, 1, cv2.LINE_AA, tipLength=0.08)
         cv2.circle(image_bgr, axis_origin, 3, axis_color, -1, cv2.LINE_AA)
         cv2.putText(image_bgr, "+X", (axis_x_end[0] + 2, axis_x_end[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, axis_color, 1, cv2.LINE_AA)
         cv2.putText(image_bgr, "+Z", (axis_z_end[0] - 30, axis_z_end[1] + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, axis_color, 1, cv2.LINE_AA)
-        cv2.putText(image_bgr, "O", (axis_origin[0] - 5, axis_origin[1] + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.38, axis_color, 1, cv2.LINE_AA)
+        cv2.putText(image_bgr, "BR", (axis_origin[0] - 10, axis_origin[1] + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.38, axis_color, 1, cv2.LINE_AA)
         field_label = f"{field_max_x - field_min_x:.1f}m x {field_max_z - field_min_z:.1f}m"
         cv2.putText(image_bgr, field_label, (x0 + 10, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (170, 185, 175), 1, cv2.LINE_AA)
 

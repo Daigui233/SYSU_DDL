@@ -4,7 +4,8 @@
     let cachedConfig = null;
     let wasdTimer = null;
     const pressedKeys = new Set();
-    const wasdPose = { x: 0, y: 0.16, z: 0, yaw: 0 };
+    const poseZBase = 0.30;
+    const wasdPose = { x: 0, y: 0.16, z: poseZBase, yaw: 0 };
 
     function byId(id) {
         return document.getElementById(id);
@@ -305,7 +306,7 @@
             wasdPose.z -= Math.sin(yawRad) * speed;
         }
         wasdPose.x = Math.max(-5, Math.min(5, wasdPose.x));
-        wasdPose.z = Math.max(-5, Math.min(5, wasdPose.z));
+        wasdPose.z = Math.max(poseZBase, Math.min(5, wasdPose.z));
         wasdPose.yaw = ((wasdPose.yaw % 360) + 360) % 360;
         updateWasdText();
         if (pressedKeys.size > 0) {

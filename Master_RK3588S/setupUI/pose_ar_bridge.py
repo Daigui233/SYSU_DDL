@@ -16,7 +16,9 @@ DEBUG_PACKET_PATH = os.environ.get("AR_POSE_PACKET_PATH", os.path.join(BASE_DIR,
 
 POSE_CONVENTION = {
     "field_m": [4.0, 3.0],
-    "origin": "bottom-right",
+    "field_bottom_right_xz_m": [0.0, 0.30],
+    "field_z_range_m": [0.30, 3.30],
+    "origin": "30cm below field bottom-right reference",
     "positive_x": "left",
     "positive_z": "up",
     "yaw_index": 1,

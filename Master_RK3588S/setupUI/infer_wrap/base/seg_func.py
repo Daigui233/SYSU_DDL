@@ -26,6 +26,12 @@ SCAN_STEP = 8
 MAX_CENTER_JUMP_RATIO = 0.20
 MIN_MID_POINTS = 4
 
+# Cardo 风格控制中心参数：用整条中线计算 track_error，而不是只看车头底部几行。
+# 远处中线点给较高权重，让弯道更早参与转向；近处点仍保留少量权重用于贴合当前车身前方。
+CONTROL_CENTER_FAR_WEIGHT_RATIO = 0.50
+CONTROL_CENTER_NEAR_MIN_WEIGHT = 1.0
+TRACK_ERROR_SMOOTH_PREV_GAIN = 0.70
+
 _prev_mask = None
 _prev_mid_points = None
 _prev_track_error = 0.0
@@ -298,6 +304,29 @@ def _draw_midline(frame, mask, points):
     return tx
 
 
+def _weighted_control_center(points, h, w):
+    if not points:
+        return None
+
+    image_center = w * 0.5
+    control_sum = image_center
+    control_weight = 1.0
+    far_weight = max(1.0, h * CONTROL_CENTER_FAR_WEIGHT_RATIO)
+    half_h = h * 0.5
+
+    for x_raw, y_raw in points:
+        x = float(np.clip(x_raw, 0, w - 1))
+        y = float(np.clip(y_raw, 0, h - 1))
+        if y < half_h:
+            weight = far_weight
+        else:
+            weight = max(CONTROL_CENTER_NEAR_MIN_WEIGHT, float(h) - y)
+        control_sum += x * weight
+        control_weight += weight
+
+    return control_sum / max(1.0, control_weight)
+
+
 def _empty_centerline_info(frame, reason="lost"):
     h, w = frame.shape[:2]
     return {
@@ -356,22 +385,20 @@ def extract_centerline_info(seg_map, frame):
         cv2.line(out, (center_x, h - 1), (center_x, int(h * 0.55)), (255, 255, 0), 1)
 
     track_error = None
+    control_center_x = None
+    raw_error = None
     if held and _prev_stable_error is not None:
         track_error = _prev_stable_error
     elif mid_ok and len(draw_points) >= 2:
-        n = min(len(draw_points) // 3, 5)
-        if n < 1:
-            n = 1
-        bottom_pts = draw_points[:n]
-        weights = np.linspace(1.0, 0.4, len(bottom_pts))
-        tx = int(np.average([p[0] for p in bottom_pts], weights=weights))
-        raw_error = float(tx - center_x)
-        track_error = 0.70 * _prev_track_error + 0.30 * raw_error
+        control_center_x = _weighted_control_center(draw_points, h, w)
+        raw_error = float(control_center_x - center_x)
+        smooth_new_gain = 1.0 - TRACK_ERROR_SMOOTH_PREV_GAIN
+        track_error = TRACK_ERROR_SMOOTH_PREV_GAIN * _prev_track_error + smooth_new_gain * raw_error
         _prev_track_error = track_error
         _prev_mask = road_mask.copy()
         _prev_valid_ts = time.time()
         _prev_stable_error = track_error
-        cv2.circle(out, (tx, draw_points[0][1]), 6, (0, 255, 0), -1)
+        cv2.circle(out, (int(control_center_x), h - 18), 6, (0, 255, 0), -1)
     else:
         _prev_track_error *= 0.9
 
@@ -396,7 +423,9 @@ def extract_centerline_info(seg_map, frame):
         "reason": reason,
         "branch_count": int(_prev_branch_count),
         "center_x": int(center_x),
-        "target_x": int(target_x) if target_x is not None else None,
+        "target_x": int(control_center_x) if control_center_x is not None else (int(target_x) if target_x is not None else None),
+        "control_center_x": int(control_center_x) if control_center_x is not None else None,
+        "raw_track_error": float(raw_error) if raw_error is not None else None,
         "road_mask": road_mask,
         "mid_points": [(int(x), int(y)) for x, y in draw_points],
     }
