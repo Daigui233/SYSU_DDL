@@ -30,6 +30,16 @@ PLANNER_DEFAULTS = {
     # RECOVER_LINE 保持上一帧 final_track_error 的衰减时间，单位 s；调大丢线后更久保持原方向。
     "RECOVER_DECAY_SECONDS": 3.0,
 
+    # 检测触发状态容易逐帧抖动；该系数决定 final_track_error 朝新目标移动的速度。
+    # 调大反应更快，调小目标线更稳。
+    "FINAL_ERROR_SMOOTH_ALPHA": 0.35,
+
+    # 每一帧 final_track_error 最大允许变化量，单位 px；用于防止目标线左右瞬移。
+    "MAX_ERROR_STEP_PER_FRAME": 38.0,
+
+    # 绘制偏移目标路径时，尽量让路径点留在 road_mask 边界内侧这么多像素。
+    "TARGET_PATH_ROAD_MARGIN": 8.0,
+
     # road mask 左右可通行性评分 ROI 的最低 y 位置比例；越大越只看画面下方近处道路。
     "ROAD_SIDE_ROI_MIN_Y_RATIO": 0.38,
 
@@ -91,12 +101,16 @@ class LocalPlanner:
             recover_decay_seconds if recover_decay_seconds is not None else self.params["RECOVER_DECAY_SECONDS"]
         )
         self.avoid_box_width_gain = float(self.params["AVOID_BOX_WIDTH_GAIN"])
+        self.final_error_smooth_alpha = float(self.params["FINAL_ERROR_SMOOTH_ALPHA"])
+        self.max_error_step_per_frame = float(self.params["MAX_ERROR_STEP_PER_FRAME"])
+        self.target_path_road_margin = float(self.params["TARGET_PATH_ROAD_MARGIN"])
         self.road_side_roi_min_y_ratio = float(self.params["ROAD_SIDE_ROI_MIN_Y_RATIO"])
         self.road_side_roi_top_box_gain = float(self.params["ROAD_SIDE_ROI_TOP_BOX_GAIN"])
         self.road_side_roi_bottom_box_gain = float(self.params["ROAD_SIDE_ROI_BOTTOM_BOX_GAIN"])
         self.road_side_balance_min_delta = float(self.params["ROAD_SIDE_BALANCE_MIN_DELTA"])
         self.road_side_balance_ratio = float(self.params["ROAD_SIDE_BALANCE_RATIO"])
         self.last_final_error = 0.0
+        self.last_output_error = None
         self.last_valid_ts = 0.0
 
     def plan(self, perception, task_decision, now=None):
@@ -138,8 +152,12 @@ class LocalPlanner:
             final_error = self._gold_error(base_error, target, center_x)
             reason = "collect_gold"
 
+        raw_final_error = final_error
         if final_error is not None:
-            final_error = _clamp(final_error, -self.max_track_error, self.max_track_error)
+            final_error = self._smooth_final_error(
+                _clamp(final_error, -self.max_track_error, self.max_track_error),
+                state,
+            )
             if line_valid:
                 self.last_final_error = final_error
                 self.last_valid_ts = now
@@ -147,11 +165,14 @@ class LocalPlanner:
         target_x = None
         if final_error is not None:
             target_x = _clamp(center_x + final_error, 0, frame_w - 1)
+        target_path = self._build_target_path(segmentation, base_error, final_error, frame_w, frame_h)
 
         return {
             "final_track_error": float(final_error) if final_error is not None else None,
+            "raw_final_track_error": float(raw_final_error) if raw_final_error is not None else None,
             "base_track_error": float(base_error) if base_error is not None else None,
             "target_x": float(target_x) if target_x is not None else None,
+            "target_path": target_path,
             "center_x": float(center_x),
             "avoid_side": avoid_side,
             "planner_reason": reason,
@@ -164,6 +185,68 @@ class LocalPlanner:
         age = max(0.0, float(now) - self.last_valid_ts)
         decay = max(0.0, 1.0 - age / max(0.01, self.recover_decay_seconds))
         return self.last_final_error * decay
+
+    def _smooth_final_error(self, target_error, state):
+        if state == TaskState.LINE_LOSS_SAFE_STOP.value:
+            return target_error
+
+        previous = self.last_output_error
+        if previous is None or state == TaskState.NORMAL_TRACK.value:
+            smoothed = target_error
+        else:
+            alpha = _clamp(self.final_error_smooth_alpha, 0.0, 1.0)
+            smoothed = previous + (target_error - previous) * alpha
+            max_step = max(1.0, self.max_error_step_per_frame)
+            smoothed = previous + _clamp(smoothed - previous, -max_step, max_step)
+
+        smoothed = _clamp(smoothed, -self.max_track_error, self.max_track_error)
+        self.last_output_error = smoothed
+        return smoothed
+
+    def _build_target_path(self, segmentation, base_error, final_error, frame_w, frame_h):
+        if final_error is None:
+            return []
+
+        mid_points = segmentation.get("mid_points") or []
+        if len(mid_points) < 2:
+            return []
+
+        if base_error is None:
+            path_offset = final_error
+        else:
+            path_offset = final_error - base_error
+
+        road_mask = segmentation.get("road_mask")
+        path = []
+        for point in mid_points:
+            try:
+                x_raw, y_raw = point
+                y = int(_clamp(y_raw, 0, frame_h - 1))
+                shifted_x = _finite_float(x_raw, frame_w * 0.5) + path_offset
+            except Exception:
+                continue
+            x = self._clamp_path_x_to_road(shifted_x, y, road_mask, frame_w)
+            path.append((int(round(x)), y))
+        return path
+
+    def _clamp_path_x_to_road(self, x, y, road_mask, frame_w):
+        x = _clamp(x, 0, frame_w - 1)
+        if road_mask is None or not hasattr(road_mask, "shape"):
+            return x
+        mask = np.asarray(road_mask)
+        if mask.ndim != 2 or y < 0 or y >= mask.shape[0]:
+            return x
+
+        xs = np.flatnonzero(mask[int(y)])
+        if xs.size < 2:
+            return x
+        margin = max(0.0, self.target_path_road_margin)
+        left = min(frame_w - 1, float(xs[0]) + margin)
+        right = max(0.0, float(xs[-1]) - margin)
+        if left > right:
+            left = float(xs[0])
+            right = float(xs[-1])
+        return _clamp(x, left, right)
 
     def _avoid_offset(self, target, default_offset):
         size = target.get("size") or [0.0, 0.0]
@@ -229,9 +312,16 @@ class LocalPlanner:
         out = frame
         h, w = out.shape[:2]
         target_x = _finite_float(plan_result.get("target_x"))
-        if target_x is not None:
+        target_path = list(plan_result.get("target_path") or [])
+        if len(target_path) >= 2:
+            pts = np.array(target_path, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(out, [pts], False, (255, 0, 255), 3)
+            lookahead_y = int(h * 0.62)
+            idx = min(range(len(target_path)), key=lambda i: abs(target_path[i][1] - lookahead_y))
+            cv2.circle(out, target_path[idx], 8, (255, 0, 255), -1)
+            cv2.circle(out, target_path[0], 5, (255, 0, 255), -1)
+        elif target_x is not None:
             x = int(_clamp(target_x, 0, w - 1))
-            cv2.line(out, (x, h - 1), (x, int(h * 0.50)), (255, 0, 255), 2)
             cv2.circle(out, (x, int(h * 0.68)), 8, (255, 0, 255), -1)
 
         state = str((task_decision or {}).get("task_state") or "N/A")

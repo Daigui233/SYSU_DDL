@@ -10,6 +10,10 @@ ROAD_CLASS_ID = int(os.environ.get("ROAD_CLASS_ID", "1"))
 ROAD_ALPHA = 0.32
 ROAD_COLOR = np.array([0, 255, 80], dtype=np.uint8)
 
+# Camera center is only the image reference used to compute track_error.
+# It is hidden by default because the real driving target is the red/purple path.
+DRAW_CAMERA_CENTER_REFERENCE = False
+
 HOLD_SECONDS = 0.5
 TOP_CROP_RATIO = 0.34
 MIN_ROAD_RATIO = 0.001
@@ -348,7 +352,8 @@ def extract_centerline_info(seg_map, frame):
 
     h, w = road_mask.shape
     center_x = w // 2
-    cv2.line(out, (center_x, h - 1), (center_x, int(h * 0.55)), (255, 255, 0), 2)
+    if DRAW_CAMERA_CENTER_REFERENCE:
+        cv2.line(out, (center_x, h - 1), (center_x, int(h * 0.55)), (255, 255, 0), 1)
 
     track_error = None
     if held and _prev_stable_error is not None:
