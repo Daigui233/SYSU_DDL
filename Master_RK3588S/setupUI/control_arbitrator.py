@@ -18,11 +18,11 @@ CONTROL_SCALE = 0.65
 CONTROL_ERROR_PARAMS = {
     TaskState.NORMAL_TRACK.value: {
         "scale": 0.65,
-        "max_abs": 135.0,
-        "max_step": 16.0,
+        "max_abs": 160.0,
+        "max_step": 22.0,
         "deadband": 3.0,
-        "curve_start": 45.0,
-        "curve_gain": 0.35,
+        "curve_start": 40.0,
+        "curve_gain": 0.55,
     },
     TaskState.RECOVER_LINE.value: {
         "scale": 0.55,
