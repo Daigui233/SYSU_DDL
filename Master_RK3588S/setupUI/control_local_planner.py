@@ -40,6 +40,12 @@ PLANNER_DEFAULTS = {
     # 绘制偏移目标路径时，尽量让路径点留在 road_mask 边界内侧这么多像素。
     "TARGET_PATH_ROAD_MARGIN": 8.0,
 
+    # 避障方向保持时间，单位 s；检测框在中线附近抖动时不立刻左右换边。
+    "AVOID_SIDE_HOLD_SECONDS": 0.8,
+
+    # 目标中心必须越过画面中线这么多 px，才允许从上一避障方向切到另一侧。
+    "AVOID_SIDE_SWITCH_MARGIN": 36.0,
+
     # road mask 左右可通行性评分 ROI 的最低 y 位置比例；越大越只看画面下方近处道路。
     "ROAD_SIDE_ROI_MIN_Y_RATIO": 0.38,
 
@@ -104,6 +110,8 @@ class LocalPlanner:
         self.final_error_smooth_alpha = float(self.params["FINAL_ERROR_SMOOTH_ALPHA"])
         self.max_error_step_per_frame = float(self.params["MAX_ERROR_STEP_PER_FRAME"])
         self.target_path_road_margin = float(self.params["TARGET_PATH_ROAD_MARGIN"])
+        self.avoid_side_hold_seconds = float(self.params["AVOID_SIDE_HOLD_SECONDS"])
+        self.avoid_side_switch_margin = float(self.params["AVOID_SIDE_SWITCH_MARGIN"])
         self.road_side_roi_min_y_ratio = float(self.params["ROAD_SIDE_ROI_MIN_Y_RATIO"])
         self.road_side_roi_top_box_gain = float(self.params["ROAD_SIDE_ROI_TOP_BOX_GAIN"])
         self.road_side_roi_bottom_box_gain = float(self.params["ROAD_SIDE_ROI_BOTTOM_BOX_GAIN"])
@@ -111,6 +119,9 @@ class LocalPlanner:
         self.road_side_balance_ratio = float(self.params["ROAD_SIDE_BALANCE_RATIO"])
         self.last_final_error = 0.0
         self.last_output_error = None
+        self.last_avoid_side = None
+        self.last_avoid_category = None
+        self.last_avoid_side_ts = 0.0
         self.last_valid_ts = 0.0
 
     def plan(self, perception, task_decision, now=None):
@@ -139,12 +150,28 @@ class LocalPlanner:
             reason = "hold_last_line"
         elif state == TaskState.AVOID_HUMAN.value:
             target = intent.get("target") or {}
-            avoid_side = self._choose_avoid_side(segmentation, target, frame_w, frame_h, prefer_away=True)
+            avoid_side = self._choose_avoid_side(
+                segmentation,
+                target,
+                frame_w,
+                frame_h,
+                prefer_away=True,
+                category="human",
+                now=now,
+            )
             final_error = base_error + self._side_sign(avoid_side) * self._avoid_offset(target, self.human_avoid_offset)
             reason = f"avoid_human_{avoid_side}"
         elif state == TaskState.AVOID_CAR.value:
             target = intent.get("target") or {}
-            avoid_side = self._choose_avoid_side(segmentation, target, frame_w, frame_h, prefer_away=False)
+            avoid_side = self._choose_avoid_side(
+                segmentation,
+                target,
+                frame_w,
+                frame_h,
+                prefer_away=False,
+                category="car",
+                now=now,
+            )
             final_error = base_error + self._side_sign(avoid_side) * self._avoid_offset(target, self.car_avoid_offset)
             reason = f"avoid_car_{avoid_side}"
         elif state == TaskState.COLLECT_GOLD.value:
@@ -262,7 +289,7 @@ class LocalPlanner:
         bias = _clamp((target_error - base_error) * self.gold_gain, -self.gold_max_bias, self.gold_max_bias)
         return base_error + bias
 
-    def _choose_avoid_side(self, segmentation, target, frame_w, frame_h, prefer_away):
+    def _choose_avoid_side(self, segmentation, target, frame_w, frame_h, prefer_away, category, now):
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
         target_center = target.get("center") or [center_x, frame_h * 0.5]
         target_x = _finite_float(target_center[0], center_x)
@@ -272,7 +299,24 @@ class LocalPlanner:
         else:
             road_side = self._road_free_side(segmentation, target, preferred)
             preferred = road_side or preferred
-        return preferred
+        return self._apply_avoid_side_hysteresis(category, preferred, target_x, center_x, now)
+
+    def _apply_avoid_side_hysteresis(self, category, preferred, target_x, center_x, now):
+        previous = self.last_avoid_side
+        same_category = self.last_avoid_category == category
+        age = max(0.0, float(now) - self.last_avoid_side_ts) if self.last_avoid_side_ts > 0.0 else None
+        in_hold = same_category and previous in ("left", "right") and age is not None and age <= self.avoid_side_hold_seconds
+
+        side = preferred
+        if in_hold and preferred != previous:
+            lateral = abs(float(target_x) - float(center_x))
+            if lateral < self.avoid_side_switch_margin:
+                side = previous
+
+        self.last_avoid_side = side
+        self.last_avoid_category = category
+        self.last_avoid_side_ts = float(now)
+        return side
 
     def _road_free_side(self, segmentation, target, default_side):
         road_mask = segmentation.get("road_mask")
