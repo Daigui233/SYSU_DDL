@@ -62,9 +62,11 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 分割模型从融合视频生成基础 `track_error`；目标检测作为感知输入进入 `control_task_state_machine.py`，由状态机输出 `task_state / desired_speed / planner_intent`。
 - `control_local_planner.py` 根据任务状态输出最终 `final_track_error`，上位机再以对应状态码、目标速度和 `flags=0x01` 下发给 TC264D。
 - 调试画面中红色曲线表示语义分割得到的赛道中线；紫色曲线表示局部规划后的最终目标路径，会基于中线形状做平滑偏置，目标检测只作为状态机输入，不直接生成跳变竖线。
+- 目标检测任务抢占先看近处风险区：检测框底边进入画面底部 40% 且靠近中部路径区域后，才按远近排序触发避人/避车/金币；远处目标只显示检测框，不提前改变目标路径。
 - 避人/避车时紫色路径带有误差平滑、单帧限幅和绕行方向滞回，避免检测框在中线附近抖动时目标路径左右乱飘。
 - 摄像头/图像中心线只作为 `track_error` 的计算参考，默认不在调试画面中显示；调车时主要看红色中线和紫色最终目标路径。
 - 当前分割和检测模型效果较差，仍需优化；`gold / car / human` 已接入第一阶段局部任务逻辑，但需要低速实车验证。
+- 当前状态机速度表中所有非停车状态默认 `0.2 m/s`，`LINE_LOSS_SAFE_STOP` 保持 `0.0 m/s`。
 - OCR 和外部 API 尚未接入；当前 `gold / car / human` 只接入第一阶段图像坐标局部策略，红绿灯、复杂任务和全局规划暂不接入。
 - 控制协议中的 `state_cmd / target_speed / track_error / flags` 保持不变；当前状态契约见 `Master_RK3588S/setupUI/state_contract.md`，新增状态时需要同步 `control_states.py` 和 `Slave_TC264D/code/State.h`。
 - 无有效分割误差或感知质量不可信但未超过 `3 s` 时，当前 `RECOVER_LINE` 会短暂保持/衰减上一帧有效目标线，默认速度由 `control_task_state_machine.py` 管理。
@@ -130,7 +132,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 
 1. 使用真实融合视频重新训练或优化分割模型，使 `track_error` 足以稳定巡线。
 2. 架空车轮验证误差方向、舵机方向、PID、速度、`flags=0x01` 和反馈帧。
-3. 首次落地前使用状态机默认 `0.3 m/s` 验证巡线和 `RECOVER_LINE`；需要更慢或更快时直接修改 `control_task_state_machine.py` 开头的速度表，重启 `ar_receiver.py` 后生效。
+3. 首次落地前使用状态机默认 `0.2 m/s` 验证巡线、避障、金币和 `RECOVER_LINE`；需要更慢或更快时直接修改 `control_task_state_machine.py` 开头的速度表，重启 `ar_receiver.py` 后生效。
 4. 当前 `target_speed` 已按同款 CarDo 车模参数粗换算为 `m/s`，TC264D 的 `actual_speed` 由编码器计数换算得到；后续仍需确认编码器正负号，并用实测速度修正轮径、周期或比例误差。
 5. 若用手柄采集数据，先确认 `Gamepad Mode` 勾选、WebUI `GAMEPAD` 状态、TC264D 反馈和现场急停手段，再低速落地。
 

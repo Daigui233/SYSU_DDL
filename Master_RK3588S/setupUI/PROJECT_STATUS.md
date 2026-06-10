@@ -53,7 +53,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 ## 当前控制
 
 - 当前以 RK 上位机状态机为准，默认状态为 `NORMAL_TRACK`，下发 `STATE_TRACK + target_speed + flags=0x01`。
-- 有有效分割误差时，基础巡线速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS[TaskState.NORMAL_TRACK]` 管理，当前默认 `0.3 m/s`。
+- 状态机速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS` 管理，当前所有非停车状态默认 `0.2 m/s`。
 - 无有效分割误差但未超过 `3 s` 时，进入 `RECOVER_LINE`，短暂保持/衰减上一帧有效目标线，速度由 `TASK_SPEED_DEFAULTS[TaskState.RECOVER_LINE]` 管理。
 - 连续 `3 s` 没有有效 `track_error` 时，上位机进入 `LINE_LOSS_SAFE_STOP`，并按状态契约下发 `STATE_LINE_LOSS_SAFE_STOP`。
 - 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`，不会锁死在停机状态。
@@ -88,7 +88,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 
 ## 已知风险
 
-- `NORMAL_TRACK` 默认速度已设为 `0.3 m/s`；避车、避人、金币和丢线恢复速度在 `control_task_state_machine.py` 开头统一维护，首次落地前仍应架空车轮确认方向和制动行为。
+- `NORMAL_TRACK`、避车、避人、金币和丢线恢复默认速度均为 `0.2 m/s`；速度在 `control_task_state_machine.py` 开头统一维护，首次落地前仍应架空车轮确认方向和制动行为。
 - TC264D 电机 PWM 硬限幅为 `±2500` duty；`STATE_TRACK` 当前使用约 `1450` duty 启动前馈 + 小 PI 修正，先解决电机死区和低速卡顿，PID 只做稳速微调。
 - `target_speed` 当前按同款 CarDo 车模参数粗换算为 `m/s`；TC264D 的 `actual_speed` 由编码器计数换算得到，后续仍需确认编码器正负号并用实测速度修正比例误差。
 - 视觉模型短时丢线会进入 `RECOVER_LINE` 并保持/衰减上一帧有效目标线；若连续 `3 s` 没有有效 `track_error`，RK3588S 会进入 `LINE_LOSS_SAFE_STOP`。

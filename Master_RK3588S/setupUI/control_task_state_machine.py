@@ -8,20 +8,20 @@ from control_states import PlannerMode, TaskState
 # 不同任务状态下发给 TC264D 的 target_speed，单位 m/s。
 # 当前不使用环境变量覆盖，避免源码默认值和实际运行值不一致。
 TASK_SPEED_DEFAULTS = {
-    # 默认视觉巡线速度；实车第一优先调这个，建议从低速开始。
-    TaskState.NORMAL_TRACK: 0.30,
+    # 默认视觉巡线速度；当前第一阶段所有非停车状态先统一 0.20 m/s。
+    TaskState.NORMAL_TRACK: 0.20,
 
-    # 静态车障绕行速度；调低可以给局部规划更多反应时间。
-    TaskState.AVOID_CAR: 0.18,
+    # 静态车障绕行速度；当前先与巡线统一，后续实车再细分。
+    TaskState.AVOID_CAR: 0.20,
 
-    # 避人速度；人是动态障碍，默认最低，优先保证安全。
-    TaskState.AVOID_HUMAN: 0.12,
+    # 避人速度；当前先与巡线统一，后续实车再细分。
+    TaskState.AVOID_HUMAN: 0.20,
 
-    # 靠近金币速度；通常应低于 NORMAL_TRACK，避免为了金币冲出路线。
-    TaskState.COLLECT_GOLD: 0.24,
+    # 靠近金币速度；当前先与巡线统一，后续实车再细分。
+    TaskState.COLLECT_GOLD: 0.20,
 
-    # 短时丢线恢复速度；调低更安全，调高可能在看不见线时继续冲。
-    TaskState.RECOVER_LINE: 0.15,
+    # 短时丢线恢复速度；当前先与巡线统一，后续实车再细分。
+    TaskState.RECOVER_LINE: 0.20,
 
     # 连续丢线超时后的目标速度，必须保持 0。
     TaskState.LINE_LOSS_SAFE_STOP: 0.0,
@@ -40,6 +40,24 @@ TASK_TIMING_DEFAULTS = {
 TASK_RULE_DEFAULTS = {
     # 通用检测排序中 area_ratio 的权重；调大时更偏向选择面积大的目标。
     "GENERIC_AREA_RANK_GAIN": 1.0,
+
+    # 近处目标风险区：检测框底边进入画面底部这部分区域才参与任务抢占。
+    # 0.40 表示只优先处理画面下方 40% 内的目标，远处目标只画框不触发避障。
+    "NEAR_ROI_BOTTOM_RATIO": 0.40,
+
+    # 近处目标还需要靠近赛道/图像中线；该值是横向允许范围占画面宽度的比例。
+    "NEAR_CENTER_LATERAL_RATIO": 0.32,
+
+    # 横向允许范围会随 bbox 宽度增大，用于适配近处大目标。
+    "NEAR_BOX_LATERAL_GAIN": 0.75,
+
+    # 横向允许范围的像素下限，防止小目标时范围过窄。
+    "NEAR_MIN_LATERAL_LIMIT_PX": 52.0,
+
+    # 近处候选排序时的类别微弱偏置，只在远近非常接近时起作用。
+    "NEAR_HUMAN_TIE_BIAS": 0.030,
+    "NEAR_CAR_TIE_BIAS": 0.020,
+    "NEAR_GOLD_TIE_BIAS": 0.000,
 
     # human 置信度门限；调高减少误触发，调低更容易提前避人。
     "HUMAN_MIN_SCORE": 0.35,
@@ -205,6 +223,112 @@ def _best_detection(detections, category, min_score, area_rank_gain):
             best = det
             best_score = rank
     return best
+
+
+def _category_min_score(category, params):
+    if category == "human":
+        return float(params["HUMAN_MIN_SCORE"])
+    if category == "car":
+        return float(params["CAR_MIN_SCORE"])
+    if category == "gold":
+        return float(params["GOLD_MIN_SCORE"])
+    return 1.0
+
+
+def _category_tie_bias(category, params):
+    if category == "human":
+        return float(params["NEAR_HUMAN_TIE_BIAS"])
+    if category == "car":
+        return float(params["NEAR_CAR_TIE_BIAS"])
+    if category == "gold":
+        return float(params["NEAR_GOLD_TIE_BIAS"])
+    return 0.0
+
+
+def _detection_geometry(det, frame_w, frame_h):
+    bbox = det.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+    center = det.get("center") or [None, None]
+    size = det.get("size") or [0.0, 0.0]
+    try:
+        left, top, right, bottom = [float(v) for v in bbox]
+    except Exception:
+        return None
+    cx = _finite_float(center[0], (left + right) * 0.5)
+    cy = _finite_float(center[1], (top + bottom) * 0.5)
+    box_w = _finite_float(size[0], right - left)
+    box_h = _finite_float(size[1], bottom - top)
+    if cx is None or cy is None or right <= left or bottom <= top:
+        return None
+    bottom = max(0.0, min(float(frame_h - 1), bottom))
+    return {
+        "cx": cx,
+        "cy": cy,
+        "bottom": bottom,
+        "box_w": max(0.0, box_w),
+        "box_h": max(0.0, box_h),
+        "bottom_ratio": bottom / float(max(1, frame_h)),
+    }
+
+
+def _near_detection_candidates(ctx, params):
+    frame_w = int(ctx["frame_w"])
+    frame_h = int(ctx["frame_h"])
+    center_x = float(ctx["center_x"])
+    min_bottom_y = frame_h * (1.0 - float(params["NEAR_ROI_BOTTOM_RATIO"]))
+    candidates = []
+
+    for det in ctx["detections"]:
+        category = _detection_category(det)
+        if category not in ("human", "car", "gold"):
+            continue
+        score = _finite_float(det.get("score"), 0.0)
+        if score < _category_min_score(category, params):
+            continue
+        geom = _detection_geometry(det, frame_w, frame_h)
+        if geom is None:
+            continue
+        if geom["bottom"] < min_bottom_y:
+            continue
+
+        lateral_dist = abs(geom["cx"] - center_x)
+        lateral_limit = max(
+            frame_w * float(params["NEAR_CENTER_LATERAL_RATIO"]),
+            geom["box_w"] * float(params["NEAR_BOX_LATERAL_GAIN"]),
+            float(params["NEAR_MIN_LATERAL_LIMIT_PX"]),
+        )
+        if lateral_dist > lateral_limit:
+            continue
+
+        if category == "gold":
+            area_ratio = _finite_float(det.get("area_ratio"), 0.0)
+            if area_ratio < params["GOLD_MIN_AREA_RATIO"]:
+                continue
+            target_error = geom["cx"] - center_x
+            track_error = _finite_float(ctx["track_error"], 0.0)
+            if abs(target_error - track_error) > frame_w * params["GOLD_MAX_TRACK_COST_RATIO"]:
+                continue
+
+        target = dict(det)
+        risk = {
+            "bottom_ratio": float(geom["bottom_ratio"]),
+            "lateral_ratio": float(lateral_dist / float(max(1, frame_w))),
+            "near_roi": True,
+        }
+        target["risk"] = risk
+        rank = (
+            float(geom["bottom_ratio"]),
+            -float(lateral_dist / float(max(1, frame_w))),
+            _category_tie_bias(category, params),
+            score * 0.01,
+        )
+        candidates.append({
+            "category": category,
+            "target": target,
+            "rank": rank,
+        })
+
+    candidates.sort(key=lambda item: item["rank"], reverse=True)
+    return candidates
 
 
 def _front_center_detection(detections, category, frame_w, frame_h, params):
@@ -446,12 +570,9 @@ class TaskStateMachine:
             human_hold_ttl if human_hold_ttl is not None else TASK_TIMING_DEFAULTS["HUMAN_HOLD_TTL"]
         )
         self.line_missing_since_ts = None
-        self.rules = [
-            HumanAvoidRule(self.rule_params, hold_ttl=human_hold_ttl),
-            CarAvoidRule(self.rule_params),
-            GoldCollectRule(self.rule_params),
-        ]
-        self.rules.sort(key=lambda rule: rule.priority, reverse=True)
+        self.human_hold_ttl = float(human_hold_ttl)
+        self.last_human_seen_ts = None
+        self.last_human_target = None
 
     def update(self, perception, now):
         segmentation = (perception or {}).get("segmentation") or {}
@@ -496,10 +617,9 @@ class TaskStateMachine:
             "perception_quality": perception_quality,
         }
 
-        for rule in self.rules:
-            decision = rule.evaluate(ctx)
-            if decision is not None:
-                return decision.as_dict()
+        near_decision = self._near_target_decision(ctx)
+        if near_decision is not None:
+            return near_decision.as_dict()
 
         return TaskDecision(
             task_state=TaskState.NORMAL_TRACK,
@@ -509,6 +629,103 @@ class TaskStateMachine:
             reason="line_track",
             perception_quality=perception_quality,
         ).as_dict()
+
+    def _near_target_decision(self, ctx):
+        candidates = _near_detection_candidates(ctx, self.rule_params)
+        if candidates:
+            selected = candidates[0]
+            category = selected["category"]
+            target = selected["target"]
+            if category == "human":
+                self.last_human_seen_ts = ctx["now"]
+                self.last_human_target = dict(target)
+                return self._build_target_decision(
+                    ctx,
+                    category,
+                    target,
+                    held=False,
+                    reason="near_human",
+                )
+            if category == "car":
+                return self._build_target_decision(
+                    ctx,
+                    category,
+                    target,
+                    held=False,
+                    reason="near_car",
+                )
+            if category == "gold":
+                return self._build_target_decision(
+                    ctx,
+                    category,
+                    target,
+                    held=False,
+                    reason="near_gold",
+                )
+
+        if (
+            self.last_human_seen_ts is not None
+            and ctx["now"] - self.last_human_seen_ts <= self.human_hold_ttl
+            and self.last_human_target is not None
+        ):
+            return self._build_target_decision(
+                ctx,
+                "human",
+                dict(self.last_human_target),
+                held=True,
+                reason="near_human_ttl",
+            )
+        return None
+
+    def _build_target_decision(self, ctx, category, target, held, reason):
+        if category == "human":
+            return TaskDecision(
+                task_state=TaskState.AVOID_HUMAN,
+                desired_speed=ctx["human_speed"],
+                planner_intent={
+                    "mode": PlannerMode.AVOID_OBSTACLE.value,
+                    "category": "human",
+                    "target": target,
+                    "dynamic": True,
+                    "held": bool(held),
+                },
+                line_valid=True,
+                reason=reason,
+                perception_quality=ctx["perception_quality"],
+            )
+
+        if category == "car":
+            return TaskDecision(
+                task_state=TaskState.AVOID_CAR,
+                desired_speed=ctx["avoid_speed"],
+                planner_intent={
+                    "mode": PlannerMode.AVOID_OBSTACLE.value,
+                    "category": "car",
+                    "target": target,
+                    "dynamic": False,
+                    "held": bool(held),
+                },
+                line_valid=True,
+                reason=reason,
+                perception_quality=ctx["perception_quality"],
+            )
+
+        if category == "gold":
+            return TaskDecision(
+                task_state=TaskState.COLLECT_GOLD,
+                desired_speed=ctx["collect_speed"],
+                planner_intent={
+                    "mode": PlannerMode.APPROACH_TARGET.value,
+                    "category": "gold",
+                    "target": target,
+                    "held": bool(held),
+                },
+                line_valid=True,
+                reason=reason,
+                perception_quality=ctx["perception_quality"],
+            )
+
+        return None
 
     def _line_loss_decision(self, now, perception_quality=None):
         now = float(now)
