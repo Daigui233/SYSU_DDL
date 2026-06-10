@@ -15,6 +15,42 @@
 #define MOTOR_FEEDFORWARD_MAX_DUTY     (1800.0f)
 #define MOTOR_PID_CORRECTION_LIMIT     (700.0f)
 
+/* ===== State control parameters: tune here first during vehicle testing. ===== */
+#define TRACK_DEFAULT_SPEED_MPS        (0.05f)
+#define TRACK_MOTOR_KP                 (100.0f)
+#define TRACK_MOTOR_KI                 (8.0f)
+#define TRACK_MOTOR_KD                 (0.0f)
+#define TRACK_SERVO_KP                 (0.55f)
+#define TRACK_SERVO_KD                 (0.18f)
+
+#define AVOID_CAR_DEFAULT_SPEED_MPS    (0.05f)
+#define AVOID_CAR_MOTOR_KP             (100.0f)
+#define AVOID_CAR_MOTOR_KI             (8.0f)
+#define AVOID_CAR_MOTOR_KD             (0.0f)
+#define AVOID_CAR_SERVO_KP             (0.78f)
+#define AVOID_CAR_SERVO_KD             (0.24f)
+
+#define AVOID_HUMAN_DEFAULT_SPEED_MPS  (0.04f)
+#define AVOID_HUMAN_MOTOR_KP           (100.0f)
+#define AVOID_HUMAN_MOTOR_KI           (8.0f)
+#define AVOID_HUMAN_MOTOR_KD           (0.0f)
+#define AVOID_HUMAN_SERVO_KP           (0.82f)
+#define AVOID_HUMAN_SERVO_KD           (0.24f)
+
+#define COLLECT_GOLD_DEFAULT_SPEED_MPS (0.05f)
+#define COLLECT_GOLD_MOTOR_KP          (100.0f)
+#define COLLECT_GOLD_MOTOR_KI          (8.0f)
+#define COLLECT_GOLD_MOTOR_KD          (0.0f)
+#define COLLECT_GOLD_SERVO_KP          (0.58f)
+#define COLLECT_GOLD_SERVO_KD          (0.18f)
+
+#define RECOVER_LINE_DEFAULT_SPEED_MPS (0.03f)
+#define RECOVER_LINE_MOTOR_KP          (100.0f)
+#define RECOVER_LINE_MOTOR_KI          (8.0f)
+#define RECOVER_LINE_MOTOR_KD          (0.0f)
+#define RECOVER_LINE_SERVO_KP          (0.45f)
+#define RECOVER_LINE_SERVO_KD          (0.12f)
+
 control_ctx_struct control_ctx;
 
 control_input_struct input_communication_temp;
@@ -131,6 +167,25 @@ control_input_struct control_get_input(void)
     return control_ctx.input;
 }
 
+static void control_set_motion_param(float motor_target_speed,
+                                     float motor_kp,
+                                     float motor_ki,
+                                     float motor_kd,
+                                     float servo_kp,
+                                     float servo_kd)
+{
+    control_ctx.param.motor_target_speed = motor_target_speed;
+    control_ctx.param.motor_kp = motor_kp;
+    control_ctx.param.motor_ki = motor_ki;
+    control_ctx.param.motor_kd = motor_kd;
+    control_ctx.param.motor_output_min = -MOTOR_PID_CORRECTION_LIMIT;
+    control_ctx.param.motor_output_max = MOTOR_PID_CORRECTION_LIMIT;
+    control_ctx.param.servo_kp = servo_kp;
+    control_ctx.param.servo_kd = servo_kd;
+    control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
+    control_ctx.param.servo_output_max = (float)(SERVO_DUTY_MAX - SERVO_DUTY_MID);
+}
+
 void control_apply_state_param(car_state_enum state)
 {
     control_ctx.current_state = state;
@@ -138,20 +193,48 @@ void control_apply_state_param(car_state_enum state)
     switch (state)
     {
     case STATE_TRACK:
+        control_set_motion_param(TRACK_DEFAULT_SPEED_MPS,
+                                 TRACK_MOTOR_KP,
+                                 TRACK_MOTOR_KI,
+                                 TRACK_MOTOR_KD,
+                                 TRACK_SERVO_KP,
+                                 TRACK_SERVO_KD);
+        break;
+
     case STATE_AVOID_CAR:
+        control_set_motion_param(AVOID_CAR_DEFAULT_SPEED_MPS,
+                                 AVOID_CAR_MOTOR_KP,
+                                 AVOID_CAR_MOTOR_KI,
+                                 AVOID_CAR_MOTOR_KD,
+                                 AVOID_CAR_SERVO_KP,
+                                 AVOID_CAR_SERVO_KD);
+        break;
+
     case STATE_AVOID_HUMAN:
+        control_set_motion_param(AVOID_HUMAN_DEFAULT_SPEED_MPS,
+                                 AVOID_HUMAN_MOTOR_KP,
+                                 AVOID_HUMAN_MOTOR_KI,
+                                 AVOID_HUMAN_MOTOR_KD,
+                                 AVOID_HUMAN_SERVO_KP,
+                                 AVOID_HUMAN_SERVO_KD);
+        break;
+
     case STATE_COLLECT_GOLD:
+        control_set_motion_param(COLLECT_GOLD_DEFAULT_SPEED_MPS,
+                                 COLLECT_GOLD_MOTOR_KP,
+                                 COLLECT_GOLD_MOTOR_KI,
+                                 COLLECT_GOLD_MOTOR_KD,
+                                 COLLECT_GOLD_SERVO_KP,
+                                 COLLECT_GOLD_SERVO_KD);
+        break;
+
     case STATE_RECOVER_LINE:
-        control_ctx.param.motor_target_speed = 0.3f;
-        control_ctx.param.motor_kp = 100.0f;
-        control_ctx.param.motor_ki = 8.0f;
-        control_ctx.param.motor_kd = 0.0f;
-        control_ctx.param.motor_output_min = -MOTOR_PID_CORRECTION_LIMIT;
-        control_ctx.param.motor_output_max = MOTOR_PID_CORRECTION_LIMIT;
-        control_ctx.param.servo_kp = 0.85f;
-        control_ctx.param.servo_kd = 0.55f;
-        control_ctx.param.servo_output_min = (float)(SERVO_DUTY_MIN - SERVO_DUTY_MID);
-        control_ctx.param.servo_output_max = (float)(SERVO_DUTY_MAX - SERVO_DUTY_MID);
+        control_set_motion_param(RECOVER_LINE_DEFAULT_SPEED_MPS,
+                                 RECOVER_LINE_MOTOR_KP,
+                                 RECOVER_LINE_MOTOR_KI,
+                                 RECOVER_LINE_MOTOR_KD,
+                                 RECOVER_LINE_SERVO_KP,
+                                 RECOVER_LINE_SERVO_KD);
         break;
 
     case STATE_LINE_LOSS_SAFE_STOP:
