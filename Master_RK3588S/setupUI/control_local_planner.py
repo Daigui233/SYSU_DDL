@@ -10,16 +10,16 @@ from control_states import TaskState
 # 当前不使用环境变量覆盖，避免源码默认值和实际运行值不一致。
 PLANNER_DEFAULTS = {
     # 最终下发给 TC264D 前允许的图像误差上限，单位 px；调大允许更猛转向，调小会更保守。
-    "MAX_TRACK_ERROR": 240.0,
+    "MAX_TRACK_ERROR": 160.0,
 
     # AVOID_CAR 基础绕行偏置，单位 px；调大绕得更远，但更容易压出赛道中心区域。
-    "CAR_AVOID_OFFSET": 80.0,
+    "CAR_AVOID_OFFSET": 55.0,
 
     # AVOID_HUMAN 基础绕行偏置，单位 px；人是动态障碍，默认比 car 更远离一些。
-    "HUMAN_AVOID_OFFSET": 115.0,
+    "HUMAN_AVOID_OFFSET": 75.0,
 
     # 障碍框越宽，额外绕行越大；实际偏置取 max(基础偏置, bbox_width * 该系数)。
-    "AVOID_BOX_WIDTH_GAIN": 0.75,
+    "AVOID_BOX_WIDTH_GAIN": 0.35,
 
     # COLLECT_GOLD 向金币吸引的比例；调大更主动靠金币，调小更偏向继续巡线。
     "GOLD_BIAS_GAIN": 0.45,
@@ -32,13 +32,25 @@ PLANNER_DEFAULTS = {
 
     # 检测触发状态容易逐帧抖动；该系数决定 final_track_error 朝新目标移动的速度。
     # 调大反应更快，调小目标线更稳。
-    "FINAL_ERROR_SMOOTH_ALPHA": 0.35,
+    "FINAL_ERROR_SMOOTH_ALPHA": 0.30,
 
     # 每一帧 final_track_error 最大允许变化量，单位 px；用于防止目标线左右瞬移。
-    "MAX_ERROR_STEP_PER_FRAME": 38.0,
+    "MAX_ERROR_STEP_PER_FRAME": 14.0,
 
     # 绘制偏移目标路径时，尽量让路径点留在 road_mask 边界内侧这么多像素。
     "TARGET_PATH_ROAD_MARGIN": 8.0,
+
+    # 最终控制误差从紫色规划线的这个 y 位置读取；0.62 表示画面高度 62% 处。
+    "CONTROL_LOOKAHEAD_Y_RATIO": 0.62,
+
+    # 紫色规划线从近处开始保持贴近红线；y 大于该比例时偏移接近 0。
+    "PATH_NEAR_ANCHOR_Y_RATIO": 0.86,
+
+    # 紫色规划线到较远处逐渐达到完整避障偏移；y 小于该比例时偏移接近完整值。
+    "PATH_FULL_BIAS_Y_RATIO": 0.50,
+
+    # 紫色规划线最多使用的点数；减少 road_mask 扫描和绘制开销，避免 RK 上帧率被拖低。
+    "TARGET_PATH_MAX_POINTS": 28,
 
     # 避障方向保持时间，单位 s；检测框在中线附近抖动时不立刻左右换边。
     "AVOID_SIDE_HOLD_SECONDS": 0.8,
@@ -110,6 +122,10 @@ class LocalPlanner:
         self.final_error_smooth_alpha = float(self.params["FINAL_ERROR_SMOOTH_ALPHA"])
         self.max_error_step_per_frame = float(self.params["MAX_ERROR_STEP_PER_FRAME"])
         self.target_path_road_margin = float(self.params["TARGET_PATH_ROAD_MARGIN"])
+        self.control_lookahead_y_ratio = float(self.params["CONTROL_LOOKAHEAD_Y_RATIO"])
+        self.path_near_anchor_y_ratio = float(self.params["PATH_NEAR_ANCHOR_Y_RATIO"])
+        self.path_full_bias_y_ratio = float(self.params["PATH_FULL_BIAS_Y_RATIO"])
+        self.target_path_max_points = int(self.params["TARGET_PATH_MAX_POINTS"])
         self.avoid_side_hold_seconds = float(self.params["AVOID_SIDE_HOLD_SECONDS"])
         self.avoid_side_switch_margin = float(self.params["AVOID_SIDE_SWITCH_MARGIN"])
         self.road_side_roi_min_y_ratio = float(self.params["ROAD_SIDE_ROI_MIN_Y_RATIO"])
@@ -138,15 +154,19 @@ class LocalPlanner:
         state = str((task_decision or {}).get("task_state") or TaskState.NORMAL_TRACK.value)
         intent = dict((task_decision or {}).get("planner_intent") or {})
 
+        path_offset = 0.0
+        raw_final_error = base_error
         final_error = base_error
         reason = "track_center"
         avoid_side = None
 
         if state == TaskState.LINE_LOSS_SAFE_STOP.value:
             final_error = None
+            raw_final_error = None
             reason = "safe_stop"
         elif state == TaskState.RECOVER_LINE.value or not line_valid:
             final_error = self._recover_error(now)
+            raw_final_error = final_error
             reason = "hold_last_line"
         elif state == TaskState.AVOID_HUMAN.value:
             target = intent.get("target") or {}
@@ -159,7 +179,7 @@ class LocalPlanner:
                 category="human",
                 now=now,
             )
-            final_error = base_error + self._side_sign(avoid_side) * self._avoid_offset(target, self.human_avoid_offset)
+            path_offset = self._side_sign(avoid_side) * self._avoid_offset(target, self.human_avoid_offset)
             reason = f"avoid_human_{avoid_side}"
         elif state == TaskState.AVOID_CAR.value:
             target = intent.get("target") or {}
@@ -172,27 +192,51 @@ class LocalPlanner:
                 category="car",
                 now=now,
             )
-            final_error = base_error + self._side_sign(avoid_side) * self._avoid_offset(target, self.car_avoid_offset)
+            path_offset = self._side_sign(avoid_side) * self._avoid_offset(target, self.car_avoid_offset)
             reason = f"avoid_car_{avoid_side}"
         elif state == TaskState.COLLECT_GOLD.value:
             target = intent.get("target") or {}
-            final_error = self._gold_error(base_error, target, center_x)
+            path_offset = self._gold_offset(base_error, target, center_x)
             reason = "collect_gold"
 
-        raw_final_error = final_error
+        raw_target_path = []
+        if line_valid and final_error is not None:
+            raw_target_path = self._build_target_path(segmentation, path_offset, frame_w, frame_h)
+            if state != TaskState.NORMAL_TRACK.value and raw_target_path:
+                raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
+                if raw_final_error is None and base_error is not None:
+                    lookahead_y = frame_h * self.control_lookahead_y_ratio
+                    raw_final_error = base_error + path_offset * self._path_bias_gain(lookahead_y, frame_h)
+
         if final_error is not None:
+            if self.last_output_error is None and state != TaskState.NORMAL_TRACK.value and base_error is not None:
+                self.last_output_error = base_error
             final_error = self._smooth_final_error(
-                _clamp(final_error, -self.max_track_error, self.max_track_error),
+                _clamp(raw_final_error, -self.max_track_error, self.max_track_error),
                 state,
             )
             if line_valid:
                 self.last_final_error = final_error
                 self.last_valid_ts = now
 
+        effective_path_offset = path_offset
+        target_path = raw_target_path
+        if line_valid and final_error is not None and state != TaskState.NORMAL_TRACK.value:
+            effective_path_offset = self._effective_path_offset_for_error(
+                segmentation,
+                final_error,
+                center_x,
+                path_offset,
+                frame_w,
+                frame_h,
+            )
+            target_path = self._build_target_path(segmentation, effective_path_offset, frame_w, frame_h)
+        elif line_valid and final_error is not None and not target_path:
+            target_path = self._build_target_path(segmentation, 0.0, frame_w, frame_h)
+
         target_x = None
         if final_error is not None:
             target_x = _clamp(center_x + final_error, 0, frame_w - 1)
-        target_path = self._build_target_path(segmentation, base_error, final_error, frame_w, frame_h)
 
         return {
             "final_track_error": float(final_error) if final_error is not None else None,
@@ -201,6 +245,8 @@ class LocalPlanner:
             "target_x": float(target_x) if target_x is not None else None,
             "target_path": target_path,
             "center_x": float(center_x),
+            "desired_path_offset": float(path_offset),
+            "effective_path_offset": float(effective_path_offset),
             "avoid_side": avoid_side,
             "planner_reason": reason,
             "line_valid": line_valid,
@@ -230,50 +276,114 @@ class LocalPlanner:
         self.last_output_error = smoothed
         return smoothed
 
-    def _build_target_path(self, segmentation, base_error, final_error, frame_w, frame_h):
-        if final_error is None:
-            return []
-
+    def _build_target_path(self, segmentation, path_offset, frame_w, frame_h):
         mid_points = segmentation.get("mid_points") or []
         if len(mid_points) < 2:
             return []
 
-        if base_error is None:
-            path_offset = final_error
-        else:
-            path_offset = final_error - base_error
-
+        points = self._sample_mid_points(mid_points)
         road_mask = segmentation.get("road_mask")
+        road_bounds = self._road_bounds_for_points(road_mask, points, frame_w)
         path = []
-        for point in mid_points:
+        for point in points:
             try:
                 x_raw, y_raw = point
                 y = int(_clamp(y_raw, 0, frame_h - 1))
-                shifted_x = _finite_float(x_raw, frame_w * 0.5) + path_offset
+                bias_gain = self._path_bias_gain(y, frame_h)
+                shifted_x = _finite_float(x_raw, frame_w * 0.5) + float(path_offset) * bias_gain
             except Exception:
                 continue
-            x = self._clamp_path_x_to_road(shifted_x, y, road_mask, frame_w)
+            x = self._clamp_path_x_to_road(shifted_x, y, road_bounds, frame_w)
             path.append((int(round(x)), y))
         return path
 
-    def _clamp_path_x_to_road(self, x, y, road_mask, frame_w):
-        x = _clamp(x, 0, frame_w - 1)
-        if road_mask is None or not hasattr(road_mask, "shape"):
-            return x
-        mask = np.asarray(road_mask)
-        if mask.ndim != 2 or y < 0 or y >= mask.shape[0]:
-            return x
+    def _sample_mid_points(self, mid_points):
+        max_points = max(2, int(self.target_path_max_points))
+        count = len(mid_points)
+        if count <= max_points:
+            return list(mid_points)
+        if max_points == 2:
+            return [mid_points[0], mid_points[-1]]
 
-        xs = np.flatnonzero(mask[int(y)])
-        if xs.size < 2:
-            return x
+        sampled = []
+        last_idx = None
+        step = (count - 1) / float(max_points - 1)
+        for i in range(max_points):
+            idx = int(round(i * step))
+            idx = max(0, min(count - 1, idx))
+            if idx != last_idx:
+                sampled.append(mid_points[idx])
+                last_idx = idx
+        return sampled
+
+    def _path_bias_gain(self, y, frame_h):
+        near_y = float(frame_h) * _clamp(self.path_near_anchor_y_ratio, 0.0, 1.0)
+        full_y = float(frame_h) * _clamp(self.path_full_bias_y_ratio, 0.0, 1.0)
+        if near_y <= full_y:
+            near_y, full_y = full_y, near_y
+        span = max(1.0, near_y - full_y)
+        t = _clamp((near_y - float(y)) / span, 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    def _road_bounds_for_points(self, road_mask, points, frame_w):
+        if road_mask is None or not hasattr(road_mask, "shape"):
+            return {}
+        mask = np.asarray(road_mask)
+        if mask.ndim != 2:
+            return {}
+
+        bounds = {}
         margin = max(0.0, self.target_path_road_margin)
-        left = min(frame_w - 1, float(xs[0]) + margin)
-        right = max(0.0, float(xs[-1]) - margin)
-        if left > right:
-            left = float(xs[0])
-            right = float(xs[-1])
+        for _x, y_raw in points:
+            y = int(_clamp(y_raw, 0, mask.shape[0] - 1))
+            if y in bounds:
+                continue
+            xs = np.flatnonzero(mask[y])
+            if xs.size < 2:
+                continue
+            left = min(frame_w - 1, float(xs[0]) + margin)
+            right = max(0.0, float(xs[-1]) - margin)
+            if left > right:
+                left = float(xs[0])
+                right = float(xs[-1])
+            bounds[y] = (left, right)
+        return bounds
+
+    def _clamp_path_x_to_road(self, x, y, road_bounds, frame_w):
+        x = _clamp(x, 0, frame_w - 1)
+        bounds = road_bounds.get(int(y)) if road_bounds else None
+        if bounds is None:
+            return x
+        left, right = bounds
         return _clamp(x, left, right)
+
+    def _path_error_at_lookahead(self, path, center_x, frame_h):
+        if not path:
+            return None
+        lookahead_y = int(_clamp(frame_h * self.control_lookahead_y_ratio, 0, frame_h - 1))
+        idx = min(range(len(path)), key=lambda i: abs(path[i][1] - lookahead_y))
+        return float(path[idx][0]) - float(center_x)
+
+    def _effective_path_offset_for_error(self, segmentation, final_error, center_x, desired_offset, frame_w, frame_h):
+        mid_points = segmentation.get("mid_points") or []
+        if len(mid_points) < 2:
+            return desired_offset
+
+        lookahead_y = int(_clamp(frame_h * self.control_lookahead_y_ratio, 0, frame_h - 1))
+        try:
+            idx = min(range(len(mid_points)), key=lambda i: abs(mid_points[i][1] - lookahead_y))
+            base_x = _finite_float(mid_points[idx][0], center_x)
+        except Exception:
+            return desired_offset
+
+        gain = self._path_bias_gain(lookahead_y, frame_h)
+        if gain < 0.05:
+            return desired_offset
+
+        target_x = _clamp(float(center_x) + float(final_error), 0, frame_w - 1)
+        effective = (target_x - base_x) / gain
+        max_abs = max(abs(float(desired_offset)), 1.0)
+        return _clamp(effective, -max_abs, max_abs)
 
     def _avoid_offset(self, target, default_offset):
         size = target.get("size") or [0.0, 0.0]
@@ -288,6 +398,14 @@ class LocalPlanner:
         target_error = target_x - center_x
         bias = _clamp((target_error - base_error) * self.gold_gain, -self.gold_max_bias, self.gold_max_bias)
         return base_error + bias
+
+    def _gold_offset(self, base_error, target, center_x):
+        if base_error is None:
+            return 0.0
+        gold_error = self._gold_error(base_error, target, center_x)
+        if gold_error is None:
+            return 0.0
+        return _clamp(gold_error - base_error, -self.gold_max_bias, self.gold_max_bias)
 
     def _choose_avoid_side(self, segmentation, target, frame_w, frame_h, prefer_away, category, now):
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)

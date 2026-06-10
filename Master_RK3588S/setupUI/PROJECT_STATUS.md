@@ -31,7 +31,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 | `vision_pipeline.py` | 分割/检测模型初始化、推理、后处理，输出结构化 `segmentation + detections` 并绘制基础视觉结果 |
 | `control_states.py` | 状态契约：定义 RK 任务状态、TC264D 状态码、局部规划模式和映射关系 |
 | `control_task_state_machine.py` | 上位机任务状态机：维护状态速度表、掉线恢复、避人滞回和任务触发规则 |
-| `control_local_planner.py` | 图像坐标局部规划，输出最终 `final_track_error` 并绘制最终目标线 |
+| `control_local_planner.py` | 图像坐标局部规划，生成连续最终目标线，输出 `final_track_error` 并绘制规划结果 |
 | `control_arbitrator.py` | 最终控制仲裁：合成状态机/局部规划结果和可选手柄覆盖，生成串口控制帧 |
 | `control_car_link.py` | 封装 `/dev/ttyUSB0` 串口控车链路，供主入口或备用桥复用 |
 | `status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
@@ -55,6 +55,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 - 当前以 RK 上位机状态机为准，默认状态为 `NORMAL_TRACK`，下发 `STATE_TRACK + target_speed + flags=0x01`。
 - 状态机速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS` 管理，当前所有非停车状态默认 `0.2 m/s`。
 - 无有效分割误差但未超过 `3 s` 时，进入 `RECOVER_LINE`，短暂保持/衰减上一帧有效目标线，速度由 `TASK_SPEED_DEFAULTS[TaskState.RECOVER_LINE]` 管理。
+- 避车/避人不再把红色中线整体平移；`control_local_planner.py` 会让紫色规划线从近处红线连续延伸，中远处逐渐偏向绕行侧，并从规划线前瞻点计算 `final_track_error`。
 - 连续 `3 s` 没有有效 `track_error` 时，上位机进入 `LINE_LOSS_SAFE_STOP`，并按状态契约下发 `STATE_LINE_LOSS_SAFE_STOP`。
 - 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`，不会锁死在停机状态。
 - 中线丢失阈值和状态保持时间由 `control_task_state_machine.py` 开头的 `TASK_TIMING_DEFAULTS` 管理；命令重复间隔由 `control_arbitrator.py` 开头参数管理。

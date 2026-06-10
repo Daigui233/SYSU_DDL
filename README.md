@@ -61,9 +61,9 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 工程约定：后续新增上位机功能时，优先新建可复用模块文件，再由 `ar_receiver.py` 调度；不要把状态机、路径规划、OCR/API、数据记录等大块逻辑直接堆进 `ar_receiver.py`。核心调车参数、阈值和速度表由对应模块维护，`ar_receiver.py` 只负责实例化和连接模块。
 - 分割模型从融合视频生成基础 `track_error`；目标检测作为感知输入进入 `control_task_state_machine.py`，由状态机输出 `task_state / desired_speed / planner_intent`。
 - `control_local_planner.py` 根据任务状态输出最终 `final_track_error`，上位机再以对应状态码、目标速度和 `flags=0x01` 下发给 TC264D。
-- 调试画面中红色曲线表示语义分割得到的赛道中线；紫色曲线表示局部规划后的最终目标路径，会基于中线形状做平滑偏置，目标检测只作为状态机输入，不直接生成跳变竖线。
+- 调试画面中红色曲线表示语义分割得到的赛道中线；紫色曲线表示局部规划后的最终目标路径。避障时紫色线从近处红线连续延伸出去，中远处逐渐偏向绕行侧，不再对整条红线做瞬时平移。
 - 目标检测任务抢占先看近处风险区：检测框底边进入画面底部 40% 且靠近中部路径区域后，才按远近排序触发避人/避车/金币；远处目标只显示检测框，不提前改变目标路径。
-- 避人/避车时紫色路径带有误差平滑、单帧限幅和绕行方向滞回，避免检测框在中线附近抖动时目标路径左右乱飘。
+- 避人/避车时 `final_track_error` 从紫色规划线前瞻点计算，并带有误差平滑、单帧限幅和绕行方向滞回，避免检测框在中线附近抖动时目标路径左右乱飘或舵机瞬时过冲。
 - 摄像头/图像中心线只作为 `track_error` 的计算参考，默认不在调试画面中显示；调车时主要看红色中线和紫色最终目标路径。
 - 当前分割和检测模型效果较差，仍需优化；`gold / car / human` 已接入第一阶段局部任务逻辑，但需要低速实车验证。
 - 当前状态机速度表中所有非停车状态默认 `0.2 m/s`，`LINE_LOSS_SAFE_STOP` 保持 `0.0 m/s`。
@@ -99,7 +99,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 
 1. `control_task_state_machine.py` 顶部已集中 `TASK_SPEED_DEFAULTS`、`TASK_TIMING_DEFAULTS`、`TASK_RULE_DEFAULTS` 和 `PERCEPTION_QUALITY_DEFAULTS`，不同状态速度、检测触发阈值、分割质量阈值和检测 age 限制都在文件开头统一修改。
 2. `control_task_state_machine.py` 已建立基础感知质量契约：状态机不再只看 `line_valid`，还会检查 segmentation `age/source/road_ratio/road_state/midline_state` 和 detection `age`，质量不可信时先进入 `RECOVER_LINE`，连续超时后才进入 `LINE_LOSS_SAFE_STOP`。
-3. `control_local_planner.py` 顶部已集中 `PLANNER_DEFAULTS`，避障偏置、金币吸引、最大误差、恢复衰减和 road mask 左右侧评分阈值都不再使用环境变量覆盖。
+3. `control_local_planner.py` 顶部已集中 `PLANNER_DEFAULTS`，避障偏置、连续规划线 ramp、前瞻点、金币吸引、最大误差、恢复衰减和 road mask 左右侧评分阈值都不再使用环境变量覆盖。
 
 后续仍需改进：
 

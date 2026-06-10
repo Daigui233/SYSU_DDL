@@ -12,8 +12,8 @@ RK3588S 负责结构化感知、任务状态选择和图像坐标局部规划。
 | RK `task_state` | RK 行为 | TC264D `state_cmd` |
 | --- | --- | --- |
 | `NORMAL_TRACK` | 使用语义分割中线 `track_error`。 | `STATE_TRACK = 1` |
-| `AVOID_CAR` | 在 road mask 内向左/右偏置 `final_track_error`。 | `STATE_AVOID_CAR = 2` |
-| `AVOID_HUMAN` | 远离人、降低速度，并在人短暂丢失后保持 TTL。 | `STATE_AVOID_HUMAN = 3` |
+| `AVOID_CAR` | 在 road mask 内生成连续绕行目标线，并从规划线前瞻点计算 `final_track_error`。 | `STATE_AVOID_CAR = 2` |
+| `AVOID_HUMAN` | 远离人，生成连续绕行目标线，并在人短暂丢失后保持 TTL。 | `STATE_AVOID_HUMAN = 3` |
 | `COLLECT_GOLD` | 当金币较近且代价不大时，让目标线偏向金币。 | `STATE_COLLECT_GOLD = 4` |
 | `RECOVER_LINE` | 短时保持/衰减上一帧有效局部规划误差。 | `STATE_RECOVER_LINE = 5` |
 | `LINE_LOSS_SAFE_STOP` | 连续丢失中线超过超时时间后停车。 | `STATE_LINE_LOSS_SAFE_STOP = 6` |
@@ -50,7 +50,7 @@ TC264D TRACK 电机/舵机控制参数。早期制作的其他任务枚举不再
 - `planner_intent`
 - 丢线计时等元数据
 
-`control_local_planner.py` 输入结构化感知和状态机决策，输出：
+`control_local_planner.py` 输入结构化感知和状态机决策，基于红色分割中线生成连续紫色目标路径，输出：
 
 - `final_track_error`
 - 局部规划调试元数据
