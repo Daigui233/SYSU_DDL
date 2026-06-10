@@ -14,36 +14,47 @@ CONTROL_SCALE = 0.65
 # max_abs: 下发给 TC264D 的最大绝对误差，避免单帧识别异常把舵机打满。
 # max_step: 连续两帧下发误差最大变化量，抑制弯道过冲后反向猛修。
 # deadband: 小误差死区，减少直道细碎抖动。
+# curve_start / curve_gain: 类似 Cardo 的大弯非线性增益，小误差不变，大误差额外增强。
 CONTROL_ERROR_PARAMS = {
     TaskState.NORMAL_TRACK.value: {
         "scale": 0.65,
-        "max_abs": 100.0,
-        "max_step": 10.0,
+        "max_abs": 135.0,
+        "max_step": 16.0,
         "deadband": 3.0,
+        "curve_start": 45.0,
+        "curve_gain": 0.35,
     },
     TaskState.RECOVER_LINE.value: {
         "scale": 0.55,
         "max_abs": 85.0,
         "max_step": 8.0,
         "deadband": 3.0,
+        "curve_start": 0.0,
+        "curve_gain": 0.0,
     },
     TaskState.COLLECT_GOLD.value: {
         "scale": 0.65,
-        "max_abs": 105.0,
-        "max_step": 12.0,
+        "max_abs": 125.0,
+        "max_step": 14.0,
         "deadband": 2.0,
+        "curve_start": 50.0,
+        "curve_gain": 0.25,
     },
     TaskState.AVOID_CAR.value: {
         "scale": 0.90,
         "max_abs": 145.0,
         "max_step": 22.0,
         "deadband": 2.0,
+        "curve_start": 60.0,
+        "curve_gain": 0.20,
     },
     TaskState.AVOID_HUMAN.value: {
         "scale": 0.90,
         "max_abs": 150.0,
         "max_step": 22.0,
         "deadband": 2.0,
+        "curve_start": 60.0,
+        "curve_gain": 0.20,
     },
 }
 
@@ -52,6 +63,8 @@ DEFAULT_CONTROL_ERROR_PARAM = {
     "max_abs": 100.0,
     "max_step": 10.0,
     "deadband": 3.0,
+    "curve_start": 0.0,
+    "curve_gain": 0.0,
 }
 
 # 没有新视频帧时，重复发送上一次状态机决策的最小间隔，单位 s。
@@ -87,13 +100,27 @@ class ControlArbitrator:
     def _clamp(value, low, high):
         return max(float(low), min(float(high), float(value)))
 
+    @staticmethod
+    def _apply_curve_boost(raw_error, shaped_error, param):
+        start = float(param.get("curve_start", 0.0))
+        gain = float(param.get("curve_gain", 0.0))
+        if start <= 0.0 or gain <= 0.0:
+            return shaped_error
+
+        extra = max(0.0, abs(float(raw_error)) - start) * gain
+        if extra <= 0.0:
+            return shaped_error
+        return float(shaped_error) + math.copysign(extra, float(raw_error))
+
     def _shape_vision_track_error(self, track_error, state_text, safe_stop=False):
         if safe_stop:
             self._last_vision_track_error = 0.0
             return 0.0
 
         param = self._param_for_state(state_text)
-        shaped = float(track_error) * float(param["scale"])
+        raw_error = float(track_error)
+        shaped = raw_error * float(param["scale"])
+        shaped = self._apply_curve_boost(raw_error, shaped, param)
         if abs(shaped) < float(param["deadband"]):
             shaped = 0.0
 
