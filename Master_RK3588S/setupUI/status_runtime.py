@@ -4,6 +4,8 @@ import os
 import threading
 import time
 
+import numpy as np
+
 
 def read_json_file(path, default=None):
     try:
@@ -41,6 +43,7 @@ class RuntimeStatusStore:
         self.ai_status_provider = ai_status_provider or self._default_ai_status
         self.lock = threading.Lock()
         self.latest_control_status = None
+        self.latest_vision_status = None
 
     def _default_ai_status(self):
         return {
@@ -86,6 +89,8 @@ class RuntimeStatusStore:
                     self.latest_control_status = dict(control_info)
                 if self.latest_control_status is not None:
                     info["control"] = dict(self.latest_control_status)
+                if self.latest_vision_status is not None:
+                    info["vision"] = dict(self.latest_vision_status)
 
                 tmp_path = self.status_path + ".tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
@@ -104,8 +109,12 @@ class RuntimeStatusStore:
         command_flags,
         gamepad_status=None,
         performance_status=None,
+        perception=None,
     ):
         pose_info = pose_bridge.snapshot()
+        vision_info = self._public_vision_status(perception)
+        if vision_info is not None:
+            self.latest_vision_status = vision_info
         control_info = {
             "state": control_state,
             "track_error": float(command_error) if command_error is not None and math.isfinite(float(command_error)) else None,
@@ -137,7 +146,46 @@ class RuntimeStatusStore:
         }
         if performance_status is not None:
             info["performance"] = performance_status
+        if self.latest_vision_status is not None:
+            info["vision"] = dict(self.latest_vision_status)
         self.write_status_json(info, "runtime status", control_info=control_info)
+
+    def _public_vision_status(self, perception):
+        if not perception:
+            return None
+
+        segmentation = dict((perception or {}).get("segmentation") or {})
+        segmentation.pop("road_mask", None)
+
+        candidates = []
+        for candidate in segmentation.get("fork_candidates") or []:
+            item = dict(candidate)
+            points = item.get("points") or []
+            item["points_count"] = len(points)
+            if points:
+                item["first_point"] = list(points[0])
+                item["last_point"] = list(points[-1])
+            item.pop("points", None)
+            candidates.append(item)
+        segmentation["fork_candidates"] = candidates
+
+        def public_value(value):
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            return value
+
+        segmentation = {
+            str(k): public_value(v)
+            for k, v in segmentation.items()
+            if isinstance(v, (str, int, float, bool, type(None), list, dict, tuple, np.generic))
+        }
+        return {
+            "timestamp": float((perception or {}).get("timestamp", time.time())),
+            "frame_shape": list((perception or {}).get("frame_shape") or []),
+            "segmentation": segmentation,
+        }
 
     def current_payload(self):
         status = read_json_file(self.status_path, {})

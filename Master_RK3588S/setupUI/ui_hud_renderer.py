@@ -416,6 +416,7 @@ def draw_pose_status(
     pose_input_port=9005,
     performance_status=None,
     target_speed=None,
+    segmentation_status=None,
     enabled=True,
 ):
     if not enabled:
@@ -449,6 +450,17 @@ def draw_pose_status(
     speed_text = "N/A" if target_speed is None else f"{float(target_speed):.2f}"
     control_line = f"CTRL {control_state}"
     cmd_line = f"CMD v={speed_text} err={err_text}"
+    fork_line = "FORK N/A"
+    if isinstance(segmentation_status, dict):
+        fork_cls = segmentation_status.get("fork_classifier") or {}
+        fork_state = segmentation_status.get("fork_state") or "N/A"
+        fork_mode = segmentation_status.get("fork_mode") or "single"
+        fork_name = fork_cls.get("name") or "none"
+        fork_conf = _safe_float(fork_cls.get("confidence"), None)
+        split_rows = segmentation_status.get("fork_split_rows", 0)
+        selected_side = segmentation_status.get("fork_selected_side") or "-"
+        conf_text = "N/A" if fork_conf is None else f"{fork_conf:.2f}"
+        fork_line = f"FORK {fork_state} {fork_mode} cls={fork_name}:{conf_text} split={split_rows} sel={selected_side}"
 
     feedback = get_car_feedback() if get_car_feedback is not None else {"online": False, "error": "waiting"}
     car_lines = []
@@ -475,6 +487,7 @@ def draw_pose_status(
         "RUN STATUS",
         control_line,
         cmd_line,
+        fork_line,
         pose_line,
     ]
     lines.extend(car_lines)

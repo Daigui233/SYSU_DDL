@@ -284,6 +284,7 @@ def main():
                             command_flags,
                             gamepad_status=gamepad_status,
                             performance_status=performance_monitor.snapshot(),
+                            perception=perception,
                         )
                         performance_monitor.stop("runtime_status_ms", perf_token)
                         last_runtime_status_ts = now
@@ -306,6 +307,7 @@ def main():
                         pose_input_port=POSE_INPUT_PORT,
                         performance_status=performance_monitor.hud_snapshot(),
                         target_speed=command_speed,
+                        segmentation_status=(perception or {}).get("segmentation"),
                         enabled=DEBUG_DRAW_POSE_PANEL,
                     )
                     performance_monitor.stop("hud_ms", perf_token)

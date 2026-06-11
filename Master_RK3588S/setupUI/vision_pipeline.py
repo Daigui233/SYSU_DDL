@@ -5,6 +5,10 @@ import cv2
 from infer_wrap import InferWrap, PPSegInfer
 from infer_wrap.base.func import CLASSES, draw
 from infer_wrap.base.seg_func import extract_centerline_info
+try:
+    from infer_wrap.base.seg_infer import ForkMaskClsInfer
+except Exception:
+    ForkMaskClsInfer = None
 from vision_traffic_light import classify_traffic_light_color
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +34,7 @@ class VisionPipeline:
 
         self.infer_det = None
         self.infer_seg = None
+        self.infer_fork = None
         self.last_seg_res = None
         self.last_seg_ts = 0.0
         self.last_det_res = None
@@ -38,6 +43,7 @@ class VisionPipeline:
             "ok": False,
             "detector": "not initialized",
             "segmenter": "not initialized",
+            "fork_classifier": "not initialized",
             "error": None,
         }
         self._init_engines()
@@ -50,13 +56,21 @@ class VisionPipeline:
         try:
             self.infer_det = InferWrap(model_dir=self.model_dir, TPEs=1, core_ids=[0], max_inflight=1)
             self.infer_seg = PPSegInfer(model_dir=self.model_dir, TPEs=1, core_ids=[1], max_inflight=1)
+            if ForkMaskClsInfer is not None:
+                try:
+                    self.infer_fork = ForkMaskClsInfer(model_dir=self.model_dir, core_id=2)
+                except FileNotFoundError as exc:
+                    self.infer_fork = None
+                    self._log(f"fork classifier disabled: {exc}")
         except Exception as exc:
             self.infer_det = None
             self.infer_seg = None
+            self.infer_fork = None
             self._status = {
                 "ok": False,
                 "detector": "disabled",
                 "segmenter": "disabled",
+                "fork_classifier": "disabled",
                 "error": str(exc),
             }
             self._log(f"NPU AI init failed: {exc}; WebUI and pose forwarding continue without vision inference")
@@ -66,6 +80,7 @@ class VisionPipeline:
             "ok": True,
             "detector": "ready",
             "segmenter": "ready",
+            "fork_classifier": "ready" if self.infer_fork is not None else "not found",
             "error": None,
         }
         self._log("AI engines loaded")
@@ -94,6 +109,14 @@ class VisionPipeline:
             "target_x": None,
             "road_mask": None,
             "mid_points": [],
+            "fork_state": "MISS",
+            "fork_mode": "single",
+            "fork_classifier": {"available": False, "name": "none", "confidence": 0.0},
+            "fork_geometry_valid": False,
+            "fork_split_rows": 0,
+            "fork_candidates": [],
+            "fork_selected_side": None,
+            "fork_reason": source,
         }
 
     @staticmethod
@@ -226,7 +249,11 @@ class VisionPipeline:
 
         if self.last_seg_res is not None and (now - self.last_seg_ts) <= self.seg_result_ttl:
             try:
-                final_frame, segmentation = extract_centerline_info(self.last_seg_res, final_frame)
+                final_frame, segmentation = extract_centerline_info(
+                    self.last_seg_res,
+                    final_frame,
+                    fork_classifier=self.infer_fork,
+                )
                 segmentation["timestamp"] = float(self.last_seg_ts)
                 segmentation["age"] = float(now - self.last_seg_ts)
                 segmentation["source"] = "fresh" if segmentation["age"] <= 0.05 else "cached"
@@ -263,3 +290,5 @@ class VisionPipeline:
             self.infer_seg.release()
         if self.infer_det is not None:
             self.infer_det.release()
+        if self.infer_fork is not None:
+            self.infer_fork.release()

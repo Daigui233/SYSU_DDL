@@ -6,10 +6,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 try:
+    from .rknnpool import initRKNN
     from .rknnpool import rknnPoolExecutor
+    from .seg_func import make_fork_classifier_input
     from .seg_func import myFunc
 except ImportError:
+    from rknnpool import initRKNN
     from rknnpool import rknnPoolExecutor
+    from seg_func import make_fork_classifier_input
     from seg_func import myFunc
 
 
@@ -49,3 +53,34 @@ class PPSegInfer:
 
     def release(self):
         self.rknn_pool.release()
+
+
+class ForkMaskClsInfer:
+    def __init__(self, model_dir="model", core_id=2):
+        model_dir = model_dir if os.path.isabs(model_dir) else os.path.join(get_current_dir(), model_dir)
+        self.model_path = self.get_model_path(model_dir)
+        self.rknn_lite = initRKNN(self.model_path, core_id=core_id)
+
+    def get_model_path(self, model_dir):
+        patterns = ("fork_mask_cls*.rknn", "fork_cls*.rknn")
+        files = []
+        for pattern in patterns:
+            files.extend(sorted(glob.glob(os.path.join(model_dir, pattern))))
+        if not files:
+            rules = ", ".join(os.path.join(model_dir, p) for p in patterns)
+            raise FileNotFoundError(f"fork classifier model not found, rules: {rules}")
+        return files[0]
+
+    def infer_mask(self, road_mask):
+        img = make_fork_classifier_input(road_mask)
+        outputs = self.rknn_lite.inference(inputs=[img[None, ...]])
+        out = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+        return {"logits": out}
+
+    def release(self):
+        if self.rknn_lite is not None:
+            try:
+                self.rknn_lite.release()
+            except Exception:
+                pass
+            self.rknn_lite = None

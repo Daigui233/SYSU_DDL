@@ -423,6 +423,10 @@
                             <span class="ar-debug-value" id="debug-ctrl">等待控制状态</span>
                         </div>
                         <div class="ar-debug-row">
+                            <span class="ar-debug-label">FORK</span>
+                            <span class="ar-debug-value" id="debug-fork">N/A</span>
+                        </div>
+                        <div class="ar-debug-row">
                             <span class="ar-debug-label">GAMEPAD</span>
                             <span class="ar-debug-value" id="debug-gamepad">默认视觉控车</span>
                         </div>
@@ -658,6 +662,9 @@
                 const serialSend = control.serial_send || {};
                 const gamepad = control.gamepad || {};
                 const feedback = data.car_feedback || {};
+                const vision = data.vision || {};
+                const segmentation = vision.segmentation || {};
+                const forkCls = segmentation.fork_classifier || {};
 
                 setText(
                     "debug-win-udp",
@@ -674,6 +681,10 @@
                 setText(
                     "debug-ctrl",
                     `${control.state || "N/A"} · err ${fmtNum(control.track_error, 1)} · v ${fmtNum(control.target_speed, 2)}m/s`
+                );
+                setText(
+                    "debug-fork",
+                    `${segmentation.fork_state || "N/A"} ${segmentation.fork_mode || "single"} · cls ${forkCls.name || "none"} ${fmtNum(forkCls.confidence, 2)} · split ${segmentation.fork_split_rows ?? "N/A"} · sel ${segmentation.fork_selected_side || "-"}`
                 );
                 setText(
                     "debug-gamepad",
@@ -712,6 +723,7 @@
                     setText("debug-ar-fwd", "N/A");
                     setText("debug-pose", "N/A");
                     setText("debug-ctrl", "N/A");
+                    setText("debug-fork", "N/A");
                     setText("debug-gamepad", "N/A");
                     setText("debug-serial", "N/A");
                     setText("debug-tc264", "N/A");
