@@ -18,8 +18,8 @@ RK3588S 负责结构化感知、任务状态选择和图像坐标局部规划。
 | `RECOVER_LINE` | 短时保持/衰减上一帧有效局部规划误差。 | `STATE_RECOVER_LINE = 5` |
 | `LINE_LOSS_SAFE_STOP` | 连续丢失中线超过超时时间后停车。 | `STATE_LINE_LOSS_SAFE_STOP = 6` |
 | `AVOID_STONE` | 在分岔区域检测到 `stone` 且命中默认外圈候选路径时，选择内圈候选路径。 | `STATE_AVOID_STONE = 8` |
-| `TRAFFIC_LIGHT_STOP` | `TrafficLight` 框内识别为红灯且进入有效触发区后停车；绿灯不进入该状态。 | `STATE_TRAFFIC_LIGHT_STOP = 9` |
-| `ENDSIGN_STOP` | 看到 `EndSign` 后继续循迹，直到 `EndSign` 消失超过短 TTL 后停车。 | `STATE_ENDSIGN_STOP = 10` |
+| `TRAFFIC_LIGHT_STOP` | `TrafficLight` 框内识别为红灯、进入近处停车区并连续确认后停车；有效绿灯会清除红灯保持并恢复通行。 | `STATE_TRAFFIC_LIGHT_STOP = 9` |
+| `ENDSIGN_STOP` | 比赛已开始且进入最后一圈后，连续稳定看到 `EndSign` 才进入终点准备；`EndSign` 消失超过短 TTL 后停车。 | `STATE_ENDSIGN_STOP = 10` |
 
 `STATE_IDLE = 0` 用于 TC264D 本地启动/空闲。`STATE_SAFE_STOP = 7` 是通用
 硬停状态，用于手动急停、程序退出清零和 TC264D 本地串口输入超时。
@@ -50,8 +50,8 @@ TC264D TRACK 电机/舵机控制参数。`STATE_TRAFFIC_LIGHT_STOP`、`STATE_END
 `control_race_state_machine.py` 输入结构化检测结果，输出：
 
 - `race_started`、`current_lap`、`completed_laps`
-- `traffic_light_state`、`traffic_light_stop_zone`、`traffic_light_stop`
-- `finish_armed`、`finish_stop`
+- `traffic_light_state`、`traffic_light_stop_zone`、`traffic_light_red_confirm_age`、`traffic_light_stop`
+- `end_sign_allowed`、`end_confirm_age`、`finish_armed`、`finish_stop`
 
 `control_task_state_machine.py` 输入结构化感知，输出：
 

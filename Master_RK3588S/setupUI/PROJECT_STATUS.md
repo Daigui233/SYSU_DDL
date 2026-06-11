@@ -55,6 +55,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 
 ## 当前控制
 
+- 停车类事件按更严格规则处理：红灯必须进入近处停车区并连续确认后才进入 `TRAFFIC_LIGHT_STOP`，有效绿灯会清除红灯保持；`EndSign` 必须在比赛已开始且进入最后一圈后连续确认，才允许最终 `ENDSIGN_STOP`。
 - 当前以 RK 上位机状态机为准，默认状态为 `NORMAL_TRACK`，下发 `STATE_TRACK + target_speed + flags=0x01`。
 - 普通检测目标已拆成风险池和奖励池：`human / car / stone` 平级进入风险池，按目标底边距离等级、相对当前路径的横向遮挡等级和短时状态保持奖励计算 `risk_score`；`gold` 属于奖励池，只在风险池为空且金币足够近、路径代价不大时触发 `COLLECT_GOLD`。
 - 状态机速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS` 管理，当前所有非停车状态默认 `0.05 m/s`。

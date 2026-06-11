@@ -24,6 +24,13 @@ RACE_STATE_DEFAULTS = {
     "SIGN_MIN_SCORE": 0.35,
     "SIGN_MIN_AREA_RATIO": 0.00025,
 
+    # EndSign 误识别会直接导致终点停车，所以比 BeginSign 更严格。
+    # confirm_seconds 表示需要连续稳定看到多久才允许进入终点停车准备。
+    "ENDSIGN_MIN_SCORE": 0.60,
+    "ENDSIGN_MIN_AREA_RATIO": 0.00035,
+    "ENDSIGN_CONFIRM_SECONDS": 0.30,
+    "ENDSIGN_CONFIRM_GAP": 0.20,
+
     # 判断标志是否在 Door 下方/内部时，允许 Door bbox 横向扩展的比例。
     "SIGN_UNDER_DOOR_X_MARGIN_RATIO": 0.30,
 
@@ -33,9 +40,9 @@ RACE_STATE_DEFAULTS = {
     # 看到 EndSign 后不立刻停车；EndSign 消失超过该时间后进入 ENDSIGN_STOP。
     "ENDSIGN_LOST_STOP_DELAY": 0.45,
 
-    # 若打开，则只有已经通过 BeginSign 开始比赛后，EndSign 才能触发终点停车。
-    # 先关闭，避免 BeginSign 漏检导致第三圈无法停车。
-    "ENDSIGN_REQUIRE_RACE_STARTED": False,
+    # EndSign 必须在比赛已经开始、且已经进入最后一圈后才允许触发。
+    "ENDSIGN_REQUIRE_RACE_STARTED": True,
+    "ENDSIGN_REQUIRE_FINAL_LAP": True,
 
     # TrafficLight 置信度和面积阈值；面积比例 0.00025 约等于 77 px。
     "TRAFFIC_LIGHT_MIN_SCORE": 0.35,
@@ -54,6 +61,10 @@ RACE_STATE_DEFAULTS = {
 
     # 红灯最近出现后的保持时间，防止红灯检测短时闪断；绿灯有效出现会立刻解除红灯保持。
     "TRAFFIC_LIGHT_RED_HOLD_TTL": 0.45,
+
+    # 红灯进入近处停车区后仍需连续确认，避免单帧红灯误识别导致硬停。
+    "TRAFFIC_LIGHT_RED_CONFIRM_SECONDS": 0.20,
+    "TRAFFIC_LIGHT_RED_CONFIRM_GAP": 0.15,
 }
 
 
@@ -164,8 +175,11 @@ class RaceStateMachine:
         self.last_begin_seen_ts = None
         self.finish_armed = False
         self.finish_stop = False
+        self.end_confirm_first_ts = None
         self.last_end_seen_ts = None
         self.last_red_seen_ts = None
+        self.red_confirm_first_ts = None
+        self.last_red_stop_ts = None
 
     def update(self, perception, now):
         now = float(now)
@@ -195,8 +209,8 @@ class RaceStateMachine:
         end = _best_detection(
             detections,
             "end_sign",
-            self.params["SIGN_MIN_SCORE"],
-            self.params["SIGN_MIN_AREA_RATIO"],
+            self.params["ENDSIGN_MIN_SCORE"],
+            self.params["ENDSIGN_MIN_AREA_RATIO"],
         )
         traffic_light = _best_detection(
             detections,
@@ -216,12 +230,16 @@ class RaceStateMachine:
         end_under_door = _sign_under_door(end, door, frame_w, frame_h, self.params)
         if begin_under_door:
             self.last_begin_seen_ts = now
-        if end_under_door:
-            self.finish_armed = True
-            self.last_end_seen_ts = now
 
         lap_event = self._update_laps(door_cross_event, now)
-        traffic_state, traffic_stop, traffic_stop_zone = self._update_traffic_light(traffic_light, frame_w, frame_h, now)
+        end_sign_allowed = self._end_sign_allowed()
+        end_confirm_age = self._update_end_sign(end_under_door, end_sign_allowed, now)
+        traffic_state, traffic_stop, traffic_stop_zone, red_confirm_age = self._update_traffic_light(
+            traffic_light,
+            frame_w,
+            frame_h,
+            now,
+        )
         if self._should_finish_stop(now):
             self.finish_stop = True
 
@@ -236,11 +254,14 @@ class RaceStateMachine:
             "lap_event": lap_event,
             "begin_under_door": bool(begin_under_door),
             "end_under_door": bool(end_under_door),
+            "end_sign_allowed": bool(end_sign_allowed),
+            "end_confirm_age": float(end_confirm_age),
             "finish_armed": bool(self.finish_armed),
             "finish_stop": bool(self.finish_stop),
             "traffic_light_visible": bool(traffic_light is not None),
             "traffic_light_state": traffic_state,
             "traffic_light_stop_zone": bool(traffic_stop_zone),
+            "traffic_light_red_confirm_age": float(red_confirm_age),
             "traffic_light_stop": bool(traffic_stop),
         }
 
@@ -277,9 +298,39 @@ class RaceStateMachine:
             return f"lap_{self.completed_laps}"
         return None
 
+    def _end_sign_allowed(self):
+        if self.params["ENDSIGN_REQUIRE_RACE_STARTED"] and not self.race_started:
+            return False
+        if self.params["ENDSIGN_REQUIRE_FINAL_LAP"]:
+            total_laps = max(1, int(self.params["TOTAL_LAPS"]))
+            if self.completed_laps < max(0, total_laps - 1):
+                return False
+        return True
+
+    def _update_end_sign(self, end_under_door, end_sign_allowed, now):
+        gap = float(self.params["ENDSIGN_CONFIRM_GAP"])
+        if not end_under_door or not end_sign_allowed:
+            if self.last_end_seen_ts is None or now - self.last_end_seen_ts > gap:
+                self.end_confirm_first_ts = None
+            return 0.0
+
+        if (
+            self.end_confirm_first_ts is None
+            or self.last_end_seen_ts is None
+            or now - self.last_end_seen_ts > gap
+        ):
+            self.end_confirm_first_ts = now
+
+        self.last_end_seen_ts = now
+        confirm_age = max(0.0, now - self.end_confirm_first_ts)
+        if confirm_age >= float(self.params["ENDSIGN_CONFIRM_SECONDS"]):
+            self.finish_armed = True
+        return confirm_age
+
     def _update_traffic_light(self, traffic_light, frame_w, frame_h, now):
         state = "none"
         stop_zone = False
+        red_confirm_age = 0.0
         if traffic_light is not None:
             geom = _geometry(traffic_light, frame_w, frame_h)
             color_state = str(traffic_light.get("traffic_light_state") or "unknown").lower()
@@ -295,27 +346,52 @@ class RaceStateMachine:
                 and geom["bottom_ratio"] >= float(self.params["TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO"])
                 and geom["lateral_ratio"] <= float(self.params["TRAFFIC_LIGHT_STOP_CENTER_LATERAL_RATIO"])
             )
-            if seen_effective and color_state == "red":
-                state = "red_stop_zone" if stop_zone else "red_far"
-                if stop_zone:
-                    self.last_red_seen_ts = now
-            elif seen_effective and color_state == "green":
+            if seen_effective and color_state == "green":
                 state = "green"
                 self.last_red_seen_ts = None
+                self.red_confirm_first_ts = None
+                self.last_red_stop_ts = None
+            elif seen_effective and color_state == "red":
+                state = "red_far"
+                if stop_zone:
+                    gap = float(self.params["TRAFFIC_LIGHT_RED_CONFIRM_GAP"])
+                    if (
+                        self.red_confirm_first_ts is None
+                        or self.last_red_seen_ts is None
+                        or now - self.last_red_seen_ts > gap
+                    ):
+                        self.red_confirm_first_ts = now
+                    self.last_red_seen_ts = now
+                    red_confirm_age = max(0.0, now - self.red_confirm_first_ts)
+                    if red_confirm_age >= float(self.params["TRAFFIC_LIGHT_RED_CONFIRM_SECONDS"]):
+                        state = "red_stop_zone"
+                        self.last_red_stop_ts = now
+                    else:
+                        state = "red_confirming"
             elif seen_effective:
                 state = color_state
             else:
                 state = "far_or_unknown"
+        else:
+            if (
+                self.last_red_seen_ts is None
+                or now - self.last_red_seen_ts > float(self.params["TRAFFIC_LIGHT_RED_CONFIRM_GAP"])
+            ):
+                self.red_confirm_first_ts = None
 
         stop = bool(
-            self.last_red_seen_ts is not None
-            and now - self.last_red_seen_ts <= float(self.params["TRAFFIC_LIGHT_RED_HOLD_TTL"])
+            self.last_red_stop_ts is not None
+            and now - self.last_red_stop_ts <= float(self.params["TRAFFIC_LIGHT_RED_HOLD_TTL"])
         )
-        return state, stop, stop_zone
+        return state, stop, stop_zone, red_confirm_age
 
     def _should_finish_stop(self, now):
         if self.finish_stop or not self.finish_armed or self.last_end_seen_ts is None:
             return self.finish_stop
         if self.params["ENDSIGN_REQUIRE_RACE_STARTED"] and not self.race_started:
             return False
+        if self.params["ENDSIGN_REQUIRE_FINAL_LAP"]:
+            total_laps = max(1, int(self.params["TOTAL_LAPS"]))
+            if self.completed_laps < max(0, total_laps - 1):
+                return False
         return (now - self.last_end_seen_ts) >= float(self.params["ENDSIGN_LOST_STOP_DELAY"])
