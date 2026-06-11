@@ -1,0 +1,51 @@
+{
+  "mode": "image_ocr_api",
+  "image": "D:\\桌面\\SYSU_DDL\\SYSU_DDL\\Master_RK3588S\\setupUI\\infer_wrap\\base\\bus.jpg",
+  "bbox": null,
+  "crop_out": null,
+  "ocr_elapsed_sec": 0.673,
+  "api_elapsed_sec": 0.0,
+  "ocr": {
+    "text": "MISOL/SEUITLLAUnminibus1ooelectricosiesplanmueveleceroemisiones",
+    "confidence": 0.8812048316001893,
+    "lines": [
+      {
+        "text": "MISOL/SEUITLLA",
+        "confidence": 0.8519750237464905
+      },
+      {
+        "text": "Unminibus1ooelectricosiesplan",
+        "confidence": 0.8515273928642273
+      },
+      {
+        "text": "muevele",
+        "confidence": 0.7187882661819458
+      },
+      {
+        "text": "cero",
+        "confidence": 0.9903102517127991
+      },
+      {
+        "text": "emisiones",
+        "confidence": 0.9934232234954834
+      }
+    ]
+  },
+  "instruction": {
+    "valid": false,
+    "instruction_type": "unknown",
+    "action": "unknown",
+    "preferred_branch": "unknown",
+    "avoid_branches": [],
+    "branch_status": {
+      "left": "unknown",
+      "right": "unknown",
+      "front": "unknown"
+    },
+    "execute_timing": "unknown",
+    "confidence": 0.0,
+    "reason": "api_not_called",
+    "source_text": "MISOL/SEUITLLAUnminibus1ooelectricosiesplanmueveleceroemisiones"
+  },
+  "ok": true
+}
