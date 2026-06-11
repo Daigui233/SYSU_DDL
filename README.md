@@ -68,7 +68,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 调试画面中红色曲线表示语义分割得到的赛道中线；紫色曲线表示局部规划后的最终目标路径。避障时紫色线从近处红线连续延伸出去，中远处逐渐偏向绕行侧，不再对整条红线做瞬时平移。
 - 目标检测任务分为硬规则层、风险池和奖励池：红灯近处停车、终点停车、连续丢线停车保持硬规则；`human / car / stone` 进入风险池，按 `distance_level + path_level + state_hold_bonus` 组成的简单 `risk_score` 排序；`gold` 属于奖励池，只有风险池为空且金币足够近、路径代价不大时才触发 `COLLECT_GOLD`。
 - `control_race_state_machine.py` 独立处理比赛事件：`TrafficLight` 框内红灯远处只记录为 `red_far`，进入近处停车区才触发 `TRAFFIC_LIGHT_STOP`，绿灯通行；`Door + BeginSign` 启动第 1 圈，之后每次有效经过 `Door` 更新圈数；看到 `EndSign` 后继续循迹，直到 `EndSign` 消失超过短 TTL 后进入终点停车。
-- 避人/避车时 `final_track_error` 从紫色规划线前瞻点计算，并带有误差平滑、单帧限幅和绕行方向滞回，避免检测框在中线附近抖动时目标路径左右乱飘或舵机瞬时过冲。
+- 避人/避车时 `final_track_error` 从紫色规划线前瞻点计算，并带有误差平滑、单帧限幅和绕行方向滞回，避免检测框在中线附近抖动时目标路径左右乱飘或舵机瞬时过冲。`AVOID_HUMAN` 会估计行人 bbox 横向速度，可靠时从行人背后绕行，运动方向不可靠时才退回静态避障。
 - 摄像头/图像中心线只作为 `track_error` 的计算参考，默认不在调试画面中显示；调车时主要看红色中线和紫色最终目标路径。
 - 当前分割和检测模型效果较差，仍需优化；`gold / car / human / stone / TrafficLight / Door / BeginSign / EndSign` 已接入第一阶段逻辑，但需要低速实车验证。
 - 当前检测模型还包含 `SpeedSign / TurnSign / Crosswalk`，这些类别暂未接入任务状态机，只作为后续 OCR/API 或赛题任务扩展入口。
@@ -124,7 +124,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 1. 分割中线稳定性：`NORMAL_TRACK` 和所有局部规划都依赖红色分割中线作为基础路径。如果 `road_mask` 抖动、断裂、把岔路粘成一大片，紫色目标线会跟着不稳定。分割相关问题先看 `vision_pipeline.py` 的 `road_ratio / line_valid` 和 HUD 中红线是否合理；当前 `branch_count / Branches` 只表示连通域数量，不应作为岔路是否存在的唯一依据。
 2. 岔路与 `stone`：当前 `AVOID_STONE` 只做图像坐标局部选择，不使用 AR 地图坐标。它会在 `road_mask` 的采样行出现左右候选段时生成两条候选中线，默认跟随更连续的一支；当 `stone` 落在默认路径附近时切换到另一支。这里的 `inner / outer` 是图像局部意义，不是全局赛道地图意义，遇到复杂岔路仍可能需要调 `control_local_planner.py` 顶部的 stone 分支参数。后续更合理的方案是把采样行 segment 识别上升为独立路况状态，再由状态机/规划器使用。
 3. 检测框远近判断：`human / car / stone` 目前进入风险池后按距离等级、路径遮挡等级和状态保持奖励组成 `risk_score` 排序，类别只保留很小的 tie-break；`gold` 属于奖励池，只有无风险目标且金币足够近时才处理。如果目标已经很近但状态没有切换，优先调 `control_task_state_machine.py` 顶部的 `RISK_*` 阈值；如果远处目标提前切换，说明底边触发带或路径横向范围过宽。
-4. 避障转向激进程度：紫色线已经改成连续规划线，但 `AVOID_CAR / AVOID_HUMAN / AVOID_STONE` 的偏置、ramp、前瞻点和单帧误差限幅仍需实车调。若进入避障瞬间舵机猛打或丢线，优先调 `control_local_planner.py` 顶部的避障偏置、平滑系数、最大步进和 lookahead；若明显吃不进弯，再结合 TC264D 舵机 PID 调整。
+4. 避障转向激进程度：紫色线已经改成连续规划线，但 `AVOID_CAR / AVOID_HUMAN / AVOID_STONE` 的偏置、ramp、前瞻点和单帧误差限幅仍需实车调。`AVOID_HUMAN` 可靠检测到行人横向运动时会走行人背后，若出现行人运动方向误判、仍跟着人同向挤出赛道，优先调 `control_local_planner.py` 顶部的 `HUMAN_MOTION_*` 和 `HUMAN_BACK_SIDE_*`。若进入避障瞬间舵机猛打或丢线，优先调避障偏置、平滑系数、最大步进和 lookahead；若明显吃不进弯，再结合 TC264D 舵机 PID 调整。
 5. 红绿灯识别：`TrafficLight` 先由目标检测给框，再由 `vision_traffic_light.py` 在框内用 HSV 判断红/绿。曝光、灯光颜色、AR 画面压缩和检测框偏移都会影响判断。当前远处红灯只记录为 `red_far`，进入 `TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO` 定义的近处停车区后还要连续确认，确认完成才进入 `TRAFFIC_LIGHT_STOP`；有效绿灯会立即清除红灯保持并恢复通行。若红灯不停或绿灯误停，先看 HUD/日志里的 `traffic_light_state / traffic_light_stop_zone / traffic_light_red_confirm_age` 和置信度，再调 `vision_traffic_light.py` 顶部的 HSV、面积阈值以及 `control_race_state_machine.py` 顶部的停车区和确认阈值。
 6. 计圈与终点：`Door + BeginSign` 用于起跑计圈，`Door` 用于过圈；`EndSign` 只有在比赛已开始且进入最后一圈后才允许触发，并且需要连续稳定看到一小段时间才会 `finish_armed`，随后在 `EndSign` 消失超过短 TTL 后进入 `ENDSIGN_STOP`。如果 BeginSign 漏检、Door 长时间停留在画面里、检测框闪烁或 EndSign 被遮挡，可能导致漏计、重复计或无法停车。相关参数集中在 `control_race_state_machine.py` 顶部。
 7. 丢线恢复：短时丢线会进入 `RECOVER_LINE`，连续约 `3 s` 无有效中线才进入 `LINE_LOSS_SAFE_STOP`。如果入弯时经常丢线后恢复失败，问题可能是分割视野、车速、舵机响应或恢复策略共同导致，不应只看模型。恢复计时在 `control_task_state_machine.py`，恢复误差衰减在 `control_local_planner.py`。

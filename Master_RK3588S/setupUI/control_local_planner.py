@@ -28,6 +28,17 @@ PLANNER_DEFAULTS = {
     # AVOID_HUMAN 基础绕行偏置，单位 px；人是动态障碍，默认比 car 更远离一些。
     "HUMAN_AVOID_OFFSET": 75.0,
 
+    # Human motion planning: vx is measured in image pixels per second.
+    # If reliable, the planner passes behind the human: vx>0 -> left, vx<0 -> right.
+    "HUMAN_MOTION_MIN_VX": 35.0,
+    "HUMAN_MOTION_SMOOTH_ALPHA": 0.45,
+    "HUMAN_MOTION_MAX_DT": 0.50,
+    "HUMAN_MOTION_MAX_MATCH_DX_RATIO": 0.35,
+
+    # Keep the back-side plan unless that side has almost no road_mask pixels.
+    "HUMAN_BACK_SIDE_MIN_ROAD_SCORE": 12.0,
+    "HUMAN_BACK_SIDE_OVERRIDE_RATIO": 0.20,
+
     # 障碍框越宽，额外绕行越大；实际偏置取 max(基础偏置, bbox_width * 该系数)。
     "AVOID_BOX_WIDTH_GAIN": 0.35,
 
@@ -172,6 +183,12 @@ class LocalPlanner:
         self.target_path_max_points = int(self.params["TARGET_PATH_MAX_POINTS"])
         self.avoid_side_hold_seconds = float(self.params["AVOID_SIDE_HOLD_SECONDS"])
         self.avoid_side_switch_margin = float(self.params["AVOID_SIDE_SWITCH_MARGIN"])
+        self.human_motion_min_vx = float(self.params["HUMAN_MOTION_MIN_VX"])
+        self.human_motion_smooth_alpha = float(self.params["HUMAN_MOTION_SMOOTH_ALPHA"])
+        self.human_motion_max_dt = float(self.params["HUMAN_MOTION_MAX_DT"])
+        self.human_motion_max_match_dx_ratio = float(self.params["HUMAN_MOTION_MAX_MATCH_DX_RATIO"])
+        self.human_back_side_min_road_score = float(self.params["HUMAN_BACK_SIDE_MIN_ROAD_SCORE"])
+        self.human_back_side_override_ratio = float(self.params["HUMAN_BACK_SIDE_OVERRIDE_RATIO"])
         self.road_side_roi_min_y_ratio = float(self.params["ROAD_SIDE_ROI_MIN_Y_RATIO"])
         self.road_side_roi_top_box_gain = float(self.params["ROAD_SIDE_ROI_TOP_BOX_GAIN"])
         self.road_side_roi_bottom_box_gain = float(self.params["ROAD_SIDE_ROI_BOTTOM_BOX_GAIN"])
@@ -186,6 +203,9 @@ class LocalPlanner:
         self.last_avoid_side = None
         self.last_avoid_category = None
         self.last_avoid_side_ts = 0.0
+        self.last_human_motion_x = None
+        self.last_human_motion_ts = None
+        self.last_human_motion_vx = 0.0
         self.last_valid_ts = 0.0
 
     def plan(self, perception, task_decision, now=None):
@@ -213,6 +233,7 @@ class LocalPlanner:
         final_error = base_error
         reason = "track_center"
         avoid_side = None
+        avoid_motion = None
         branch_candidates = []
         selected_branch = None
 
@@ -234,17 +255,17 @@ class LocalPlanner:
             reason = "hold_last_line"
         elif state == TaskState.AVOID_HUMAN.value:
             target = intent.get("target") or {}
-            avoid_side = self._choose_avoid_side(
+            avoid_side, avoid_motion = self._choose_human_avoid_side(
                 segmentation,
                 target,
                 frame_w,
                 frame_h,
-                prefer_away=True,
-                category="human",
                 now=now,
+                held=bool(intent.get("held")),
             )
             path_offset = self._side_sign(avoid_side) * self._avoid_offset(target, self.human_avoid_offset)
-            reason = f"avoid_human_{avoid_side}"
+            motion_source = (avoid_motion or {}).get("source") or "static"
+            reason = f"avoid_human_{avoid_side}_{motion_source}"
         elif state == TaskState.AVOID_CAR.value:
             target = intent.get("target") or {}
             avoid_side = self._choose_avoid_side(
@@ -335,6 +356,7 @@ class LocalPlanner:
             "effective_path_offset": float(effective_path_offset),
             "track_error_limit": float(self.max_track_error),
             "avoid_side": avoid_side,
+            "avoid_motion": dict(avoid_motion or {}),
             "branch_candidates": branch_candidates,
             "selected_branch": selected_branch,
             "planner_reason": reason,
@@ -652,6 +674,113 @@ class LocalPlanner:
             return 0.0
         return _clamp(gold_error - base_error, -self.gold_max_bias, self.gold_max_bias)
 
+    def _choose_human_avoid_side(self, segmentation, target, frame_w, frame_h, now, held=False):
+        center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
+        target_center = target.get("center") or [center_x, frame_h * 0.5]
+        target_x = _finite_float(target_center[0], center_x)
+        if held and self.last_avoid_category == "human" and self.last_avoid_side in ("left", "right"):
+            return self.last_avoid_side, {
+                "reliable": False,
+                "vx": float(self.last_human_motion_vx),
+                "raw_vx": 0.0,
+                "dt": 0.0,
+                "preferred_side": self.last_avoid_side,
+                "road_checked_side": self.last_avoid_side,
+                "source": "held_side",
+            }
+
+        motion = self._update_human_motion(target, now, frame_w)
+
+        if motion.get("reliable"):
+            # If the human moves right, pass from left; if moving left, pass from right.
+            back_side = "left" if motion.get("vx", 0.0) > 0.0 else "right"
+            preferred = self._road_side_for_dynamic_human(segmentation, target, back_side)
+            motion["preferred_side"] = back_side
+            motion["road_checked_side"] = preferred
+            motion["source"] = "motion_back" if preferred == back_side else "motion_back_road_override"
+            side = self._apply_avoid_side_hysteresis(
+                "human",
+                preferred,
+                target_x,
+                center_x,
+                now,
+                force_switch=(preferred == back_side),
+            )
+            return side, motion
+
+        preferred = "right" if target_x <= center_x else "left"
+        road_side = self._road_free_side(segmentation, target, preferred)
+        preferred = road_side or preferred
+        motion["preferred_side"] = preferred
+        motion["road_checked_side"] = preferred
+        motion["source"] = "static_away"
+        side = self._apply_avoid_side_hysteresis("human", preferred, target_x, center_x, now)
+        return side, motion
+
+    def _update_human_motion(self, target, now, frame_w):
+        center = target.get("center") or [None, None]
+        target_x = _finite_float(center[0])
+        info = {
+            "reliable": False,
+            "vx": 0.0,
+            "raw_vx": 0.0,
+            "dt": 0.0,
+        }
+        if target_x is None:
+            self.last_human_motion_x = None
+            self.last_human_motion_ts = None
+            self.last_human_motion_vx = 0.0
+            return info
+
+        now = float(now)
+        last_x = self.last_human_motion_x
+        last_ts = self.last_human_motion_ts
+        self.last_human_motion_x = float(target_x)
+        self.last_human_motion_ts = now
+
+        if last_x is None or last_ts is None:
+            self.last_human_motion_vx = 0.0
+            return info
+
+        dt = max(0.0, now - float(last_ts))
+        info["dt"] = float(dt)
+        if dt <= 1e-3 or dt > max(1e-3, self.human_motion_max_dt):
+            self.last_human_motion_vx = 0.0
+            return info
+
+        dx = float(target_x) - float(last_x)
+        if abs(dx) > max(1.0, float(frame_w) * self.human_motion_max_match_dx_ratio):
+            self.last_human_motion_vx = 0.0
+            return info
+
+        raw_vx = dx / dt
+        alpha = _clamp(self.human_motion_smooth_alpha, 0.0, 1.0)
+        vx = self.last_human_motion_vx * (1.0 - alpha) + raw_vx * alpha
+        self.last_human_motion_vx = vx
+        info["raw_vx"] = float(raw_vx)
+        info["vx"] = float(vx)
+        info["reliable"] = abs(vx) >= max(1.0, self.human_motion_min_vx)
+        return info
+
+    def _road_side_for_dynamic_human(self, segmentation, target, back_side):
+        scores = self._road_side_scores(segmentation, target)
+        if scores is None:
+            return back_side
+
+        left_score, right_score = scores
+        if back_side == "left":
+            back_score, other_score, other_side = left_score, right_score, "right"
+        else:
+            back_score, other_score, other_side = right_score, left_score, "left"
+
+        min_score = max(0.0, self.human_back_side_min_road_score)
+        override_ratio = _clamp(self.human_back_side_override_ratio, 0.0, 1.0)
+        if other_score > min_score and back_score <= min_score:
+            return other_side
+        if other_score > min_score and back_score < other_score * override_ratio:
+            return other_side
+        return back_side
+
     def _choose_avoid_side(self, segmentation, target, frame_w, frame_h, prefer_away, category, now):
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
         target_center = target.get("center") or [center_x, frame_h * 0.5]
@@ -664,14 +793,14 @@ class LocalPlanner:
             preferred = road_side or preferred
         return self._apply_avoid_side_hysteresis(category, preferred, target_x, center_x, now)
 
-    def _apply_avoid_side_hysteresis(self, category, preferred, target_x, center_x, now):
+    def _apply_avoid_side_hysteresis(self, category, preferred, target_x, center_x, now, force_switch=False):
         previous = self.last_avoid_side
         same_category = self.last_avoid_category == category
         age = max(0.0, float(now) - self.last_avoid_side_ts) if self.last_avoid_side_ts > 0.0 else None
         in_hold = same_category and previous in ("left", "right") and age is not None and age <= self.avoid_side_hold_seconds
 
         side = preferred
-        if in_hold and preferred != previous:
+        if in_hold and preferred != previous and not force_switch:
             lateral = abs(float(target_x) - float(center_x))
             if lateral < self.avoid_side_switch_margin:
                 side = previous
@@ -682,12 +811,26 @@ class LocalPlanner:
         return side
 
     def _road_free_side(self, segmentation, target, default_side):
+        scores = self._road_side_scores(segmentation, target)
+        if scores is None:
+            return default_side
+        left_score, right_score = scores
+        if left_score <= 0.0 and right_score <= 0.0:
+            return default_side
+        if abs(left_score - right_score) < max(
+            self.road_side_balance_min_delta,
+            self.road_side_balance_ratio * (left_score + right_score),
+        ):
+            return default_side
+        return "left" if left_score > right_score else "right"
+
+    def _road_side_scores(self, segmentation, target):
         road_mask = segmentation.get("road_mask")
         if road_mask is None or not hasattr(road_mask, "shape"):
-            return default_side
+            return None
         mask = np.asarray(road_mask)
         if mask.ndim != 2 or not np.any(mask):
-            return default_side
+            return None
 
         h, w = mask.shape[:2]
         center = target.get("center") or [w * 0.5, h * 0.6]
@@ -700,14 +843,7 @@ class LocalPlanner:
         roi = mask[y0:y1, :]
         left_score = float(np.count_nonzero(roi[:, :target_x]))
         right_score = float(np.count_nonzero(roi[:, target_x:]))
-        if left_score <= 0.0 and right_score <= 0.0:
-            return default_side
-        if abs(left_score - right_score) < max(
-            self.road_side_balance_min_delta,
-            self.road_side_balance_ratio * (left_score + right_score),
-        ):
-            return default_side
-        return "left" if left_score > right_score else "right"
+        return left_score, right_score
 
     @staticmethod
     def _side_sign(side):

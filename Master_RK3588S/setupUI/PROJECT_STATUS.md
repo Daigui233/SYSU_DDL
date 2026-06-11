@@ -60,7 +60,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 - 普通检测目标已拆成风险池和奖励池：`human / car / stone` 平级进入风险池，按目标底边距离等级、相对当前路径的横向遮挡等级和短时状态保持奖励计算 `risk_score`；`gold` 属于奖励池，只在风险池为空且金币足够近、路径代价不大时触发 `COLLECT_GOLD`。
 - 状态机速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS` 管理，当前所有非停车状态默认 `0.05 m/s`。
 - 无有效分割误差但未超过 `3 s` 时，进入 `RECOVER_LINE`，短暂保持/衰减上一帧有效目标线，速度由 `TASK_SPEED_DEFAULTS[TaskState.RECOVER_LINE]` 管理。
-- 避车/避人不再把红色中线整体平移；`control_local_planner.py` 会让紫色规划线从近处红线连续延伸，中远处逐渐偏向绕行侧，并从规划线前瞻点计算 `final_track_error`。`AVOID_STONE` 使用独立状态，在分岔候选中默认走外圈，若 stone 命中默认外圈候选路径则选择内圈。
+- 避车/避人不再把红色中线整体平移；`control_local_planner.py` 会让紫色规划线从近处红线连续延伸，中远处逐渐偏向绕行侧，并从规划线前瞻点计算 `final_track_error`。`AVOID_HUMAN` 会估计行人 bbox 横向速度，可靠时走行人背后，运动方向不可靠时退回静态避障。`AVOID_STONE` 使用独立状态，在分岔候选中默认走外圈，若 stone 命中默认外圈候选路径则选择内圈。
 - `final_track_error` 使用目标线相对摄像头视觉中心线的实际像素偏差；误差上限默认从 `dist/main_config.json` 的 `width` 自动取半幅宽，当前 `640x480` 为 `±320 px`。
 - 连续 `3 s` 没有有效 `track_error` 时，上位机进入 `LINE_LOSS_SAFE_STOP`，并按状态契约下发 `STATE_LINE_LOSS_SAFE_STOP`。
 - 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`，不会锁死在停机状态。

@@ -13,7 +13,7 @@ RK3588S 负责结构化感知、任务状态选择和图像坐标局部规划。
 | --- | --- | --- |
 | `NORMAL_TRACK` | 使用语义分割中线 `track_error`。 | `STATE_TRACK = 1` |
 | `AVOID_CAR` | 在 road mask 内生成连续绕行目标线，并从规划线前瞻点计算 `final_track_error`。 | `STATE_AVOID_CAR = 2` |
-| `AVOID_HUMAN` | 远离人，生成连续绕行目标线，并在人短暂丢失后保持 TTL。 | `STATE_AVOID_HUMAN = 3` |
+| `AVOID_HUMAN` | 动态行人优先按图像横向运动方向走背后；运动方向不可靠时退回静态避障，生成连续绕行目标线，并在人短暂丢失后保持 TTL。 | `STATE_AVOID_HUMAN = 3` |
 | `COLLECT_GOLD` | 当金币较近且代价不大时，让目标线偏向金币。 | `STATE_COLLECT_GOLD = 4` |
 | `RECOVER_LINE` | 短时保持/衰减上一帧有效局部规划误差。 | `STATE_RECOVER_LINE = 5` |
 | `LINE_LOSS_SAFE_STOP` | 连续丢失中线超过超时时间后停车。 | `STATE_LINE_LOSS_SAFE_STOP = 6` |
