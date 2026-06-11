@@ -56,13 +56,14 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 ## 当前控制
 
 - 当前以 RK 上位机状态机为准，默认状态为 `NORMAL_TRACK`，下发 `STATE_TRACK + target_speed + flags=0x01`。
+- 普通检测目标已拆成风险池和奖励池：`human / car / stone` 平级进入风险池，按目标底边距离等级、相对当前路径的横向遮挡等级和短时状态保持奖励计算 `risk_score`；`gold` 属于奖励池，只在风险池为空且金币足够近、路径代价不大时触发 `COLLECT_GOLD`。
 - 状态机速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS` 管理，当前所有非停车状态默认 `0.05 m/s`。
 - 无有效分割误差但未超过 `3 s` 时，进入 `RECOVER_LINE`，短暂保持/衰减上一帧有效目标线，速度由 `TASK_SPEED_DEFAULTS[TaskState.RECOVER_LINE]` 管理。
 - 避车/避人不再把红色中线整体平移；`control_local_planner.py` 会让紫色规划线从近处红线连续延伸，中远处逐渐偏向绕行侧，并从规划线前瞻点计算 `final_track_error`。`AVOID_STONE` 使用独立状态，在分岔候选中默认走外圈，若 stone 命中默认外圈候选路径则选择内圈。
 - `final_track_error` 使用目标线相对摄像头视觉中心线的实际像素偏差；误差上限默认从 `dist/main_config.json` 的 `width` 自动取半幅宽，当前 `640x480` 为 `±320 px`。
 - 连续 `3 s` 没有有效 `track_error` 时，上位机进入 `LINE_LOSS_SAFE_STOP`，并按状态契约下发 `STATE_LINE_LOSS_SAFE_STOP`。
 - 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`，不会锁死在停机状态。
-- 比赛事件由 `control_race_state_machine.py` 管理：红灯近处确认后进入 `TRAFFIC_LIGHT_STOP`，绿灯继续通行；`Door + BeginSign` 开始第 1 圈，之后每次有效经过 Door 更新圈数；看到 `EndSign` 后继续循迹，直到 EndSign 消失超过短 TTL 后进入 `ENDSIGN_STOP`。
+- 比赛事件由 `control_race_state_machine.py` 管理：远处红灯只记录为 `red_far`，红灯进入近处停车区后才进入 `TRAFFIC_LIGHT_STOP`，绿灯继续通行；`Door + BeginSign` 开始第 1 圈，之后每次有效经过 Door 更新圈数；看到 `EndSign` 后继续循迹，直到 EndSign 消失超过短 TTL 后进入 `ENDSIGN_STOP`。
 - 中线丢失阈值和状态保持时间由 `control_task_state_machine.py` 开头的 `TASK_TIMING_DEFAULTS` 管理；命令重复间隔由 `control_arbitrator.py` 开头参数管理。
 - TC264D 本地连续 `2.5 s` 未收到有效控制帧时，自行进入 `STATE_SAFE_STOP`。
 - OCR/API 和更多任务决策尚未接入；`state_cmd / target_speed / track_error / flags` 接口为后续扩展保留。

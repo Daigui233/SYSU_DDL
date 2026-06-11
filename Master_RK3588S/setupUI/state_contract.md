@@ -50,7 +50,7 @@ TC264D TRACK 电机/舵机控制参数。`STATE_TRAFFIC_LIGHT_STOP`、`STATE_END
 `control_race_state_machine.py` 输入结构化检测结果，输出：
 
 - `race_started`、`current_lap`、`completed_laps`
-- `traffic_light_state`、`traffic_light_stop`
+- `traffic_light_state`、`traffic_light_stop_zone`、`traffic_light_stop`
 - `finish_armed`、`finish_stop`
 
 `control_task_state_machine.py` 输入结构化感知，输出：

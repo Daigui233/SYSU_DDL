@@ -70,6 +70,32 @@ TASK_RULE_DEFAULTS = {
     "NEAR_CAR_TIE_BIAS": 0.020,
     "NEAR_GOLD_TIE_BIAS": 0.000,
 
+    # Risk pool distance levels use bbox bottom position, not object area.
+    # This keeps tuning intuitive: move the visual trigger bands up/down in the image.
+    "RISK_IGNORE_BOTTOM_RATIO": 0.45,
+    "RISK_NEAR_BOTTOM_RATIO": 0.60,
+    "RISK_VERY_NEAR_BOTTOM_RATIO": 0.78,
+    "RISK_URGENT_BOTTOM_RATIO": 0.88,
+
+    # Risk pool path influence bands. The target is only a risk if it is near the
+    # current visual track path; side objects are ignored until they can affect driving.
+    "RISK_BLOCKING_LATERAL_RATIO": 0.10,
+    "RISK_NEAR_PATH_LATERAL_RATIO": 0.22,
+    "RISK_BOX_LATERAL_GAIN": 0.75,
+    "RISK_MIN_LATERAL_LIMIT_PX": 52.0,
+
+    # Simple and robust score: distance level dominates, path level refines it.
+    # Category bias is intentionally tiny and only breaks near ties.
+    "RISK_DISTANCE_LEVEL_WEIGHT": 10.0,
+    "RISK_PATH_LEVEL_WEIGHT": 3.0,
+    "RISK_STATE_HOLD_BONUS": 0.8,
+    "RISK_STATE_HOLD_SECONDS": 0.8,
+
+    # Gold is a reward target, not a risk target. It is considered only when no
+    # human/car/stone risk exists, and only if it is close enough and cheap to reach.
+    "GOLD_MIN_BOTTOM_RATIO": 0.55,
+    "GOLD_MAX_PATH_LATERAL_RATIO": 0.28,
+
     # human 置信度门限；调高减少误触发，调低更容易提前避人。
     "HUMAN_MIN_SCORE": 0.35,
 
@@ -292,16 +318,53 @@ def _detection_geometry(det, frame_w, frame_h):
     }
 
 
-def _near_detection_candidates(ctx, params):
+def _path_reference_x(ctx):
+    center_x = float(ctx["center_x"])
+    track_error = _finite_float(ctx.get("track_error"), 0.0)
+    frame_w = int(ctx["frame_w"])
+    return max(0.0, min(float(frame_w - 1), center_x + track_error))
+
+
+def _risk_distance_level(bottom_ratio, params):
+    bottom_ratio = float(bottom_ratio)
+    if bottom_ratio < float(params["RISK_IGNORE_BOTTOM_RATIO"]):
+        return 0
+    if bottom_ratio >= float(params["RISK_URGENT_BOTTOM_RATIO"]):
+        return 4
+    if bottom_ratio >= float(params["RISK_VERY_NEAR_BOTTOM_RATIO"]):
+        return 3
+    if bottom_ratio >= float(params["RISK_NEAR_BOTTOM_RATIO"]):
+        return 2
+    return 1
+
+
+def _risk_path_level(lateral_dist, box_w, frame_w, params):
+    blocking_limit = max(
+        frame_w * float(params["RISK_BLOCKING_LATERAL_RATIO"]),
+        box_w * float(params["RISK_BOX_LATERAL_GAIN"]) * 0.55,
+        float(params["RISK_MIN_LATERAL_LIMIT_PX"]) * 0.65,
+    )
+    near_limit = max(
+        frame_w * float(params["RISK_NEAR_PATH_LATERAL_RATIO"]),
+        box_w * float(params["RISK_BOX_LATERAL_GAIN"]),
+        float(params["RISK_MIN_LATERAL_LIMIT_PX"]),
+    )
+    if lateral_dist <= blocking_limit:
+        return 2
+    if lateral_dist <= near_limit:
+        return 1
+    return 0
+
+
+def _risk_detection_candidates(ctx, params):
     frame_w = int(ctx["frame_w"])
     frame_h = int(ctx["frame_h"])
-    center_x = float(ctx["center_x"])
-    min_bottom_y = frame_h * (1.0 - float(params["NEAR_ROI_BOTTOM_RATIO"]))
+    path_x = _path_reference_x(ctx)
     candidates = []
 
     for det in ctx["detections"]:
         category = _detection_category(det)
-        if category not in ("human", "stone", "car", "gold"):
+        if category not in ("human", "stone", "car"):
             continue
         score = _finite_float(det.get("score"), 0.0)
         if score < _category_min_score(category, params):
@@ -309,16 +372,14 @@ def _near_detection_candidates(ctx, params):
         geom = _detection_geometry(det, frame_w, frame_h)
         if geom is None:
             continue
-        if geom["bottom"] < min_bottom_y:
+
+        distance_level = _risk_distance_level(geom["bottom_ratio"], params)
+        if distance_level <= 0:
             continue
 
-        lateral_dist = abs(geom["cx"] - center_x)
-        lateral_limit = max(
-            frame_w * float(params["NEAR_CENTER_LATERAL_RATIO"]),
-            geom["box_w"] * float(params["NEAR_BOX_LATERAL_GAIN"]),
-            float(params["NEAR_MIN_LATERAL_LIMIT_PX"]),
-        )
-        if lateral_dist > lateral_limit:
+        lateral_dist = abs(geom["cx"] - path_x)
+        path_level = _risk_path_level(lateral_dist, geom["box_w"], frame_w, params)
+        if path_level <= 0:
             continue
 
         if category == "stone":
@@ -326,35 +387,94 @@ def _near_detection_candidates(ctx, params):
             if area_ratio < params["STONE_MIN_AREA_RATIO"]:
                 continue
 
-        if category == "gold":
-            area_ratio = _finite_float(det.get("area_ratio"), 0.0)
-            if area_ratio < params["GOLD_MIN_AREA_RATIO"]:
-                continue
-            target_error = geom["cx"] - center_x
-            track_error = _finite_float(ctx["track_error"], 0.0)
-            if abs(target_error - track_error) > frame_w * params["GOLD_MAX_TRACK_COST_RATIO"]:
-                continue
+        hold_bonus = 0.0
+        if (
+            category == ctx.get("last_risk_category")
+            and ctx.get("last_risk_ts") is not None
+            and ctx["now"] - float(ctx["last_risk_ts"]) <= float(params["RISK_STATE_HOLD_SECONDS"])
+        ):
+            hold_bonus = float(params["RISK_STATE_HOLD_BONUS"])
+
+        risk_score = (
+            float(distance_level) * float(params["RISK_DISTANCE_LEVEL_WEIGHT"])
+            + float(path_level) * float(params["RISK_PATH_LEVEL_WEIGHT"])
+            + hold_bonus
+            + _category_tie_bias(category, params)
+            + score * 0.01
+        )
 
         target = dict(det)
         risk = {
             "bottom_ratio": float(geom["bottom_ratio"]),
             "lateral_ratio": float(lateral_dist / float(max(1, frame_w))),
-            "near_roi": True,
+            "distance_level": int(distance_level),
+            "path_level": int(path_level),
+            "risk_score": float(risk_score),
+            "path_x": float(path_x),
+            "state_hold_bonus": float(hold_bonus),
         }
         target["risk"] = risk
-        rank = (
-            float(geom["bottom_ratio"]),
-            -float(lateral_dist / float(max(1, frame_w))),
-            _category_tie_bias(category, params),
-            score * 0.01,
-        )
         candidates.append({
             "category": category,
             "target": target,
-            "rank": rank,
+            "risk_score": risk_score,
         })
 
-    candidates.sort(key=lambda item: item["rank"], reverse=True)
+    candidates.sort(key=lambda item: item["risk_score"], reverse=True)
+    return candidates
+
+
+def _gold_reward_candidates(ctx, params):
+    frame_w = int(ctx["frame_w"])
+    frame_h = int(ctx["frame_h"])
+    center_x = float(ctx["center_x"])
+    path_x = _path_reference_x(ctx)
+    candidates = []
+
+    for det in ctx["detections"]:
+        if _detection_category(det) != "gold":
+            continue
+        score = _finite_float(det.get("score"), 0.0)
+        if score < float(params["GOLD_MIN_SCORE"]):
+            continue
+        geom = _detection_geometry(det, frame_w, frame_h)
+        if geom is None:
+            continue
+        if geom["bottom_ratio"] < float(params["GOLD_MIN_BOTTOM_RATIO"]):
+            continue
+
+        area_ratio = _finite_float(det.get("area_ratio"), 0.0)
+        if area_ratio < params["GOLD_MIN_AREA_RATIO"]:
+            continue
+
+        lateral_to_center = abs(geom["cx"] - center_x) / float(max(1, frame_w))
+        if lateral_to_center > float(params["GOLD_MAX_LATERAL_RATIO"]):
+            continue
+
+        lateral_to_path = abs(geom["cx"] - path_x) / float(max(1, frame_w))
+        if lateral_to_path > float(params["GOLD_MAX_PATH_LATERAL_RATIO"]):
+            continue
+
+        target_error = geom["cx"] - center_x
+        track_error = _finite_float(ctx["track_error"], 0.0)
+        if abs(target_error - track_error) > frame_w * params["GOLD_MAX_TRACK_COST_RATIO"]:
+            continue
+
+        reward_score = float(geom["bottom_ratio"]) - lateral_to_path + score * 0.01
+        target = dict(det)
+        target["risk"] = {
+            "bottom_ratio": float(geom["bottom_ratio"]),
+            "lateral_ratio": float(lateral_to_path),
+            "reward_score": float(reward_score),
+            "path_x": float(path_x),
+        }
+        candidates.append({
+            "category": "gold",
+            "target": target,
+            "reward_score": reward_score,
+        })
+
+    candidates.sort(key=lambda item: item["reward_score"], reverse=True)
     return candidates
 
 
@@ -610,6 +730,8 @@ class TaskStateMachine:
         self.human_hold_ttl = float(human_hold_ttl)
         self.last_human_seen_ts = None
         self.last_human_target = None
+        self.last_risk_category = None
+        self.last_risk_ts = None
 
     def update(self, perception, now):
         segmentation = (perception or {}).get("segmentation") or {}
@@ -671,6 +793,8 @@ class TaskStateMachine:
             "collect_speed": self.collect_speed,
             "perception_quality": perception_quality,
             "race_state": race_state,
+            "last_risk_category": self.last_risk_category,
+            "last_risk_ts": self.last_risk_ts,
         }
 
         near_decision = self._near_target_decision(ctx)
@@ -700,11 +824,13 @@ class TaskStateMachine:
         )
 
     def _near_target_decision(self, ctx):
-        candidates = _near_detection_candidates(ctx, self.rule_params)
-        if candidates:
-            selected = candidates[0]
+        risk_candidates = _risk_detection_candidates(ctx, self.rule_params)
+        if risk_candidates:
+            selected = risk_candidates[0]
             category = selected["category"]
             target = selected["target"]
+            self.last_risk_category = category
+            self.last_risk_ts = ctx["now"]
             if category == "human":
                 self.last_human_seen_ts = ctx["now"]
                 self.last_human_target = dict(target)
@@ -713,7 +839,7 @@ class TaskStateMachine:
                     category,
                     target,
                     held=False,
-                    reason="near_human",
+                    reason="risk_human",
                 )
             if category == "stone":
                 return self._build_target_decision(
@@ -721,7 +847,7 @@ class TaskStateMachine:
                     category,
                     target,
                     held=False,
-                    reason="near_stone",
+                    reason="risk_stone",
                 )
             if category == "car":
                 return self._build_target_decision(
@@ -729,15 +855,7 @@ class TaskStateMachine:
                     category,
                     target,
                     held=False,
-                    reason="near_car",
-                )
-            if category == "gold":
-                return self._build_target_decision(
-                    ctx,
-                    category,
-                    target,
-                    held=False,
-                    reason="near_gold",
+                    reason="risk_car",
                 )
 
         if (
@@ -751,6 +869,17 @@ class TaskStateMachine:
                 dict(self.last_human_target),
                 held=True,
                 reason="near_human_ttl",
+            )
+
+        gold_candidates = _gold_reward_candidates(ctx, self.rule_params)
+        if gold_candidates:
+            selected = gold_candidates[0]
+            return self._build_target_decision(
+                ctx,
+                "gold",
+                selected["target"],
+                held=False,
+                reason="reward_gold",
             )
         return None
 

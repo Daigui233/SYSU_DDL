@@ -45,6 +45,10 @@ RACE_STATE_DEFAULTS = {
     "TRAFFIC_LIGHT_MIN_BOTTOM_RATIO": 0.26,
     "TRAFFIC_LIGHT_CENTER_LATERAL_RATIO": 0.42,
 
+    # 红灯只有进入更近的停车区才硬停；远处红灯只记录为 red_far，不抢占近处避障。
+    "TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO": 0.55,
+    "TRAFFIC_LIGHT_STOP_CENTER_LATERAL_RATIO": 0.34,
+
     # OpenCV 框内红/绿识别置信度下限。
     "TRAFFIC_LIGHT_MIN_COLOR_CONFIDENCE": 0.018,
 
@@ -217,7 +221,7 @@ class RaceStateMachine:
             self.last_end_seen_ts = now
 
         lap_event = self._update_laps(door_cross_event, now)
-        traffic_state, traffic_stop = self._update_traffic_light(traffic_light, frame_w, frame_h, now)
+        traffic_state, traffic_stop, traffic_stop_zone = self._update_traffic_light(traffic_light, frame_w, frame_h, now)
         if self._should_finish_stop(now):
             self.finish_stop = True
 
@@ -236,6 +240,7 @@ class RaceStateMachine:
             "finish_stop": bool(self.finish_stop),
             "traffic_light_visible": bool(traffic_light is not None),
             "traffic_light_state": traffic_state,
+            "traffic_light_stop_zone": bool(traffic_stop_zone),
             "traffic_light_stop": bool(traffic_stop),
         }
 
@@ -274,27 +279,39 @@ class RaceStateMachine:
 
     def _update_traffic_light(self, traffic_light, frame_w, frame_h, now):
         state = "none"
+        stop_zone = False
         if traffic_light is not None:
             geom = _geometry(traffic_light, frame_w, frame_h)
             color_state = str(traffic_light.get("traffic_light_state") or "unknown").lower()
             color_conf = _finite_float(traffic_light.get("traffic_light_confidence"), 0.0)
-            effective = bool(
+            seen_effective = bool(
                 geom is not None
                 and geom["bottom_ratio"] >= float(self.params["TRAFFIC_LIGHT_MIN_BOTTOM_RATIO"])
                 and geom["lateral_ratio"] <= float(self.params["TRAFFIC_LIGHT_CENTER_LATERAL_RATIO"])
                 and color_conf >= float(self.params["TRAFFIC_LIGHT_MIN_COLOR_CONFIDENCE"])
             )
-            state = color_state if effective else "far_or_unknown"
-            if effective and color_state == "red":
-                self.last_red_seen_ts = now
-            elif effective and color_state == "green":
+            stop_zone = bool(
+                seen_effective
+                and geom["bottom_ratio"] >= float(self.params["TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO"])
+                and geom["lateral_ratio"] <= float(self.params["TRAFFIC_LIGHT_STOP_CENTER_LATERAL_RATIO"])
+            )
+            if seen_effective and color_state == "red":
+                state = "red_stop_zone" if stop_zone else "red_far"
+                if stop_zone:
+                    self.last_red_seen_ts = now
+            elif seen_effective and color_state == "green":
+                state = "green"
                 self.last_red_seen_ts = None
+            elif seen_effective:
+                state = color_state
+            else:
+                state = "far_or_unknown"
 
         stop = bool(
             self.last_red_seen_ts is not None
             and now - self.last_red_seen_ts <= float(self.params["TRAFFIC_LIGHT_RED_HOLD_TTL"])
         )
-        return state, stop
+        return state, stop, stop_zone
 
     def _should_finish_stop(self, now):
         if self.finish_stop or not self.finish_armed or self.last_end_seen_ts is None:
