@@ -25,6 +25,7 @@ seg_func.py segmentation track_error
 - TC264D 使用 `SERVO_FULL_STEER_ERROR_PX=200`，即约 `200 px` 对应线性转向输出满量程。
 - TC264D 舵机当前为 P-only，`SERVO_LINEAR_KP=0.8`，`KD=0`，再由 `Servo.h` 做硬限幅。
 - TC264D 本地控制帧超时为 `0.5 s`。
+- TC264D 反馈帧已扩展到 v3，HUD 会显示下位机实际收到的 error、输入年龄、舵机/电机输出、限幅标志、前馈/PID 修正和反馈序号。
 
 ## 当前保留的软件处理
 
@@ -34,6 +35,7 @@ seg_func.py segmentation track_error
 - `control_local_planner.py` 保留连续目标线生成、road mask 内几何约束、避障侧选择、行人短时运动预测、stone 分支选择、gold 偏移逻辑和短时 `RECOVER_LINE` 衰减。
 - `control_arbitrator.py` 只保留手柄覆盖、安全停车清零、非法输入保护、状态/速度/flags 组帧和命令重复间隔。
 - TC264D 保留电机速度 PID/PWM 硬限幅、舵机 PWM 硬限幅、串口超时和 STOP 安全保护。
+- HUD 右侧 `ERR cmd/tc/d` 用于确认 `CMD err` 与 `TC264D input_track_error` 是否对齐；`SERVO` 和 `MOTOR` 行用于判断下位机输出是否已经足够；`SAFE` 行用于判断是否发生超时、停车、舵机饱和、电机饱和或速度死区。
 
 ## 当前路径规划做法
 
@@ -51,3 +53,4 @@ seg_func.py segmentation track_error
 - 分割层取消帧保持后，旧视频中“车跑偏但分割还保留前几帧”的问题会消失，但分割模型抖动会更直接暴露出来。
 - 行人路径规划仍是图像局部启发式预测，不是严格动态避障。若行人横向速度估计不稳，仍可能选边不自然，需要用实车视频继续调 `HUMAN_MOTION_*` 和 `ROAD_SIDE_*`。
 - 如果 HUD 中 `Final err / CMD err / TC264D input_track_error` 已经一致，但车仍响应慢，下一步优先看 TC264D 舵机映射、舵机机械速度/角度和供电；如果车身已经能快速给角但路径仍不合理，再回看上位机规划。
+- 这次反馈扩展主要提升可观测性，不是帧数优化。串口帧从旧 v2 的 50 字节增加到 v3 的 74 字节，在 `460800 baud` 下开销很小；HUD 多显示几行文字可能略增绘制耗时，但通常不应成为主要 FPS 瓶颈。若后续要专门优化帧数，应优先看视觉推理、HUD 绘制、窗口显示和 MJPEG 发布。
