@@ -305,6 +305,7 @@ def main():
                         get_car_feedback=get_car_feedback,
                         pose_input_port=POSE_INPUT_PORT,
                         performance_status=performance_monitor.hud_snapshot(),
+                        target_speed=command_speed,
                         enabled=DEBUG_DRAW_POSE_PANEL,
                     )
                     performance_monitor.stop("hud_ms", perf_token)

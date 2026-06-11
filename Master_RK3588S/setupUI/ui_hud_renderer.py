@@ -8,6 +8,13 @@ from urllib.parse import quote
 import cv2
 import numpy as np
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REFEREE_RECORDS_DIR = os.path.join(BASE_DIR, "dist")
@@ -17,10 +24,10 @@ REFEREE_RECORDS_GLOB = "match_record_*.json"
 # OpenCV 默认字体不支持中文，所以这里使用英文短标签，避免预览窗口乱码。
 REFEREE_PANEL_DEFAULTS = {
     # 左侧面板宽度，单位 px；调大可显示更长事件文本，但会占用更多窗口宽度。
-    "PANEL_WIDTH": 285,
+    "PANEL_WIDTH": 300,
 
-    # 重新扫描 dist/match_record_*.json 的间隔，单位 s；调小更实时，调大会减少磁盘读取。
-    "SCAN_INTERVAL": 1.0,
+    # Referee event polling interval, seconds. The reference project uses a 500 ms cycle.
+    "SCAN_INTERVAL": 0.5,
 
     # 裁判系统事件 API，参考 SmartCar-Auto-Refresh-Events 的 Python 脚本。
     # RK 上通常是本机 5000；若裁判系统部署在别处，可改成对应地址。
@@ -29,19 +36,55 @@ REFEREE_PANEL_DEFAULTS = {
     # API 请求超时时间，单位 s；调大更能容忍慢响应，但会拖慢 HUD 刷新。
     "API_TIMEOUT": 0.35,
 
-    # 显示最近几条事件；调大可看到更多历史事件，但面板会更拥挤。
+    # Number of latest referee events kept on the left panel.
     "MAX_EVENTS": 4,
+    "MAX_BUFFER_EVENTS": 24,
 
     # 最近多少秒内文件有更新时显示为 LIVE；超过后显示 STALE，提醒去刷新/检查裁判系统。
     "FRESH_FILE_SECONDS": 5.0,
 
-    # 单行最大字符数；调大会更长但容易超出面板。
+    # Max characters per line when the fallback OpenCV font is used.
     "MAX_LINE_CHARS": 36,
+
+    # Optional Chinese font for referee messages. If none of these exists, the HUD falls back
+    # to ASCII text so it does not show OpenCV question marks.
+    "FONT_SIZE": 16,
+    "FONT_PATHS": [
+        os.environ.get("AR_HUD_FONT_PATH", ""),
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+    ],
 }
 
 _referee_cache = {
     "next_scan_ts": 0.0,
     "summary": None,
+    "filename": "",
+    "event_count": 0,
+    "events": [],
+}
+
+_font_cache = {
+    "font": None,
+    "tried": False,
+}
+
+TC264_STATE_NAMES = {
+    0: "STATE_IDLE",
+    1: "STATE_TRACK",
+    2: "STATE_AVOID_CAR",
+    3: "STATE_AVOID_HUMAN",
+    4: "STATE_COLLECT_GOLD",
+    5: "STATE_RECOVER_LINE",
+    6: "STATE_LINE_LOSS_SAFE_STOP",
+    7: "STATE_SAFE_STOP",
+    8: "STATE_AVOID_STONE",
+    9: "STATE_TRAFFIC_LIGHT_STOP",
+    10: "STATE_ENDSIGN_STOP",
 }
 
 
@@ -50,6 +93,31 @@ def short_text(text, max_len=74):
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "..."
+
+
+def _ascii_hud_text(text, fallback=""):
+    text = str(text or "")
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = text.replace("?", "")
+    text = " ".join(text.split())
+    return text or fallback
+
+
+def _clean_referee_text(text):
+    text = str(text or "")
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    if text.count("?") >= min(3, max(1, len(text) // 2)):
+        return ""
+    return text
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def _safe_float(value, default=0.0):
@@ -76,14 +144,35 @@ def _read_json_url(url, timeout):
 
 
 def _format_event(event):
-    event_type = str(event.get("type") or "EVENT")
-    message = str(event.get("message") or "")
-    time_text = str(event.get("time_str") or "")
+    event = event or {}
+    event_type = _clean_referee_text(event.get("type") or event.get("event_type") or event.get("name") or "EVENT")
+    message = _clean_referee_text(event.get("message") or event.get("msg") or event.get("description") or "")
+    time_text = _clean_referee_text(event.get("time_str") or event.get("time") or "")
     elapsed = event.get("elapsed_seconds")
     if elapsed is not None:
         time_text = f"{_safe_float(elapsed):.1f}s"
     prefix = f"{time_text} " if time_text else ""
     return f"{prefix}{event_type} {message}".strip()
+
+
+def _append_referee_events(filename, events, total_events, params):
+    max_buffer = int(params["MAX_BUFFER_EVENTS"])
+    if filename != _referee_cache["filename"]:
+        _referee_cache["filename"] = filename
+        _referee_cache["event_count"] = 0
+        _referee_cache["events"] = []
+
+    old_count = int(_referee_cache["event_count"])
+    total_events = max(total_events, len(events))
+    if total_events < old_count:
+        old_count = 0
+        _referee_cache["events"] = []
+
+    new_events = list(events[old_count:total_events])
+    if new_events:
+        _referee_cache["events"].extend(new_events)
+        _referee_cache["events"] = _referee_cache["events"][-max_buffer:]
+    _referee_cache["event_count"] = total_events
 
 
 def _read_referee_api_summary(now, params):
@@ -98,8 +187,8 @@ def _read_referee_api_summary(now, params):
             "source": "API",
             "file": None,
             "file_age": 0.0,
-            "total_events": 0,
-            "events": [],
+            "total_events": int(_referee_cache["event_count"]),
+            "events": list(_referee_cache["events"])[-int(params["MAX_EVENTS"]):][::-1],
             "error": None,
         }
 
@@ -108,75 +197,57 @@ def _read_referee_api_summary(now, params):
     if not filename:
         raise RuntimeError("latest record has no filename")
 
+    listed_total = latest_record.get("total_events", latest_record.get("event_count"))
+    listed_total = None if listed_total is None else _safe_int(listed_total, None)
+    if (
+        listed_total is not None
+        and filename == _referee_cache["filename"]
+        and listed_total <= int(_referee_cache["event_count"])
+    ):
+        return {
+            "ok": True,
+            "state": "API LIVE",
+            "source": "API",
+            "file": filename,
+            "file_age": 0.0,
+            "total_events": int(_referee_cache["event_count"]),
+            "events": list(_referee_cache["events"])[-int(params["MAX_EVENTS"]):][::-1],
+            "error": None,
+        }
+
     record_url = f"{base_url}/api/match_record/{quote(filename)}"
     record_payload = _read_json_url(record_url, timeout)
     data = record_payload.get("data") if isinstance(record_payload.get("data"), dict) else record_payload
     events = list((data or {}).get("events") or [])
-    max_events = int(params["MAX_EVENTS"])
-    recent = events[-max_events:][::-1]
+    total_events = len(events)
+    _append_referee_events(filename, events, total_events, params)
+    recent = list(_referee_cache["events"])[-int(params["MAX_EVENTS"]):][::-1]
     return {
         "ok": True,
         "state": "API LIVE",
         "source": "API",
         "file": filename,
         "file_age": 0.0,
-        "total_events": int(latest_record.get("total_events", len(events)) or len(events)),
+        "total_events": int(_referee_cache["event_count"]),
         "events": recent,
         "error": None,
     }
 
 
 def _read_referee_summary(records_dir, now, params):
-    api_error = None
     try:
         return _read_referee_api_summary(now, params)
     except Exception as exc:
-        api_error = str(exc)
-
-    latest_path = _latest_match_record(records_dir)
-    if latest_path is None:
         return {
             "ok": False,
-            "state": "NO RECORD",
-            "source": "LOCAL",
-            "file": None,
+            "state": "API OFFLINE",
+            "source": "API",
+            "file": _referee_cache.get("filename") or None,
             "file_age": None,
-            "total_events": 0,
-            "events": [],
-            "error": api_error,
-        }
-
-    file_mtime = os.path.getmtime(latest_path)
-    file_age = max(0.0, now - file_mtime)
-    state = "LIVE" if file_age <= params["FRESH_FILE_SECONDS"] else "STALE"
-    try:
-        with open(latest_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "state": "READ ERR",
-            "source": "LOCAL",
-            "file": os.path.basename(latest_path),
-            "file_age": file_age,
-            "total_events": 0,
-            "events": [],
+            "total_events": int(_referee_cache["event_count"]),
+            "events": list(_referee_cache["events"])[-int(params["MAX_EVENTS"]):][::-1],
             "error": str(exc),
         }
-
-    events = list(payload.get("events") or [])
-    max_events = int(params["MAX_EVENTS"])
-    recent = events[-max_events:][::-1]
-    return {
-        "ok": True,
-        "state": state,
-        "source": "LOCAL",
-        "file": os.path.basename(latest_path),
-        "file_age": file_age,
-        "total_events": int(payload.get("total_events", len(events)) or 0),
-        "events": recent,
-        "error": api_error,
-    }
 
 
 def _referee_summary(now, records_dir=REFEREE_RECORDS_DIR, params=None):
@@ -228,6 +299,112 @@ def _format_perf_lines(performance_status):
     return lines
 
 
+def _format_compact_perf_lines(performance_status, fps):
+    if fps is None:
+        view_text = "N/A"
+    else:
+        view_text = f"{fps:.1f}"
+
+    if not performance_status or not performance_status.get("enabled"):
+        return [f"FPS view={view_text}"]
+
+    stages = performance_status.get("stages_ms") or {}
+    raw_fps = _safe_float(performance_status.get("raw_fps"), None)
+    loop_fps = _safe_float(performance_status.get("loop_fps"), None)
+    total_ms = _safe_float(performance_status.get("total_ms"), None)
+    vision_ms = _safe_float(stages.get("vision_ms"), None)
+    command_ms = _safe_float(stages.get("command_ms"), None)
+
+    def fmt(value):
+        return "N/A" if value is None else f"{value:.1f}"
+
+    lines = [
+        f"FPS view={view_text} raw={fmt(raw_fps)} loop={fmt(loop_fps)}",
+    ]
+    if vision_ms is not None or command_ms is not None or total_ms is not None:
+        lines.append(f"MS ai={fmt(vision_ms)} cmd={fmt(command_ms)} total={fmt(total_ms)}")
+    return lines
+
+
+def _tc264_state_name(value):
+    try:
+        state_value = int(value)
+    except Exception:
+        return "STATE_N/A"
+    return TC264_STATE_NAMES.get(state_value, f"STATE_{state_value}")
+
+
+def _load_hud_font(params):
+    if _font_cache["tried"]:
+        return _font_cache["font"]
+    _font_cache["tried"] = True
+    if ImageFont is None:
+        return None
+    for path in params.get("FONT_PATHS", []):
+        if not path:
+            continue
+        try:
+            if os.path.exists(path):
+                _font_cache["font"] = ImageFont.truetype(path, int(params["FONT_SIZE"]))
+                return _font_cache["font"]
+        except Exception:
+            continue
+    return None
+
+
+def _fit_text_for_pil(draw, text, font, max_width):
+    text = str(text or "")
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    suffix = "..."
+    for n in range(max(0, len(text) - 1), 0, -1):
+        candidate = text[:n] + suffix
+        if draw.textlength(candidate, font=font) <= max_width:
+            return candidate
+    return suffix
+
+
+def _draw_text_lines(panel, lines, title_color, text_color, params, line_h=24):
+    font = _load_hud_font(params)
+    if font is None:
+        y = 28
+        for i, line in enumerate(lines):
+            color = title_color if i == 0 else text_color
+            cv2.putText(
+                panel,
+                short_text(_ascii_hud_text(line, "N/A"), params["MAX_LINE_CHARS"]),
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            y += line_h
+            if i in (0, 4):
+                cv2.line(panel, (10, y - 8), (panel.shape[1] - 12, y - 8), (55, 70, 70), 1, cv2.LINE_AA)
+            if y > panel.shape[0] - 12:
+                break
+        return panel
+
+    image = Image.fromarray(cv2.cvtColor(panel, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(image)
+    max_width = panel.shape[1] - 24
+    y = 12
+    for i, line in enumerate(lines):
+        color = title_color if i == 0 else text_color
+        rgb = (int(color[2]), int(color[1]), int(color[0]))
+        text = _fit_text_for_pil(draw, line, font, max_width)
+        draw.text((12, y), text, font=font, fill=rgb)
+        y += line_h
+        if i in (0, 4):
+            draw.line((10, y - 2, panel.shape[1] - 12, y - 2), fill=(70, 70, 55), width=1)
+        if y > panel.shape[0] - 18:
+            break
+    panel[:, :] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+    return panel
+
+
 def draw_pose_status(
     frame,
     pose_bridge,
@@ -238,6 +415,7 @@ def draw_pose_status(
     get_car_feedback=None,
     pose_input_port=9005,
     performance_status=None,
+    target_speed=None,
     enabled=True,
 ):
     if not enabled:
@@ -263,98 +441,60 @@ def draw_pose_status(
             f"yaw={euler[1]:.1f} age={age_text}"
         )
 
-    source_line = (
-        f"WIN-UDP {short_text(info['status'], 18)} "
-        f"ok={info['packet_count']} bad={info['invalid_count']}"
-    )
-    udp_line = f"AR-FWD ok={info['udp_send_count']} fail={info['udp_fail_count']}"
     if track_error is not None and np.isfinite(track_error):
-        control_line = f"CTRL {control_state} err={track_error:.1f}"
+        err_text = f"{track_error:.1f}"
     else:
-        control_line = f"CTRL {control_state} err=N/A"
+        err_text = "N/A"
 
-    gamepad_lines = []
-    if gamepad_status is not None:
-        gp_age = gamepad_status.get("age")
-        gp_age_text = f"{gp_age:.1f}s" if gp_age is not None else "N/A"
-        gp_state = "ACTIVE" if gamepad_status.get("active") else "idle"
-        gamepad_lines.append(
-            f"GAMEPAD {gp_state} ok={gamepad_status.get('packet_count', 0)} "
-            f"bad={gamepad_status.get('invalid_count', 0)} age={gp_age_text}"
-        )
-        if gamepad_status.get("last_packet"):
-            inputs = gamepad_status.get("inputs") or {}
-            gamepad_lines.append(
-                f"GP v={gamepad_status.get('target_speed', 0.0):.2f} "
-                f"err={gamepad_status.get('track_error', 0.0):.0f} "
-                f"RT={inputs.get('rt', 0.0):.2f} LT={inputs.get('lt', 0.0):.2f} B={int(bool(inputs.get('b', False)))}"
-            )
+    speed_text = "N/A" if target_speed is None else f"{float(target_speed):.2f}"
+    control_line = f"CTRL {control_state}"
+    cmd_line = f"CMD v={speed_text} err={err_text}"
 
     feedback = get_car_feedback() if get_car_feedback is not None else {"online": False, "error": "waiting"}
     car_lines = []
     if feedback.get("online"):
         fb_age = feedback.get("age")
         fb_age_text = f"{fb_age:.1f}s" if fb_age is not None else "N/A"
-        flags = feedback.get("flags")
-        flag_text = "N/A" if flags is None else f"0x{int(flags):02X}"
         car_lines.append(
-            f"TC264 fb={feedback.get('count', 0)} age={fb_age_text} "
-            f"st={feedback.get('state', 'N/A')} flags={flag_text}"
+            f"CAR v={feedback.get('actual_speed', 0.0):.2f}m/s "
+            f"target={feedback.get('input_target_speed', 0.0):.2f}"
         )
         car_lines.append(
-            f"RX raw={feedback.get('raw_rx', 0)} drop={feedback.get('raw_drop', 0)} "
-            f"bad={feedback.get('bad', 0)}"
-        )
-        car_lines.append(
-            f"SPD in={feedback.get('input_target_speed', 0.0):.2f} "
-            f"tgt={feedback.get('motor_target', 0.0):.2f} "
-            f"act={feedback.get('actual_speed', 0.0):.2f}m/s"
-        )
-        car_lines.append(
-            f"OUT m={feedback.get('motor_output', 0)} s={feedback.get('servo_output', 0)}"
-        )
-        car_lines.append(
-            f"PID {feedback.get('motor_kp', 0.0):.1f}/{feedback.get('motor_ki', 0.0):.1f}/{feedback.get('motor_kd', 0.0):.1f} "
-            f"SV {feedback.get('servo_kp', 0.0):.1f}/{feedback.get('servo_kd', 0.0):.1f}"
+            f"TC264 {_tc264_state_name(feedback.get('state'))} age={fb_age_text}"
         )
     else:
-        err = short_text(feedback.get("error", "waiting"), 28)
+        err = short_text(_ascii_hud_text(feedback.get("error", "waiting"), "waiting"), 28)
+        car_lines.append("CAR v=N/A target=N/A")
         car_lines.append(
-            f"TC264 waiting fb={feedback.get('count', 0)} raw={feedback.get('raw_rx', 0)} "
-            f"drop={feedback.get('raw_drop', 0)} bad={feedback.get('bad', 0)}"
+            f"TC264 waiting fb={feedback.get('count', 0)} bad={feedback.get('bad', 0)}"
         )
-        if feedback.get("last_rx"):
-            car_lines.append(f"last rx {short_text(feedback.get('last_rx', ''), 28)}")
-        car_lines.append(err)
-    fps_line = f"FPS {fps:.1f}" if fps is not None else "FPS N/A"
+        if err:
+            car_lines.append(err)
 
     lines = [
-        "DEBUG STATUS",
-        source_line,
-        pose_line,
-        udp_line,
+        "RUN STATUS",
         control_line,
+        cmd_line,
+        pose_line,
     ]
-    lines.extend(gamepad_lines)
     lines.extend(car_lines)
-    lines.append(fps_line)
-    lines.extend(_format_perf_lines(performance_status))
+    lines.extend(_format_compact_perf_lines(performance_status, fps))
 
     h = frame.shape[0]
     left_panel = _draw_referee_panel(h, frame.dtype, now)
 
-    panel_w = 430
+    panel_w = 340
     panel = np.zeros((h, panel_w, 3), dtype=frame.dtype)
     panel[:, :] = (12, 16, 16)
     cv2.rectangle(panel, (0, 0), (panel_w - 1, h - 1), color, 1)
 
-    line_h = 22
+    line_h = 24
     y = 28
     for i, line in enumerate(lines):
         text_color = color if i == 0 else (230, 245, 245)
-        cv2.putText(panel, short_text(line, 58), (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, text_color, 1, cv2.LINE_AA)
+        cv2.putText(panel, short_text(line, 42), (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, text_color, 1, cv2.LINE_AA)
         y += line_h
-        if i in (0, 4):
+        if i in (0, 3):
             cv2.line(panel, (10, y - 8), (panel_w - 12, y - 8), (55, 70, 70), 1, cv2.LINE_AA)
 
     return np.hstack([left_panel, frame, panel])
@@ -368,57 +508,31 @@ def _draw_referee_panel(h, dtype, now):
     panel[:, :] = (10, 12, 15)
 
     state = summary.get("state") or "NO RECORD"
-    if state in ("LIVE", "API LIVE"):
+    if state == "API LIVE":
         color = (70, 240, 70)
-    elif state == "STALE":
+    elif state == "API EMPTY":
         color = (0, 220, 255)
     else:
         color = (40, 80, 255)
     cv2.rectangle(panel, (0, 0), (panel_w - 1, h - 1), color, 1)
 
-    file_age = summary.get("file_age")
-    file_age_text = "N/A" if file_age is None else f"{float(file_age):.1f}s"
     lines = [
         "REFEREE EVENTS",
-        f"STATE {state}",
-        f"SRC {summary.get('source', 'N/A')}",
-        f"REFRESH auto {params['SCAN_INTERVAL']:.1f}s",
-        f"FILE age {file_age_text}",
+        f"STATUS {state}",
+        f"POLL {params['SCAN_INTERVAL']:.1f}s",
         f"TOTAL {summary.get('total_events', 0)}",
     ]
     if summary.get("file"):
-        lines.append(short_text(summary["file"], params["MAX_LINE_CHARS"]))
-    if summary.get("error"):
-        lines.append(short_text(f"API {summary['error']}", params["MAX_LINE_CHARS"]))
+        lines.append(short_text(f"FILE {summary['file']}", params["MAX_LINE_CHARS"]))
 
     events = summary.get("events") or []
     if events:
         lines.append("RECENT")
         for event in events:
-            lines.append(short_text(_format_event(event), params["MAX_LINE_CHARS"]))
+            lines.append(_format_event(event))
     else:
         lines.append("RECENT none")
-        lines.append("Use WebUI refresh")
-        lines.append("or wait for engine")
+        if summary.get("error"):
+            lines.append(short_text(f"ERR {_ascii_hud_text(summary['error'], 'offline')}", params["MAX_LINE_CHARS"]))
 
-    line_h = 22
-    y = 28
-    for i, line in enumerate(lines):
-        text_color = color if i == 0 else (230, 245, 245)
-        cv2.putText(
-            panel,
-            short_text(line, params["MAX_LINE_CHARS"]),
-            (12, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            text_color,
-            1,
-            cv2.LINE_AA,
-        )
-        y += line_h
-        if i in (0, 5):
-            cv2.line(panel, (10, y - 8), (panel_w - 12, y - 8), (55, 70, 70), 1, cv2.LINE_AA)
-        if y > h - 12:
-            break
-
-    return panel
+    return _draw_text_lines(panel, lines, color, (230, 245, 245), params, line_h=24)
