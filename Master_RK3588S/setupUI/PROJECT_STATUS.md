@@ -12,6 +12,7 @@ Windows 顶置相机
   -> 融合视频 shm_ar_video
   -> ar_receiver.py 读取视频并运行模型
   -> 结构化感知 segmentation + detections
+  -> control_race_state_machine.py 更新圈数、红绿灯和终点事件
   -> control_task_state_machine.py 生成 task_state / desired_speed / planner_intent
   -> control_local_planner.py 生成 final_track_error
   -> state_cmd + target_speed + final_track_error + flags
@@ -19,7 +20,7 @@ Windows 顶置相机
   -> TC264D
 ```
 
-AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `track_error`、`state_cmd` 或转向控制。检测模型输出 `gold / car / human` 等结构化感知结果，进入上位机状态机；检测结果不直接控车。
+AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `track_error`、`state_cmd` 或转向控制。检测模型输出 `gold / car / human / stone / traffic_light / door / begin_sign / end_sign` 等结构化感知结果，进入上位机状态机；检测结果不直接控车。
 
 ## 当前模块边界
 
@@ -29,7 +30,9 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 | `pose_ar_bridge.py` | 独立接收 Windows `robot_position`，校验、记录并转发到 `127.0.0.1:9006` |
 | `control_gamepad_receiver.py` | 独立接收 `9010` 手柄遥控包，只提供候选控制命令，不直接写串口 |
 | `vision_pipeline.py` | 分割/检测模型初始化、推理、后处理，输出结构化 `segmentation + detections` 并绘制基础视觉结果 |
+| `vision_traffic_light.py` | 在 `TrafficLight` 检测框内用 OpenCV HSV 判断红/绿/未知 |
 | `control_states.py` | 状态契约：定义 RK 任务状态、TC264D 状态码、局部规划模式和映射关系 |
+| `control_race_state_machine.py` | 比赛事件状态机：只基于图像检测框跟踪 Door、BeginSign、EndSign、红绿灯和圈数 |
 | `control_task_state_machine.py` | 上位机任务状态机：维护状态速度表、掉线恢复、避人滞回和任务触发规则 |
 | `control_local_planner.py` | 图像坐标局部规划，生成连续最终目标线，输出 `final_track_error` 并绘制规划结果 |
 | `control_arbitrator.py` | 最终控制仲裁：合成状态机/局部规划结果和可选手柄覆盖，生成串口控制帧 |
@@ -53,14 +56,17 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 ## 当前控制
 
 - 当前以 RK 上位机状态机为准，默认状态为 `NORMAL_TRACK`，下发 `STATE_TRACK + target_speed + flags=0x01`。
-- 状态机速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS` 管理，当前所有非停车状态默认 `0.2 m/s`。
+- 状态机速度由 `control_task_state_machine.py` 开头的 `TASK_SPEED_DEFAULTS` 管理，当前所有非停车状态默认 `0.05 m/s`。
 - 无有效分割误差但未超过 `3 s` 时，进入 `RECOVER_LINE`，短暂保持/衰减上一帧有效目标线，速度由 `TASK_SPEED_DEFAULTS[TaskState.RECOVER_LINE]` 管理。
-- 避车/避人不再把红色中线整体平移；`control_local_planner.py` 会让紫色规划线从近处红线连续延伸，中远处逐渐偏向绕行侧，并从规划线前瞻点计算 `final_track_error`。
+- 避车/避人不再把红色中线整体平移；`control_local_planner.py` 会让紫色规划线从近处红线连续延伸，中远处逐渐偏向绕行侧，并从规划线前瞻点计算 `final_track_error`。`AVOID_STONE` 使用独立状态，在分岔候选中默认走外圈，若 stone 命中默认外圈候选路径则选择内圈。
+- `final_track_error` 使用目标线相对摄像头视觉中心线的实际像素偏差；误差上限默认从 `dist/main_config.json` 的 `width` 自动取半幅宽，当前 `640x480` 为 `±320 px`。
 - 连续 `3 s` 没有有效 `track_error` 时，上位机进入 `LINE_LOSS_SAFE_STOP`，并按状态契约下发 `STATE_LINE_LOSS_SAFE_STOP`。
 - 再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`，不会锁死在停机状态。
+- 比赛事件由 `control_race_state_machine.py` 管理：红灯近处确认后进入 `TRAFFIC_LIGHT_STOP`，绿灯继续通行；`Door + BeginSign` 开始第 1 圈，之后每次有效经过 Door 更新圈数；看到 `EndSign` 后继续循迹，直到 EndSign 消失超过短 TTL 后进入 `ENDSIGN_STOP`。
 - 中线丢失阈值和状态保持时间由 `control_task_state_machine.py` 开头的 `TASK_TIMING_DEFAULTS` 管理；命令重复间隔由 `control_arbitrator.py` 开头参数管理。
 - TC264D 本地连续 `2.5 s` 未收到有效控制帧时，自行进入 `STATE_SAFE_STOP`。
-- OCR/API 和多状态任务决策尚未接入；`state_cmd / target_speed / track_error / flags` 接口为后续扩展保留。
+- OCR/API 和更多任务决策尚未接入；`state_cmd / target_speed / track_error / flags` 接口为后续扩展保留。
+- 检测模型标签包含 `Door / SpeedSign / TurnSign / Stone / BeginSign / EndSign / Crosswalk / TrafficLight / Coin / Human / Car`；当前进入控车/比赛事件逻辑的是 `gold / car / human / stone / Door / BeginSign / EndSign / TrafficLight`，`SpeedSign / TurnSign / Crosswalk` 暂不参与控车。
 - 当前分割和检测模型效果较差，仍需继续训练、调参和实车验证。
 
 ## 可选手柄遥控
@@ -89,7 +95,7 @@ AprilTag 定位只服务官方 AR 融合、坐标显示和记录，不参与 `tr
 
 ## 已知风险
 
-- `NORMAL_TRACK`、避车、避人、金币和丢线恢复默认速度均为 `0.2 m/s`；速度在 `control_task_state_machine.py` 开头统一维护，首次落地前仍应架空车轮确认方向和制动行为。
+- `NORMAL_TRACK`、避车、避人、stone、金币和丢线恢复默认速度均为 `0.05 m/s`；`TRAFFIC_LIGHT_STOP / ENDSIGN_STOP / LINE_LOSS_SAFE_STOP` 为 `0.0 m/s`。速度在 `control_task_state_machine.py` 开头统一维护，首次落地前仍应架空车轮确认方向和制动行为。
 - TC264D 电机 PWM 硬限幅为 `±2500` duty；`STATE_TRACK` 当前使用约 `1450` duty 启动前馈 + 小 PI 修正，先解决电机死区和低速卡顿，PID 只做稳速微调。
 - `target_speed` 当前按同款 CarDo 车模参数粗换算为 `m/s`；TC264D 的 `actual_speed` 由编码器计数换算得到，后续仍需确认编码器正负号并用实测速度修正比例误差。
 - 视觉模型短时丢线会进入 `RECOVER_LINE` 并保持/衰减上一帧有效目标线；若连续 `3 s` 没有有效 `track_error`，RK3588S 会进入 `LINE_LOSS_SAFE_STOP`。

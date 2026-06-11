@@ -1,16 +1,26 @@
+import json
 import math
+import os
 
 import cv2
 import numpy as np
 
 from control_states import TaskState
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_AR_CONFIG_PATH = os.path.join(BASE_DIR, "dist", "main_config.json")
 
 # ===== 局部规划调车参数区：修改这里后需要重启 ar_receiver.py 生效 =====
 # 当前不使用环境变量覆盖，避免源码默认值和实际运行值不一致。
 PLANNER_DEFAULTS = {
-    # 最终下发给 TC264D 前允许的图像误差上限，单位 px；调大允许更猛转向，调小会更保守。
-    "MAX_TRACK_ERROR": 160.0,
+    # 最终图像误差固定上限，单位 px；<=0 表示自动按 dist/main_config.json 的 width 计算。
+    "MAX_TRACK_ERROR": 0.0,
+
+    # 自动误差上限 = AR 图像宽度 * 该比例；Cardo 320 宽时为 160，当前 640 宽时为 320。
+    "MAX_TRACK_ERROR_WIDTH_RATIO": 0.50,
+
+    # 读取不到配置或帧宽时的兜底上限，单位 px。
+    "MAX_TRACK_ERROR_FALLBACK": 160.0,
 
     # AVOID_CAR 基础绕行偏置，单位 px；调大绕得更远，但更容易压出赛道中心区域。
     "CAR_AVOID_OFFSET": 55.0,
@@ -76,6 +86,18 @@ PLANNER_DEFAULTS = {
 
     # 左右 road mask 像素数相对差值门限；调大更不容易因为轻微差异改变绕行侧。
     "ROAD_SIDE_BALANCE_RATIO": 0.05,
+
+    # stone 分岔候选至少需要多少个采样行同时出现两个 segment，避免噪声误判为分岔。
+    "STONE_BRANCH_MIN_SPLIT_ROWS": 4,
+
+    # stone 是否在外圈候选路径上的横向走廊阈值，按画面宽度取比例。
+    "STONE_PATH_HIT_LATERAL_RATIO": 0.08,
+
+    # stone bbox 越宽，路径走廊越宽；用于近处大目标。
+    "STONE_PATH_HIT_BOX_GAIN": 0.75,
+
+    # stone 路径走廊最小像素宽度。
+    "STONE_PATH_HIT_MIN_PX": 32.0,
 }
 
 
@@ -100,6 +122,19 @@ def _copy_params(defaults, overrides=None):
     return params
 
 
+def _load_config_frame_width(config_path=DEFAULT_AR_CONFIG_PATH):
+    try:
+        with open(config_path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except Exception:
+        return None
+
+    width = _finite_float(data.get("width"))
+    if width is None or width <= 1.0:
+        return None
+    return width
+
+
 class LocalPlanner:
     """Image-space local planner that converts RK task state into final track error."""
 
@@ -114,7 +149,11 @@ class LocalPlanner:
         planner_params=None,
     ):
         self.params = _copy_params(PLANNER_DEFAULTS, planner_params)
-        self.max_track_error = float(max_track_error if max_track_error is not None else self.params["MAX_TRACK_ERROR"])
+        self.max_track_error_override = _finite_float(max_track_error)
+        self.config_frame_width = _load_config_frame_width()
+        self.track_error_width_ratio = float(self.params["MAX_TRACK_ERROR_WIDTH_RATIO"])
+        self.max_track_error_fallback = float(self.params["MAX_TRACK_ERROR_FALLBACK"])
+        self.max_track_error = self._track_error_limit(self.config_frame_width)
         self.car_avoid_offset = float(car_avoid_offset if car_avoid_offset is not None else self.params["CAR_AVOID_OFFSET"])
         self.human_avoid_offset = float(human_avoid_offset if human_avoid_offset is not None else self.params["HUMAN_AVOID_OFFSET"])
         self.gold_gain = float(gold_gain if gold_gain is not None else self.params["GOLD_BIAS_GAIN"])
@@ -138,6 +177,10 @@ class LocalPlanner:
         self.road_side_roi_bottom_box_gain = float(self.params["ROAD_SIDE_ROI_BOTTOM_BOX_GAIN"])
         self.road_side_balance_min_delta = float(self.params["ROAD_SIDE_BALANCE_MIN_DELTA"])
         self.road_side_balance_ratio = float(self.params["ROAD_SIDE_BALANCE_RATIO"])
+        self.stone_branch_min_split_rows = int(self.params["STONE_BRANCH_MIN_SPLIT_ROWS"])
+        self.stone_path_hit_lateral_ratio = float(self.params["STONE_PATH_HIT_LATERAL_RATIO"])
+        self.stone_path_hit_box_gain = float(self.params["STONE_PATH_HIT_BOX_GAIN"])
+        self.stone_path_hit_min_px = float(self.params["STONE_PATH_HIT_MIN_PX"])
         self.last_final_error = 0.0
         self.last_output_error = None
         self.last_avoid_side = None
@@ -153,22 +196,38 @@ class LocalPlanner:
         frame_w = int(frame_shape[1]) if len(frame_shape) >= 2 else 0
         frame_w = max(frame_w, 1)
         frame_h = max(frame_h, 1)
+        self.max_track_error = self._track_error_limit(frame_w)
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
         base_error = _finite_float(segmentation.get("track_error"))
         line_valid = bool(segmentation.get("line_valid") and base_error is not None)
         state = str((task_decision or {}).get("task_state") or TaskState.NORMAL_TRACK.value)
         intent = dict((task_decision or {}).get("planner_intent") or {})
+        stop_state = state in (
+            TaskState.LINE_LOSS_SAFE_STOP.value,
+            TaskState.TRAFFIC_LIGHT_STOP.value,
+            TaskState.ENDSIGN_STOP.value,
+        )
 
         path_offset = 0.0
         raw_final_error = base_error
         final_error = base_error
         reason = "track_center"
         avoid_side = None
+        branch_candidates = []
+        selected_branch = None
 
-        if state == TaskState.LINE_LOSS_SAFE_STOP.value:
+        if stop_state:
             final_error = None
             raw_final_error = None
             reason = "safe_stop"
+            if state == TaskState.TRAFFIC_LIGHT_STOP.value:
+                final_error = 0.0
+                raw_final_error = 0.0
+                reason = "traffic_light_stop"
+            elif state == TaskState.ENDSIGN_STOP.value:
+                final_error = 0.0
+                raw_final_error = 0.0
+                reason = "endsign_stop"
         elif state == TaskState.RECOVER_LINE.value or not line_valid:
             final_error = self._recover_error(now)
             raw_final_error = final_error
@@ -203,11 +262,29 @@ class LocalPlanner:
             target = intent.get("target") or {}
             path_offset = self._gold_offset(base_error, target, center_x)
             reason = "collect_gold"
+        elif state == TaskState.AVOID_STONE.value:
+            reason = "stone_branch_select"
 
         raw_target_path = []
-        if line_valid and final_error is not None:
-            raw_target_path = self._build_target_path(segmentation, path_offset, frame_w, frame_h)
-            if state != TaskState.NORMAL_TRACK.value and raw_target_path:
+        if line_valid and final_error is not None and not stop_state:
+            if state == TaskState.AVOID_STONE.value:
+                target = intent.get("target") or {}
+                branch_candidates = self._build_stone_branch_candidates(segmentation, frame_w, frame_h, center_x, base_error)
+                branch_plan = self._select_stone_branch(branch_candidates, target, frame_w, frame_h)
+                if branch_plan is not None:
+                    raw_target_path = list(branch_plan["path"])
+                    selected_branch = branch_plan["branch"]
+                    reason = branch_plan["reason"]
+                    raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
+                if not raw_target_path:
+                    raw_target_path = self._build_target_path(segmentation, 0.0, frame_w, frame_h)
+                    reason = "stone_branch_fallback"
+                    if raw_target_path:
+                        raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
+            else:
+                raw_target_path = self._build_target_path(segmentation, path_offset, frame_w, frame_h)
+
+            if state != TaskState.NORMAL_TRACK.value and raw_target_path and state != TaskState.AVOID_STONE.value:
                 raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
                 if raw_final_error is None and base_error is not None:
                     lookahead_y = frame_h * self.control_lookahead_y_ratio
@@ -226,7 +303,11 @@ class LocalPlanner:
 
         effective_path_offset = path_offset
         target_path = raw_target_path
-        if line_valid and final_error is not None and state != TaskState.NORMAL_TRACK.value:
+        if stop_state:
+            target_path = []
+        elif line_valid and final_error is not None and state == TaskState.AVOID_STONE.value:
+            target_path = raw_target_path
+        elif line_valid and final_error is not None and state != TaskState.NORMAL_TRACK.value:
             effective_path_offset = self._effective_path_offset_for_error(
                 segmentation,
                 final_error,
@@ -252,10 +333,29 @@ class LocalPlanner:
             "center_x": float(center_x),
             "desired_path_offset": float(path_offset),
             "effective_path_offset": float(effective_path_offset),
+            "track_error_limit": float(self.max_track_error),
             "avoid_side": avoid_side,
+            "branch_candidates": branch_candidates,
+            "selected_branch": selected_branch,
             "planner_reason": reason,
             "line_valid": line_valid,
         }
+
+    def _track_error_limit(self, frame_w=None):
+        if self.max_track_error_override is not None and self.max_track_error_override > 0.0:
+            return max(1.0, float(self.max_track_error_override))
+
+        fixed_limit = _finite_float(self.params.get("MAX_TRACK_ERROR"), 0.0)
+        if fixed_limit is not None and fixed_limit > 0.0:
+            return max(1.0, fixed_limit)
+
+        width = _finite_float(frame_w)
+        if width is None or width <= 1.0:
+            width = self.config_frame_width
+        if width is not None and width > 1.0:
+            return max(1.0, width * max(0.01, self.track_error_width_ratio))
+
+        return max(1.0, self.max_track_error_fallback)
 
     def _recover_error(self, now):
         if self.last_valid_ts <= 0.0:
@@ -265,7 +365,11 @@ class LocalPlanner:
         return self.last_final_error * decay
 
     def _smooth_final_error(self, target_error, state):
-        if state == TaskState.LINE_LOSS_SAFE_STOP.value:
+        if state in (
+            TaskState.LINE_LOSS_SAFE_STOP.value,
+            TaskState.TRAFFIC_LIGHT_STOP.value,
+            TaskState.ENDSIGN_STOP.value,
+        ):
             return target_error
 
         previous = self.last_output_error
@@ -392,6 +496,140 @@ class LocalPlanner:
         max_abs = max(abs(float(desired_offset)), 1.0)
         return _clamp(effective, -max_abs, max_abs)
 
+    def _build_stone_branch_candidates(self, segmentation, frame_w, frame_h, center_x, base_error):
+        mid_points = segmentation.get("mid_points") or []
+        road_mask = segmentation.get("road_mask")
+        if len(mid_points) < 2 or road_mask is None or not hasattr(road_mask, "shape"):
+            return []
+
+        mask = np.asarray(road_mask)
+        if mask.ndim != 2 or not np.any(mask):
+            return []
+
+        points = self._sample_mid_points(mid_points)
+        left_path = []
+        right_path = []
+        split_rows = 0
+        min_width = max(8, int(frame_w * 0.025))
+
+        for point in points:
+            try:
+                base_x, y_raw = point
+                y = int(_clamp(y_raw, 0, min(frame_h - 1, mask.shape[0] - 1)))
+                base_x = _finite_float(base_x, center_x)
+            except Exception:
+                continue
+
+            segments = self._row_segments(mask[y], min_width)
+            if len(segments) >= 2:
+                split_rows += 1
+                left_path.append((int(round(segments[0]["center"])), y))
+                right_path.append((int(round(segments[-1]["center"])), y))
+            else:
+                left_path.append((int(round(base_x)), y))
+                right_path.append((int(round(base_x)), y))
+
+        if split_rows < max(1, self.stone_branch_min_split_rows):
+            return []
+        if len(left_path) < 2 or len(right_path) < 2:
+            return []
+
+        reference_error = self.last_output_error if self.last_output_error is not None else base_error
+        reference_error = _finite_float(reference_error, 0.0)
+        candidates = []
+        for label, path in (("left", left_path), ("right", right_path)):
+            err = self._path_error_at_lookahead(path, center_x, frame_h)
+            if err is None:
+                continue
+            candidates.append({
+                "side": label,
+                "path": path,
+                "error": float(err),
+                "continuity_cost": abs(float(err) - float(reference_error)),
+                "split_rows": int(split_rows),
+            })
+
+        if len(candidates) < 2:
+            return []
+
+        candidates.sort(key=lambda item: item["continuity_cost"])
+        candidates[0]["branch"] = "outer"
+        candidates[1]["branch"] = "inner"
+        return candidates
+
+    @staticmethod
+    def _row_segments(row, min_width):
+        xs = np.flatnonzero(row)
+        if xs.size < min_width:
+            return []
+        splits = np.where(np.diff(xs) > 1)[0] + 1
+        result = []
+        for seg in np.split(xs, splits):
+            width = int(seg[-1] - seg[0] + 1)
+            if width < min_width:
+                continue
+            result.append({
+                "left": int(seg[0]),
+                "right": int(seg[-1]),
+                "center": (float(seg[0]) + float(seg[-1])) * 0.5,
+                "width": width,
+            })
+        return result
+
+    def _select_stone_branch(self, branch_candidates, target, frame_w, frame_h):
+        if not branch_candidates:
+            return None
+
+        outer = None
+        inner = None
+        for candidate in branch_candidates:
+            if candidate.get("branch") == "outer":
+                outer = candidate
+            elif candidate.get("branch") == "inner":
+                inner = candidate
+
+        if outer is None:
+            outer = branch_candidates[0]
+        if inner is None and len(branch_candidates) >= 2:
+            inner = branch_candidates[1]
+
+        if inner is not None and self._stone_hits_path(target, outer.get("path") or [], frame_w, frame_h):
+            return {
+                "branch": "inner",
+                "path": inner.get("path") or [],
+                "reason": "stone_on_outer_choose_inner",
+            }
+
+        return {
+            "branch": "outer",
+            "path": outer.get("path") or [],
+            "reason": "stone_not_on_outer_keep_outer",
+        }
+
+    def _stone_hits_path(self, target, path, frame_w, frame_h):
+        if not target or not path:
+            return False
+        center = target.get("center") or [None, None]
+        size = target.get("size") or [0.0, 0.0]
+        stone_x = _finite_float(center[0])
+        stone_y = _finite_float(center[1])
+        if stone_x is None or stone_y is None:
+            return False
+
+        try:
+            idx = min(range(len(path)), key=lambda i: abs(path[i][1] - stone_y))
+            path_x = float(path[idx][0])
+        except Exception:
+            return False
+
+        box_w = _finite_float(size[0], 0.0)
+        threshold = max(
+            frame_w * self.stone_path_hit_lateral_ratio,
+            box_w * self.stone_path_hit_box_gain,
+            self.stone_path_hit_min_px,
+        )
+        return abs(float(stone_x) - path_x) <= threshold
+
     def _avoid_offset(self, target, default_offset):
         size = target.get("size") or [0.0, 0.0]
         box_w = _finite_float(size[0], 0.0)
@@ -481,6 +719,20 @@ class LocalPlanner:
         out = frame
         h, w = out.shape[:2]
         target_x = _finite_float(plan_result.get("target_x"))
+        branch_candidates = list(plan_result.get("branch_candidates") or [])
+        selected_branch = plan_result.get("selected_branch")
+        for candidate in branch_candidates:
+            path = list(candidate.get("path") or [])
+            if len(path) < 2:
+                continue
+            color = (160, 160, 160)
+            thickness = 1
+            if candidate.get("branch") == selected_branch:
+                color = (255, 0, 255)
+                thickness = 2
+            pts = np.array(path, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(out, [pts], False, color, thickness)
+
         target_path = list(plan_result.get("target_path") or [])
         if len(target_path) >= 2:
             pts = np.array(target_path, np.int32).reshape((-1, 1, 2))
@@ -498,4 +750,6 @@ class LocalPlanner:
         err_text = "N/A" if err is None else f"{float(err):.1f}"
         cv2.putText(out, f"Task: {state}", (10, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
         cv2.putText(out, f"Final err: {err_text}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
+        if selected_branch:
+            cv2.putText(out, f"Branch: {selected_branch}", (10, 228), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
         return out

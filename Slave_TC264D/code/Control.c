@@ -20,8 +20,19 @@
 #define TRACK_MOTOR_KP                 (100.0f)
 #define TRACK_MOTOR_KI                 (8.0f)
 #define TRACK_MOTOR_KD                 (0.0f)
-#define TRACK_SERVO_KP                 (0.38f)
-#define TRACK_SERVO_KD                 (0.06f)
+#define TRACK_SERVO_KP                 (0.55f)
+#define TRACK_SERVO_KD                 (0.08f)
+/* Extra output boost for large TRACK-like errors. It keeps straight-line small errors soft
+ * while allowing real-pixel final_track_error in large curves to approach the steering limit. */
+#define TRACK_SERVO_BOOST_START_ERROR  (80.0f)
+#define TRACK_SERVO_BOOST_OUTPUT_GAIN  (0.90f)
+
+#define AVOID_STONE_DEFAULT_SPEED_MPS  TRACK_DEFAULT_SPEED_MPS
+#define AVOID_STONE_MOTOR_KP           TRACK_MOTOR_KP
+#define AVOID_STONE_MOTOR_KI           TRACK_MOTOR_KI
+#define AVOID_STONE_MOTOR_KD           TRACK_MOTOR_KD
+#define AVOID_STONE_SERVO_KP           TRACK_SERVO_KP
+#define AVOID_STONE_SERVO_KD           TRACK_SERVO_KD
 
 #define AVOID_CAR_DEFAULT_SPEED_MPS    (0.05f)
 #define AVOID_CAR_MOTOR_KP             (100.0f)
@@ -65,6 +76,41 @@ static float control_abs_float(float input)
     return input;
 }
 
+static float control_sign_float(float input)
+{
+    if(input > 0.0f)
+    {
+        return 1.0f;
+    }
+
+    if(input < 0.0f)
+    {
+        return -1.0f;
+    }
+
+    return 0.0f;
+}
+
+static float control_track_servo_large_error_boost(car_state_enum state, float track_error)
+{
+    float abs_error;
+    float boost;
+
+    if(state != STATE_TRACK && state != STATE_AVOID_STONE)
+    {
+        return 0.0f;
+    }
+
+    abs_error = control_abs_float(track_error);
+    if(abs_error <= TRACK_SERVO_BOOST_START_ERROR)
+    {
+        return 0.0f;
+    }
+
+    boost = (abs_error - TRACK_SERVO_BOOST_START_ERROR) * TRACK_SERVO_BOOST_OUTPUT_GAIN;
+    return -control_sign_float(track_error) * boost;
+}
+
 static float control_limit_float(float input, float max, float min)
 {
     if(input > max)
@@ -98,6 +144,7 @@ static uint8 control_allow_speed_override(car_state_enum state)
     switch (state)
     {
     case STATE_TRACK:
+    case STATE_AVOID_STONE:
     case STATE_AVOID_CAR:
     case STATE_AVOID_HUMAN:
     case STATE_COLLECT_GOLD:
@@ -105,6 +152,8 @@ static uint8 control_allow_speed_override(car_state_enum state)
         return 1;
 
     case STATE_LINE_LOSS_SAFE_STOP:
+    case STATE_TRAFFIC_LIGHT_STOP:
+    case STATE_ENDSIGN_STOP:
     case STATE_SAFE_STOP:
     case STATE_IDLE:
     default:
@@ -201,6 +250,15 @@ void control_apply_state_param(car_state_enum state)
                                  TRACK_SERVO_KD);
         break;
 
+    case STATE_AVOID_STONE:
+        control_set_motion_param(AVOID_STONE_DEFAULT_SPEED_MPS,
+                                 AVOID_STONE_MOTOR_KP,
+                                 AVOID_STONE_MOTOR_KI,
+                                 AVOID_STONE_MOTOR_KD,
+                                 AVOID_STONE_SERVO_KP,
+                                 AVOID_STONE_SERVO_KD);
+        break;
+
     case STATE_AVOID_CAR:
         control_set_motion_param(AVOID_CAR_DEFAULT_SPEED_MPS,
                                  AVOID_CAR_MOTOR_KP,
@@ -238,6 +296,8 @@ void control_apply_state_param(car_state_enum state)
         break;
 
     case STATE_LINE_LOSS_SAFE_STOP:
+    case STATE_TRAFFIC_LIGHT_STOP:
+    case STATE_ENDSIGN_STOP:
     case STATE_SAFE_STOP:
         control_ctx.param.motor_target_speed = 0.0f;
         control_ctx.param.motor_kp = 0.0f;
@@ -336,7 +396,8 @@ static void Servo_PID_Control(void)
     control_ctx.servo_target = 0.0f;
 
     pid_out = pid_pd_calc(&control_ctx.servo_pid, control_ctx.servo_target, control_ctx.input.track_error);
-
+    pid_out += control_track_servo_large_error_boost(control_ctx.current_state, control_ctx.input.track_error);
+    pid_out = control_limit_float(pid_out, control_ctx.param.servo_output_max, control_ctx.param.servo_output_min);
 
     duty = (int32)((float)SERVO_DUTY_MID + pid_out);
     duty = (int32)control_limit_uint32(duty, SERVO_DUTY_MAX, SERVO_DUTY_MIN);

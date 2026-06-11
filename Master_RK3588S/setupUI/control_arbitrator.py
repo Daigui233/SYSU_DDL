@@ -1,24 +1,38 @@
+import json
 import math
+import os
 
 from control_car_link import CONTROL_FLAG_USE_TARGET_SPEED, STATE_SAFE_STOP, STATE_TRACK
 from control_states import TaskState
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_AR_CONFIG_PATH = os.path.join(BASE_DIR, "dist", "main_config.json")
 
 # ===== 控制下发参数区：修改这里后需要重启 ar_receiver.py 生效 =====
 # control_scale 用于把上位机图像误差换算成 TC264D 舵机误差输入。
 # 这里保留全局默认值，实际视觉控车优先使用下面的 CONTROL_ERROR_PARAMS 分状态参数表。
 CONTROL_SCALE = 0.65
+CONTROL_ERROR_AUTO_MAX_RATIO = 0.50
+CONTROL_ERROR_FALLBACK_MAX_ABS = 160.0
 
 # 分状态误差下发表。修改这里后需要重启 ar_receiver.py 生效。
 # scale: 上位机 final_track_error 乘到 TC264D input_track_error 的比例。
-# max_abs: 下发给 TC264D 的最大绝对误差，避免单帧识别异常把舵机打满。
+# max_abs: 下发给 TC264D 的最大绝对误差；<=0 表示按 dist/main_config.json 的 width 自动计算。
 # max_step: 连续两帧下发误差最大变化量，抑制弯道过冲后反向猛修。
 # deadband: 小误差死区，减少直道细碎抖动。
 # curve_start / curve_gain: 类似 Cardo 的大弯非线性增益，小误差不变，大误差额外增强。
 CONTROL_ERROR_PARAMS = {
     TaskState.NORMAL_TRACK.value: {
         "scale": 0.65,
-        "max_abs": 160.0,
+        "max_abs": 0.0,
+        "max_step": 22.0,
+        "deadband": 3.0,
+        "curve_start": 40.0,
+        "curve_gain": 0.55,
+    },
+    TaskState.AVOID_STONE.value: {
+        "scale": 0.65,
+        "max_abs": 0.0,
         "max_step": 22.0,
         "deadband": 3.0,
         "curve_start": 40.0,
@@ -34,7 +48,7 @@ CONTROL_ERROR_PARAMS = {
     },
     TaskState.COLLECT_GOLD.value: {
         "scale": 0.65,
-        "max_abs": 125.0,
+        "max_abs": 0.0,
         "max_step": 14.0,
         "deadband": 2.0,
         "curve_start": 50.0,
@@ -42,7 +56,7 @@ CONTROL_ERROR_PARAMS = {
     },
     TaskState.AVOID_CAR.value: {
         "scale": 0.90,
-        "max_abs": 145.0,
+        "max_abs": 0.0,
         "max_step": 22.0,
         "deadband": 2.0,
         "curve_start": 60.0,
@@ -50,17 +64,33 @@ CONTROL_ERROR_PARAMS = {
     },
     TaskState.AVOID_HUMAN.value: {
         "scale": 0.90,
-        "max_abs": 150.0,
+        "max_abs": 0.0,
         "max_step": 22.0,
         "deadband": 2.0,
         "curve_start": 60.0,
         "curve_gain": 0.20,
     },
+    TaskState.TRAFFIC_LIGHT_STOP.value: {
+        "scale": 0.0,
+        "max_abs": 1.0,
+        "max_step": 999.0,
+        "deadband": 0.0,
+        "curve_start": 0.0,
+        "curve_gain": 0.0,
+    },
+    TaskState.ENDSIGN_STOP.value: {
+        "scale": 0.0,
+        "max_abs": 1.0,
+        "max_step": 999.0,
+        "deadband": 0.0,
+        "curve_start": 0.0,
+        "curve_gain": 0.0,
+    },
 }
 
 DEFAULT_CONTROL_ERROR_PARAM = {
     "scale": CONTROL_SCALE,
-    "max_abs": 100.0,
+    "max_abs": 0.0,
     "max_step": 10.0,
     "deadband": 3.0,
     "curve_start": 0.0,
@@ -69,6 +99,22 @@ DEFAULT_CONTROL_ERROR_PARAM = {
 
 # 没有新视频帧时，重复发送上一次状态机决策的最小间隔，单位 s。
 CONTROL_COMMAND_REPEAT_INTERVAL = 0.2
+
+
+def _load_config_frame_width(config_path=DEFAULT_AR_CONFIG_PATH):
+    try:
+        with open(config_path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except Exception:
+        return None
+
+    try:
+        width = float(data.get("width"))
+    except Exception:
+        return None
+    if not math.isfinite(width) or width <= 1.0:
+        return None
+    return width
 
 
 class ControlArbitrator:
@@ -91,10 +137,23 @@ class ControlArbitrator:
         self.control_flag_use_target_speed = int(
             CONTROL_FLAG_USE_TARGET_SPEED if control_flag_use_target_speed is None else control_flag_use_target_speed
         )
+        self.config_frame_width = _load_config_frame_width()
+        self.auto_max_abs = self._auto_max_abs()
         self._last_vision_track_error = None
 
     def _param_for_state(self, state_text):
         return CONTROL_ERROR_PARAMS.get(str(state_text or ""), DEFAULT_CONTROL_ERROR_PARAM)
+
+    def _auto_max_abs(self):
+        if self.config_frame_width is None:
+            return CONTROL_ERROR_FALLBACK_MAX_ABS
+        return max(1.0, float(self.config_frame_width) * CONTROL_ERROR_AUTO_MAX_RATIO)
+
+    def _max_abs_for_param(self, param):
+        max_abs = float(param.get("max_abs", 0.0))
+        if max_abs > 0.0:
+            return max_abs
+        return self.auto_max_abs
 
     @staticmethod
     def _clamp(value, low, high):
@@ -124,7 +183,7 @@ class ControlArbitrator:
         if abs(shaped) < float(param["deadband"]):
             shaped = 0.0
 
-        max_abs = max(1.0, float(param["max_abs"]))
+        max_abs = max(1.0, self._max_abs_for_param(param))
         shaped = self._clamp(shaped, -max_abs, max_abs)
 
         previous = self._last_vision_track_error

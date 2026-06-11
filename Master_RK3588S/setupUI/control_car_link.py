@@ -16,6 +16,9 @@ STATE_COLLECT_GOLD = getattr(_serial_comm, "STATE_COLLECT_GOLD", 4) if _serial_c
 STATE_RECOVER_LINE = getattr(_serial_comm, "STATE_RECOVER_LINE", 5) if _serial_comm else 5
 STATE_LINE_LOSS_SAFE_STOP = getattr(_serial_comm, "STATE_LINE_LOSS_SAFE_STOP", 6) if _serial_comm else 6
 STATE_SAFE_STOP = getattr(_serial_comm, "STATE_SAFE_STOP", 7) if _serial_comm else 7
+STATE_AVOID_STONE = getattr(_serial_comm, "STATE_AVOID_STONE", 8) if _serial_comm else 8
+STATE_TRAFFIC_LIGHT_STOP = getattr(_serial_comm, "STATE_TRAFFIC_LIGHT_STOP", 9) if _serial_comm else 9
+STATE_ENDSIGN_STOP = getattr(_serial_comm, "STATE_ENDSIGN_STOP", 10) if _serial_comm else 10
 CONTROL_FLAG_USE_TARGET_SPEED = (
     getattr(_serial_comm, "CONTROL_FLAG_USE_TARGET_SPEED", 0x01) if _serial_comm else 0x01
 )

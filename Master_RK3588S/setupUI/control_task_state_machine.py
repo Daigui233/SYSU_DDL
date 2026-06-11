@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass, field
 
+from control_race_state_machine import RaceStateMachine
 from control_states import PlannerMode, TaskState
 
 
@@ -17,8 +18,17 @@ TASK_SPEED_DEFAULTS = {
     # 避人速度；当前先与巡线统一，后续实车再细分。
     TaskState.AVOID_HUMAN: 0.05,
 
+    # 石头触发分岔路线选择速度；当前先与巡线统一，后续实车再细分。
+    TaskState.AVOID_STONE: 0.05,
+
     # 靠近金币速度；当前先与巡线统一，后续实车再细分。
     TaskState.COLLECT_GOLD: 0.05,
+
+    # 红灯停车速度，必须保持 0；绿灯不进入该状态，继续正常循迹。
+    TaskState.TRAFFIC_LIGHT_STOP: 0.0,
+
+    # 终点停车速度，必须保持 0。
+    TaskState.ENDSIGN_STOP: 0.0,
 
     # 短时丢线恢复速度；当前先与巡线统一，后续实车再细分。
     TaskState.RECOVER_LINE: 0.05,
@@ -56,6 +66,7 @@ TASK_RULE_DEFAULTS = {
 
     # 近处候选排序时的类别微弱偏置，只在远近非常接近时起作用。
     "NEAR_HUMAN_TIE_BIAS": 0.030,
+    "NEAR_STONE_TIE_BIAS": 0.025,
     "NEAR_CAR_TIE_BIAS": 0.020,
     "NEAR_GOLD_TIE_BIAS": 0.000,
 
@@ -79,6 +90,12 @@ TASK_RULE_DEFAULTS = {
 
     # car 目标排序中面积的权重；调大更偏向处理近处/更大的车。
     "CAR_AREA_RANK_GAIN": 6.0,
+
+    # stone 置信度门限；stone 用于触发分岔路线选择，不直接作为普通障碍绕行。
+    "STONE_MIN_SCORE": 0.35,
+
+    # stone 最小面积比例；太小通常表示距离远或误检，先不触发路线切换。
+    "STONE_MIN_AREA_RATIO": 0.0005,
 
     # gold 置信度门限；调高减少误收集，调低更容易尝试靠近金币。
     "GOLD_MIN_SCORE": 0.35,
@@ -120,7 +137,8 @@ PERCEPTION_QUALITY_DEFAULTS = {
     # 可接受的 midline_state；通常 OK/HOLD 可用，LOST 不可用。
     "VALID_MIDLINE_STATES": ("OK", "HOLD"),
 
-    # detection 最大可用年龄；超过后不参与 human/car/gold 任务判断。
+    # detection 最大可用年龄；超过后不参与 human/car/gold/stone 任务判断。
+    # Door/BeginSign/EndSign/TrafficLight 由 control_race_state_machine.py 单独管理。
     "MAX_DETECTION_AGE": 1.00,
 }
 
@@ -230,6 +248,8 @@ def _category_min_score(category, params):
         return float(params["HUMAN_MIN_SCORE"])
     if category == "car":
         return float(params["CAR_MIN_SCORE"])
+    if category == "stone":
+        return float(params["STONE_MIN_SCORE"])
     if category == "gold":
         return float(params["GOLD_MIN_SCORE"])
     return 1.0
@@ -238,6 +258,8 @@ def _category_min_score(category, params):
 def _category_tie_bias(category, params):
     if category == "human":
         return float(params["NEAR_HUMAN_TIE_BIAS"])
+    if category == "stone":
+        return float(params["NEAR_STONE_TIE_BIAS"])
     if category == "car":
         return float(params["NEAR_CAR_TIE_BIAS"])
     if category == "gold":
@@ -279,7 +301,7 @@ def _near_detection_candidates(ctx, params):
 
     for det in ctx["detections"]:
         category = _detection_category(det)
-        if category not in ("human", "car", "gold"):
+        if category not in ("human", "stone", "car", "gold"):
             continue
         score = _finite_float(det.get("score"), 0.0)
         if score < _category_min_score(category, params):
@@ -298,6 +320,11 @@ def _near_detection_candidates(ctx, params):
         )
         if lateral_dist > lateral_limit:
             continue
+
+        if category == "stone":
+            area_ratio = _finite_float(det.get("area_ratio"), 0.0)
+            if area_ratio < params["STONE_MIN_AREA_RATIO"]:
+                continue
 
         if category == "gold":
             area_ratio = _finite_float(det.get("area_ratio"), 0.0)
@@ -378,6 +405,7 @@ class TaskDecision:
     line_loss_age: float = 0.0
     reason: str = ""
     perception_quality: dict = field(default_factory=dict)
+    race_state: dict = field(default_factory=dict)
 
     def as_dict(self):
         return {
@@ -388,6 +416,7 @@ class TaskDecision:
             "line_loss_age": float(self.line_loss_age),
             "reason": self.reason,
             "perception_quality": dict(self.perception_quality),
+            "race_state": dict(self.race_state),
         }
 
 
@@ -532,14 +561,17 @@ class TaskStateMachine:
         fallback_speed=None,
         line_loss_safe_stop_timeout=None,
         human_speed=None,
+        stone_speed=None,
         avoid_speed=None,
         collect_speed=None,
         human_hold_ttl=None,
         rule_params=None,
         perception_quality_params=None,
+        race_state_machine=None,
     ):
         self.rule_params = _copy_params(TASK_RULE_DEFAULTS, rule_params)
         self.perception_quality_params = _copy_params(PERCEPTION_QUALITY_DEFAULTS, perception_quality_params)
+        self.race_state_machine = race_state_machine or RaceStateMachine()
         self.track_speed = float(
             track_speed if track_speed is not None else TASK_SPEED_DEFAULTS[TaskState.NORMAL_TRACK]
         )
@@ -555,6 +587,11 @@ class TaskStateMachine:
             human_speed
             if human_speed is not None
             else TASK_SPEED_DEFAULTS[TaskState.AVOID_HUMAN]
+        )
+        self.stone_speed = float(
+            stone_speed
+            if stone_speed is not None
+            else TASK_SPEED_DEFAULTS[TaskState.AVOID_STONE]
         )
         self.avoid_speed = float(
             avoid_speed
@@ -584,6 +621,7 @@ class TaskStateMachine:
         frame_h = max(frame_h, 1)
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
         track_error = _finite_float(segmentation.get("track_error"))
+        race_state = self.race_state_machine.update(perception, now)
         perception_quality = _segmentation_quality(
             segmentation,
             track_error,
@@ -592,8 +630,24 @@ class TaskStateMachine:
         )
         line_valid = bool(perception_quality["line_valid"])
 
+        if race_state.get("finish_stop"):
+            return self._race_stop_decision(
+                TaskState.ENDSIGN_STOP,
+                "endsign_lost_after_seen",
+                perception_quality,
+                race_state,
+            ).as_dict()
+
+        if race_state.get("traffic_light_stop"):
+            return self._race_stop_decision(
+                TaskState.TRAFFIC_LIGHT_STOP,
+                "traffic_light_red",
+                perception_quality,
+                race_state,
+            ).as_dict()
+
         if not line_valid:
-            return self._line_loss_decision(now, perception_quality)
+            return self._line_loss_decision(now, perception_quality, race_state)
 
         self.line_missing_since_ts = None
         detections = _fresh_detections(
@@ -612,9 +666,11 @@ class TaskStateMachine:
             "track_error": track_error,
             "track_speed": self.track_speed,
             "human_speed": self.human_speed,
+            "stone_speed": self.stone_speed,
             "avoid_speed": self.avoid_speed,
             "collect_speed": self.collect_speed,
             "perception_quality": perception_quality,
+            "race_state": race_state,
         }
 
         near_decision = self._near_target_decision(ctx)
@@ -628,7 +684,20 @@ class TaskStateMachine:
             line_valid=True,
             reason="line_track",
             perception_quality=perception_quality,
+            race_state=race_state,
         ).as_dict()
+
+    def _race_stop_decision(self, task_state, reason, perception_quality, race_state):
+        return TaskDecision(
+            task_state=task_state,
+            desired_speed=TASK_SPEED_DEFAULTS[task_state],
+            planner_intent={"mode": PlannerMode.SAFE_STOP.value},
+            line_valid=bool((perception_quality or {}).get("line_valid", False)),
+            line_loss_age=0.0,
+            reason=reason,
+            perception_quality=perception_quality or {},
+            race_state=race_state or {},
+        )
 
     def _near_target_decision(self, ctx):
         candidates = _near_detection_candidates(ctx, self.rule_params)
@@ -645,6 +714,14 @@ class TaskStateMachine:
                     target,
                     held=False,
                     reason="near_human",
+                )
+            if category == "stone":
+                return self._build_target_decision(
+                    ctx,
+                    category,
+                    target,
+                    held=False,
+                    reason="near_stone",
                 )
             if category == "car":
                 return self._build_target_decision(
@@ -692,6 +769,7 @@ class TaskStateMachine:
                 line_valid=True,
                 reason=reason,
                 perception_quality=ctx["perception_quality"],
+                race_state=ctx["race_state"],
             )
 
         if category == "car":
@@ -708,6 +786,25 @@ class TaskStateMachine:
                 line_valid=True,
                 reason=reason,
                 perception_quality=ctx["perception_quality"],
+                race_state=ctx["race_state"],
+            )
+
+        if category == "stone":
+            return TaskDecision(
+                task_state=TaskState.AVOID_STONE,
+                desired_speed=ctx["stone_speed"],
+                planner_intent={
+                    "mode": PlannerMode.BRANCH_SELECT.value,
+                    "category": "stone",
+                    "target": target,
+                    "default_branch": "outer",
+                    "stone_branch": "inner",
+                    "held": bool(held),
+                },
+                line_valid=True,
+                reason=reason,
+                perception_quality=ctx["perception_quality"],
+                race_state=ctx["race_state"],
             )
 
         if category == "gold":
@@ -723,11 +820,12 @@ class TaskStateMachine:
                 line_valid=True,
                 reason=reason,
                 perception_quality=ctx["perception_quality"],
+                race_state=ctx["race_state"],
             )
 
         return None
 
-    def _line_loss_decision(self, now, perception_quality=None):
+    def _line_loss_decision(self, now, perception_quality=None, race_state=None):
         now = float(now)
         if self.line_missing_since_ts is None:
             self.line_missing_since_ts = now
@@ -744,6 +842,7 @@ class TaskStateMachine:
                 line_loss_age=line_loss_age,
                 reason=f"line_loss_timeout:{quality_reason}",
                 perception_quality=perception_quality,
+                race_state=race_state or {},
             ).as_dict()
 
         return TaskDecision(
@@ -754,4 +853,5 @@ class TaskStateMachine:
             line_loss_age=line_loss_age,
             reason=f"line_recover:{quality_reason}",
             perception_quality=perception_quality,
+            race_state=race_state or {},
         ).as_dict()

@@ -5,6 +5,7 @@ import cv2
 from infer_wrap import InferWrap, PPSegInfer
 from infer_wrap.base.func import CLASSES, draw
 from infer_wrap.base.seg_func import extract_centerline_info
+from vision_traffic_light import classify_traffic_light_color
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", "base", "model"))
@@ -111,10 +112,19 @@ class VisionPipeline:
             "human": "human",
             "person": "human",
             "car": "car",
+            "door": "door",
+            "stone": "stone",
+            "rock": "stone",
+            "trafficlight": "traffic_light",
+            "traffic_light": "traffic_light",
+            "beginsign": "begin_sign",
+            "begin_sign": "begin_sign",
+            "endsign": "end_sign",
+            "end_sign": "end_sign",
         }
         return aliases.get(key, key)
 
-    def _build_detection_list(self, det_res, frame_shape, timestamp, age):
+    def _build_detection_list(self, det_res, frame, timestamp, age):
         if det_res is None:
             return []
 
@@ -126,7 +136,7 @@ class VisionPipeline:
         if boxes is None or scores is None or classes is None:
             return []
 
-        h, w = frame_shape[:2]
+        h, w = frame.shape[:2]
         detections = []
         for box, score, class_id in zip(boxes, scores, classes):
             try:
@@ -144,24 +154,52 @@ class VisionPipeline:
                 continue
 
             label = self._class_name(class_i)
+            category = self._category_for_label(label)
             box_w = right - left
             box_h = bottom - top
             area = box_w * box_h
-            detections.append({
+            det = {
                 "timestamp": float(timestamp),
                 "age": float(age),
                 "class_id": class_i,
                 "label": label,
-                "category": self._category_for_label(label),
+                "category": category,
                 "score": score_f,
                 "bbox": [left, top, right, bottom],
                 "center": [left + box_w * 0.5, top + box_h * 0.5],
                 "size": [box_w, box_h],
                 "area_ratio": area / float(max(1, h * w)),
-            })
+            }
+            if category == "traffic_light":
+                det.update(classify_traffic_light_color(frame, det["bbox"]))
+            detections.append(det)
 
         detections.sort(key=lambda item: item["score"], reverse=True)
         return detections
+
+    @staticmethod
+    def _draw_detection_extras(frame, detections):
+        for det in detections:
+            if det.get("category") != "traffic_light":
+                continue
+            state = str(det.get("traffic_light_state") or "unknown")
+            conf = float(det.get("traffic_light_confidence") or 0.0)
+            bbox = det.get("bbox") or [0, 0, 0, 0]
+            left, top = int(bbox[0]), int(bbox[1])
+            color = (0, 255, 255)
+            if state == "red":
+                color = (0, 0, 255)
+            elif state == "green":
+                color = (0, 255, 0)
+            cv2.putText(
+                frame,
+                f"TL {state} {conf:.2f}",
+                (left, max(42, top + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
 
     def process(self, frame, now):
         final_frame = frame.copy()
@@ -204,10 +242,11 @@ class VisionPipeline:
                 draw(final_frame, boxes, scores, classes)
                 detections = self._build_detection_list(
                     self.last_det_res,
-                    final_frame.shape,
+                    final_frame,
                     self.last_det_ts,
                     now - self.last_det_ts,
                 )
+                self._draw_detection_extras(final_frame, detections)
             except Exception as exc:
                 self._log(f"det draw skip: {exc}")
 
