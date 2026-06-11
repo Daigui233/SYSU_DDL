@@ -1,4 +1,5 @@
 import importlib.util
+import struct
 from pathlib import Path
 import unittest
 
@@ -6,6 +7,7 @@ import numpy as np
 
 from control_arbitrator import ControlArbitrator
 from control_local_planner import LocalPlanner
+from control_serial_comm import CarController, FEEDBACK_V3_PAYLOAD_LEN, FRAME_HEAD, TX_ADDR
 from control_states import TaskState
 
 SEG_FUNC_PATH = Path(__file__).resolve().parent / "infer_wrap" / "base" / "seg_func.py"
@@ -91,6 +93,43 @@ class LightweightControlChainTest(unittest.TestCase):
         self.assertIsNone(second["track_error"])
         self.assertFalse(second["road_held"])
         self.assertEqual([], second["mid_points"])
+
+    def test_v3_feedback_decodes_extra_diagnostics(self):
+        frame = bytearray(FEEDBACK_V3_PAYLOAD_LEN + 4)
+        frame[0] = FRAME_HEAD
+        frame[1] = TX_ADDR
+        frame[2] = FEEDBACK_V3_PAYLOAD_LEN
+        struct.pack_into("<f", frame, 3, 0.04)
+        struct.pack_into("<f", frame, 7, 0.05)
+        struct.pack_into("<f", frame, 11, 0.05)
+        struct.pack_into("<f", frame, 15, 160.0)
+        struct.pack_into("<i", frame, 19, 1410)
+        struct.pack_into("<i", frame, 23, 602)
+        struct.pack_into("<f", frame, 27, 100.0)
+        struct.pack_into("<f", frame, 31, 8.0)
+        struct.pack_into("<f", frame, 35, 0.0)
+        struct.pack_into("<f", frame, 39, 0.8)
+        struct.pack_into("<f", frame, 43, 0.0)
+        frame[47] = 1
+        frame[48] = 1
+        struct.pack_into("<H", frame, 49, 12)
+        struct.pack_into("<H", frame, 51, 0x0004)
+        struct.pack_into("<f", frame, 53, -128.0)
+        struct.pack_into("<f", frame, 57, -128.0)
+        struct.pack_into("<f", frame, 61, 1012.5)
+        struct.pack_into("<f", frame, 65, -20.0)
+        struct.pack_into("<I", frame, 69, 1234)
+        frame[73] = sum(frame[:-1]) & 0xFF
+
+        controller = CarController.__new__(CarController)
+        decoded = controller._decode_feedback(bytes(frame), FEEDBACK_V3_PAYLOAD_LEN)
+
+        self.assertEqual("v3", decoded["format"])
+        self.assertEqual(12, decoded["input_age_ms"])
+        self.assertEqual(0x0004, decoded["safety_flags"])
+        self.assertEqual(1234, decoded["feedback_seq"])
+        self.assertAlmostEqual(-128.0, decoded["servo_raw_output"])
+        self.assertAlmostEqual(1012.5, decoded["motor_feedforward"])
 
 
 if __name__ == "__main__":

@@ -87,6 +87,12 @@ TC264_STATE_NAMES = {
     10: "STATE_ENDSIGN_STOP",
 }
 
+TC264_FB_FLAG_INPUT_TIMEOUT = 0x0001
+TC264_FB_FLAG_STOP_STATE = 0x0002
+TC264_FB_FLAG_SERVO_SATURATED = 0x0004
+TC264_FB_FLAG_MOTOR_SATURATED = 0x0008
+TC264_FB_FLAG_TARGET_DEADBAND = 0x0010
+
 
 def short_text(text, max_len=74):
     text = str(text or "")
@@ -334,6 +340,20 @@ def _tc264_state_name(value):
     return TC264_STATE_NAMES.get(state_value, f"STATE_{state_value}")
 
 
+def _fb_flag(feedback, mask):
+    try:
+        return 1 if (int(feedback.get("safety_flags") or 0) & int(mask)) else 0
+    except Exception:
+        return 0
+
+
+def _format_feedback_float(feedback, key, digits=1, default="N/A"):
+    value = _safe_float(feedback.get(key), None)
+    if value is None:
+        return default
+    return f"{value:.{digits}f}"
+
+
 def _load_hud_font(params):
     if _font_cache["tried"]:
         return _font_cache["font"]
@@ -467,12 +487,51 @@ def draw_pose_status(
     if feedback.get("online"):
         fb_age = feedback.get("age")
         fb_age_text = f"{fb_age:.1f}s" if fb_age is not None else "N/A"
+        cmd_err = _safe_float(track_error, None)
+        tc_err = _safe_float(feedback.get("input_track_error"), None)
+        if cmd_err is not None and tc_err is not None:
+            err_diff_text = f"{tc_err - cmd_err:.1f}"
+        else:
+            err_diff_text = "N/A"
+        input_age_ms = feedback.get("input_age_ms")
+        if input_age_ms is None:
+            input_age_text = "sat" if feedback.get("input_age_saturated") else "N/A"
+        else:
+            input_age_text = f"{int(input_age_ms)}ms"
+        seq_text = feedback.get("feedback_seq")
+        seq_text = "N/A" if seq_text is None else str(int(seq_text))
         car_lines.append(
-            f"CAR v={feedback.get('actual_speed', 0.0):.2f}m/s "
-            f"target={feedback.get('input_target_speed', 0.0):.2f}"
+            f"ERR cmd={err_text} tc={_format_feedback_float(feedback, 'input_track_error', 1)} "
+            f"d={err_diff_text}"
         )
         car_lines.append(
-            f"TC264 {_tc264_state_name(feedback.get('state'))} age={fb_age_text}"
+            f"SERVO pwm={feedback.get('servo_output', 0)} "
+            f"raw={_format_feedback_float(feedback, 'servo_raw_output', 1)} "
+            f"lim={_format_feedback_float(feedback, 'servo_limited_output', 1)}"
+        )
+        car_lines.append(
+            f"MOTOR tgt={_format_feedback_float(feedback, 'input_target_speed', 2)} "
+            f"act={_format_feedback_float(feedback, 'actual_speed', 2)} "
+            f"out={feedback.get('motor_output', 0)}"
+        )
+        car_lines.append(
+            f"MOTOR ff={_format_feedback_float(feedback, 'motor_feedforward', 0)} "
+            f"pid={_format_feedback_float(feedback, 'motor_pid_correction', 0)}"
+        )
+        car_lines.append(
+            f"SAFE to{_fb_flag(feedback, TC264_FB_FLAG_INPUT_TIMEOUT)} "
+            f"st{_fb_flag(feedback, TC264_FB_FLAG_STOP_STATE)} "
+            f"ss{_fb_flag(feedback, TC264_FB_FLAG_SERVO_SATURATED)} "
+            f"ms{_fb_flag(feedback, TC264_FB_FLAG_MOTOR_SATURATED)} "
+            f"db{_fb_flag(feedback, TC264_FB_FLAG_TARGET_DEADBAND)}"
+        )
+        car_lines.append(
+            f"TC264 {_tc264_state_name(feedback.get('state'))} "
+            f"in={input_age_text} fb={fb_age_text}"
+        )
+        car_lines.append(
+            f"FB seq={seq_text} bad={feedback.get('bad', 0)} "
+            f"drop={feedback.get('raw_drop', 0)} fmt={feedback.get('format', '?')}"
         )
     else:
         err = short_text(_ascii_hud_text(feedback.get("error", "waiting"), "waiting"), 28)

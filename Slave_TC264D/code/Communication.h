@@ -29,8 +29,8 @@
 
 #define COMM_RX_PAYLOAD_LEN (10) // 控制帧数据区长度
 #define COMM_RX_FRAME_LEN (14)
-#define COMM_TX_PAYLOAD_LEN (46)
-#define COMM_TX_FRAME_LEN (50)
+#define COMM_TX_PAYLOAD_LEN (70)
+#define COMM_TX_FRAME_LEN (74)
 
 typedef struct
 {

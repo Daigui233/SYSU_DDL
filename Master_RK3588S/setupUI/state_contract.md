@@ -76,6 +76,38 @@ segmentation track_error
 - `track_error`
 - `flags`
 
+TC264D v3 反馈帧字段：
+
+- `input_track_error`：下位机实际收到的误差，应与 HUD `CMD err` 对齐。
+- `input_target_speed`：下位机实际收到的目标速度。
+- `actual_speed`：编码器换算速度。
+- `motor_output`：最终电机 PWM。
+- `servo_output`：最终舵机 PWM。
+- `input_age_ms`：距离上一帧有效控制输入的时间。
+- `safety_flags`：下位机保护/限幅标志。
+- `servo_raw_output`：舵机控制限幅前输出。
+- `servo_limited_output`：舵机控制限幅后输出。
+- `motor_feedforward`：电机前馈输出。
+- `motor_pid_correction`：电机 PID 修正输出。
+- `feedback_seq`：下位机反馈序号。
+
+`safety_flags` bit 定义：
+
+- `0x0001`：输入超时或尚未收到有效输入。
+- `0x0002`：当前为停车/安全状态。
+- `0x0004`：舵机输出发生软件或硬件限幅。
+- `0x0008`：电机输出发生 PWM 限幅。
+- `0x0010`：目标速度落在电机死区。
+
+HUD 右侧 TC264D 调试行用于视频归因：
+
+- `ERR cmd/tc/d`：上位机命令误差、下位机输入误差、二者差值。
+- `SERVO pwm/raw/lim`：最终舵机 PWM、限幅前输出、限幅后输出。
+- `MOTOR tgt/act/out`：目标速度、实际速度、电机 PWM。
+- `MOTOR ff/pid`：电机前馈和 PID 修正。
+- `SAFE to/st/ss/ms/db`：超时、停车状态、舵机饱和、电机饱和、速度死区。
+- `FB seq/bad/drop/fmt`：反馈序号、坏帧、丢弃字节和反馈格式。
+
 ## 当前仍允许的非控制滤波
 
 - 状态机 TTL/滞回：用于防止检测误触发。

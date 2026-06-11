@@ -46,6 +46,38 @@ static void communication_put_int32(uint8 index, int32 value)
         communication_info.tx_buffer[index + i] = data.data_byte[i];
     }
 }
+
+static void communication_put_uint16(uint8 index, uint16 value)
+{
+    comm_uint16_union data;
+    uint8 i;
+
+    data.data_uint16 = value;
+    for (i = 0; i < 2; i++)
+    {
+        communication_info.tx_buffer[index + i] = data.data_byte[i];
+    }
+}
+
+static uint16 communication_input_age_ms(const control_ctx_struct *ctx)
+{
+    uint32 now_us;
+    uint32 age_ms;
+
+    if (0U == ctx->last_input_time_us)
+    {
+        return 0xFFFFU;
+    }
+
+    now_us = system_getval_us();
+    age_ms = (uint32)(now_us - ctx->last_input_time_us) / 1000U;
+    if (age_ms > 0xFFFFU)
+    {
+        return 0xFFFFU;
+    }
+    return (uint16)age_ms;
+}
+
 static uint8 communication_checksum(const uint8 *buff, uint8 len)
 {
     uint8 i;
@@ -182,7 +214,15 @@ void communication_send_feedback(void)
     communication_put_float(43, ctx->param.servo_kd);
     communication_info.tx_buffer[47] = (uint8)state_get();
     communication_info.tx_buffer[48] = ctx->input.flags;
-    communication_info.tx_buffer[49] = communication_checksum(communication_info.tx_buffer, COMM_TX_FRAME_LEN - 1);
+    communication_put_uint16(49, communication_input_age_ms(ctx));
+    communication_put_uint16(51, ctx->safety_flags);
+    communication_put_float(53, ctx->servo_raw_output);
+    communication_put_float(57, ctx->servo_limited_output);
+    communication_put_float(61, ctx->motor_feedforward);
+    communication_put_float(65, ctx->motor_pid_correction);
+    communication_put_int32(69, (int32)ctx->feedback_seq);
+    control_ctx.feedback_seq++;
+    communication_info.tx_buffer[73] = communication_checksum(communication_info.tx_buffer, COMM_TX_FRAME_LEN - 1);
 
     uart_write_buffer(COMM_UART_INDEX, communication_info.tx_buffer, COMM_TX_FRAME_LEN);
 }

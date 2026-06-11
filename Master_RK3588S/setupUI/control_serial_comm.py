@@ -25,7 +25,9 @@ FRAME_HEAD = 0x42
 RX_ADDR = 0x10
 RX_PAYLOAD_LEN = 10
 TX_ADDR = 0x90
-FEEDBACK_PAYLOAD_LEN = 46
+FEEDBACK_V3_PAYLOAD_LEN = 70
+FEEDBACK_V2_PAYLOAD_LEN = 46
+FEEDBACK_PAYLOAD_LEN = FEEDBACK_V3_PAYLOAD_LEN
 FEEDBACK_FRAME_LEN = FEEDBACK_PAYLOAD_LEN + 4
 OLD_FEEDBACK_PAYLOAD_LEN = 11
 
@@ -248,8 +250,8 @@ class CarController:
 
     def _decode_feedback(self, frame, payload_len):
         try:
-            if payload_len == FEEDBACK_PAYLOAD_LEN:
-                return {
+            if payload_len in (FEEDBACK_V2_PAYLOAD_LEN, FEEDBACK_V3_PAYLOAD_LEN):
+                feedback = {
                     "actual_speed": struct.unpack_from("<f", frame, 3)[0],
                     "motor_target": struct.unpack_from("<f", frame, 7)[0],
                     "input_target_speed": struct.unpack_from("<f", frame, 11)[0],
@@ -263,8 +265,23 @@ class CarController:
                     "servo_kd": struct.unpack_from("<f", frame, 43)[0],
                     "state": frame[47],
                     "flags": frame[48],
-                    "format": "v2",
+                    "format": "v3" if payload_len == FEEDBACK_V3_PAYLOAD_LEN else "v2",
                 }
+                if payload_len == FEEDBACK_V3_PAYLOAD_LEN:
+                    input_age_ms = struct.unpack_from("<H", frame, 49)[0]
+                    feedback.update(
+                        {
+                            "input_age_ms": None if input_age_ms == 0xFFFF else int(input_age_ms),
+                            "input_age_saturated": input_age_ms == 0xFFFF,
+                            "safety_flags": struct.unpack_from("<H", frame, 51)[0],
+                            "servo_raw_output": struct.unpack_from("<f", frame, 53)[0],
+                            "servo_limited_output": struct.unpack_from("<f", frame, 57)[0],
+                            "motor_feedforward": struct.unpack_from("<f", frame, 61)[0],
+                            "motor_pid_correction": struct.unpack_from("<f", frame, 65)[0],
+                            "feedback_seq": struct.unpack_from("<I", frame, 69)[0],
+                        }
+                    )
+                return feedback
             if payload_len == OLD_FEEDBACK_PAYLOAD_LEN:
                 return {
                     "actual_speed": struct.unpack_from("<f", frame, 3)[0],
