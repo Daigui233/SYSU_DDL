@@ -1,102 +1,85 @@
 # RK 任务状态与 TC264D 状态契约
 
-## 第一阶段约定
+## 控制误差契约
 
-Windows AprilTag 定位只用于 AR 融合、HUD、WebUI 和日志记录，不能进入
-`track_error`、局部规划或 TC264D 控制状态。
+控制误差只允许按下面方向传递：
 
-RK3588S 负责结构化感知、任务状态选择和图像坐标局部规划。TC264D 接收
-对应的 `state_cmd` 作为状态执行和反馈字段，但最终 `track_error` 和
-`target_speed` 仍由 RK3588S 给出。
+```text
+segmentation track_error
+  -> task_state_machine
+  -> local_planner final_track_error
+  -> control_arbitrator 直通下发
+  -> TC264D input_track_error
+```
+
+- `segmentation track_error`：`seg_func.py` 在当前帧分割中线 `lookahead_y=300` 处取点，计算 `x - center_x`。
+- `final_track_error`：`control_local_planner.py` 在当前帧最终目标路径 `lookahead_y=300` 处取点，计算 `x - center_x`。
+- `command["track_error"]`：视觉自动驾驶时必须等于 `final_track_error`。
+- `TC264D input_track_error`：应等于串口收到的 `command["track_error"]`。
+
+上位机禁止对视觉控制误差做比例缩放、死区、限幅、限步、跨帧平滑或非线性增强。手柄接管、安全停车清零、非法输入保护不属于视觉误差后处理。
+
+## 参数归属
+
+- 上位机负责感知、任务状态机、局部路径规划和串口组帧。
+- 下位机负责舵机线性控制、电机速度 PID、PWM 硬限幅、串口超时和 STOP 安全保护。
+- 当前前瞻点为 `lookahead_y=300`。
+- 当前舵机满量程误差为 `SERVO_FULL_STEER_ERROR_PX=200`。
+- 当前 TC264D 舵机映射为 P-only：`servo_pwm = SERVO_DUTY_MID + SERVO_LINEAR_KP * (0 - input_track_error)`，`SERVO_LINEAR_KP=0.8`，再进入 `Servo.h` 硬限幅。
+
+## 状态映射
 
 | RK `task_state` | RK 行为 | TC264D `state_cmd` |
 | --- | --- | --- |
-| `NORMAL_TRACK` | 使用语义分割中线 `track_error`。 | `STATE_TRACK = 1` |
-| `AVOID_CAR` | 在 road mask 内生成连续绕行目标线，并从规划线前瞻点计算 `final_track_error`。 | `STATE_AVOID_CAR = 2` |
-| `AVOID_HUMAN` | 动态行人优先按图像横向运动方向走背后；运动方向不可靠时退回静态避障，生成连续绕行目标线，并在人短暂丢失后保持 TTL。 | `STATE_AVOID_HUMAN = 3` |
-| `COLLECT_GOLD` | 当金币较近且代价不大时，让目标线偏向金币。 | `STATE_COLLECT_GOLD = 4` |
-| `RECOVER_LINE` | 短时保持/衰减上一帧有效局部规划误差。 | `STATE_RECOVER_LINE = 5` |
-| `LINE_LOSS_SAFE_STOP` | 连续丢失中线超过超时时间后停车。 | `STATE_LINE_LOSS_SAFE_STOP = 6` |
-| `AVOID_STONE` | 在分岔区域检测到 `stone` 且命中默认外圈候选路径时，选择内圈候选路径。 | `STATE_AVOID_STONE = 8` |
-| `TRAFFIC_LIGHT_STOP` | `TrafficLight` 框内识别为红灯、进入近处停车区并连续确认后停车；有效绿灯会清除红灯保持并恢复通行。 | `STATE_TRAFFIC_LIGHT_STOP = 9` |
-| `ENDSIGN_STOP` | 比赛已开始且进入最后一圈后，连续稳定看到 `EndSign` 才进入终点准备；`EndSign` 消失超过短 TTL 后停车。 | `STATE_ENDSIGN_STOP = 10` |
+| `NORMAL_TRACK` | 使用分割中线生成目标路径，并从 `y=300` 计算误差 | `STATE_TRACK = 1` |
+| `AVOID_CAR` | 在 road mask 内生成连续绕车目标线 | `STATE_AVOID_CAR = 2` |
+| `AVOID_HUMAN` | 用行人横向速度预测短时占用区，再选择可通行走廊 | `STATE_AVOID_HUMAN = 3` |
+| `COLLECT_GOLD` | 无风险目标时将目标线偏向金币 | `STATE_COLLECT_GOLD = 4` |
+| `RECOVER_LINE` | 短时衰减上一帧有效规划误差 | `STATE_RECOVER_LINE = 5` |
+| `LINE_LOSS_SAFE_STOP` | 连续丢线超过约 `0.8 s` 后停车 | `STATE_LINE_LOSS_SAFE_STOP = 6` |
+| `AVOID_STONE` | 在分岔候选路径中选择避开 stone 的分支 | `STATE_AVOID_STONE = 8` |
+| `TRAFFIC_LIGHT_STOP` | 近处红灯确认后停车，绿灯恢复 | `STATE_TRAFFIC_LIGHT_STOP = 9` |
+| `ENDSIGN_STOP` | 终点标志完成确认后停车 | `STATE_ENDSIGN_STOP = 10` |
 
-`STATE_IDLE = 0` 用于 TC264D 本地启动/空闲。`STATE_SAFE_STOP = 7` 是通用
-硬停状态，用于手动急停、程序退出清零和 TC264D 本地串口输入超时。
-
-## TC264D 职责
-
-TC264D 继续负责低层电机和舵机控制：
-
-- 固定 PID/PD 参数
-- 输出限幅
-- 电机启动前馈和本地速度环
-- 舵机 PD 环
-- 串口帧输入超时保护
-- 最终安全停车执行
-
-第一阶段中，`STATE_TRACK`、`STATE_AVOID_CAR`、`STATE_AVOID_HUMAN`、
-`STATE_AVOID_STONE`、`STATE_COLLECT_GOLD` 和 `STATE_RECOVER_LINE` 都复用当前效果较稳定的
-TC264D TRACK 电机/舵机控制参数。`STATE_TRAFFIC_LIGHT_STOP`、`STATE_ENDSIGN_STOP`、
-`STATE_LINE_LOSS_SAFE_STOP` 和 `STATE_SAFE_STOP` 都按停车状态执行。早期制作的其他任务枚举不再属于当前有效状态契约。
+`STATE_IDLE = 0` 用于 TC264D 本地空闲。`STATE_SAFE_STOP = 7` 用于手动急停、程序退出清零和 TC264D 本地串口超时。
 
 ## 接口形状
 
 `vision_pipeline.py` 输出：
 
-- `segmentation`：`line_valid`、`track_error`、`road_mask`、`mid_points` 和质量字段。
-- `detections`：归一化检测对象，包含 `category`、`label`、`score`、`bbox`、`center`、`size`、`area_ratio`；`TrafficLight` 额外包含 `traffic_light_state` 和颜色置信度。
+- `segmentation.line_valid`
+- `segmentation.track_error`
+- `segmentation.road_mask`
+- `segmentation.mid_points`
+- `segmentation.road_held`，当前固定为 `False`
+- `detections[]`
 
-`control_race_state_machine.py` 输入结构化检测结果，输出：
-
-- `race_started`、`current_lap`、`completed_laps`
-- `traffic_light_state`、`traffic_light_stop_zone`、`traffic_light_red_confirm_age`、`traffic_light_stop`
-- `end_sign_allowed`、`end_confirm_age`、`finish_armed`、`finish_stop`
-
-`control_task_state_machine.py` 输入结构化感知，输出：
+`control_task_state_machine.py` 输出：
 
 - `task_state`
 - `desired_speed`
 - `planner_intent`
-- 丢线计时等元数据
+- 丢线计时、状态原因等调试字段
 
-`control_local_planner.py` 输入结构化感知和状态机决策，基于红色分割中线生成连续紫色目标路径，输出：
+`control_local_planner.py` 输出：
 
 - `final_track_error`
-- 局部规划调试元数据
+- `raw_final_track_error`
+- `target_path`
+- `control_lookahead_y`
+- `planner_mode`
 
-`control_arbitrator.py` 将 RK 最终命令转换成不变的串口协议字段：
-`track_error`、`target_speed`、`state_cmd` 和 `flags`。
+`control_arbitrator.py` 输出串口控制帧字段：
 
-## 参数归属
+- `state_cmd`
+- `target_speed`
+- `track_error`
+- `flags`
 
-`ar_receiver.py` 只作为运行调度入口：启动模块、读取帧、转发模块输出、发送最终命令并更新显示。
+## 当前仍允许的非控制滤波
 
-模块默认值、阈值、TTL、增益、速度表等调车参数归拥有对应行为的模块维护。
-核心调车值保留为源码顶部可见表格/常量，不使用环境变量覆盖，避免代码默认值和实际运行值不一致。
-
-- `vision_pipeline.py`：模型路径、分割/检测结果 TTL、检测类别标签。
-- `vision_traffic_light.py`：红绿灯框内 HSV 阈值、有效颜色面积比例。
-- `control_race_state_machine.py`：Door/BeginSign/EndSign/TrafficLight 触发区、TTL、圈数和停车判定。
-- `control_task_state_machine.py`：任务状态速度表、丢线超时、状态保持 TTL。
-- `control_local_planner.py`：图像坐标偏置、目标吸引增益、局部规划限幅。
-- `control_arbitrator.py`：最终控制缩放、命令重复间隔、控制 flags。
-- `control_car_link.py` / `control_serial_comm.py`：串口、波特率、TC264D 协议常量。
-
-## 状态数量
-
-RK Python 侧任务状态没有实际数量限制，但串口协议中的 `state_cmd` 是一个字节。
-因此，只要 `State.h` 和 Python 映射保持一致，下位机最多支持 `0..255` 共 256
-个数值状态码。
-
-为了可读性和调试安全，第一阶段应远低于该上限。当前有效契约使用 11 个状态码：
-`0` 空闲、`1..6` 常规 RK 任务状态、`7` 通用安全停车、`8` stone 分岔状态、`9` 红灯停车、`10` 终点停车。新增状态前需要先定义清楚进入、
-保持、退出和失效策略。
-
-## 文件分工
-
-`control_states.py` 是状态契约文件：定义有哪些状态、状态码是多少、RK 任务状态如何映射到 TC264D 状态。
-
-`control_task_state_machine.py` 是状态决策文件：每一帧读取结构化感知结果，按优先级、TTL 和丢线计时决定当前任务状态、目标速度和局部规划意图。
-
-`control_race_state_machine.py` 是比赛事件状态机：每一帧读取结构化检测结果，按图像触发区和 TTL 维护红绿灯、Door、BeginSign、EndSign 和圈数事件。
+- 状态机 TTL/滞回：用于防止检测误触发。
+- 行人 bbox 横向速度 EMA：用于短时占用区预测，不直接滤波 CMD error。
+- road mask 形态学处理、连通域筛选和同帧中线跳变保护：用于分割几何稳定。
+- 当前帧多项式中线拟合：用于降低单帧行扫描噪声。
+- `RECOVER_LINE` 短时衰减：只在丢线恢复状态使用，正常 TRACK/AVOID/COLLECT/STONE 不使用。

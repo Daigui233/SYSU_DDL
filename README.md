@@ -16,6 +16,7 @@ Windows 顶置相机
        - control_race_state_machine.py -> 圈数、红绿灯、终点事件
        - control_task_state_machine.py -> task_state / desired_speed / planner_intent
        - control_local_planner.py -> final_track_error
+       - control_arbitrator.py -> track_error 直通下发
   -> /dev/ttyUSB0 -> TC264D
   -> 电机、舵机和状态执行
 
@@ -63,28 +64,41 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 
 - 工程约定：后续新增上位机功能时，优先新建可复用模块文件，再由 `ar_receiver.py` 调度；不要把状态机、路径规划、OCR/API、数据记录等大块逻辑直接堆进 `ar_receiver.py`。核心调车参数、阈值和速度表由对应模块维护，`ar_receiver.py` 只负责实例化和连接模块。
 - 分割模型从融合视频生成基础 `track_error`；目标检测作为感知输入进入 `control_task_state_machine.py`，由状态机输出 `task_state / desired_speed / planner_intent`。
-- `control_local_planner.py` 根据任务状态输出最终 `final_track_error`，上位机再以对应状态码、目标速度和 `flags=0x01` 下发给 TC264D。
-- `final_track_error` 定义为目标线相对摄像头视觉中心线的实际像素偏差；误差上限默认从 `dist/main_config.json` 的 `width` 自动计算为半幅宽，当前 `640x480` 对应 `±320 px`。
+- `control_local_planner.py` 根据任务状态输出最终 `final_track_error`，`control_arbitrator.py` 不再缩放、死区、限幅、限步或非线性增强视觉误差，视觉自动驾驶时直接下发 `command["track_error"] = final_track_error`。
+- `final_track_error` 定义为当前帧目标线 `lookahead_y=300` 处相对摄像头视觉中心线的实际像素偏差；上位机不再对该误差做人为上限、跨帧平滑或逐帧追赶。
 - 调试画面中红色曲线表示语义分割得到的赛道中线；紫色曲线表示局部规划后的最终目标路径。避障时紫色线从近处红线连续延伸出去，中远处逐渐偏向绕行侧，不再对整条红线做瞬时平移。
 - 目标检测任务分为硬规则层、风险池和奖励池：红灯近处停车、终点停车、连续丢线停车保持硬规则；`human / car / stone` 进入风险池，按 `distance_level + path_level + state_hold_bonus` 组成的简单 `risk_score` 排序；`gold` 属于奖励池，只有风险池为空且金币足够近、路径代价不大时才触发 `COLLECT_GOLD`。
 - `control_race_state_machine.py` 独立处理比赛事件：`TrafficLight` 框内红灯远处只记录为 `red_far`，进入近处停车区才触发 `TRAFFIC_LIGHT_STOP`，绿灯通行；`Door + BeginSign` 启动第 1 圈，之后每次有效经过 `Door` 更新圈数；看到 `EndSign` 后继续循迹，直到 `EndSign` 消失超过短 TTL 后进入终点停车。
-- 避人/避车时 `final_track_error` 从紫色规划线前瞻点计算，并带有误差平滑、单帧限幅和绕行方向滞回，避免检测框在中线附近抖动时目标路径左右乱飘或舵机瞬时过冲。`AVOID_HUMAN` 会估计行人 bbox 横向速度，可靠时从行人背后绕行，运动方向不可靠时才退回静态避障。
+- 避人/避车时 `final_track_error` 直接从当前紫色规划线前瞻点计算。`AVOID_HUMAN` 会估计行人 bbox 横向速度，并把人的短时预测占用区纳入 road mask 左右走廊评分；运动方向参与动态占用区预测和接近打平时的倾向，不再用单帧运动方向直接强行决定绕行侧。
+- 当前控制链路为：`segmentation track_error -> control_task_state_machine.py -> control_local_planner.py final_track_error -> control_arbitrator.py 直通下发 -> TC264D input_track_error -> 舵机线性 P / 电机 PID / PWM 硬限幅`。
+- 上位机控制层不做 error 限幅、不做 CMD error 限步、不做 error 非线性增强；下位机是唯一控制执行和硬保护位置。
 - 摄像头/图像中心线只作为 `track_error` 的计算参考，默认不在调试画面中显示；调车时主要看红色中线和紫色最终目标路径。
 - 当前分割和检测模型效果较差，仍需优化；`gold / car / human / stone / TrafficLight / Door / BeginSign / EndSign` 已接入第一阶段逻辑，但需要低速实车验证。
 - 当前检测模型还包含 `SpeedSign / TurnSign / Crosswalk`，这些类别暂未接入任务状态机，只作为后续 OCR/API 或赛题任务扩展入口。
 - 当前状态机速度表中所有非停车状态默认 `0.05 m/s`，`LINE_LOSS_SAFE_STOP` 保持 `0.0 m/s`。
 - OCR 和外部 API 尚未接入；当前 `gold / car / human / stone` 只接入第一阶段图像坐标局部策略，红绿灯和圈数/终点只作为比赛事件状态机输入，全局规划暂不接入。
 - 控制协议中的 `state_cmd / target_speed / track_error / flags` 保持不变；当前状态契约见 `Master_RK3588S/setupUI/state_contract.md`，新增状态时需要同步 `control_states.py` 和 `Slave_TC264D/code/State.h`。
-- 无有效分割误差或感知质量不可信但未超过 `3 s` 时，当前 `RECOVER_LINE` 会短暂保持/衰减上一帧有效目标线，默认速度由 `control_task_state_machine.py` 管理。
-- 连续 `3 s` 没有有效 `track_error` 时，RK3588S 进入 `LINE_LOSS_SAFE_STOP`，并按状态契约下发 `STATE_LINE_LOSS_SAFE_STOP`；再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`。
+- 无有效分割误差或感知质量不可信但未超过约 `0.8 s` 时，当前 `RECOVER_LINE` 会短暂保持/衰减上一帧有效目标线，恢复衰减窗口约 `0.5 s`，默认速度由 `control_task_state_machine.py` 管理。
+- 连续约 `0.8 s` 没有有效 `track_error` 时，RK3588S 进入 `LINE_LOSS_SAFE_STOP`，并按状态契约下发 `STATE_LINE_LOSS_SAFE_STOP`；再次识别到语义分割中线后，下一帧恢复 `STATE_TRACK + NORMAL_TRACK`。
 - 手柄遥控仅用于调试和采集数据：默认关闭，只有定位 EXE 勾选 `Gamepad Mode` 后才通过 UDP `9010` 接管；关闭、丢包超时或赛方定位模块没有遥控包时，一律回到视觉控车。
 - `Gamepad Mode` 在定位 EXE 内部用独立定时器发送，频率与当前相机/视频帧率一致；它不依赖固定 Tag、车载 Tag、标定状态或 `robot_position` 是否成功发送。
 - 遥控模式下定位 UDP `9005` 仍正常发送并被 RK3588S 转发到 `9006`，不会因为手柄接管而停止 AR 融合。
 - 遥控映射：`RT` 前进、`LT` 倒车，合成为 `target_speed=(RT-LT)*1.0 m/s`；左摇杆横轴 `LX` 控制 `track_error`；`B` 键或手柄断连时发送 `STATE_SAFE_STOP`。Windows 定位 EXE 优先读取 XInput，读不到时会用 pygame/DirectInput 兜底，便于蓝牙手柄调试。
 - 如果采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要定位转发和手柄控车，可在 RK3588S 手动运行 `python3 Master_RK3588S/setupUI/standalone_control_bridge.py`；该备用脚本不要和 `ar_receiver.py` 同时运行。
-- TC264D 保留现有串口协议，同时增加 `2.5 s` 本地输入超时；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。
+- TC264D 保留现有串口协议，本地输入超时为 `0.5 s`；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。舵机转向已关闭大误差 boost，当前使用 `FULL_STEER_ERROR_PX=200` 的线性 P 映射，再经 `Servo.h` 硬限幅。
 - `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、HUD 绘制、窗口显示还是硬件降频。
 - `ui_debug_stream_server.py` 已接入 `ar_receiver.py`：发布的是完整调试画面，即分割/检测/局部规划目标线 + 左侧裁判事件 + 右侧调试 HUD；网络慢时浏览器端丢帧，不阻塞控车主循环。
+
+## 当前仍保留的软件处理
+
+下面列出当前控制链路中仍会影响误差、路径或执行输出的软件处理，便于实车归因：
+
+- `seg_func.py` 分割中线层仍保留：road mask 闭运算/开运算、连通域筛选、中线行扫描与同帧跳变保护、多项式拟合。已关闭旧 mask 帧保持、4 帧 mask 投票、底部锚点跨帧混合、中线点跨帧混合和 `track_error` 跨帧 EMA；当前分割 `track_error` 直接取 `lookahead_y=300` 处当前中线点相对图像中心的像素偏差。若当前帧无有效 road mask，则直接输出 LOST，不再沿用上一帧分割结果。
+- `control_task_state_machine.py` 仍保留检测触发阈值、风险排序、状态 TTL/滞回、短时丢线进入 `RECOVER_LINE` 和超时安全停车。这些改变状态和目标，不直接滤波 CMD error。
+- `control_local_planner.py` 仍保留路径几何处理：目标线按 y 位置平滑渐进偏移、目标线点限制在图像和 `road_mask` 内、金币吸引偏移上限、避障方向短时滞回、行人横向速度 EMA、行人短时占用区预测、stone 分支连续性选择，以及 `RECOVER_LINE` 对最后有效误差的线性衰减。正常 TRACK/AVOID/COLLECT/STONE 的 `final_track_error` 不再跨帧平滑、限步、限幅或非线性增强。
+- `control_arbitrator.py` 对合法视觉误差不做后处理，直接下发；只保留手柄覆盖、安全停车清零、非法输入保护、命令重复间隔、状态/速度/flags 组帧。
+- `control_gamepad_receiver.py` 仍对手柄候选命令做软件限幅，默认 `track_error` 为 `±240`、速度为配置的手柄最大速度；该限幅只影响手柄接管，不影响视觉自动驾驶。
+- TC264D 舵机层不再有大误差 boost；当前为线性 P，`SERVO_LINEAR_KP=(SERVO_DUTY_MID-SERVO_DUTY_MIN)/200=0.8`，`KD=0`，软件输出范围为 `730±160`，再由 `SERVO_DUTY_MIN/MAX` 最终硬限幅。TC264D 电机层仍保留目标速度死区、启动前馈、速度 PI/PID 修正限幅和电机 PWM 硬限幅。
 
 ## Windows 访问地址
 
@@ -105,7 +119,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 
 1. `control_task_state_machine.py` 顶部已集中 `TASK_SPEED_DEFAULTS`、`TASK_TIMING_DEFAULTS`、`TASK_RULE_DEFAULTS` 和 `PERCEPTION_QUALITY_DEFAULTS`，不同状态速度、检测触发阈值、分割质量阈值和检测 age 限制都在文件开头统一修改。
 2. `control_task_state_machine.py` 已建立基础感知质量契约：状态机不再只看 `line_valid`，还会检查 segmentation `age/source/road_ratio/road_state/midline_state` 和 detection `age`，质量不可信时先进入 `RECOVER_LINE`，连续超时后才进入 `LINE_LOSS_SAFE_STOP`。
-3. `control_local_planner.py` 顶部已集中 `PLANNER_DEFAULTS`，避障偏置、连续规划线 ramp、前瞻点、金币吸引、最大误差、恢复衰减和 road mask 左右侧评分阈值都不再使用环境变量覆盖；最大误差默认按 AR 配置宽度自动换算，不再固定为 160。
+3. `control_local_planner.py` 顶部已集中 `PLANNER_DEFAULTS`，避障偏置、连续规划线 ramp、前瞻点、金币吸引、恢复衰减、行人运动预测和 road mask 左右侧评分阈值都不再使用环境变量覆盖；最终误差不再按 AR 配置宽度限幅。
 4. `control_task_state_machine.py` 已将普通目标选择改为风险池/奖励池：`human / car / stone` 平级按近处风险评分排序，`gold` 不参与风险抢占，只有无风险目标时才进入奖励池；`control_race_state_machine.py` 已把红灯分为远处记录和近处硬停，避免远处红灯过早压制近处避障。
 
 后续仍需改进：
@@ -116,6 +130,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 4. WebUI/HUD 调车信息还可以更完整：当前能看到控制状态、误差、速度和串口反馈，但对状态机 `reason`、`perception_quality`、`planner_reason`、`line_loss_age`、检测目标摘要等信息展示不足。后续应把 `task_decision` 和 `plan_result` 写入 `/pose_status`。
 5. 缺少离线回放和单元测试：状态切换、丢线恢复、避人/避车/金币偏置、串口状态码映射都适合用保存下来的 perception 数据做回放测试。后续应补充最小测试集，先验证不改协议、不误触发、不在短时丢线时过早停车。
 6. 岔路识别语义需要重构：当前 HUD 中的 `Branches` 实际表示 `road_mask` 连通域数量，很多真实岔路在分割上仍是一个连通域，因此 `Branches=1` 不代表没有岔路。后续应新增独立的 `road_topology` 或 `road_path_state`，用多条采样行的横向 segment 数量、segment 宽度、间距和连续帧稳定性判断 `ROAD_SINGLE / ROAD_FORK / ROAD_MERGE / ROAD_UNKNOWN`，再把 `AVOID_STONE` 分岔选择建立在该路况状态上。
+7. 控制链路已轻量化：局部规划输出的 `final_track_error` 直通到串口 `track_error`，TC264D 反馈中的 `input_track_error` 应与 HUD 的 CMD err 对齐；若不对齐，优先查串口帧、反馈解析或显示延迟。
 
 ## 当前实测风险与关注点
 
@@ -124,18 +139,18 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 1. 分割中线稳定性：`NORMAL_TRACK` 和所有局部规划都依赖红色分割中线作为基础路径。如果 `road_mask` 抖动、断裂、把岔路粘成一大片，紫色目标线会跟着不稳定。分割相关问题先看 `vision_pipeline.py` 的 `road_ratio / line_valid` 和 HUD 中红线是否合理；当前 `branch_count / Branches` 只表示连通域数量，不应作为岔路是否存在的唯一依据。
 2. 岔路与 `stone`：当前 `AVOID_STONE` 只做图像坐标局部选择，不使用 AR 地图坐标。它会在 `road_mask` 的采样行出现左右候选段时生成两条候选中线，默认跟随更连续的一支；当 `stone` 落在默认路径附近时切换到另一支。这里的 `inner / outer` 是图像局部意义，不是全局赛道地图意义，遇到复杂岔路仍可能需要调 `control_local_planner.py` 顶部的 stone 分支参数。后续更合理的方案是把采样行 segment 识别上升为独立路况状态，再由状态机/规划器使用。
 3. 检测框远近判断：`human / car / stone` 目前进入风险池后按距离等级、路径遮挡等级和状态保持奖励组成 `risk_score` 排序，类别只保留很小的 tie-break；`gold` 属于奖励池，只有无风险目标且金币足够近时才处理。如果目标已经很近但状态没有切换，优先调 `control_task_state_machine.py` 顶部的 `RISK_*` 阈值；如果远处目标提前切换，说明底边触发带或路径横向范围过宽。
-4. 避障转向激进程度：紫色线已经改成连续规划线，但 `AVOID_CAR / AVOID_HUMAN / AVOID_STONE` 的偏置、ramp、前瞻点和单帧误差限幅仍需实车调。`AVOID_HUMAN` 可靠检测到行人横向运动时会走行人背后，若出现行人运动方向误判、仍跟着人同向挤出赛道，优先调 `control_local_planner.py` 顶部的 `HUMAN_MOTION_*` 和 `HUMAN_BACK_SIDE_*`。若进入避障瞬间舵机猛打或丢线，优先调避障偏置、平滑系数、最大步进和 lookahead；若明显吃不进弯，再结合 TC264D 舵机 PID 调整。
+4. 避障转向激进程度：紫色线已经改成连续规划线，`AVOID_CAR / AVOID_HUMAN / AVOID_STONE` 的偏置、ramp、前瞻点 `lookahead_y=300` 和 road mask 走廊评分仍需实车调。`AVOID_HUMAN` 使用行人横向速度预测短时占用区，再在 road mask 内选择左右走廊；若人运动方向误判或绕行侧不合理，优先调 `HUMAN_MOTION_*`、`HUMAN_MOTION_PREDICT_SECONDS` 和 `ROAD_SIDE_*`。若 final/CMD err 已经足够大但转不过来，再看 TC264D 舵机线性 P 映射、硬限幅和机械舵机。
 5. 红绿灯识别：`TrafficLight` 先由目标检测给框，再由 `vision_traffic_light.py` 在框内用 HSV 判断红/绿。曝光、灯光颜色、AR 画面压缩和检测框偏移都会影响判断。当前远处红灯只记录为 `red_far`，进入 `TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO` 定义的近处停车区后还要连续确认，确认完成才进入 `TRAFFIC_LIGHT_STOP`；有效绿灯会立即清除红灯保持并恢复通行。若红灯不停或绿灯误停，先看 HUD/日志里的 `traffic_light_state / traffic_light_stop_zone / traffic_light_red_confirm_age` 和置信度，再调 `vision_traffic_light.py` 顶部的 HSV、面积阈值以及 `control_race_state_machine.py` 顶部的停车区和确认阈值。
 6. 计圈与终点：`Door + BeginSign` 用于起跑计圈，`Door` 用于过圈；`EndSign` 只有在比赛已开始且进入最后一圈后才允许触发，并且需要连续稳定看到一小段时间才会 `finish_armed`，随后在 `EndSign` 消失超过短 TTL 后进入 `ENDSIGN_STOP`。如果 BeginSign 漏检、Door 长时间停留在画面里、检测框闪烁或 EndSign 被遮挡，可能导致漏计、重复计或无法停车。相关参数集中在 `control_race_state_machine.py` 顶部。
-7. 丢线恢复：短时丢线会进入 `RECOVER_LINE`，连续约 `3 s` 无有效中线才进入 `LINE_LOSS_SAFE_STOP`。如果入弯时经常丢线后恢复失败，问题可能是分割视野、车速、舵机响应或恢复策略共同导致，不应只看模型。恢复计时在 `control_task_state_machine.py`，恢复误差衰减在 `control_local_planner.py`。
-8. 下位机控制响应：上位机输出的是图像像素误差，TC264D 仍负责舵机 PID、限幅、速度闭环和安全保护。若 HUD 中 `final_track_error` 已经很大但车仍转不过来，优先检查 `Slave_TC264D/code/Control.c` 中舵机 PID、误差缩放、输出限幅、前馈和机械舵机角度；若直道摆动，则优先降低小误差增益或增加死区/阻尼。
+7. 丢线恢复：短时丢线会进入 `RECOVER_LINE`，连续约 `0.8 s` 无有效中线才进入 `LINE_LOSS_SAFE_STOP`。如果入弯时经常丢线后恢复失败，问题可能是分割视野、车速、舵机响应或恢复策略共同导致，不应只看模型。恢复计时在 `control_task_state_machine.py`，恢复误差衰减在 `control_local_planner.py`。
+8. 下位机控制响应：上位机输出的是图像像素误差，TC264D 负责舵机线性 P、速度闭环、PWM 硬限幅和安全保护。若 HUD 中 `final_track_error / CMD err / TC264D input_track_error` 已经一致且数值足够大但车仍转不过来，优先检查 `Slave_TC264D/code/Control.c` 中 `SERVO_FULL_STEER_ERROR_PX`、`Servo.h` 硬限幅和机械舵机角度；若直道摆动，则优先减小小误差增益或重新讨论是否加入少量阻尼。
 9. 调试显示与主循环负载：`8090/debug_feed` 会发布完整 HUD 画面，网络慢时浏览器端丢帧，不应阻塞主循环。若 FPS 明显下降，先看 HUD 中 `PERF raw / loop / vision / command / hud / display / total`，判断是 AR 输入源、视觉推理、规划/绘制、本地窗口还是 MJPEG 编码瓶颈。
 10. 状态显示可观测性：当前 HUD 已能显示主要状态和误差，但比赛事件的细节、状态机 `reason`、检测目标摘要还不够完整。若实测时出现“状态切换原因不清楚”，后续应优先把 `task_decision`、`race_state` 和 `plan_result` 更完整地写入 `/pose_status` 和 HUD。
 
 主要调参入口：
 
 - 巡线/避障速度、风险池 `RISK_*`、金币奖励池 `GOLD_*`、丢线计时：`Master_RK3588S/setupUI/control_task_state_machine.py`
-- 避障路径、stone 分支、目标线平滑、前瞻点和误差限幅：`Master_RK3588S/setupUI/control_local_planner.py`
+- 避障路径、行人运动预测、stone 分支、目标线几何和前瞻点：`Master_RK3588S/setupUI/control_local_planner.py`
 - 红绿灯 HSV 与颜色置信度：`Master_RK3588S/setupUI/vision_traffic_light.py`
 - Door/BeginSign/EndSign/红灯停车的比赛事件时序：`Master_RK3588S/setupUI/control_race_state_machine.py`
 - 舵机 PID、速度 PID、前馈、限幅和安全停车：`Slave_TC264D/code/Control.c`

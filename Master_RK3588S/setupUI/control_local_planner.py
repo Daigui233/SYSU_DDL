@@ -1,27 +1,13 @@
-import json
 import math
-import os
 
 import cv2
 import numpy as np
 
 from control_states import TaskState
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_AR_CONFIG_PATH = os.path.join(BASE_DIR, "dist", "main_config.json")
-
 # ===== 局部规划调车参数区：修改这里后需要重启 ar_receiver.py 生效 =====
 # 当前不使用环境变量覆盖，避免源码默认值和实际运行值不一致。
 PLANNER_DEFAULTS = {
-    # 最终图像误差固定上限，单位 px；<=0 表示自动按 dist/main_config.json 的 width 计算。
-    "MAX_TRACK_ERROR": 0.0,
-
-    # 自动误差上限 = AR 图像宽度 * 该比例；Cardo 320 宽时为 160，当前 640 宽时为 320。
-    "MAX_TRACK_ERROR_WIDTH_RATIO": 0.50,
-
-    # 读取不到配置或帧宽时的兜底上限，单位 px。
-    "MAX_TRACK_ERROR_FALLBACK": 160.0,
-
     # AVOID_CAR 基础绕行偏置，单位 px；调大绕得更远，但更容易压出赛道中心区域。
     "CAR_AVOID_OFFSET": 55.0,
 
@@ -35,12 +21,14 @@ PLANNER_DEFAULTS = {
     "HUMAN_MOTION_MAX_DT": 0.50,
     "HUMAN_MOTION_MAX_MATCH_DX_RATIO": 0.35,
 
-    # Keep the back-side plan unless that side has almost no road_mask pixels.
-    "HUMAN_BACK_SIDE_MIN_ROAD_SCORE": 12.0,
-    "HUMAN_BACK_SIDE_OVERRIDE_RATIO": 0.20,
+    # Predict the short-term occupied bbox for moving humans before scoring corridors.
+    "HUMAN_MOTION_PREDICT_SECONDS": 0.45,
 
     # 障碍框越宽，额外绕行越大；实际偏置取 max(基础偏置, bbox_width * 该系数)。
     "AVOID_BOX_WIDTH_GAIN": 0.35,
+
+    # Human uses a wider bbox-based clearance because the occupied area is dynamic.
+    "HUMAN_BOX_WIDTH_GAIN": 0.65,
 
     # COLLECT_GOLD 向金币吸引的比例；调大更主动靠金币，调小更偏向继续巡线。
     "GOLD_BIAS_GAIN": 0.45,
@@ -49,20 +37,13 @@ PLANNER_DEFAULTS = {
     "GOLD_MAX_BIAS": 75.0,
 
     # RECOVER_LINE 保持上一帧 final_track_error 的衰减时间，单位 s；调大丢线后更久保持原方向。
-    "RECOVER_DECAY_SECONDS": 3.0,
-
-    # 检测触发状态容易逐帧抖动；该系数决定 final_track_error 朝新目标移动的速度。
-    # 调大反应更快，调小目标线更稳。
-    "FINAL_ERROR_SMOOTH_ALPHA": 0.45,
-
-    # 每一帧 final_track_error 最大允许变化量，单位 px；用于防止目标线左右瞬移。
-    "MAX_ERROR_STEP_PER_FRAME": 28.0,
+    "RECOVER_DECAY_SECONDS": 0.5,
 
     # 绘制偏移目标路径时，尽量让路径点留在 road_mask 边界内侧这么多像素。
     "TARGET_PATH_ROAD_MARGIN": 8.0,
 
     # 最终控制误差从紫色规划线的这个 y 位置读取；数值越小越偏向画面远处，转向会更提前。
-    "CONTROL_LOOKAHEAD_Y_RATIO": 0.58,
+    "CONTROL_LOOKAHEAD_Y": 300.0,
 
     # 紫色规划线近处过渡起点；配合 PATH_NEAR_BIAS_GAIN，近处不再完全贴死红线。
     "PATH_NEAR_ANCHOR_Y_RATIO": 0.94,
@@ -133,19 +114,6 @@ def _copy_params(defaults, overrides=None):
     return params
 
 
-def _load_config_frame_width(config_path=DEFAULT_AR_CONFIG_PATH):
-    try:
-        with open(config_path, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except Exception:
-        return None
-
-    width = _finite_float(data.get("width"))
-    if width is None or width <= 1.0:
-        return None
-    return width
-
-
 class LocalPlanner:
     """Image-space local planner that converts RK task state into final track error."""
 
@@ -160,11 +128,7 @@ class LocalPlanner:
         planner_params=None,
     ):
         self.params = _copy_params(PLANNER_DEFAULTS, planner_params)
-        self.max_track_error_override = _finite_float(max_track_error)
-        self.config_frame_width = _load_config_frame_width()
-        self.track_error_width_ratio = float(self.params["MAX_TRACK_ERROR_WIDTH_RATIO"])
-        self.max_track_error_fallback = float(self.params["MAX_TRACK_ERROR_FALLBACK"])
-        self.max_track_error = self._track_error_limit(self.config_frame_width)
+        # max_track_error is accepted only for old call-site compatibility.
         self.car_avoid_offset = float(car_avoid_offset if car_avoid_offset is not None else self.params["CAR_AVOID_OFFSET"])
         self.human_avoid_offset = float(human_avoid_offset if human_avoid_offset is not None else self.params["HUMAN_AVOID_OFFSET"])
         self.gold_gain = float(gold_gain if gold_gain is not None else self.params["GOLD_BIAS_GAIN"])
@@ -173,10 +137,9 @@ class LocalPlanner:
             recover_decay_seconds if recover_decay_seconds is not None else self.params["RECOVER_DECAY_SECONDS"]
         )
         self.avoid_box_width_gain = float(self.params["AVOID_BOX_WIDTH_GAIN"])
-        self.final_error_smooth_alpha = float(self.params["FINAL_ERROR_SMOOTH_ALPHA"])
-        self.max_error_step_per_frame = float(self.params["MAX_ERROR_STEP_PER_FRAME"])
+        self.human_box_width_gain = float(self.params.get("HUMAN_BOX_WIDTH_GAIN", 0.65))
         self.target_path_road_margin = float(self.params["TARGET_PATH_ROAD_MARGIN"])
-        self.control_lookahead_y_ratio = float(self.params["CONTROL_LOOKAHEAD_Y_RATIO"])
+        self.control_lookahead_y = float(self.params["CONTROL_LOOKAHEAD_Y"])
         self.path_near_anchor_y_ratio = float(self.params["PATH_NEAR_ANCHOR_Y_RATIO"])
         self.path_full_bias_y_ratio = float(self.params["PATH_FULL_BIAS_Y_RATIO"])
         self.path_near_bias_gain = float(self.params["PATH_NEAR_BIAS_GAIN"])
@@ -187,8 +150,7 @@ class LocalPlanner:
         self.human_motion_smooth_alpha = float(self.params["HUMAN_MOTION_SMOOTH_ALPHA"])
         self.human_motion_max_dt = float(self.params["HUMAN_MOTION_MAX_DT"])
         self.human_motion_max_match_dx_ratio = float(self.params["HUMAN_MOTION_MAX_MATCH_DX_RATIO"])
-        self.human_back_side_min_road_score = float(self.params["HUMAN_BACK_SIDE_MIN_ROAD_SCORE"])
-        self.human_back_side_override_ratio = float(self.params["HUMAN_BACK_SIDE_OVERRIDE_RATIO"])
+        self.human_motion_predict_seconds = float(self.params.get("HUMAN_MOTION_PREDICT_SECONDS", 0.45))
         self.road_side_roi_min_y_ratio = float(self.params["ROAD_SIDE_ROI_MIN_Y_RATIO"])
         self.road_side_roi_top_box_gain = float(self.params["ROAD_SIDE_ROI_TOP_BOX_GAIN"])
         self.road_side_roi_bottom_box_gain = float(self.params["ROAD_SIDE_ROI_BOTTOM_BOX_GAIN"])
@@ -199,10 +161,9 @@ class LocalPlanner:
         self.stone_path_hit_box_gain = float(self.params["STONE_PATH_HIT_BOX_GAIN"])
         self.stone_path_hit_min_px = float(self.params["STONE_PATH_HIT_MIN_PX"])
         self.last_final_error = 0.0
-        self.last_output_error = None
         self.last_avoid_side = None
         self.last_avoid_category = None
-        self.last_avoid_side_ts = 0.0
+        self.last_avoid_side_ts = None
         self.last_human_motion_x = None
         self.last_human_motion_ts = None
         self.last_human_motion_vx = 0.0
@@ -216,7 +177,6 @@ class LocalPlanner:
         frame_w = int(frame_shape[1]) if len(frame_shape) >= 2 else 0
         frame_w = max(frame_w, 1)
         frame_h = max(frame_h, 1)
-        self.max_track_error = self._track_error_limit(frame_w)
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
         base_error = _finite_float(segmentation.get("track_error"))
         line_valid = bool(segmentation.get("line_valid") and base_error is not None)
@@ -229,7 +189,7 @@ class LocalPlanner:
         )
 
         path_offset = 0.0
-        raw_final_error = base_error
+        raw_final_error = None
         final_error = base_error
         reason = "track_center"
         avoid_side = None
@@ -263,7 +223,11 @@ class LocalPlanner:
                 now=now,
                 held=bool(intent.get("held")),
             )
-            path_offset = self._side_sign(avoid_side) * self._avoid_offset(target, self.human_avoid_offset)
+            path_offset = self._side_sign(avoid_side) * self._avoid_offset(
+                target,
+                self.human_avoid_offset,
+                width_gain=self.human_box_width_gain,
+            )
             motion_source = (avoid_motion or {}).get("source") or "static"
             reason = f"avoid_human_{avoid_side}_{motion_source}"
         elif state == TaskState.AVOID_CAR.value:
@@ -304,23 +268,16 @@ class LocalPlanner:
                         raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
             else:
                 raw_target_path = self._build_target_path(segmentation, path_offset, frame_w, frame_h)
-
-            if state != TaskState.NORMAL_TRACK.value and raw_target_path and state != TaskState.AVOID_STONE.value:
                 raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
-                if raw_final_error is None and base_error is not None:
-                    lookahead_y = frame_h * self.control_lookahead_y_ratio
-                    raw_final_error = base_error + path_offset * self._path_bias_gain(lookahead_y, frame_h)
 
-        if final_error is not None:
-            if self.last_output_error is None and state != TaskState.NORMAL_TRACK.value and base_error is not None:
-                self.last_output_error = base_error
-            final_error = self._smooth_final_error(
-                _clamp(raw_final_error, -self.max_track_error, self.max_track_error),
-                state,
-            )
-            if line_valid:
-                self.last_final_error = final_error
-                self.last_valid_ts = now
+        if raw_final_error is not None and math.isfinite(float(raw_final_error)):
+            final_error = float(raw_final_error)
+        else:
+            final_error = None
+
+        if final_error is not None and line_valid and not stop_state:
+            self.last_final_error = final_error
+            self.last_valid_ts = now
 
         effective_path_offset = path_offset
         target_path = raw_target_path
@@ -329,21 +286,13 @@ class LocalPlanner:
         elif line_valid and final_error is not None and state == TaskState.AVOID_STONE.value:
             target_path = raw_target_path
         elif line_valid and final_error is not None and state != TaskState.NORMAL_TRACK.value:
-            effective_path_offset = self._effective_path_offset_for_error(
-                segmentation,
-                final_error,
-                center_x,
-                path_offset,
-                frame_w,
-                frame_h,
-            )
-            target_path = self._build_target_path(segmentation, effective_path_offset, frame_w, frame_h)
+            target_path = raw_target_path
         elif line_valid and final_error is not None and not target_path:
             target_path = self._build_target_path(segmentation, 0.0, frame_w, frame_h)
 
         target_x = None
         if final_error is not None:
-            target_x = _clamp(center_x + final_error, 0, frame_w - 1)
+            target_x = center_x + final_error
 
         return {
             "final_track_error": float(final_error) if final_error is not None else None,
@@ -352,9 +301,10 @@ class LocalPlanner:
             "target_x": float(target_x) if target_x is not None else None,
             "target_path": target_path,
             "center_x": float(center_x),
+            "control_lookahead_y": float(self._control_lookahead_y(frame_h)),
             "desired_path_offset": float(path_offset),
             "effective_path_offset": float(effective_path_offset),
-            "track_error_limit": float(self.max_track_error),
+            "track_error_limit": None,
             "avoid_side": avoid_side,
             "avoid_motion": dict(avoid_motion or {}),
             "branch_candidates": branch_candidates,
@@ -363,49 +313,12 @@ class LocalPlanner:
             "line_valid": line_valid,
         }
 
-    def _track_error_limit(self, frame_w=None):
-        if self.max_track_error_override is not None and self.max_track_error_override > 0.0:
-            return max(1.0, float(self.max_track_error_override))
-
-        fixed_limit = _finite_float(self.params.get("MAX_TRACK_ERROR"), 0.0)
-        if fixed_limit is not None and fixed_limit > 0.0:
-            return max(1.0, fixed_limit)
-
-        width = _finite_float(frame_w)
-        if width is None or width <= 1.0:
-            width = self.config_frame_width
-        if width is not None and width > 1.0:
-            return max(1.0, width * max(0.01, self.track_error_width_ratio))
-
-        return max(1.0, self.max_track_error_fallback)
-
     def _recover_error(self, now):
         if self.last_valid_ts <= 0.0:
             return 0.0
         age = max(0.0, float(now) - self.last_valid_ts)
         decay = max(0.0, 1.0 - age / max(0.01, self.recover_decay_seconds))
         return self.last_final_error * decay
-
-    def _smooth_final_error(self, target_error, state):
-        if state in (
-            TaskState.LINE_LOSS_SAFE_STOP.value,
-            TaskState.TRAFFIC_LIGHT_STOP.value,
-            TaskState.ENDSIGN_STOP.value,
-        ):
-            return target_error
-
-        previous = self.last_output_error
-        if previous is None or state == TaskState.NORMAL_TRACK.value:
-            smoothed = target_error
-        else:
-            alpha = _clamp(self.final_error_smooth_alpha, 0.0, 1.0)
-            smoothed = previous + (target_error - previous) * alpha
-            max_step = max(1.0, self.max_error_step_per_frame)
-            smoothed = previous + _clamp(smoothed - previous, -max_step, max_step)
-
-        smoothed = _clamp(smoothed, -self.max_track_error, self.max_track_error)
-        self.last_output_error = smoothed
-        return smoothed
 
     def _build_target_path(self, segmentation, path_offset, frame_w, frame_h):
         mid_points = segmentation.get("mid_points") or []
@@ -490,33 +403,15 @@ class LocalPlanner:
         left, right = bounds
         return _clamp(x, left, right)
 
+    def _control_lookahead_y(self, frame_h):
+        return _clamp(self.control_lookahead_y, 0, max(0, int(frame_h) - 1))
+
     def _path_error_at_lookahead(self, path, center_x, frame_h):
         if not path:
             return None
-        lookahead_y = int(_clamp(frame_h * self.control_lookahead_y_ratio, 0, frame_h - 1))
+        lookahead_y = int(self._control_lookahead_y(frame_h))
         idx = min(range(len(path)), key=lambda i: abs(path[i][1] - lookahead_y))
         return float(path[idx][0]) - float(center_x)
-
-    def _effective_path_offset_for_error(self, segmentation, final_error, center_x, desired_offset, frame_w, frame_h):
-        mid_points = segmentation.get("mid_points") or []
-        if len(mid_points) < 2:
-            return desired_offset
-
-        lookahead_y = int(_clamp(frame_h * self.control_lookahead_y_ratio, 0, frame_h - 1))
-        try:
-            idx = min(range(len(mid_points)), key=lambda i: abs(mid_points[i][1] - lookahead_y))
-            base_x = _finite_float(mid_points[idx][0], center_x)
-        except Exception:
-            return desired_offset
-
-        gain = self._path_bias_gain(lookahead_y, frame_h)
-        if gain < 0.05:
-            return desired_offset
-
-        target_x = _clamp(float(center_x) + float(final_error), 0, frame_w - 1)
-        effective = (target_x - base_x) / gain
-        max_abs = max(abs(float(desired_offset)), 1.0)
-        return _clamp(effective, -max_abs, max_abs)
 
     def _build_stone_branch_candidates(self, segmentation, frame_w, frame_h, center_x, base_error):
         mid_points = segmentation.get("mid_points") or []
@@ -556,7 +451,7 @@ class LocalPlanner:
         if len(left_path) < 2 or len(right_path) < 2:
             return []
 
-        reference_error = self.last_output_error if self.last_output_error is not None else base_error
+        reference_error = self.last_final_error if self.last_valid_ts > 0.0 else base_error
         reference_error = _finite_float(reference_error, 0.0)
         candidates = []
         for label, path in (("left", left_path), ("right", right_path)):
@@ -652,10 +547,11 @@ class LocalPlanner:
         )
         return abs(float(stone_x) - path_x) <= threshold
 
-    def _avoid_offset(self, target, default_offset):
+    def _avoid_offset(self, target, default_offset, width_gain=None):
         size = target.get("size") or [0.0, 0.0]
         box_w = _finite_float(size[0], 0.0)
-        return max(float(default_offset), min(self.max_track_error, box_w * self.avoid_box_width_gain))
+        gain = self.avoid_box_width_gain if width_gain is None else float(width_gain)
+        return max(float(default_offset), box_w * gain)
 
     def _gold_error(self, base_error, target, center_x):
         center = target.get("center") or [None, None]
@@ -690,32 +586,89 @@ class LocalPlanner:
             }
 
         motion = self._update_human_motion(target, now, frame_w)
-
+        static_side = "right" if target_x <= center_x else "left"
+        motion_side = None
         if motion.get("reliable"):
-            # If the human moves right, pass from left; if moving left, pass from right.
-            back_side = "left" if motion.get("vx", 0.0) > 0.0 else "right"
-            preferred = self._road_side_for_dynamic_human(segmentation, target, back_side)
-            motion["preferred_side"] = back_side
-            motion["road_checked_side"] = preferred
-            motion["source"] = "motion_back" if preferred == back_side else "motion_back_road_override"
-            side = self._apply_avoid_side_hysteresis(
-                "human",
-                preferred,
-                target_x,
-                center_x,
-                now,
-                force_switch=(preferred == back_side),
-            )
-            return side, motion
+            motion_side = "left" if motion.get("vx", 0.0) > 0.0 else "right"
 
-        preferred = "right" if target_x <= center_x else "left"
-        road_side = self._road_free_side(segmentation, target, preferred)
-        preferred = road_side or preferred
-        motion["preferred_side"] = preferred
+        preferred, corridor = self._human_corridor_side(segmentation, target, frame_w, frame_h, static_side, motion)
+        motion["preferred_side"] = motion_side or static_side
         motion["road_checked_side"] = preferred
-        motion["source"] = "static_away"
+        motion["corridor_left_score"] = float(corridor.get("left_score", 0.0))
+        motion["corridor_right_score"] = float(corridor.get("right_score", 0.0))
+        motion["predicted_shift_px"] = float(corridor.get("predicted_shift_px", 0.0))
+        motion["source"] = corridor.get("source") or "corridor"
         side = self._apply_avoid_side_hysteresis("human", preferred, target_x, center_x, now)
         return side, motion
+
+    def _human_corridor_side(self, segmentation, target, frame_w, frame_h, static_side, motion=None):
+        motion = dict(motion or {})
+        vx = _finite_float(motion.get("vx"), 0.0)
+        motion_reliable = bool(motion.get("reliable"))
+        motion_side = None
+        if motion_reliable:
+            motion_side = "left" if vx > 0.0 else "right"
+
+        road_mask = segmentation.get("road_mask")
+        if road_mask is None or not hasattr(road_mask, "shape"):
+            return motion_side or static_side, {
+                "left_score": 0.0,
+                "right_score": 0.0,
+                "predicted_shift_px": 0.0,
+                "source": "no_road_mask_motion_tie" if motion_side else "no_road_mask_static",
+            }
+
+        mask = np.asarray(road_mask)
+        if mask.ndim != 2 or not np.any(mask):
+            return motion_side or static_side, {
+                "left_score": 0.0,
+                "right_score": 0.0,
+                "predicted_shift_px": 0.0,
+                "source": "empty_road_mask_motion_tie" if motion_side else "empty_road_mask_static",
+            }
+
+        h, w = mask.shape[:2]
+        bbox = target.get("bbox") or [0.0, h * 0.35, w, h * 0.75]
+        try:
+            left, top, right, bottom = [float(v) for v in bbox]
+        except Exception:
+            left, top, right, bottom = 0.0, h * 0.35, float(w), h * 0.75
+
+        size = target.get("size") or [max(0.0, right - left), max(0.0, bottom - top)]
+        box_w = max(0.0, _finite_float(size[0], right - left))
+        box_h = max(1.0, _finite_float(size[1], bottom - top))
+        predicted_shift = vx * self.human_motion_predict_seconds if motion_reliable else 0.0
+        predicted_left = left + predicted_shift
+        predicted_right = right + predicted_shift
+        occupied_left = min(left, predicted_left)
+        occupied_right = max(right, predicted_right)
+        clearance = max(16.0, frame_w * 0.04, box_w * 0.25)
+        x_left = int(_clamp(occupied_left - clearance, 0, w - 1))
+        x_right = int(_clamp(occupied_right + clearance, 0, w - 1))
+        y0 = int(_clamp(bottom - box_h * self.road_side_roi_top_box_gain, h * self.road_side_roi_min_y_ratio, h - 1))
+        y1 = int(_clamp(bottom + box_h * self.road_side_roi_bottom_box_gain, y0 + 1, h))
+        roi = mask[y0:y1, :]
+        left_score = float(np.count_nonzero(roi[:, :x_left]))
+        right_score = float(np.count_nonzero(roi[:, x_right:]))
+        total = max(1.0, left_score + right_score)
+        min_delta = max(self.road_side_balance_min_delta, self.road_side_balance_ratio * total)
+
+        if abs(left_score - right_score) >= min_delta:
+            side = "left" if left_score > right_score else "right"
+            source = "corridor_motion_prediction" if motion_reliable else "corridor_road"
+        elif motion_side in ("left", "right"):
+            side = motion_side
+            source = "corridor_motion_tie"
+        else:
+            side = static_side
+            source = "corridor_static_tie"
+
+        return side, {
+            "left_score": left_score,
+            "right_score": right_score,
+            "predicted_shift_px": float(predicted_shift),
+            "source": source,
+        }
 
     def _update_human_motion(self, target, now, frame_w):
         center = target.get("center") or [None, None]
@@ -762,25 +715,6 @@ class LocalPlanner:
         info["reliable"] = abs(vx) >= max(1.0, self.human_motion_min_vx)
         return info
 
-    def _road_side_for_dynamic_human(self, segmentation, target, back_side):
-        scores = self._road_side_scores(segmentation, target)
-        if scores is None:
-            return back_side
-
-        left_score, right_score = scores
-        if back_side == "left":
-            back_score, other_score, other_side = left_score, right_score, "right"
-        else:
-            back_score, other_score, other_side = right_score, left_score, "left"
-
-        min_score = max(0.0, self.human_back_side_min_road_score)
-        override_ratio = _clamp(self.human_back_side_override_ratio, 0.0, 1.0)
-        if other_score > min_score and back_score <= min_score:
-            return other_side
-        if other_score > min_score and back_score < other_score * override_ratio:
-            return other_side
-        return back_side
-
     def _choose_avoid_side(self, segmentation, target, frame_w, frame_h, prefer_away, category, now):
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
         target_center = target.get("center") or [center_x, frame_h * 0.5]
@@ -793,21 +727,22 @@ class LocalPlanner:
             preferred = road_side or preferred
         return self._apply_avoid_side_hysteresis(category, preferred, target_x, center_x, now)
 
-    def _apply_avoid_side_hysteresis(self, category, preferred, target_x, center_x, now, force_switch=False):
+    def _apply_avoid_side_hysteresis(self, category, preferred, target_x, center_x, now):
         previous = self.last_avoid_side
         same_category = self.last_avoid_category == category
-        age = max(0.0, float(now) - self.last_avoid_side_ts) if self.last_avoid_side_ts > 0.0 else None
+        age = max(0.0, float(now) - self.last_avoid_side_ts) if self.last_avoid_side_ts is not None else None
         in_hold = same_category and previous in ("left", "right") and age is not None and age <= self.avoid_side_hold_seconds
 
         side = preferred
-        if in_hold and preferred != previous and not force_switch:
+        if in_hold and preferred != previous:
             lateral = abs(float(target_x) - float(center_x))
             if lateral < self.avoid_side_switch_margin:
                 side = previous
 
+        if not same_category or side != previous:
+            self.last_avoid_side_ts = float(now)
         self.last_avoid_side = side
         self.last_avoid_category = category
-        self.last_avoid_side_ts = float(now)
         return side
 
     def _road_free_side(self, segmentation, target, default_side):
@@ -873,7 +808,8 @@ class LocalPlanner:
         if len(target_path) >= 2:
             pts = np.array(target_path, np.int32).reshape((-1, 1, 2))
             cv2.polylines(out, [pts], False, (255, 0, 255), 3)
-            lookahead_y = int(h * self.control_lookahead_y_ratio)
+            lookahead_y = int(self._control_lookahead_y(h))
+            cv2.line(out, (0, lookahead_y), (w - 1, lookahead_y), (255, 0, 255), 1)
             idx = min(range(len(target_path)), key=lambda i: abs(target_path[i][1] - lookahead_y))
             cv2.circle(out, target_path[idx], 8, (255, 0, 255), -1)
             cv2.circle(out, target_path[0], 5, (255, 0, 255), -1)

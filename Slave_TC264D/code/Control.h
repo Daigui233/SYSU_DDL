@@ -26,7 +26,13 @@ extern "C"
 #include "Communication.h"
 
 #define CONTROL_FLAG_USE_TARGET_SPEED (0x01U) // 使用上位机下发目标速度
-#define CONTROL_INPUT_TIMEOUT_US (2500000U)   // Valid control-frame timeout for TC264D local failsafe.
+#define CONTROL_INPUT_TIMEOUT_US (500000U)    // Valid control-frame timeout for TC264D local failsafe.
+
+#define CONTROL_FB_FLAG_INPUT_TIMEOUT      (0x0001U)
+#define CONTROL_FB_FLAG_STOP_STATE         (0x0002U)
+#define CONTROL_FB_FLAG_SERVO_SATURATED    (0x0004U)
+#define CONTROL_FB_FLAG_MOTOR_SATURATED    (0x0008U)
+#define CONTROL_FB_FLAG_TARGET_DEADBAND    (0x0010U)
 
     /*********************************************************************************************************************
      *                                               控制输入结构体
@@ -75,6 +81,12 @@ extern "C"
         int32 motor_output;
         uint32 servo_output;
 
+        float motor_feedforward;
+        float motor_pid_correction;
+        float servo_raw_output;
+        float servo_limited_output;
+        uint16 safety_flags;
+        uint32 feedback_seq;
         uint32 last_input_time_us;
         uint8 input_online;
 

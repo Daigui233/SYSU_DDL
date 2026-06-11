@@ -1,6 +1,4 @@
 import os
-import time
-
 import cv2
 import numpy as np
 
@@ -14,7 +12,6 @@ ROAD_COLOR = np.array([0, 255, 80], dtype=np.uint8)
 # It is hidden by default because the real driving target is the red/purple path.
 DRAW_CAMERA_CENTER_REFERENCE = False
 
-HOLD_SECONDS = 0.5
 TOP_CROP_RATIO = 0.34
 MIN_ROAD_RATIO = 0.001
 MAX_ROAD_RATIO = 0.60
@@ -25,21 +22,10 @@ MIN_SEGMENT_WIDTH = 12
 SCAN_STEP = 8
 MAX_CENTER_JUMP_RATIO = 0.20
 MIN_MID_POINTS = 4
+SEGMENTATION_LOOKAHEAD_Y = 300
 
-# Cardo 风格控制中心参数：用整条中线计算 track_error，而不是只看车头底部几行。
-# 远处中线点给较高权重，让弯道更早参与转向；近处点仍保留少量权重用于贴合当前车身前方。
-CONTROL_CENTER_FAR_WEIGHT_RATIO = 0.50
-CONTROL_CENTER_NEAR_MIN_WEIGHT = 1.0
-TRACK_ERROR_SMOOTH_PREV_GAIN = 0.70
-
-_prev_mask = None
-_prev_mid_points = None
-_prev_track_error = 0.0
-_prev_valid_ts = 0.0
-_prev_stable_error = None
+# Pixel error is measured at one fixed lookahead row; no weighted error is applied.
 _prev_branch_count = 0
-_mask_history = []
-_bottom_anchor_x = None
 
 
 def _to_class_map(seg_map):
@@ -145,37 +131,16 @@ def _quality(mask, raw_ratio):
     return True, ratio, "ok"
 
 
-def _hold_available():
-    return (
-        _prev_mask is not None
-        and _prev_mid_points is not None
-        and _prev_stable_error is not None
-        and (time.time() - _prev_valid_ts) <= HOLD_SECONDS
-    )
-
-
-def _stable_mask(mask, valid, raw_ratio):
+def _valid_mask(mask, valid, raw_ratio):
     ok = False
     ratio = 0.0
     reason = "lost"
     if valid:
         ok, ratio, reason = _quality(mask, raw_ratio)
 
-    if ok and _prev_mask is not None and _prev_mask.shape == mask.shape:
-        prev_ratio = float(_prev_mask.sum()) / float(_prev_mask.size)
-        inter = np.logical_and(mask, _prev_mask).sum()
-        union = np.logical_or(mask, _prev_mask).sum()
-        iou = float(inter) / float(union) if union else 0.0
-        if abs(ratio - prev_ratio) > 0.25 and iou < 0.18:
-            ok = False
-            reason = "jump"
-
     if ok:
-        return mask, True, False, ratio, reason
-    if _hold_available():
-        hold_ratio = float(_prev_mask.sum()) / float(_prev_mask.size)
-        return _prev_mask.copy(), True, True, hold_ratio, reason
-    return np.zeros_like(mask), False, False, ratio, reason
+        return mask, True, ratio, reason
+    return np.zeros_like(mask), False, ratio, reason
 
 
 def _overlay_road(frame, mask):
@@ -232,23 +197,15 @@ def _fit_midline(points, w):
 
 
 def _build_midline(mask):
-    global _prev_mid_points, _bottom_anchor_x
-
     h, w = mask.shape
     top = int(h * TOP_CROP_RATIO)
     image_center = w // 2
 
+    ref_x = image_center
     bot_xs = np.flatnonzero(mask[h - 1])
     if bot_xs.size >= MIN_SEGMENT_WIDTH:
         bot_cx = float(int(bot_xs[0]) + int(bot_xs[-1])) * 0.5
-        if _bottom_anchor_x is None:
-            _bottom_anchor_x = bot_cx
-        else:
-            _bottom_anchor_x = _bottom_anchor_x * 0.80 + bot_cx * 0.20
-    if _bottom_anchor_x is None:
-        _bottom_anchor_x = float(image_center)
-
-    ref_x = int(_bottom_anchor_x)
+        ref_x = int(bot_cx)
     max_jump = max(35, int(w * MAX_CENTER_JUMP_RATIO))
     points = []
     misses = 0
@@ -262,32 +219,13 @@ def _build_midline(mask):
                 break
             continue
         misses = 0
-        if points:
-            bottom_weight = float(y - top) / float(h - top)
-            w_hist = 0.25 + 0.50 * bottom_weight
-            cx = int((1.0 - w_hist) * cx + w_hist * ref_x)
-        else:
-            cx = int(0.20 * cx + 0.80 * ref_x)
         ref_x = cx
         points.append((cx, y))
 
     if len(points) < MIN_MID_POINTS:
         return [], False
 
-    if _prev_mid_points and len(_prev_mid_points) >= MIN_MID_POINTS:
-        n = min(len(points), len(_prev_mid_points))
-        mixed = []
-        for i in range(n):
-            x, y = points[i]
-            px, _ = _prev_mid_points[i]
-            bottom_weight = float(y - top) / float(h - top)
-            pw = 0.25 + 0.45 * bottom_weight
-            mixed.append((int((1.0 - pw) * x + pw * px), y))
-        mixed.extend(points[n:])
-        points = mixed
-
     points = _fit_midline(points, w)
-    _prev_mid_points = points
     return points, True
 
 
@@ -297,34 +235,19 @@ def _draw_midline(frame, mask, points):
     pts = np.array(points, np.int32).reshape((-1, 1, 2))
     cv2.polylines(frame, [pts], False, (0, 0, 255), 5)
     h, _ = mask.shape
-    lookahead_y = int(h * 0.62)
+    lookahead_y = int(np.clip(SEGMENTATION_LOOKAHEAD_Y, 0, h - 1))
     idx = min(range(len(points)), key=lambda i: abs(points[i][1] - lookahead_y))
     tx, ty = points[idx]
     cv2.circle(frame, (tx, ty), 8, (0, 255, 255), -1)
     return tx
 
 
-def _weighted_control_center(points, h, w):
+def _point_x_at_y(points, target_y, w):
     if not points:
         return None
 
-    image_center = w * 0.5
-    control_sum = image_center
-    control_weight = 1.0
-    far_weight = max(1.0, h * CONTROL_CENTER_FAR_WEIGHT_RATIO)
-    half_h = h * 0.5
-
-    for x_raw, y_raw in points:
-        x = float(np.clip(x_raw, 0, w - 1))
-        y = float(np.clip(y_raw, 0, h - 1))
-        if y < half_h:
-            weight = far_weight
-        else:
-            weight = max(CONTROL_CENTER_NEAR_MIN_WEIGHT, float(h) - y)
-        control_sum += x * weight
-        control_weight += weight
-
-    return control_sum / max(1.0, control_weight)
+    idx = min(range(len(points)), key=lambda i: abs(points[i][1] - target_y))
+    return float(np.clip(points[idx][0], 0, w - 1))
 
 
 def _empty_centerline_info(frame, reason="lost"):
@@ -342,15 +265,13 @@ def _empty_centerline_info(frame, reason="lost"):
         "branch_count": 0,
         "center_x": w // 2,
         "target_x": None,
+        "segmentation_lookahead_y": int(np.clip(SEGMENTATION_LOOKAHEAD_Y, 0, h - 1)),
         "road_mask": None,
         "mid_points": [],
     }
 
 
 def extract_centerline_info(seg_map, frame):
-    global _prev_mask, _prev_track_error, _prev_valid_ts, _prev_stable_error
-    global _mask_history
-
     try:
         class_map = _to_class_map(seg_map)
     except ValueError as exc:
@@ -362,21 +283,11 @@ def extract_centerline_info(seg_map, frame):
     raw_mask = _make_raw_mask(class_map)
     raw_ratio = float((class_map == ROAD_CLASS_ID).sum()) / float(class_map.size) if class_map.size else 0.0
     selected, selected_valid = _select_road(raw_mask)
-    road_mask, road_valid, held, ratio, reason = _stable_mask(selected, selected_valid, raw_ratio)
+    road_mask, road_valid, ratio, reason = _valid_mask(selected, selected_valid, raw_ratio)
 
-    if road_valid and not held:
-        _mask_history.append(road_mask.copy())
-        if len(_mask_history) > 4:
-            _mask_history.pop(0)
-        if len(_mask_history) >= 2:
-            acc = sum(m.astype(np.float32) for m in _mask_history)
-            road_mask = (acc >= len(_mask_history) * 0.5).astype(np.uint8)
-            if not np.any(road_mask):
-                road_valid = False
-                reason = "vote"
     out = _overlay_road(frame.copy(), road_mask)
     mid_points, mid_ok = _build_midline(road_mask) if road_valid else ([], False)
-    draw_points = mid_points if mid_ok else (_prev_mid_points if held else [])
+    draw_points = mid_points if mid_ok else []
     target_x = _draw_midline(out, road_mask, draw_points)
 
     h, w = road_mask.shape
@@ -387,24 +298,16 @@ def extract_centerline_info(seg_map, frame):
     track_error = None
     control_center_x = None
     raw_error = None
-    if held and _prev_stable_error is not None:
-        track_error = _prev_stable_error
-    elif mid_ok and len(draw_points) >= 2:
-        control_center_x = _weighted_control_center(draw_points, h, w)
+    lookahead_y = int(np.clip(SEGMENTATION_LOOKAHEAD_Y, 0, h - 1))
+    if mid_ok and len(draw_points) >= 2:
+        control_center_x = _point_x_at_y(draw_points, lookahead_y, w)
         raw_error = float(control_center_x - center_x)
-        smooth_new_gain = 1.0 - TRACK_ERROR_SMOOTH_PREV_GAIN
-        track_error = TRACK_ERROR_SMOOTH_PREV_GAIN * _prev_track_error + smooth_new_gain * raw_error
-        _prev_track_error = track_error
-        _prev_mask = road_mask.copy()
-        _prev_valid_ts = time.time()
-        _prev_stable_error = track_error
-        cv2.circle(out, (int(control_center_x), h - 18), 6, (0, 255, 0), -1)
-    else:
-        _prev_track_error *= 0.9
+        track_error = raw_error
+        cv2.circle(out, (int(control_center_x), lookahead_y), 6, (0, 255, 0), -1)
 
-    road_state = "HOLD" if held else ("OK" if road_valid else "LOST")
-    mid_state = "HOLD" if held and draw_points else ("OK" if mid_ok else "LOST")
-    state_color = (0, 255, 255) if held else ((0, 255, 0) if road_valid else (0, 165, 255))
+    road_state = "OK" if road_valid else "LOST"
+    mid_state = "OK" if mid_ok else "LOST"
+    state_color = (0, 255, 0) if road_valid else (0, 165, 255)
     cv2.putText(out, f"Road seg: {road_state} {ratio:.1%} {reason}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
     cv2.putText(out, f"Midline: {mid_state}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
     err_text = f"Track err: {track_error:.1f}" if track_error is not None else "Track err: N/A"
@@ -415,9 +318,9 @@ def extract_centerline_info(seg_map, frame):
         "line_valid": track_error is not None,
         "track_error": float(track_error) if track_error is not None else None,
         "road_valid": bool(road_valid),
-        "road_held": bool(held),
+        "road_held": False,
         "road_state": road_state,
-        "midline_valid": bool(mid_ok or (held and draw_points)),
+        "midline_valid": bool(mid_ok),
         "midline_state": mid_state,
         "road_ratio": float(ratio),
         "reason": reason,
@@ -425,6 +328,7 @@ def extract_centerline_info(seg_map, frame):
         "center_x": int(center_x),
         "target_x": int(control_center_x) if control_center_x is not None else (int(target_x) if target_x is not None else None),
         "control_center_x": int(control_center_x) if control_center_x is not None else None,
+        "segmentation_lookahead_y": int(lookahead_y),
         "raw_track_error": float(raw_error) if raw_error is not None else None,
         "road_mask": road_mask,
         "mid_points": [(int(x), int(y)) for x, y in draw_points],

@@ -40,10 +40,10 @@ TASK_SPEED_DEFAULTS = {
 # 状态保持/失效判断参数，单位 s。状态机统一负责这些上位机状态判断。
 TASK_TIMING_DEFAULTS = {
     # human 检测短暂丢失后的保持时间；调大可减少抖动，但会更久停留在 AVOID_HUMAN。
-    "HUMAN_HOLD_TTL": 0.8,
+    "HUMAN_HOLD_TTL": 0.5,
 
     # 中线/感知质量连续无效超过该时间后才 safe stop；短时丢线先 RECOVER_LINE。
-    "LINE_LOSS_SAFE_STOP_TIMEOUT": 3.0,
+    "LINE_LOSS_SAFE_STOP_TIMEOUT": 0.8,
 }
 
 # 检测任务规则参数。后续实车调车时优先改这里，不要去 Rule 内部找散落阈值。
@@ -89,7 +89,7 @@ TASK_RULE_DEFAULTS = {
     "RISK_DISTANCE_LEVEL_WEIGHT": 10.0,
     "RISK_PATH_LEVEL_WEIGHT": 3.0,
     "RISK_STATE_HOLD_BONUS": 0.8,
-    "RISK_STATE_HOLD_SECONDS": 0.8,
+    "RISK_STATE_HOLD_SECONDS": 0.5,
 
     # Gold is a reward target, not a risk target. It is considered only when no
     # human/car/stone risk exists, and only if it is close enough and cheap to reach.
@@ -140,7 +140,7 @@ TASK_RULE_DEFAULTS = {
 # age 单位为 s；road_ratio 是语义分割 road mask 占整幅图比例。
 PERCEPTION_QUALITY_DEFAULTS = {
     # segmentation 结果最大可用年龄；超过后视为过旧，进入 RECOVER_LINE。
-    "MAX_SEGMENTATION_AGE": 0.80,
+    "MAX_SEGMENTATION_AGE": 0.50,
 
     # road mask 最小面积比例；太小通常说明没有看到路或分割失败。
     "MIN_ROAD_RATIO": 0.001,
@@ -165,7 +165,7 @@ PERCEPTION_QUALITY_DEFAULTS = {
 
     # detection 最大可用年龄；超过后不参与 human/car/gold/stone 任务判断。
     # Door/BeginSign/EndSign/TrafficLight 由 control_race_state_machine.py 单独管理。
-    "MAX_DETECTION_AGE": 1.00,
+    "MAX_DETECTION_AGE": 0.80,
 }
 
 
