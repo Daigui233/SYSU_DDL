@@ -470,8 +470,19 @@ def draw_pose_status(
     speed_text = "N/A" if target_speed is None else f"{float(target_speed):.2f}"
     control_line = f"CTRL {control_state}"
     cmd_line = f"CMD v={speed_text} err={err_text}"
+    seg_line = "SEG N/A"
     fork_line = "FORK N/A"
     if isinstance(segmentation_status, dict):
+        seg_source = segmentation_status.get("source") or "N/A"
+        frame_id = segmentation_status.get("frame_id")
+        seg_frame_id = segmentation_status.get("seg_frame_id")
+        lag_frames = segmentation_status.get("seg_lag_frames")
+        seg_age_ms = _safe_float(segmentation_status.get("seg_age_ms"), None)
+        frame_text = "-" if frame_id is None else str(frame_id)
+        seg_frame_text = "-" if seg_frame_id is None else str(seg_frame_id)
+        lag_text = "-" if lag_frames is None else str(lag_frames)
+        age_text = "-" if seg_age_ms is None else f"{seg_age_ms:.0f}ms"
+        seg_line = f"SEG {seg_source} fid={frame_text} sid={seg_frame_text} lag={lag_text} age={age_text}"
         fork_cls = segmentation_status.get("fork_classifier") or {}
         fork_state = segmentation_status.get("fork_state") or "N/A"
         fork_mode = segmentation_status.get("fork_mode") or "single"
@@ -546,6 +557,7 @@ def draw_pose_status(
         "RUN STATUS",
         control_line,
         cmd_line,
+        seg_line,
         fork_line,
         pose_line,
     ]
@@ -566,7 +578,7 @@ def draw_pose_status(
         text_color = color if i == 0 else (230, 245, 245)
         cv2.putText(panel, short_text(line, 42), (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, text_color, 1, cv2.LINE_AA)
         y += line_h
-        if i in (0, 3):
+        if i in (0, 4):
             cv2.line(panel, (10, y - 8), (panel_w - 12, y - 8), (55, 70, 70), 1, cv2.LINE_AA)
 
     return np.hstack([left_panel, frame, panel])

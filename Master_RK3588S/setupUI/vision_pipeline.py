@@ -1,4 +1,5 @@
 import os
+import time
 
 import cv2
 
@@ -13,7 +14,6 @@ from vision_traffic_light import classify_traffic_light_color
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", "base", "model"))
-DEFAULT_SEG_RESULT_TTL = float(os.environ.get("AR_SEG_RESULT_TTL", "2.0"))
 DEFAULT_DET_RESULT_TTL = float(os.environ.get("AR_DET_RESULT_TTL", "1.0"))
 
 
@@ -28,15 +28,15 @@ class VisionPipeline:
 
     def __init__(self, model_dir=None, seg_result_ttl=None, det_result_ttl=None, log_func=None):
         self.model_dir = model_dir or DEFAULT_MODEL_DIR
-        self.seg_result_ttl = float(DEFAULT_SEG_RESULT_TTL if seg_result_ttl is None else seg_result_ttl)
+        # Constructor compatibility only: segmentation results must be current-frame.
+        _ = seg_result_ttl
+        self.seg_result_ttl = 0.0
         self.det_result_ttl = float(DEFAULT_DET_RESULT_TTL if det_result_ttl is None else det_result_ttl)
         self.log_func = log_func or print
 
         self.infer_det = None
         self.infer_seg = None
         self.infer_fork = None
-        self.last_seg_res = None
-        self.last_seg_ts = 0.0
         self.last_det_res = None
         self.last_det_ts = 0.0
         self._status = {
@@ -89,11 +89,25 @@ class VisionPipeline:
         return dict(self._status)
 
     @staticmethod
-    def _empty_segmentation(frame, now, source="missing"):
+    def _normalize_frame_id(frame_id):
+        if frame_id is None:
+            return None
+        try:
+            return int(frame_id)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _empty_segmentation(frame, now, source="missing", frame_id=None):
         h, w = frame.shape[:2]
+        frame_id_value = VisionPipeline._normalize_frame_id(frame_id)
         return {
             "timestamp": float(now),
             "age": None,
+            "frame_id": frame_id_value,
+            "seg_frame_id": None,
+            "seg_lag_frames": None,
+            "seg_age_ms": None,
             "source": source,
             "line_valid": False,
             "track_error": None,
@@ -224,19 +238,50 @@ class VisionPipeline:
                 2,
             )
 
-    def process(self, frame, now):
+    def process(self, frame, now, frame_id=None):
         final_frame = frame.copy()
-        segmentation = self._empty_segmentation(frame, now)
+        segmentation = self._empty_segmentation(frame, now, frame_id=frame_id)
         detections = []
 
         if self.infer_seg is not None:
             try:
-                seg_res, seg_flag = self.infer_seg.infer(frame.copy())
-                if seg_flag and seg_res is not None:
-                    self.last_seg_res = seg_res
-                    self.last_seg_ts = now
+                if hasattr(self.infer_seg, "infer_current"):
+                    seg_res, seg_flag, seg_meta = self.infer_seg.infer_current(
+                        frame.copy(),
+                        frame_id=frame_id,
+                        timestamp=now,
+                    )
+                else:
+                    raise RuntimeError("segmenter does not support current-frame inference")
+
+                frame_id_value = self._normalize_frame_id(frame_id)
+                seg_frame_id = self._normalize_frame_id(seg_meta.get("frame_id"))
+                frame_matches = frame_id_value is None or seg_frame_id == frame_id_value
+                if seg_flag and seg_res is not None and frame_matches:
+                    final_frame, segmentation = extract_centerline_info(
+                        seg_res,
+                        final_frame,
+                        fork_classifier=self.infer_fork,
+                    )
+                    seg_done_ts = time.time()
+                    seg_age = max(0.0, seg_done_ts - float(seg_meta.get("timestamp") or now))
+                    segmentation["timestamp"] = float(now)
+                    segmentation["age"] = seg_age
+                    segmentation["frame_id"] = frame_id_value
+                    segmentation["seg_frame_id"] = seg_frame_id
+                    segmentation["seg_lag_frames"] = 0 if frame_id_value is not None and seg_frame_id is not None else None
+                    segmentation["seg_age_ms"] = float(seg_age * 1000.0)
+                    segmentation["source"] = "current"
+                else:
+                    if seg_flag and seg_res is not None and not frame_matches:
+                        segmentation = self._empty_segmentation(frame, now, source="stale_rejected", frame_id=frame_id)
+                    draw_waiting(final_frame)
             except Exception as exc:
                 self._log(f"seg infer skip: {exc}")
+                segmentation = self._empty_segmentation(frame, now, source="seg_error", frame_id=frame_id)
+                draw_waiting(final_frame)
+        else:
+            draw_waiting(final_frame)
 
         if self.infer_det is not None:
             try:
@@ -246,22 +291,6 @@ class VisionPipeline:
                     self.last_det_ts = now
             except Exception as exc:
                 self._log(f"det infer skip: {exc}")
-
-        if self.last_seg_res is not None and (now - self.last_seg_ts) <= self.seg_result_ttl:
-            try:
-                final_frame, segmentation = extract_centerline_info(
-                    self.last_seg_res,
-                    final_frame,
-                    fork_classifier=self.infer_fork,
-                )
-                segmentation["timestamp"] = float(self.last_seg_ts)
-                segmentation["age"] = float(now - self.last_seg_ts)
-                segmentation["source"] = "fresh" if segmentation["age"] <= 0.05 else "cached"
-            except Exception as exc:
-                self._log(f"seg draw skip: {exc}")
-                draw_waiting(final_frame)
-        else:
-            draw_waiting(final_frame)
 
         if self.last_det_res is not None and (now - self.last_det_ts) <= self.det_result_ttl:
             try:

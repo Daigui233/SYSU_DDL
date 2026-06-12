@@ -414,6 +414,41 @@ class LocalPlanner:
         return float(path[idx][0]) - float(center_x)
 
     def _build_stone_branch_candidates(self, segmentation, frame_w, frame_h, center_x, base_error):
+        direct_candidates = []
+        for candidate in (segmentation.get("fork_candidates") or []):
+            side = str(candidate.get("side") or "")
+            if side not in ("left", "right"):
+                continue
+            raw_path = candidate.get("points") or candidate.get("path") or []
+            path = []
+            for point in raw_path:
+                try:
+                    x_raw, y_raw = point
+                    x = int(round(_clamp(_finite_float(x_raw, center_x), 0, frame_w - 1)))
+                    y = int(round(_clamp(_finite_float(y_raw, 0.0), 0, frame_h - 1)))
+                except Exception:
+                    continue
+                path.append((x, y))
+            if len(path) < 2:
+                continue
+            err = self._path_error_at_lookahead(path, center_x, frame_h)
+            if err is None:
+                continue
+            direct_candidates.append({
+                "side": side,
+                "branch": "outer" if side == "left" else "inner",
+                "path": path,
+                "error": float(err),
+                "split_rows": int(segmentation.get("fork_split_rows") or 0),
+                "source": "segmentation_candidates",
+            })
+
+        if any(c.get("branch") == "outer" for c in direct_candidates) and any(
+            c.get("branch") == "inner" for c in direct_candidates
+        ):
+            direct_candidates.sort(key=lambda item: 0 if item.get("branch") == "outer" else 1)
+            return direct_candidates
+
         mid_points = segmentation.get("mid_points") or []
         road_mask = segmentation.get("road_mask")
         if len(mid_points) < 2 or road_mask is None or not hasattr(road_mask, "shape"):
@@ -451,8 +486,6 @@ class LocalPlanner:
         if len(left_path) < 2 or len(right_path) < 2:
             return []
 
-        reference_error = self.last_final_error if self.last_valid_ts > 0.0 else base_error
-        reference_error = _finite_float(reference_error, 0.0)
         candidates = []
         for label, path in (("left", left_path), ("right", right_path)):
             err = self._path_error_at_lookahead(path, center_x, frame_h)
@@ -460,18 +493,16 @@ class LocalPlanner:
                 continue
             candidates.append({
                 "side": label,
+                "branch": "outer" if label == "left" else "inner",
                 "path": path,
                 "error": float(err),
-                "continuity_cost": abs(float(err) - float(reference_error)),
                 "split_rows": int(split_rows),
+                "source": "road_mask_scan",
             })
 
         if len(candidates) < 2:
             return []
 
-        candidates.sort(key=lambda item: item["continuity_cost"])
-        candidates[0]["branch"] = "outer"
-        candidates[1]["branch"] = "inner"
         return candidates
 
     @staticmethod

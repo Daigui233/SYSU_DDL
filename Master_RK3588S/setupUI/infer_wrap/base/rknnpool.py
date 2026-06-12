@@ -82,6 +82,16 @@ class rknnPoolExecutor:
         self._submit(frame)
         return result, flag
 
+    def infer_current(self, frame, meta=None):
+        meta = dict(meta or {})
+        rknn = self.rknnPool[self.submit_index % self.TPEs]
+        self.submit_index += 1
+        try:
+            return self.func(rknn, frame.copy()), True, meta
+        except Exception as exc:
+            print(f"RKNN current inference failed: {exc}")
+            return None, False, meta
+
     def release(self):
         self.pool.shutdown(wait=True)
         for rknn_lite in self.rknnPool:

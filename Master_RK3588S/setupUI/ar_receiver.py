@@ -28,7 +28,7 @@ from control_local_planner import LocalPlanner
 from status_runtime import RuntimeStatusStore
 from control_task_state_machine import TaskStateMachine
 from performance_monitor import PerformanceMonitor
-from ui_debug_stream_server import DebugStreamServer
+from ui_debug_stream_server import DebugStreamServer, apply_current_thread_affinity
 from vision_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
 from vision_pipeline import VisionPipeline
 from webui_status_server import WebUIStatusServer
@@ -52,6 +52,8 @@ DEBUG_STATUS_PATH = os.environ.get("AR_POSE_STATUS_PATH", os.path.join(BASE_DIR,
 DEBUG_PACKET_PATH = os.environ.get("AR_POSE_PACKET_PATH", os.path.join(BASE_DIR, "xverse_control_live.json"))
 DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEBUG_DRAW_POSE_PANEL = True
+DEBUG_LOCAL_PREVIEW = os.environ.get("AR_LOCAL_PREVIEW", "0").strip().lower() not in ("0", "false", "no", "off")
+MAIN_CPUSET = os.environ.get("AR_MAIN_CPUSET", "").strip()
 POSE_STATUS_HTTP_HOST = os.environ.get("AR_POSE_STATUS_HOST", "0.0.0.0")
 POSE_STATUS_HTTP_PORT = int(os.environ.get("AR_POSE_STATUS_PORT", "9105"))
 
@@ -124,6 +126,7 @@ atexit.register(stop_car_on_exit)
 
 def main():
     global vision_pipeline
+    apply_current_thread_affinity(MAIN_CPUSET, write_debug_log, "ar-main")
 
     pose_status_server = WebUIStatusServer(
         host=POSE_STATUS_HTTP_HOST,
@@ -240,7 +243,7 @@ def main():
                                 last_runtime_status_ts = now
                             last_line_loss_command_ts = now
                         time.sleep(0.002)
-                        if cv2.waitKey(1) == 27:
+                        if DEBUG_LOCAL_PREVIEW and cv2.waitKey(1) == 27:
                             raise KeyboardInterrupt
                         continue
                     last_fid = fid
@@ -249,7 +252,7 @@ def main():
                     now = time.time()
                     performance_monitor.begin_frame(fid, now)
                     perf_token = performance_monitor.start()
-                    final_frame, perception = vision_pipeline.process(frame, now)
+                    final_frame, perception = vision_pipeline.process(frame, now, frame_id=fid)
                     performance_monitor.stop("vision_ms", perf_token)
                     perf_token = performance_monitor.start()
                     command, gamepad_status, task_decision, plan_result = build_autonomy_command(now, perception)
@@ -314,10 +317,12 @@ def main():
                     if final_frame is None or final_frame.size == 0:
                         final_frame = frame
                     debug_stream_server.publish(final_frame)
-                    perf_token = performance_monitor.start()
-                    cv2.imshow("ret", final_frame)
-                    key = cv2.waitKey(1)
-                    performance_monitor.stop("display_ms", perf_token)
+                    key = -1
+                    if DEBUG_LOCAL_PREVIEW:
+                        perf_token = performance_monitor.start()
+                        cv2.imshow("ret", final_frame)
+                        key = cv2.waitKey(1)
+                        performance_monitor.stop("display_ms", perf_token)
                     performance_monitor.finish_frame(time.time())
                     if key == 27:
                         raise KeyboardInterrupt
@@ -335,7 +340,8 @@ def main():
                     shm.close()
                 except Exception:
                     pass
-            cv2.destroyAllWindows()
+            if DEBUG_LOCAL_PREVIEW:
+                cv2.destroyAllWindows()
             time.sleep(1.0)
         finally:
             if shm:

@@ -26,27 +26,16 @@ MAX_CENTER_JUMP_RATIO = 0.22
 MIN_MID_POINTS = 4
 SEGMENTATION_LOOKAHEAD_Y = 300
 
-FORK_HISTORY_LEN = 4
-FORK_CONFIRM_FRAMES = 2
-FORK_RELEASE_FRAMES = 4
 FORK_CLASS_CONF = 0.48
 FORK_MISS_CONF = 0.58
 ENABLE_GEOMETRY_ONLY_FORK = os.environ.get("ENABLE_GEOMETRY_ONLY_FORK", "0") == "1"
-FORK_MIN_SPLIT_ROWS = 4
+FORK_MIN_SPLIT_ROWS = 2
 FORK_MIN_BRANCH_POINTS = 4
 FORK_MIN_BRANCH_SEPARATION_RATIO = 0.10
-FORK_MIN_BRANCH_ERROR_SEPARATION_RATIO = 0.08
-
-TEMPORAL_ERROR_ALPHA = 0.65
-TEMPORAL_MAX_ERROR_STEP_RATIO = 0.22
 
 FORK_CLASS_NAMES = ["normal", "fork", "miss"]
 
 _prev_branch_count = 0
-_fork_history = []
-_fork_hold = 0
-_fork_state = "NORMAL"
-_prev_track_error = None
 
 
 def _to_class_map(seg_map):
@@ -345,20 +334,16 @@ def _build_midline(mask):
     return _smooth_path(points, w), True, rows, score
 
 
-def _make_forced_branch_rows(split_rows, index):
-    rows = []
-    for row in split_rows:
-        seg = row["segments"][index]
-        rows.append({"y": row["y"], "segments": [seg]})
-    return rows
-
-
-def _join_stem_and_branch(main_points, branch_points, split_start_y, w):
-    stem = [p for p in main_points if p[1] > split_start_y]
-    merged = stem + branch_points
-    if len(merged) < 2:
-        merged = branch_points
-    return _smooth_path(sorted(merged, key=lambda p: p[1], reverse=True), w)
+def _make_side_rows(rows, side):
+    side_index = 0 if side == "left" else -1
+    forced = []
+    for row in rows:
+        segments = row.get("segments") or []
+        if not segments:
+            continue
+        seg = segments[side_index] if len(segments) >= 2 else segments[0]
+        forced.append({"y": row["y"], "segments": [seg]})
+    return forced
 
 
 def _point_x_at_y(points, target_y, w):
@@ -379,7 +364,7 @@ def _path_error(points, center_x, lookahead_y, w):
     return float(x - center_x)
 
 
-def _extract_fork_geometry(rows, main_points, center_x, lookahead_y, w):
+def _extract_fork_geometry(rows, center_x, lookahead_y, w):
     min_sep = max(28.0, w * FORK_MIN_BRANCH_SEPARATION_RATIO)
     split_rows = []
     for row in rows:
@@ -403,11 +388,11 @@ def _extract_fork_geometry(rows, main_points, center_x, lookahead_y, w):
             "candidates": [],
         }
 
-    left_branch_rows = _make_forced_branch_rows(split_rows, 0)
-    right_branch_rows = _make_forced_branch_rows(split_rows, -1)
-    left_branch, left_score = _path_from_rows(left_branch_rows, w, start_ref=center_x, side="left")
-    right_branch, right_score = _path_from_rows(right_branch_rows, w, start_ref=center_x, side="right")
-    if len(left_branch) < FORK_MIN_BRANCH_POINTS or len(right_branch) < FORK_MIN_BRANCH_POINTS:
+    left_rows = _make_side_rows(rows, "left")
+    right_rows = _make_side_rows(rows, "right")
+    left_path, left_score = _path_from_rows(left_rows, w, start_ref=center_x, side="left")
+    right_path, right_score = _path_from_rows(right_rows, w, start_ref=center_x, side="right")
+    if len(left_path) < FORK_MIN_BRANCH_POINTS or len(right_path) < FORK_MIN_BRANCH_POINTS:
         return {
             "valid": False,
             "reason": "short_branch",
@@ -415,9 +400,8 @@ def _extract_fork_geometry(rows, main_points, center_x, lookahead_y, w):
             "candidates": [],
         }
 
-    split_start_y = max(row["y"] for row in split_rows)
-    left_path = _join_stem_and_branch(main_points, left_branch, split_start_y, w)
-    right_path = _join_stem_and_branch(main_points, right_branch, split_start_y, w)
+    left_path = _smooth_path(left_path, w)
+    right_path = _smooth_path(right_path, w)
     left_err = _path_error(left_path, center_x, lookahead_y, w)
     right_err = _path_error(right_path, center_x, lookahead_y, w)
     if left_err is None or right_err is None:
@@ -428,23 +412,17 @@ def _extract_fork_geometry(rows, main_points, center_x, lookahead_y, w):
             "candidates": [],
         }
 
-    if abs(float(right_err) - float(left_err)) < max(24.0, w * FORK_MIN_BRANCH_ERROR_SEPARATION_RATIO):
-        return {
-            "valid": False,
-            "reason": "weak_separation",
-            "split_rows": len(split_rows),
-            "candidates": [],
-        }
-
     candidates = [
         {
             "side": "left",
+            "branch": "outer",
             "path": [(int(x), int(y)) for x, y in left_path],
             "error": float(left_err),
             "score": float(left_score),
         },
         {
             "side": "right",
+            "branch": "inner",
             "path": [(int(x), int(y)) for x, y in right_path],
             "error": float(right_err),
             "score": float(right_score),
@@ -530,87 +508,38 @@ def _run_fork_classifier(fork_classifier, road_mask):
 
 
 def _update_fork_state(fork_cls, geometry, road_valid):
-    global _fork_history, _fork_hold, _fork_state
+    if not road_valid:
+        return "MISS"
 
     geometry_valid = bool(geometry.get("valid"))
     cls_available = bool(fork_cls.get("available"))
     cls_label = fork_cls.get("label")
     cls_conf = float(fork_cls.get("confidence") or 0.0)
 
-    miss_vote = (not road_valid) or (cls_available and cls_label == 2 and cls_conf >= FORK_MISS_CONF)
-    if miss_vote:
-        _fork_history = []
-        _fork_hold = 0
-        _fork_state = "MISS"
-        return _fork_state
+    if cls_available and cls_label == 2 and cls_conf >= FORK_MISS_CONF:
+        return "MISS"
 
     if cls_available:
-        fork_vote = geometry_valid and cls_label == 1 and cls_conf >= FORK_CLASS_CONF
-        normal_vote = cls_label == 0 and cls_conf >= 0.62
-    else:
-        fork_vote = bool(ENABLE_GEOMETRY_ONLY_FORK and geometry_valid)
-        normal_vote = True
+        if geometry_valid and cls_label == 1 and cls_conf >= FORK_CLASS_CONF:
+            return "FORK_CONFIRMED"
+        if cls_label == 1:
+            return "FORK_CANDIDATE"
+        return "NORMAL"
 
-    _fork_history.append(bool(fork_vote))
-    if len(_fork_history) > FORK_HISTORY_LEN:
-        _fork_history = _fork_history[-FORK_HISTORY_LEN:]
-
-    recent_confirm = sum(1 for v in _fork_history[-FORK_CONFIRM_FRAMES:] if v) >= FORK_CONFIRM_FRAMES
-    if recent_confirm:
-        _fork_hold = FORK_RELEASE_FRAMES
-        _fork_state = "FORK_CONFIRMED"
-    elif fork_vote:
-        _fork_state = "FORK_CANDIDATE"
-    elif _fork_hold > 0 and not normal_vote:
-        _fork_hold -= 1
-        _fork_state = "FORK_CONFIRMED" if geometry_valid else "FORK_CANDIDATE"
-    else:
-        _fork_hold = max(0, _fork_hold - 1)
-        _fork_state = "NORMAL"
-
-    return _fork_state
+    if ENABLE_GEOMETRY_ONLY_FORK and geometry_valid:
+        return "FORK_CONFIRMED"
+    return "NORMAL"
 
 
-def _choose_control_path(main_points, fork_candidates, center_x, lookahead_y, w, fork_state):
-    global _prev_track_error
-
-    if fork_state != "FORK_CONFIRMED" or len(fork_candidates) < 2:
+def _choose_control_path(main_points, fork_candidates):
+    if len(fork_candidates) < 2:
         return main_points, "main"
 
-    ref_error = 0.0 if _prev_track_error is None else float(_prev_track_error)
-    best = None
-    best_cost = 1e18
     for candidate in fork_candidates:
-        path = candidate.get("path") or []
-        err = _path_error(path, center_x, lookahead_y, w)
-        if err is None:
-            continue
-        cost = abs(float(err) - ref_error)
-        if cost < best_cost:
-            best = candidate
-            best_cost = cost
-
-    if best is None:
-        return main_points, "main"
-    return best.get("path") or main_points, str(best.get("side") or "fork")
-
-
-def _filter_track_error(raw_error, w):
-    global _prev_track_error
-    if raw_error is None:
-        _prev_track_error = None
-        return None
-
-    raw_error = float(raw_error)
-    if _prev_track_error is None:
-        _prev_track_error = raw_error
-        return raw_error
-
-    max_step = max(35.0, float(w) * TEMPORAL_MAX_ERROR_STEP_RATIO)
-    limited = float(np.clip(raw_error, _prev_track_error - max_step, _prev_track_error + max_step))
-    filtered = TEMPORAL_ERROR_ALPHA * limited + (1.0 - TEMPORAL_ERROR_ALPHA) * _prev_track_error
-    _prev_track_error = filtered
-    return filtered
+        if candidate.get("side") == "left":
+            return candidate.get("path") or main_points, "left"
+    candidate = fork_candidates[0]
+    return candidate.get("path") or main_points, str(candidate.get("side") or "fork")
 
 
 def _draw_path(frame, points, color, thickness=4):
@@ -621,11 +550,9 @@ def _draw_path(frame, points, color, thickness=4):
 
 
 def _draw_centerlines(frame, mask, selected_points, fork_candidates, fork_state, selected_side):
-    if fork_state == "FORK_CONFIRMED":
+    if len(fork_candidates) >= 2:
         for candidate in fork_candidates:
-            side = candidate.get("side")
-            color = (255, 180, 0) if side == "left" else (255, 0, 255)
-            _draw_path(frame, candidate.get("path") or [], color, 3)
+            _draw_path(frame, candidate.get("path") or [], (96, 96, 96), 3)
 
     _draw_path(frame, selected_points, (0, 0, 255), 5)
     if not selected_points:
@@ -637,7 +564,7 @@ def _draw_centerlines(frame, mask, selected_points, fork_candidates, fork_state,
     if tx is None:
         return None
     cv2.circle(frame, (int(round(tx)), lookahead_y), 8, (0, 255, 255), -1)
-    if fork_state == "FORK_CONFIRMED":
+    if len(fork_candidates) >= 2:
         cv2.putText(
             frame,
             f"selected: {selected_side}",
@@ -708,8 +635,8 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
     fork_raw = _run_fork_classifier(fork_classifier, road_mask) if road_valid else None
     fork_cls = _parse_fork_result(fork_raw)
     geometry = (
-        _extract_fork_geometry(rows, mid_points, center_x, lookahead_y, w)
-        if road_valid and mid_ok
+        _extract_fork_geometry(rows, center_x, lookahead_y, w)
+        if road_valid and rows
         else {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
     )
     fork_state = _update_fork_state(fork_cls, geometry, road_valid)
@@ -717,13 +644,10 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
     selected_points, selected_side = _choose_control_path(
         mid_points,
         fork_candidates,
-        center_x,
-        lookahead_y,
-        w,
-        fork_state,
     )
 
-    draw_points = selected_points if mid_ok else []
+    selected_ok = len(selected_points) >= MIN_MID_POINTS
+    draw_points = selected_points if selected_ok else []
     target_x = _draw_centerlines(out, road_mask, draw_points, fork_candidates, fork_state, selected_side)
 
     if DRAW_CAMERA_CENTER_REFERENCE:
@@ -732,15 +656,15 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
     track_error = None
     control_center_x = None
     raw_error = None
-    if mid_ok and len(draw_points) >= 2:
+    if selected_ok and len(draw_points) >= 2:
         control_center_x = _point_x_at_y(draw_points, lookahead_y, w)
         if control_center_x is not None:
             raw_error = float(control_center_x - center_x)
-            track_error = _filter_track_error(raw_error, w)
+            track_error = raw_error
             cv2.circle(out, (int(round(control_center_x)), lookahead_y), 6, (0, 255, 0), -1)
 
     road_state = "OK" if road_valid else "LOST"
-    mid_state = "OK" if mid_ok else "LOST"
+    mid_state = "OK" if selected_ok else "LOST"
     state_color = (0, 255, 0) if road_valid else (0, 165, 255)
     fork_color = (0, 255, 255)
     if fork_state == "FORK_CONFIRMED":
@@ -769,7 +693,7 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
         "road_valid": bool(road_valid),
         "road_held": False,
         "road_state": road_state,
-        "midline_valid": bool(mid_ok),
+        "midline_valid": bool(selected_ok),
         "midline_state": mid_state,
         "road_ratio": float(ratio),
         "reason": reason,
@@ -783,13 +707,14 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
         "mid_points": [(int(x), int(y)) for x, y in draw_points],
         "midline_score": float(mid_score),
         "fork_state": fork_state,
-        "fork_mode": "dual" if fork_state == "FORK_CONFIRMED" and len(fork_candidates) >= 2 else "single",
+        "fork_mode": "dual" if len(fork_candidates) >= 2 else "single",
         "fork_classifier": fork_cls,
         "fork_geometry_valid": bool(geometry.get("valid")),
         "fork_split_rows": int(geometry.get("split_rows", 0)),
         "fork_candidates": [
             {
                 "side": str(c.get("side")),
+                "branch": str(c.get("branch") or ""),
                 "error": float(c.get("error", 0.0)),
                 "score": float(c.get("score", 0.0)),
                 "points": [(int(x), int(y)) for x, y in (c.get("path") or [])],
