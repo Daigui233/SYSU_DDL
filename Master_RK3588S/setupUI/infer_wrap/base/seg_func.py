@@ -612,13 +612,90 @@ def _empty_centerline_info(frame, reason="lost"):
     }
 
 
-def extract_centerline_info(seg_map, frame, fork_classifier=None):
+def draw_centerline_debug(frame, info):
+    info = dict(info or {})
+    road_mask = info.get("road_mask")
+    if road_mask is None:
+        road_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    else:
+        road_mask = np.asarray(road_mask, dtype=np.uint8)
+
+    out = _overlay_road(frame.copy(), road_mask)
+    h, w = out.shape[:2]
+    center_x = int(info.get("center_x") or (w // 2))
+    lookahead_y = int(np.clip(info.get("segmentation_lookahead_y", SEGMENTATION_LOOKAHEAD_Y), 0, h - 1))
+    selected_points = [(int(x), int(y)) for x, y in (info.get("mid_points") or [])]
+    fork_candidates = []
+    for candidate in info.get("fork_candidates") or []:
+        item = dict(candidate)
+        item["path"] = [(int(x), int(y)) for x, y in (item.get("path") or item.get("points") or [])]
+        fork_candidates.append(item)
+
+    _draw_centerlines(
+        out,
+        road_mask,
+        selected_points,
+        fork_candidates,
+        info.get("fork_state") or "MISS",
+        info.get("fork_selected_side") or "main",
+    )
+
+    if DRAW_CAMERA_CENTER_REFERENCE:
+        cv2.line(out, (center_x, h - 1), (center_x, int(h * 0.55)), (255, 255, 0), 1)
+
+    control_center_x = info.get("control_center_x")
+    if control_center_x is not None:
+        cv2.circle(out, (int(round(float(control_center_x))), lookahead_y), 6, (0, 255, 0), -1)
+
+    road_valid = bool(info.get("road_valid"))
+    road_state = str(info.get("road_state") or ("OK" if road_valid else "LOST"))
+    mid_state = str(info.get("midline_state") or ("OK" if info.get("midline_valid") else "LOST"))
+    ratio = float(info.get("road_ratio") or 0.0)
+    reason = str(info.get("reason") or "")
+    state_color = (0, 255, 0) if road_valid else (0, 165, 255)
+    fork_state = str(info.get("fork_state") or "MISS")
+    fork_color = (0, 255, 255)
+    if fork_state == "FORK_CONFIRMED":
+        fork_color = (255, 0, 255)
+    elif fork_state == "MISS":
+        fork_color = (0, 165, 255)
+
+    fork_cls = info.get("fork_classifier") or {}
+    fork_name = str(fork_cls.get("name") or "none")
+    try:
+        fork_conf = float(fork_cls.get("confidence") or 0.0)
+    except Exception:
+        fork_conf = 0.0
+    split_rows = int(info.get("fork_split_rows") or 0)
+    branch_count = int(info.get("branch_count") or 0)
+    track_error = info.get("track_error")
+    err_text = f"Track err: {float(track_error):.1f}" if track_error is not None else "Track err: N/A"
+
+    cv2.putText(out, f"Road seg: {road_state} {ratio:.1%} {reason}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
+    cv2.putText(out, f"Midline: {mid_state}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
+    cv2.putText(out, err_text, (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+    cv2.putText(
+        out,
+        f"Fork: {fork_state} cls={fork_name} {fork_conf:.2f} split={split_rows}",
+        (10, 144),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        fork_color,
+        2,
+    )
+    cv2.putText(out, f"Branches: {branch_count}", (10, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+    return out
+
+
+def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=True):
     try:
         class_map = _to_class_map(seg_map)
     except ValueError as exc:
-        out = frame.copy()
-        cv2.putText(out, "SEG MAP ERROR", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
-        cv2.putText(out, str(exc), (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        out = frame
+        if draw_debug:
+            out = frame.copy()
+            cv2.putText(out, "SEG MAP ERROR", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
+            cv2.putText(out, str(exc), (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
         return out, _empty_centerline_info(frame, reason=str(exc))
 
     raw_mask = _make_raw_mask(class_map)
@@ -626,7 +703,6 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
     selected, selected_valid = _select_road(raw_mask)
     road_mask, road_valid, ratio, reason = _valid_mask(selected, selected_valid, raw_ratio)
 
-    out = _overlay_road(frame.copy(), road_mask)
     h, w = road_mask.shape
     center_x = w // 2
     lookahead_y = int(np.clip(SEGMENTATION_LOOKAHEAD_Y, 0, h - 1))
@@ -648,44 +724,18 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
 
     selected_ok = len(selected_points) >= MIN_MID_POINTS
     draw_points = selected_points if selected_ok else []
-    target_x = _draw_centerlines(out, road_mask, draw_points, fork_candidates, fork_state, selected_side)
-
-    if DRAW_CAMERA_CENTER_REFERENCE:
-        cv2.line(out, (center_x, h - 1), (center_x, int(h * 0.55)), (255, 255, 0), 1)
-
+    target_x = _point_x_at_y(draw_points, lookahead_y, w) if selected_ok else None
     track_error = None
     control_center_x = None
     raw_error = None
     if selected_ok and len(draw_points) >= 2:
-        control_center_x = _point_x_at_y(draw_points, lookahead_y, w)
+        control_center_x = target_x
         if control_center_x is not None:
             raw_error = float(control_center_x - center_x)
             track_error = raw_error
-            cv2.circle(out, (int(round(control_center_x)), lookahead_y), 6, (0, 255, 0), -1)
 
     road_state = "OK" if road_valid else "LOST"
     mid_state = "OK" if selected_ok else "LOST"
-    state_color = (0, 255, 0) if road_valid else (0, 165, 255)
-    fork_color = (0, 255, 255)
-    if fork_state == "FORK_CONFIRMED":
-        fork_color = (255, 0, 255)
-    elif fork_state == "MISS":
-        fork_color = (0, 165, 255)
-
-    cv2.putText(out, f"Road seg: {road_state} {ratio:.1%} {reason}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
-    cv2.putText(out, f"Midline: {mid_state}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
-    err_text = f"Track err: {track_error:.1f}" if track_error is not None else "Track err: N/A"
-    cv2.putText(out, err_text, (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-    cv2.putText(
-        out,
-        f"Fork: {fork_state} cls={fork_cls['name']} {fork_cls['confidence']:.2f} split={geometry.get('split_rows', 0)}",
-        (10, 144),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        fork_color,
-        2,
-    )
-    cv2.putText(out, f"Branches: {_prev_branch_count}", (10, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
     info = {
         "line_valid": track_error is not None,
@@ -724,6 +774,7 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None):
         "fork_selected_side": selected_side if selected_side != "main" else None,
         "fork_reason": str(geometry.get("reason") or reason),
     }
+    out = draw_centerline_debug(frame, info) if draw_debug else frame
     return out, info
 
 

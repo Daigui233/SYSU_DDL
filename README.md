@@ -50,6 +50,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Master_RK3588S/setupUI/performance_monitor.py` | 运行时性能探针：统计 AR 帧率、主循环耗时、HUD/显示耗时、NPU/温度信息，并写入 CSV |
 | `Master_RK3588S/setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
 | `Master_RK3588S/setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
+| `Master_RK3588S/setupUI/ui_debug_render_worker.py` | latest-only 调试画面渲染线程：绘制分割/检测/规划/HUD，慢时丢 debug 帧，不阻塞控车主循环 |
 | `Master_RK3588S/setupUI/ui_debug_stream_server.py` | 独立调试视频流服务，把完整 HUD 调试画面发布到浏览器可访问的 MJPEG 端口 |
 | `Master_RK3588S/setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
 | `Master_RK3588S/setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
@@ -87,8 +88,9 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 如果采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要定位转发和手柄控车，可在 RK3588S 手动运行 `python3 Master_RK3588S/setupUI/standalone_control_bridge.py`；该备用脚本不要和 `ar_receiver.py` 同时运行。
 - TC264D 保留现有串口协议，本地输入超时为 `0.5 s`；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。舵机转向已关闭大误差 boost，当前使用 `FULL_STEER_ERROR_PX=320` 的线性 P 映射，再经 `Servo.h` 硬限幅。
 - TC264D 反馈帧已扩展到 v3：HUD 会显示 `ERR cmd/tc/d`、`SERVO pwm/raw/lim`、`MOTOR tgt/act/out`、`MOTOR ff/pid`、`SAFE to/st/ss/ms/db` 和 `FB seq/bad/drop/fmt`，用于录视频后判断问题在上位机命令、串口传输、下位机限幅/PID 还是机械响应。
-- `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、HUD 绘制、窗口显示还是硬件降频。
-- `ui_debug_stream_server.py` 已接入 `ar_receiver.py`：发布的是完整调试画面，即分割/检测/局部规划目标线 + 左侧裁判事件 + 右侧调试 HUD；网络慢时浏览器端丢帧，不阻塞控车主循环。
+- `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、控制主循环、debug 渲染/JPEG 编码还是硬件降频。
+- `ui_debug_render_worker.py` 和 `ui_debug_stream_server.py` 已接入 `ar_receiver.py`：发布的是完整调试画面，即分割/检测/局部规划目标线 + 左侧裁判事件 + 右侧调试 HUD；debug 画面渲染和 MJPEG 编码在独立线程中 latest-only 处理，慢时丢 debug 帧，不阻塞控车主循环。
+- HUD 右侧性能行含义：`FPS ctrl/raw/loop` 分别表示控车循环统计值、共享内存输入帧率估计、性能监控主循环帧率；`DBG r/enc/pub/drop` 分别表示 debug 渲染 FPS、JPEG 编码 FPS、debug 发布 FPS、渲染/编码前丢弃的 debug 帧数。若 `ctrl/loop` 高但 `DBG` 低，是显示链路慢，不代表实际控车低帧。
 
 ## 当前仍保留的软件处理
 
@@ -128,7 +130,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 
 1. `RECOVER_LINE` 还可以更聪明：当前丢线恢复主要依赖 `control_local_planner.py` 保持/衰减上一帧 `final_track_error`。如果入弯时转向偏慢、目标线跑出视野，单纯衰减可能会越恢复越接近直行。后续应加入最近误差趋势、弯道方向保持和低速搜索恢复。
 2. 上下位机状态契约需要自动校验：当前状态码同时存在于 `control_states.py`、`control_serial_comm.py`、`control_car_link.py` 和 `Slave_TC264D/code/State.h`。虽然文档已对齐，但后续新增状态时仍有手工漏改风险。建议增加轻量检查脚本或测试，验证 Python 状态映射和 TC264D 枚举值一致。
-3. `ar_receiver.py` 仍承担过多运行细节：它现在保持主入口名称不变，但同时负责帧循环、无新帧重复下发、状态写入、HUD 显示和模块生命周期。后续可以在不改入口名的前提下，把控制循环、运行状态组装和显示更新拆成更小模块。
+3. `ar_receiver.py` 仍承担较多运行调度：它现在保持主入口名称不变，负责帧循环、无新帧重复下发、状态写入和模块生命周期；HUD/调试画面绘制已拆到 `ui_debug_render_worker.py`，后续还可以继续把控制循环和运行状态组装拆成更小模块。
 4. WebUI/HUD 调车信息还可以更完整：当前能看到控制状态、误差、速度和串口反馈，但对状态机 `reason`、`perception_quality`、`planner_reason`、`line_loss_age`、检测目标摘要等信息展示不足。后续应把 `task_decision` 和 `plan_result` 写入 `/pose_status`。
 5. 缺少离线回放和单元测试：状态切换、丢线恢复、避人/避车/金币偏置、串口状态码映射都适合用保存下来的 perception 数据做回放测试。后续应补充最小测试集，先验证不改协议、不误触发、不在短时丢线时过早停车。
 6. 岔路识别语义需要重构：当前 HUD 中的 `Branches` 实际表示 `road_mask` 连通域数量，很多真实岔路在分割上仍是一个连通域，因此 `Branches=1` 不代表没有岔路。后续应新增独立的 `road_topology` 或 `road_path_state`，用多条采样行的横向 segment 数量、segment 宽度、间距和连续帧稳定性判断 `ROAD_SINGLE / ROAD_FORK / ROAD_MERGE / ROAD_UNKNOWN`，再把 `AVOID_STONE` 分岔选择建立在该路况状态上。
@@ -146,7 +148,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 6. 计圈与终点：`Door + BeginSign` 用于起跑计圈，`Door` 用于过圈；`EndSign` 只有在比赛已开始且进入最后一圈后才允许触发，并且需要连续稳定看到一小段时间才会 `finish_armed`，随后在 `EndSign` 消失超过短 TTL 后进入 `ENDSIGN_STOP`。如果 BeginSign 漏检、Door 长时间停留在画面里、检测框闪烁或 EndSign 被遮挡，可能导致漏计、重复计或无法停车。相关参数集中在 `control_race_state_machine.py` 顶部。
 7. 丢线恢复：短时丢线会进入 `RECOVER_LINE`，连续约 `0.8 s` 无有效中线才进入 `LINE_LOSS_SAFE_STOP`。如果入弯时经常丢线后恢复失败，问题可能是分割视野、车速、舵机响应或恢复策略共同导致，不应只看模型。恢复计时在 `control_task_state_machine.py`，恢复误差衰减在 `control_local_planner.py`。
 8. 下位机控制响应：上位机输出的是图像像素误差，TC264D 负责舵机线性 P、速度闭环、PWM 硬限幅和安全保护。若 HUD 中 `final_track_error / CMD err / TC264D input_track_error` 已经一致且数值足够大但车仍转不过来，优先检查 `Slave_TC264D/code/Control.c` 中 `SERVO_FULL_STEER_ERROR_PX`、`Servo.h` 硬限幅和机械舵机角度；若直道摆动，则优先减小小误差增益或重新讨论是否加入少量阻尼。
-9. 调试显示与主循环负载：`8090/debug_feed` 会发布完整 HUD 画面，网络慢时浏览器端丢帧，不应阻塞主循环。若 FPS 明显下降，先看 HUD 中 `PERF raw / loop / vision / command / hud / display / total`，判断是 AR 输入源、视觉推理、规划/绘制、本地窗口还是 MJPEG 编码瓶颈。
+9. 调试显示与主循环负载：`8090/debug_feed` 会发布完整 HUD 画面，debug 渲染和 MJPEG 编码慢时只丢 debug 帧，不应阻塞控车主循环。若 FPS 明显下降，先看 HUD 中 `FPS ctrl/raw/loop` 判断实际控车帧率，再看 `DBG r/enc/pub/drop` 和 `MS ai/cmd/ctrl/dbg/jpg` 判断是视觉推理、控制主循环、debug 绘制还是 JPEG/网络链路瓶颈。
 10. 状态显示可观测性：当前 HUD 已能显示主要状态和误差，但比赛事件的细节、状态机 `reason`、检测目标摘要还不够完整。若实测时出现“状态切换原因不清楚”，后续应优先把 `task_decision`、`race_state` 和 `plan_result` 更完整地写入 `/pose_status` 和 HUD。
 
 主要调参入口：

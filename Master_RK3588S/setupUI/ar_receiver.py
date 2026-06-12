@@ -23,12 +23,12 @@ from control_arbitrator import ControlArbitrator
 from control_states import TaskState, task_state_to_tc264_state
 from debug_tools import PosePathDebugPrinter, RotatingDebugLogger
 from control_gamepad_receiver import GAMEPAD_CONTROL_PORT, GamepadControlReceiver
-from ui_hud_renderer import draw_pose_status
 from control_local_planner import LocalPlanner
 from status_runtime import RuntimeStatusStore
 from control_task_state_machine import TaskStateMachine
 from performance_monitor import PerformanceMonitor
 from ui_debug_stream_server import DebugStreamServer, apply_current_thread_affinity
+from ui_debug_render_worker import DebugRenderWorker
 from vision_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
 from vision_pipeline import VisionPipeline
 from webui_status_server import WebUIStatusServer
@@ -54,6 +54,7 @@ DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEBUG_DRAW_POSE_PANEL = True
 DEBUG_LOCAL_PREVIEW = os.environ.get("AR_LOCAL_PREVIEW", "0").strip().lower() not in ("0", "false", "no", "off")
 MAIN_CPUSET = os.environ.get("AR_MAIN_CPUSET", "").strip()
+DEBUG_RENDER_CPUSET = os.environ.get("AR_DEBUG_RENDER_CPUSET", "").strip()
 POSE_STATUS_HTTP_HOST = os.environ.get("AR_POSE_STATUS_HOST", "0.0.0.0")
 POSE_STATUS_HTTP_PORT = int(os.environ.get("AR_POSE_STATUS_PORT", "9105"))
 
@@ -164,6 +165,19 @@ def main():
     )
     performance_monitor = PerformanceMonitor(log_func=write_debug_log)
     debug_stream_server = DebugStreamServer(log_func=write_debug_log).start()
+    debug_render_worker = DebugRenderWorker(
+        vision_pipeline=vision_pipeline,
+        local_planner=local_planner,
+        debug_stream_server=debug_stream_server,
+        pose_bridge=pose_bridge,
+        get_car_feedback=get_car_feedback,
+        performance_provider=performance_monitor.hud_snapshot,
+        pose_input_port=POSE_INPUT_PORT,
+        draw_pose_panel=DEBUG_DRAW_POSE_PANEL,
+        local_preview=DEBUG_LOCAL_PREVIEW,
+        cpu_set=DEBUG_RENDER_CPUSET,
+        log_func=write_debug_log,
+    ).start()
 
     def build_autonomy_command(now, perception):
         task_decision = task_state_machine.update(perception, now)
@@ -186,6 +200,16 @@ def main():
             line_loss_age=task_decision.get("line_loss_age", 0.0),
         )
         return command, gamepad_status, task_decision, plan_result
+
+    def runtime_performance_snapshot():
+        data = performance_monitor.snapshot()
+        if not isinstance(data, dict):
+            data = {"enabled": False}
+        else:
+            data = dict(data)
+        data["debug_render"] = debug_render_worker.snapshot()
+        data["debug_stream"] = debug_stream_server.snapshot()
+        return data
 
     print("vision client ready, waiting for camera shared memory...")
     last_line_loss_command_ts = 0.0
@@ -238,13 +262,11 @@ def main():
                                     command_state,
                                     command_flags,
                                     gamepad_status=gamepad_status,
-                                    performance_status=performance_monitor.snapshot(),
+                                    performance_status=runtime_performance_snapshot(),
                                 )
                                 last_runtime_status_ts = now
                             last_line_loss_command_ts = now
                         time.sleep(0.002)
-                        if DEBUG_LOCAL_PREVIEW and cv2.waitKey(1) == 27:
-                            raise KeyboardInterrupt
                         continue
                     last_fid = fid
                     have_frame = True
@@ -252,14 +274,11 @@ def main():
                     now = time.time()
                     performance_monitor.begin_frame(fid, now)
                     perf_token = performance_monitor.start()
-                    final_frame, perception = vision_pipeline.process(frame, now, frame_id=fid)
+                    _, perception = vision_pipeline.process(frame, now, frame_id=fid, draw_debug=False)
                     performance_monitor.stop("vision_ms", perf_token)
                     perf_token = performance_monitor.start()
                     command, gamepad_status, task_decision, plan_result = build_autonomy_command(now, perception)
                     performance_monitor.stop("command_ms", perf_token)
-                    perf_token = performance_monitor.start()
-                    final_frame = local_planner.draw_debug(final_frame, task_decision, plan_result)
-                    performance_monitor.stop("planner_draw_ms", perf_token)
                     command_error = command["track_error"]
                     command_speed = command["target_speed"]
                     command_state = command["state_cmd"]
@@ -286,7 +305,7 @@ def main():
                             command_state,
                             command_flags,
                             gamepad_status=gamepad_status,
-                            performance_status=performance_monitor.snapshot(),
+                            performance_status=runtime_performance_snapshot(),
                             perception=perception,
                         )
                         performance_monitor.stop("runtime_status_ms", perf_token)
@@ -298,34 +317,17 @@ def main():
                         fps_n = 0
                         fps_t = now
 
-                    perf_token = performance_monitor.start()
-                    final_frame = draw_pose_status(
-                        final_frame,
-                        pose_bridge,
-                        fps=cur_fps,
-                        track_error=command_error,
-                        control_state=control_state_text,
-                        gamepad_status=gamepad_status,
-                        get_car_feedback=get_car_feedback,
-                        pose_input_port=POSE_INPUT_PORT,
-                        performance_status=performance_monitor.hud_snapshot(),
-                        target_speed=command_speed,
-                        segmentation_status=(perception or {}).get("segmentation"),
-                        enabled=DEBUG_DRAW_POSE_PANEL,
-                    )
-                    performance_monitor.stop("hud_ms", perf_token)
-                    if final_frame is None or final_frame.size == 0:
-                        final_frame = frame
-                    debug_stream_server.publish(final_frame)
-                    key = -1
-                    if DEBUG_LOCAL_PREVIEW:
-                        perf_token = performance_monitor.start()
-                        cv2.imshow("ret", final_frame)
-                        key = cv2.waitKey(1)
-                        performance_monitor.stop("display_ms", perf_token)
                     performance_monitor.finish_frame(time.time())
-                    if key == 27:
-                        raise KeyboardInterrupt
+                    debug_render_worker.publish(
+                        frame=frame,
+                        frame_id=fid,
+                        perception=perception,
+                        task_decision=task_decision,
+                        plan_result=plan_result,
+                        command=command,
+                        gamepad_status=gamepad_status,
+                        control_fps=cur_fps,
+                    )
 
                 except (ValueError, StructError, BufferError):
                     raise FileNotFoundError
@@ -340,8 +342,6 @@ def main():
                     shm.close()
                 except Exception:
                     pass
-            if DEBUG_LOCAL_PREVIEW:
-                cv2.destroyAllWindows()
             time.sleep(1.0)
         finally:
             if shm:
@@ -358,12 +358,13 @@ def main():
         0.0,
         STATE_SAFE_STOP,
         0,
-        performance_status=performance_monitor.snapshot(),
+        performance_status=runtime_performance_snapshot(),
     )
     pose_bridge.stop()
     gamepad_receiver.stop()
     if pose_status_server is not None:
         pose_status_server.stop()
+    debug_render_worker.stop()
     debug_stream_server.stop()
     if vision_pipeline is not None:
         vision_pipeline.release()

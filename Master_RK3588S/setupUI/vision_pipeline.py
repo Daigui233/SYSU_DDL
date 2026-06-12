@@ -5,7 +5,7 @@ import cv2
 
 from infer_wrap import InferWrap, PPSegInfer
 from infer_wrap.base.func import CLASSES, draw
-from infer_wrap.base.seg_func import extract_centerline_info
+from infer_wrap.base.seg_func import draw_centerline_debug, extract_centerline_info
 try:
     from infer_wrap.base.seg_infer import ForkMaskClsInfer
 except Exception:
@@ -238,8 +238,50 @@ class VisionPipeline:
                 2,
             )
 
-    def process(self, frame, now, frame_id=None):
-        final_frame = frame.copy()
+    @staticmethod
+    def _draw_detection_list(frame, detections):
+        if not detections:
+            return frame
+        h, w = frame.shape[:2]
+        for det in detections:
+            bbox = det.get("bbox") or [0, 0, 0, 0]
+            left, top, right, bottom = [int(v) for v in bbox]
+            left = max(0, min(w - 1, left))
+            right = max(0, min(w - 1, right))
+            top = max(0, min(h - 1, top))
+            bottom = max(0, min(h - 1, bottom))
+            if right <= left or bottom <= top:
+                continue
+            label = det.get("label") or det.get("category") or "obj"
+            score = float(det.get("score") or 0.0)
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                f"{label} {score:.2f}",
+                (left, max(20, top - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+            )
+        return frame
+
+    def draw_debug_frame(self, frame, perception):
+        out = frame.copy()
+        perception = perception or {}
+        segmentation = perception.get("segmentation") or {}
+        if segmentation.get("source") == "current" or segmentation.get("road_mask") is not None:
+            out = draw_centerline_debug(out, segmentation)
+        else:
+            draw_waiting(out)
+
+        detections = list(perception.get("detections") or [])
+        self._draw_detection_list(out, detections)
+        self._draw_detection_extras(out, detections)
+        return out
+
+    def process(self, frame, now, frame_id=None, draw_debug=False):
+        final_frame = frame.copy() if draw_debug else frame
         segmentation = self._empty_segmentation(frame, now, frame_id=frame_id)
         detections = []
 
@@ -262,6 +304,7 @@ class VisionPipeline:
                         seg_res,
                         final_frame,
                         fork_classifier=self.infer_fork,
+                        draw_debug=draw_debug,
                     )
                     seg_done_ts = time.time()
                     seg_age = max(0.0, seg_done_ts - float(seg_meta.get("timestamp") or now))
@@ -275,13 +318,16 @@ class VisionPipeline:
                 else:
                     if seg_flag and seg_res is not None and not frame_matches:
                         segmentation = self._empty_segmentation(frame, now, source="stale_rejected", frame_id=frame_id)
-                    draw_waiting(final_frame)
+                    if draw_debug:
+                        draw_waiting(final_frame)
             except Exception as exc:
                 self._log(f"seg infer skip: {exc}")
                 segmentation = self._empty_segmentation(frame, now, source="seg_error", frame_id=frame_id)
-                draw_waiting(final_frame)
+                if draw_debug:
+                    draw_waiting(final_frame)
         else:
-            draw_waiting(final_frame)
+            if draw_debug:
+                draw_waiting(final_frame)
 
         if self.infer_det is not None:
             try:
@@ -294,15 +340,16 @@ class VisionPipeline:
 
         if self.last_det_res is not None and (now - self.last_det_ts) <= self.det_result_ttl:
             try:
-                boxes, scores, classes = self.last_det_res
-                draw(final_frame, boxes, scores, classes)
                 detections = self._build_detection_list(
                     self.last_det_res,
-                    final_frame,
+                    frame,
                     self.last_det_ts,
                     now - self.last_det_ts,
                 )
-                self._draw_detection_extras(final_frame, detections)
+                if draw_debug:
+                    boxes, scores, classes = self.last_det_res
+                    draw(final_frame, boxes, scores, classes)
+                    self._draw_detection_extras(final_frame, detections)
             except Exception as exc:
                 self._log(f"det draw skip: {exc}")
 

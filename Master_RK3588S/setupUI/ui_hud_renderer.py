@@ -307,28 +307,45 @@ def _format_perf_lines(performance_status):
 
 def _format_compact_perf_lines(performance_status, fps):
     if fps is None:
-        view_text = "N/A"
+        control_text = "N/A"
     else:
-        view_text = f"{fps:.1f}"
+        control_text = f"{fps:.1f}"
 
     if not performance_status or not performance_status.get("enabled"):
-        return [f"FPS view={view_text}"]
+        return [f"FPS ctrl={control_text}"]
 
     stages = performance_status.get("stages_ms") or {}
+    debug_render = performance_status.get("debug_render") or {}
+    debug_stream = performance_status.get("debug_stream") or {}
     raw_fps = _safe_float(performance_status.get("raw_fps"), None)
     loop_fps = _safe_float(performance_status.get("loop_fps"), None)
     total_ms = _safe_float(performance_status.get("total_ms"), None)
     vision_ms = _safe_float(stages.get("vision_ms"), None)
     command_ms = _safe_float(stages.get("command_ms"), None)
+    render_fps = _safe_float(debug_render.get("render_fps"), None)
+    render_ms = _safe_float(debug_render.get("render_ms"), None)
+    encode_fps = _safe_float(debug_stream.get("encode_fps"), None)
+    encode_ms = _safe_float(debug_stream.get("encode_ms"), None)
+    publish_fps = _safe_float(debug_stream.get("publish_fps"), None)
+    render_drop = int(debug_render.get("drop_before_render") or 0)
+    encode_drop = int(debug_stream.get("drop_before_encode") or 0)
 
     def fmt(value):
         return "N/A" if value is None else f"{value:.1f}"
 
     lines = [
-        f"FPS view={view_text} raw={fmt(raw_fps)} loop={fmt(loop_fps)}",
+        f"FPS ctrl={control_text} raw={fmt(raw_fps)} loop={fmt(loop_fps)}",
     ]
+    if debug_render or debug_stream:
+        lines.append(
+            f"DBG r={fmt(render_fps)} enc={fmt(encode_fps)} pub={fmt(publish_fps)} "
+            f"drop={render_drop}/{encode_drop}"
+        )
     if vision_ms is not None or command_ms is not None or total_ms is not None:
-        lines.append(f"MS ai={fmt(vision_ms)} cmd={fmt(command_ms)} total={fmt(total_ms)}")
+        lines.append(
+            f"MS ai={fmt(vision_ms)} cmd={fmt(command_ms)} ctrl={fmt(total_ms)} "
+            f"dbg={fmt(render_ms)} jpg={fmt(encode_ms)}"
+        )
     return lines
 
 
