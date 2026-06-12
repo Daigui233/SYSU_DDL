@@ -41,12 +41,26 @@ TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 RUNTIME_STATUS_INTERVAL = 0.5
 
+
+def _env_flag(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
 # ===== 定位数据终端调试开关 =====
 # Windows AprilTag localization sends official robot_position JSON over UDP.
 # 稳定后如果嫌终端刷屏，把这里改成 False。
-DEBUG_PRINT_POSE = True
-DEBUG_PRINT_POSE_EVERY_N = 1
-DEBUG_LOG_POSE_TO_FILE = True
+DEBUG_PRINT_POSE = _env_flag("AR_DEBUG_PRINT_POSE", False)
+DEBUG_PRINT_POSE_EVERY_N = max(1, _env_int("AR_DEBUG_PRINT_POSE_EVERY_N", 60))
+DEBUG_LOG_POSE_TO_FILE = _env_flag("AR_POSE_LOG_TO_FILE", False)
 DEBUG_LOG_PATH = os.environ.get("AR_POSE_LOG_PATH", os.path.join(BASE_DIR, "ar_pose_debug.log"))
 DEBUG_STATUS_PATH = os.environ.get("AR_POSE_STATUS_PATH", os.path.join(BASE_DIR, "ar_pose_status.json"))
 DEBUG_PACKET_PATH = os.environ.get("AR_POSE_PACKET_PATH", os.path.join(BASE_DIR, "xverse_control_live.json"))
@@ -61,8 +75,8 @@ POSE_STATUS_HTTP_PORT = int(os.environ.get("AR_POSE_STATUS_PORT", "9105"))
 # ===== POSE_PATH_DEBUG_START：定位链路分段验证打印，稳定后可整段删除 =====
 # The staged debug output identifies UDP input, JSON validation, local mirror, and AR forwarding.
 # 删除方法：搜索 POSE_PATH_DEBUG_START 到 POSE_PATH_DEBUG_END，以及代码中的 POSE_PATH_DEBUG 调用点。
-POSE_PATH_DEBUG = True
-POSE_PATH_DEBUG_EVERY_N = 1
+POSE_PATH_DEBUG = _env_flag("AR_POSE_PATH_DEBUG", False)
+POSE_PATH_DEBUG_EVERY_N = max(1, _env_int("AR_POSE_PATH_DEBUG_EVERY_N", 60))
 # ===== POSE_PATH_DEBUG_END =====
 
 def send_car_cmd(track_error, target_speed, state_cmd, flags=CONTROL_FLAG_USE_TARGET_SPEED, mark_activity=True):

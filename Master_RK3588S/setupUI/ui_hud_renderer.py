@@ -470,6 +470,11 @@ def draw_pose_status(
 
     packet = info["last_packet"]
     pose_line = "POSE: waiting"
+    pose_drop = int(info.get("input_drop_count") or 0)
+    pose_rx = int(info.get("datagram_count") or 0)
+    pose_fwd_ms = _safe_float(info.get("last_forward_ms"), 0.0)
+    pose_handle_ms = _safe_float(info.get("last_handle_ms"), 0.0)
+    pose_io_line = f"POSE_IO rx={pose_rx} drop={pose_drop} fwd={pose_fwd_ms:.1f} h={pose_handle_ms:.1f}"
     if packet:
         pos = packet.get("pos", [0.0, 0.0, 0.0])
         euler = packet.get("euler", [0.0, 0.0, 0.0])
@@ -577,6 +582,7 @@ def draw_pose_status(
         seg_line,
         fork_line,
         pose_line,
+        pose_io_line,
     ]
     lines.extend(car_lines)
     lines.extend(_format_compact_perf_lines(performance_status, fps))

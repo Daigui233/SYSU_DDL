@@ -672,7 +672,7 @@
                 );
                 setText(
                     "debug-ar-fwd",
-                    `ok ${data.udp_send_count || 0} · fail ${data.udp_fail_count || 0}`
+                    `ok ${data.udp_send_count || 0} · fail ${data.udp_fail_count || 0} · drop ${data.input_drop_count || 0} · fwd ${fmtNum(data.last_forward_ms, 1)}ms`
                 );
                 setText(
                     "debug-pose",

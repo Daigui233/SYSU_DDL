@@ -13,6 +13,10 @@ DEFAULT_AR_UDP_PORT = 9006
 POSE_INPUT_HOST = os.environ.get("AR_POSE_INPUT_HOST", "0.0.0.0")
 POSE_INPUT_PORT = int(os.environ.get("AR_POSE_INPUT_PORT", "9005"))
 DEBUG_PACKET_PATH = os.environ.get("AR_POSE_PACKET_PATH", os.path.join(BASE_DIR, "xverse_control_live.json"))
+POSE_STATUS_WRITE_INTERVAL = float(os.environ.get("AR_POSE_STATUS_INTERVAL", "0.20"))
+POSE_LIVE_JSON_WRITE_INTERVAL = float(os.environ.get("AR_POSE_LIVE_JSON_INTERVAL", "0.20"))
+POSE_RX_DRAIN_LATEST = os.environ.get("AR_POSE_RX_DRAIN_LATEST", "1").strip().lower() not in ("0", "false", "no", "off")
+POSE_RX_BUFFER_BYTES = int(os.environ.get("AR_POSE_RX_BUFFER_BYTES", "65536"))
 
 POSE_CONVENTION = {
     "field_m": [4.0, 3.0],
@@ -214,6 +218,13 @@ class ARPoseBridge:
         self.udp_send_count = 0
         self.udp_fail_count = 0
         self.live_json_count = 0
+        self.input_drop_count = 0
+        self.last_recv_ts = 0.0
+        self.last_forward_ts = 0.0
+        self.last_forward_ms = 0.0
+        self.last_handle_ms = 0.0
+        self._next_pose_status_ts = 0.0
+        self._next_live_json_ts = 0.0
 
     def start(self):
         self.log("=" * 60)
@@ -259,6 +270,17 @@ class ARPoseBridge:
             return
         self.pose_path_debug(stage, message, count=count, force=force)
 
+    def should_debug(self, count=None, force=False):
+        printer = self.pose_path_debug
+        if printer is None or not getattr(printer, "enabled", False):
+            return False
+        if force:
+            return True
+        if count is None:
+            return True
+        every_n = max(1, int(getattr(printer, "every_n", 1)))
+        return count % every_n == 0
+
     def write_pose_status(self, status, packet=None, raw_line="", input_packet=None, ar_packet=None):
         if self.pose_status_writer is None:
             return
@@ -292,6 +314,11 @@ class ARPoseBridge:
                 "udp_send_count": self.udp_send_count,
                 "udp_fail_count": self.udp_fail_count,
                 "live_json_count": self.live_json_count,
+                "input_drop_count": self.input_drop_count,
+                "last_recv_ts": self.last_recv_ts,
+                "last_forward_ts": self.last_forward_ts,
+                "last_forward_ms": self.last_forward_ms,
+                "last_handle_ms": self.last_handle_ms,
                 "log_path": self.log_path,
                 "status_path": self.status_path,
                 "packet_path": self.packet_path,
@@ -318,6 +345,10 @@ class ARPoseBridge:
     def _udp_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, POSE_RX_BUFFER_BYTES)
+        except Exception:
+            pass
         sock.settimeout(0.5)
         self.input_sock = sock
         try:
@@ -336,19 +367,24 @@ class ARPoseBridge:
                         break
                     raise
 
+                data, source, dropped = self._drain_latest_datagram(sock, data, source)
+                recv_ts = time.time()
                 source_text = f"{source[0]}:{source[1]}"
                 packet, raw_text, error = parse_official_pose_datagram(data)
                 with self.lock:
-                    self.datagram_count += 1
+                    self.datagram_count += 1 + dropped
+                    self.input_drop_count += dropped
                     self.last_datagram = raw_text
                     self.last_source = source_text
+                    self.last_recv_ts = recv_ts
                     datagram_count = self.datagram_count
-                self.debug(
-                    "UDP_RAW",
-                    f"#{datagram_count} from={source_text} bytes={len(data)} text={repr(raw_text)}",
-                    count=datagram_count,
-                )
-                self.handle_packet(packet, raw_text, source_text, error)
+                if self.should_debug(datagram_count):
+                    self.debug(
+                        "UDP_RAW",
+                        f"#{datagram_count} from={source_text} bytes={len(data)} dropped={dropped} text={repr(raw_text)}",
+                        count=datagram_count,
+                    )
+                self.handle_packet(packet, raw_text, source_text, error, recv_ts=recv_ts)
         except Exception as exc:
             if not self.stop_event.is_set():
                 self.set_status(f"udp error: {exc}", f"UDP pose receiver stopped: {exc}")
@@ -360,14 +396,32 @@ class ARPoseBridge:
             if self.input_sock is sock:
                 self.input_sock = None
 
-    def handle_packet(self, packet, raw_text, source_text, error=""):
-        now = time.time()
+    def _drain_latest_datagram(self, sock, data, source):
+        if not POSE_RX_DRAIN_LATEST:
+            return data, source, 0
+        dropped = 0
+        original_timeout = sock.gettimeout()
+        try:
+            sock.setblocking(False)
+            while True:
+                latest_data, latest_source = sock.recvfrom(65535)
+                data, source = latest_data, latest_source
+                dropped += 1
+        except (BlockingIOError, socket.timeout):
+            pass
+        finally:
+            sock.settimeout(original_timeout)
+        return data, source, dropped
+
+    def handle_packet(self, packet, raw_text, source_text, error="", recv_ts=None):
+        start_perf = time.perf_counter()
+        now = time.time() if recv_ts is None else float(recv_ts)
         if packet is None:
             with self.lock:
                 self.invalid_count += 1
                 self.status = "invalid pose datagram"
                 invalid_count = self.invalid_count
-            self.write_pose_status("invalid pose datagram", raw_line=raw_text)
+            self.write_pose_status_throttled("invalid pose datagram", now, raw_line=raw_text, force=True)
             self.debug(
                 "PARSE_FAIL",
                 f"from={source_text} reason={error} raw={repr(raw_text)} invalid_count={invalid_count}",
@@ -392,36 +446,52 @@ class ARPoseBridge:
             count = self.packet_count
 
         payload = json.dumps(ar_packet, separators=(",", ":")).encode("utf-8")
-        self.debug(
-            "PARSE_OK",
-            f"#{count} from={source_text} input={json.dumps(packet, separators=(',', ':'))} ar={payload.decode('utf-8')}",
-            count=count,
-        )
+        forward_start = time.perf_counter()
         udp_ok, udp_fail = self.send_pose_payload(payload)
-        json_ok = self.write_live_pose_packet(ar_packet)
+        forward_ms = (time.perf_counter() - forward_start) * 1000.0
+        forward_ts = time.time()
         with self.lock:
             self.udp_send_count += udp_ok
             self.udp_fail_count += udp_fail
-            if json_ok:
-                self.live_json_count += 1
-            live_json_count = self.live_json_count
+            self.last_forward_ts = forward_ts
+            self.last_forward_ms = forward_ms
             udp_send_count = self.udp_send_count
             udp_fail_count = self.udp_fail_count
             invalid_count = self.invalid_count
-        self.debug(
-            "LIVE_JSON_OK" if json_ok else "LIVE_JSON_FAIL",
-            f"path={self.packet_path} live_json_count={live_json_count}",
-            count=count,
-            force=not json_ok,
-        )
-        self.debug(
-            "UDP_SEND",
-            f"ok_targets={udp_ok} fail_targets={udp_fail} total_ok={udp_send_count} total_fail={udp_fail_count} targets={self.target_text}",
-            count=count,
-            force=udp_fail > 0,
-        )
-        self.write_pose_status(
+
+        if self.should_debug(count):
+            self.debug(
+                "PARSE_OK",
+                f"#{count} from={source_text} input={json.dumps(packet, separators=(',', ':'))} ar={payload.decode('utf-8')}",
+                count=count,
+            )
+
+        json_ok = None
+        live_json_count = self.live_json_count
+        if self.should_write_live_json(now, force=count == 1):
+            json_ok = self.write_live_pose_packet(ar_packet)
+            with self.lock:
+                if json_ok:
+                    self.live_json_count += 1
+                live_json_count = self.live_json_count
+            if self.should_debug(count, force=not json_ok):
+                self.debug(
+                    "LIVE_JSON_OK" if json_ok else "LIVE_JSON_FAIL",
+                    f"path={self.packet_path} live_json_count={live_json_count}",
+                    count=count,
+                    force=not json_ok,
+                )
+
+        if self.should_debug(count, force=udp_fail > 0):
+            self.debug(
+                "UDP_SEND",
+                f"ok_targets={udp_ok} fail_targets={udp_fail} total_ok={udp_send_count} total_fail={udp_fail_count} forward_ms={forward_ms:.3f} targets={self.target_text}",
+                count=count,
+                force=udp_fail > 0,
+            )
+        self.write_pose_status_throttled(
             "receiving",
+            now,
             packet=packet,
             raw_line=raw_text,
             input_packet=packet,
@@ -441,8 +511,31 @@ class ARPoseBridge:
                 f"udp={self.target_text} "
                 f"json={payload.decode('utf-8')}"
             )
-        elif count == 1 or count % 10 == 0:
+        elif count == 1 or count % 60 == 0:
             self.log(f"AR pose forwarded #{count}: {payload.decode('utf-8')}")
+
+        with self.lock:
+            self.last_handle_ms = (time.perf_counter() - start_perf) * 1000.0
+
+    def should_write_live_json(self, now, force=False):
+        if force:
+            self._next_live_json_ts = float(now) + POSE_LIVE_JSON_WRITE_INTERVAL
+            return True
+        if now < self._next_live_json_ts:
+            return False
+        self._next_live_json_ts = float(now) + POSE_LIVE_JSON_WRITE_INTERVAL
+        return True
+
+    def write_pose_status_throttled(self, status, now, force=False, **kwargs):
+        if force:
+            self._next_pose_status_ts = float(now) + POSE_STATUS_WRITE_INTERVAL
+            self.write_pose_status(status, **kwargs)
+            return True
+        if now < self._next_pose_status_ts:
+            return False
+        self._next_pose_status_ts = float(now) + POSE_STATUS_WRITE_INTERVAL
+        self.write_pose_status(status, **kwargs)
+        return True
 
     def write_live_pose_packet(self, packet):
         if not packet:

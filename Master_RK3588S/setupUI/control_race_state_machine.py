@@ -40,6 +40,10 @@ RACE_STATE_DEFAULTS = {
     # 看到 EndSign 后不立刻停车；EndSign 消失超过该时间后进入 ENDSIGN_STOP。
     "ENDSIGN_LOST_STOP_DELAY": 0.45,
 
+    # 当前 BeginSign/EndSign 容易混淆，先禁用 EndSign 终点停车锁存。
+    # 仍保留 EndSign 检测和 HUD 状态观测，后续模型稳定后再重新打开。
+    "ENDSIGN_STOP_ENABLED": False,
+
     # EndSign 必须在比赛已经开始、且已经进入最后一圈后才允许触发。
     "ENDSIGN_REQUIRE_RACE_STARTED": True,
     "ENDSIGN_REQUIRE_FINAL_LAP": True,
@@ -232,8 +236,10 @@ class RaceStateMachine:
             self.last_begin_seen_ts = now
 
         lap_event = self._update_laps(door_cross_event, now)
+        end_stop_enabled = bool(self.params["ENDSIGN_STOP_ENABLED"])
         end_sign_allowed = self._end_sign_allowed()
-        end_confirm_age = self._update_end_sign(end_under_door, end_sign_allowed, now)
+        end_sign_can_stop = bool(end_stop_enabled and end_sign_allowed)
+        end_confirm_age = self._update_end_sign(end_under_door, end_sign_can_stop, now)
         traffic_state, traffic_stop, traffic_stop_zone, red_confirm_age = self._update_traffic_light(
             traffic_light,
             frame_w,
@@ -255,6 +261,7 @@ class RaceStateMachine:
             "begin_under_door": bool(begin_under_door),
             "end_under_door": bool(end_under_door),
             "end_sign_allowed": bool(end_sign_allowed),
+            "end_sign_stop_enabled": bool(end_stop_enabled),
             "end_confirm_age": float(end_confirm_age),
             "finish_armed": bool(self.finish_armed),
             "finish_stop": bool(self.finish_stop),
@@ -386,6 +393,10 @@ class RaceStateMachine:
         return state, stop, stop_zone, red_confirm_age
 
     def _should_finish_stop(self, now):
+        if not self.params["ENDSIGN_STOP_ENABLED"]:
+            self.finish_armed = False
+            self.finish_stop = False
+            return False
         if self.finish_stop or not self.finish_armed or self.last_end_seen_ts is None:
             return self.finish_stop
         if self.params["ENDSIGN_REQUIRE_RACE_STARTED"] and not self.race_started:

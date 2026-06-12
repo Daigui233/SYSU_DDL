@@ -39,7 +39,7 @@ segmentation track_error
 | `LINE_LOSS_SAFE_STOP` | 连续丢线超过约 `0.8 s` 后停车 | `STATE_LINE_LOSS_SAFE_STOP = 6` |
 | `AVOID_STONE` | 在分岔候选路径中选择避开 stone 的分支 | `STATE_AVOID_STONE = 8` |
 | `TRAFFIC_LIGHT_STOP` | 近处红灯确认后停车，绿灯恢复 | `STATE_TRAFFIC_LIGHT_STOP = 9` |
-| `ENDSIGN_STOP` | 终点标志完成确认后停车 | `STATE_ENDSIGN_STOP = 10` |
+| `ENDSIGN_STOP` | 预留终点停车；当前 `ENDSIGN_STOP_ENABLED=False`，EndSign 只观测不抢占 | `STATE_ENDSIGN_STOP = 10` |
 
 `STATE_IDLE = 0` 用于 TC264D 本地空闲。`STATE_SAFE_STOP = 7` 用于手动急停、程序退出清零和 TC264D 本地串口超时。
 

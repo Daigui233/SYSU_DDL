@@ -26,8 +26,10 @@ seg_func.py segmentation track_error
 - TC264D 舵机当前为 P-only，`SERVO_LINEAR_KP=0.5`，`KD=0`，再由 `Servo.h` 做硬限幅。
 - TC264D 本地控制帧超时为 `0.5 s`。
 - TC264D 反馈帧已扩展到 v3，HUD 会显示下位机实际收到的 error、输入年龄、舵机/电机输出、限幅标志、前馈/PID 修正和反馈序号。
+- 当前 `EndSign` 终点停车默认禁用：`control_race_state_machine.py` 中 `ENDSIGN_STOP_ENABLED=False`，只观测 EndSign 状态，不进入 `ENDSIGN_STOP`，避免 BeginSign 误识别后卡死。
 - 调试画面已从控车主循环拆到 `ui_debug_render_worker.py`：debug 仍显示完整分割/检测/规划/HUD 信息，但渲染/JPEG 慢时只丢 debug 帧，不阻塞串口控车。
 - HUD 性能行中 `FPS ctrl/raw/loop` 表示实际控车循环、共享内存输入帧率估计和性能监控主循环帧率；`DBG r/enc/pub/drop` 表示 debug 渲染、JPEG 编码、debug 发布和 debug 丢帧情况。
+- 定位 UDP 转发采用低延迟热路径：`pose_ar_bridge.py` 收到有效 `robot_position` 后先转发到 AR，再降频写状态 JSON；默认丢弃输入队列旧定位包、保留最新包，HUD `POSE_IO rx/drop/fwd/h` 用于判断定位是否在排队或转发变慢。
 
 ## 当前保留的软件处理
 
@@ -54,5 +56,6 @@ seg_func.py segmentation track_error
 - `320 px` 满舵比旧版 `200 px` 更不敏感，用于先验证是否能缓解转向过猛；如果转不过来，可用二分法回调 `SERVO_FULL_STEER_ERROR_PX`。
 - 分割层取消帧保持后，旧视频中“车跑偏但分割还保留前几帧”的问题会消失，但分割模型抖动会更直接暴露出来。
 - 行人路径规划仍是图像局部启发式预测，不是严格动态避障。若行人横向速度估计不稳，仍可能选边不自然，需要用实车视频继续调 `HUMAN_MOTION_*` 和 `ROAD_SIDE_*`。
+- `EndSign` 当前只观测不停车；如果后续需要终点自动停车，必须先解决 BeginSign/EndSign 混淆，再打开 `ENDSIGN_STOP_ENABLED` 并实车验证不会误锁死。
 - 如果 HUD 中 `Final err / CMD err / TC264D input_track_error` 已经一致，但车仍响应慢，下一步优先看 TC264D 舵机映射、舵机机械速度/角度和供电；如果车身已经能快速给角但路径仍不合理，再回看上位机规划。
 - TC264D 反馈扩展主要提升可观测性，不是帧数优化。串口帧从旧 v2 的 50 字节增加到 v3 的 74 字节，在 `460800 baud` 下开销很小；HUD/调试画面已拆到独立线程，若 `DBG` 帧率低但 `FPS ctrl/loop` 正常，说明只是显示链路低帧。若 `FPS ctrl/loop` 本身低，应优先看视觉推理、检测频率、fork 分类器和 NPU/CPU 资源。

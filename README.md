@@ -68,8 +68,8 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - `control_local_planner.py` 根据任务状态输出最终 `final_track_error`，`control_arbitrator.py` 不再缩放、死区、限幅、限步或非线性增强视觉误差，视觉自动驾驶时直接下发 `command["track_error"] = final_track_error`。
 - `final_track_error` 定义为当前帧目标线 `lookahead_y=300` 处相对摄像头视觉中心线的实际像素偏差；上位机不再对该误差做人为上限、跨帧平滑或逐帧追赶。
 - 调试画面中红色曲线表示语义分割得到的赛道中线；紫色曲线表示局部规划后的最终目标路径。避障时紫色线从近处红线连续延伸出去，中远处逐渐偏向绕行侧，不再对整条红线做瞬时平移。
-- 目标检测任务分为硬规则层、风险池和奖励池：红灯近处停车、终点停车、连续丢线停车保持硬规则；`human / car / stone` 进入风险池，按 `distance_level + path_level + state_hold_bonus` 组成的简单 `risk_score` 排序；`gold` 属于奖励池，只有风险池为空且金币足够近、路径代价不大时才触发 `COLLECT_GOLD`。
-- `control_race_state_machine.py` 独立处理比赛事件：`TrafficLight` 框内红灯远处只记录为 `red_far`，进入近处停车区才触发 `TRAFFIC_LIGHT_STOP`，绿灯通行；`Door + BeginSign` 启动第 1 圈，之后每次有效经过 `Door` 更新圈数；看到 `EndSign` 后继续循迹，直到 `EndSign` 消失超过短 TTL 后进入终点停车。
+- 目标检测任务分为硬规则层、风险池和奖励池：红灯近处停车、连续丢线停车保持硬规则；`human / car / stone` 进入风险池，按 `distance_level + path_level + state_hold_bonus` 组成的简单 `risk_score` 排序；`gold` 属于奖励池，只有风险池为空且金币足够近、路径代价不大时才触发 `COLLECT_GOLD`。当前 `EndSign` 终点停车默认禁用，只保留观测。
+- `control_race_state_machine.py` 独立处理比赛事件：`TrafficLight` 框内红灯远处只记录为 `red_far`，进入近处停车区才触发 `TRAFFIC_LIGHT_STOP`，绿灯通行；`Door + BeginSign` 启动第 1 圈，之后每次有效经过 `Door` 更新圈数；当前 `EndSign` 因容易与 `BeginSign` 混淆，只记录 `end_under_door / end_sign_allowed / end_sign_stop_enabled`，不会进入 `ENDSIGN_STOP`。
 - 避人/避车时 `final_track_error` 直接从当前紫色规划线前瞻点计算。`AVOID_HUMAN` 会估计行人 bbox 横向速度，并把人的短时预测占用区纳入 road mask 左右走廊评分；运动方向参与动态占用区预测和接近打平时的倾向，不再用单帧运动方向直接强行决定绕行侧。
 - 当前控制链路为：`segmentation track_error -> control_task_state_machine.py -> control_local_planner.py final_track_error -> control_arbitrator.py 直通下发 -> TC264D input_track_error -> 舵机线性 P / 电机 PID / PWM 硬限幅`。
 - 上位机控制层不做 error 限幅、不做 CMD error 限步、不做 error 非线性增强；下位机是唯一控制执行和硬保护位置。
@@ -145,7 +145,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 3. 检测框远近判断：`human / car / stone` 目前进入风险池后按距离等级、路径遮挡等级和状态保持奖励组成 `risk_score` 排序，类别只保留很小的 tie-break；`gold` 属于奖励池，只有无风险目标且金币足够近时才处理。如果目标已经很近但状态没有切换，优先调 `control_task_state_machine.py` 顶部的 `RISK_*` 阈值；如果远处目标提前切换，说明底边触发带或路径横向范围过宽。
 4. 避障转向激进程度：紫色线已经改成连续规划线，`AVOID_CAR / AVOID_HUMAN / AVOID_STONE` 的偏置、ramp、前瞻点 `lookahead_y=300` 和 road mask 走廊评分仍需实车调。`AVOID_HUMAN` 使用行人横向速度预测短时占用区，再在 road mask 内选择左右走廊；若人运动方向误判或绕行侧不合理，优先调 `HUMAN_MOTION_*`、`HUMAN_MOTION_PREDICT_SECONDS` 和 `ROAD_SIDE_*`。若 final/CMD err 已经足够大但转不过来，再看 TC264D 舵机线性 P 映射、硬限幅和机械舵机。
 5. 红绿灯识别：`TrafficLight` 先由目标检测给框，再由 `vision_traffic_light.py` 在框内用 HSV 判断红/绿。曝光、灯光颜色、AR 画面压缩和检测框偏移都会影响判断。当前远处红灯只记录为 `red_far`，进入 `TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO` 定义的近处停车区后还要连续确认，确认完成才进入 `TRAFFIC_LIGHT_STOP`；有效绿灯会立即清除红灯保持并恢复通行。若红灯不停或绿灯误停，先看 HUD/日志里的 `traffic_light_state / traffic_light_stop_zone / traffic_light_red_confirm_age` 和置信度，再调 `vision_traffic_light.py` 顶部的 HSV、面积阈值以及 `control_race_state_machine.py` 顶部的停车区和确认阈值。
-6. 计圈与终点：`Door + BeginSign` 用于起跑计圈，`Door` 用于过圈；`EndSign` 只有在比赛已开始且进入最后一圈后才允许触发，并且需要连续稳定看到一小段时间才会 `finish_armed`，随后在 `EndSign` 消失超过短 TTL 后进入 `ENDSIGN_STOP`。如果 BeginSign 漏检、Door 长时间停留在画面里、检测框闪烁或 EndSign 被遮挡，可能导致漏计、重复计或无法停车。相关参数集中在 `control_race_state_machine.py` 顶部。
+6. 计圈与终点：`Door + BeginSign` 用于起跑计圈，`Door` 用于过圈；当前 `ENDSIGN_STOP_ENABLED=False`，`EndSign` 只观测不停车，避免 `BeginSign` 被误识别为 `EndSign` 后卡死。后续模型稳定后再打开 `control_race_state_machine.py` 顶部的 `ENDSIGN_STOP_ENABLED`，并重新调 `ENDSIGN_MIN_SCORE / ENDSIGN_CONFIRM_SECONDS / ENDSIGN_LOST_STOP_DELAY`。
 7. 丢线恢复：短时丢线会进入 `RECOVER_LINE`，连续约 `0.8 s` 无有效中线才进入 `LINE_LOSS_SAFE_STOP`。如果入弯时经常丢线后恢复失败，问题可能是分割视野、车速、舵机响应或恢复策略共同导致，不应只看模型。恢复计时在 `control_task_state_machine.py`，恢复误差衰减在 `control_local_planner.py`。
 8. 下位机控制响应：上位机输出的是图像像素误差，TC264D 负责舵机线性 P、速度闭环、PWM 硬限幅和安全保护。若 HUD 中 `final_track_error / CMD err / TC264D input_track_error` 已经一致且数值足够大但车仍转不过来，优先检查 `Slave_TC264D/code/Control.c` 中 `SERVO_FULL_STEER_ERROR_PX`、`Servo.h` 硬限幅和机械舵机角度；若直道摆动，则优先减小小误差增益或重新讨论是否加入少量阻尼。
 9. 调试显示与主循环负载：`8090/debug_feed` 会发布完整 HUD 画面，debug 渲染和 MJPEG 编码慢时只丢 debug 帧，不应阻塞控车主循环。若 FPS 明显下降，先看 HUD 中 `FPS ctrl/raw/loop` 判断实际控车帧率，再看 `DBG r/enc/pub/drop` 和 `MS ai/cmd/ctrl/dbg/jpg` 判断是视觉推理、控制主循环、debug 绘制还是 JPEG/网络链路瓶颈。
@@ -169,6 +169,8 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 
 - Windows 定位程序发送到板卡局域网 IP 的 UDP `9005`。
 - `ar_receiver.py` 转发到板卡本机 `127.0.0.1:9006`；转发给官方 AR 时只交换平移轴为 `pos=[z,0.16,x]`，`yaw=euler[1]` 保持不变。
+- 定位 UDP 转发采用低延迟热路径：收到有效定位后先转发到 AR，再降频写 `xverse_control_live.json` 和 `ar_pose_status.json`。默认 `AR_POSE_RX_DRAIN_LATEST=1` 会丢弃 UDP 队列里的旧定位包，只保留最新包，避免 AR 继续消费过期位置。
+- 默认关闭逐包定位打印和日志写入；需要临时排查时再打开 `AR_DEBUG_PRINT_POSE=1`、`AR_POSE_PATH_DEBUG=1` 或 `AR_POSE_LOG_TO_FILE=1`。HUD 右侧 `POSE_IO rx/drop/fwd/h` 分别表示定位接收计数、主动丢弃的旧定位包数、UDP 转发耗时和定位线程处理耗时。
 - WebUI 定位数据地址填写 `127.0.0.1`，端口填写 `9006`。
 - 手柄遥控输入为独立 UDP `9010`，只接收 `type=gamepad_control`，不复用定位包。
 - UNITY 同步端口为 `9003`。
