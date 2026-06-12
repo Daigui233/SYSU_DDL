@@ -85,7 +85,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 遥控模式下定位 UDP `9005` 仍正常发送并被 RK3588S 转发到 `9006`，不会因为手柄接管而停止 AR 融合。
 - 遥控映射：`RT` 前进、`LT` 倒车，合成为 `target_speed=(RT-LT)*1.0 m/s`；左摇杆横轴 `LX` 控制 `track_error`；`B` 键或手柄断连时发送 `STATE_SAFE_STOP`。Windows 定位 EXE 优先读取 XInput，读不到时会用 pygame/DirectInput 兜底，便于蓝牙手柄调试。
 - 如果采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要定位转发和手柄控车，可在 RK3588S 手动运行 `python3 Master_RK3588S/setupUI/standalone_control_bridge.py`；该备用脚本不要和 `ar_receiver.py` 同时运行。
-- TC264D 保留现有串口协议，本地输入超时为 `0.5 s`；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。舵机转向已关闭大误差 boost，当前使用 `FULL_STEER_ERROR_PX=200` 的线性 P 映射，再经 `Servo.h` 硬限幅。
+- TC264D 保留现有串口协议，本地输入超时为 `0.5 s`；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。舵机转向已关闭大误差 boost，当前使用 `FULL_STEER_ERROR_PX=320` 的线性 P 映射，再经 `Servo.h` 硬限幅。
 - TC264D 反馈帧已扩展到 v3：HUD 会显示 `ERR cmd/tc/d`、`SERVO pwm/raw/lim`、`MOTOR tgt/act/out`、`MOTOR ff/pid`、`SAFE to/st/ss/ms/db` 和 `FB seq/bad/drop/fmt`，用于录视频后判断问题在上位机命令、串口传输、下位机限幅/PID 还是机械响应。
 - `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、HUD 绘制、窗口显示还是硬件降频。
 - `ui_debug_stream_server.py` 已接入 `ar_receiver.py`：发布的是完整调试画面，即分割/检测/局部规划目标线 + 左侧裁判事件 + 右侧调试 HUD；网络慢时浏览器端丢帧，不阻塞控车主循环。
@@ -99,7 +99,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - `control_local_planner.py` 仍保留路径几何处理：目标线按 y 位置平滑渐进偏移、目标线点限制在图像和 `road_mask` 内、金币吸引偏移上限、避障方向短时滞回、行人横向速度 EMA、行人短时占用区预测、stone 分支连续性选择，以及 `RECOVER_LINE` 对最后有效误差的线性衰减。正常 TRACK/AVOID/COLLECT/STONE 的 `final_track_error` 不再跨帧平滑、限步、限幅或非线性增强。
 - `control_arbitrator.py` 对合法视觉误差不做后处理，直接下发；只保留手柄覆盖、安全停车清零、非法输入保护、命令重复间隔、状态/速度/flags 组帧。
 - `control_gamepad_receiver.py` 仍对手柄候选命令做软件限幅，默认 `track_error` 为 `±240`、速度为配置的手柄最大速度；该限幅只影响手柄接管，不影响视觉自动驾驶。
-- TC264D 舵机层不再有大误差 boost；当前为线性 P，`SERVO_LINEAR_KP=(SERVO_DUTY_MID-SERVO_DUTY_MIN)/200=0.8`，`KD=0`，软件输出范围为 `730±160`，再由 `SERVO_DUTY_MIN/MAX` 最终硬限幅。TC264D 电机层仍保留目标速度死区、启动前馈、速度 PI/PID 修正限幅和电机 PWM 硬限幅。
+- TC264D 舵机层不再有大误差 boost；当前为线性 P，`SERVO_LINEAR_KP=(SERVO_DUTY_MID-SERVO_DUTY_MIN)/320=0.5`，`KD=0`，软件输出范围为 `730±160`，再由 `SERVO_DUTY_MIN/MAX` 最终硬限幅。TC264D 电机层仍保留目标速度死区、启动前馈、速度 PI/PID 修正限幅和电机 PWM 硬限幅。
 - TC264D v3 反馈额外回传输入年龄、保护/限幅 flags、舵机限幅前后输出、电机前馈、电机 PID 修正和反馈序号。这些字段只用于观测和 HUD 显示，不参与上位机控制决策。
 
 ## Windows 访问地址

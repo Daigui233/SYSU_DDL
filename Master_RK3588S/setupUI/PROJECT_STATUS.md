@@ -22,8 +22,8 @@ seg_func.py segmentation track_error
 - `track_error/final_track_error = lookahead 点 x - center_x`，单位为像素。
 - 上位机不再做 error 限幅、限步、跨帧平滑或非线性增强。
 - 视觉自动驾驶下，`control_arbitrator.py` 直通下发 `final_track_error`。
-- TC264D 使用 `SERVO_FULL_STEER_ERROR_PX=200`，即约 `200 px` 对应线性转向输出满量程。
-- TC264D 舵机当前为 P-only，`SERVO_LINEAR_KP=0.8`，`KD=0`，再由 `Servo.h` 做硬限幅。
+- TC264D 使用 `SERVO_FULL_STEER_ERROR_PX=320`，即约 `320 px` 对应线性转向输出满量程。
+- TC264D 舵机当前为 P-only，`SERVO_LINEAR_KP=0.5`，`KD=0`，再由 `Servo.h` 做硬限幅。
 - TC264D 本地控制帧超时为 `0.5 s`。
 - TC264D 反馈帧已扩展到 v3，HUD 会显示下位机实际收到的 error、输入年龄、舵机/电机输出、限幅标志、前馈/PID 修正和反馈序号。
 
@@ -48,8 +48,8 @@ seg_func.py segmentation track_error
 
 ## 当前风险与不足
 
-- `lookahead_y=300` 和 `FULL_STEER_ERROR_PX=200` 是第一版实车调参基线，不保证一次到位。摄像头接近车头，前瞻点不宜过低，也不宜过远，后续应通过 HUD 中紫色目标点和实车响应微调。
-- `200 px` 满舵会比 `320 px` 更敏感，利于低速纠偏；如果直道摆动或避障过猛，优先增大 `SERVO_FULL_STEER_ERROR_PX` 或降低舵机 Kp。
+- `lookahead_y=300` 和 `FULL_STEER_ERROR_PX=320` 是当前实车调参基线，不保证一次到位。摄像头接近车头，前瞻点不宜过低，也不宜过远，后续应通过 HUD 中紫色目标点和实车响应微调。
+- `320 px` 满舵比旧版 `200 px` 更不敏感，用于先验证是否能缓解转向过猛；如果转不过来，可用二分法回调 `SERVO_FULL_STEER_ERROR_PX`。
 - 分割层取消帧保持后，旧视频中“车跑偏但分割还保留前几帧”的问题会消失，但分割模型抖动会更直接暴露出来。
 - 行人路径规划仍是图像局部启发式预测，不是严格动态避障。若行人横向速度估计不稳，仍可能选边不自然，需要用实车视频继续调 `HUMAN_MOTION_*` 和 `ROAD_SIDE_*`。
 - 如果 HUD 中 `Final err / CMD err / TC264D input_track_error` 已经一致，但车仍响应慢，下一步优先看 TC264D 舵机映射、舵机机械速度/角度和供电；如果车身已经能快速给角但路径仍不合理，再回看上位机规划。

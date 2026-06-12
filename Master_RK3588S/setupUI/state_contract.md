@@ -24,8 +24,8 @@ segmentation track_error
 - 上位机负责感知、任务状态机、局部路径规划和串口组帧。
 - 下位机负责舵机线性控制、电机速度 PID、PWM 硬限幅、串口超时和 STOP 安全保护。
 - 当前前瞻点为 `lookahead_y=300`。
-- 当前舵机满量程误差为 `SERVO_FULL_STEER_ERROR_PX=200`。
-- 当前 TC264D 舵机映射为 P-only：`servo_pwm = SERVO_DUTY_MID + SERVO_LINEAR_KP * (0 - input_track_error)`，`SERVO_LINEAR_KP=0.8`，再进入 `Servo.h` 硬限幅。
+- 当前舵机满量程误差为 `SERVO_FULL_STEER_ERROR_PX=320`。
+- 当前 TC264D 舵机映射为 P-only：`servo_pwm = SERVO_DUTY_MID + SERVO_LINEAR_KP * (0 - input_track_error)`，`SERVO_LINEAR_KP=0.5`，再进入 `Servo.h` 硬限幅。
 
 ## 状态映射
 
