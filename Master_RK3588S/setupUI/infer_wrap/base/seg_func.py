@@ -32,6 +32,8 @@ ENABLE_GEOMETRY_ONLY_FORK = os.environ.get("ENABLE_GEOMETRY_ONLY_FORK", "0") == 
 FORK_MIN_SPLIT_ROWS = 2
 FORK_MIN_BRANCH_POINTS = 4
 FORK_MIN_BRANCH_SEPARATION_RATIO = 0.10
+FORK_MIN_BRANCH_PIXELS = 160
+FORK_MIN_TOTAL_PIXELS = 420
 
 FORK_CLASS_NAMES = ["normal", "fork", "miss"]
 
@@ -367,6 +369,9 @@ def _path_error(points, center_x, lookahead_y, w):
 def _extract_fork_geometry(rows, center_x, lookahead_y, w):
     min_sep = max(28.0, w * FORK_MIN_BRANCH_SEPARATION_RATIO)
     split_rows = []
+    left_pixels = 0
+    right_pixels = 0
+    area_scale = max(1, int(SCAN_STEP))
     for row in rows:
         segments = row["segments"]
         if len(segments) < 2:
@@ -374,11 +379,34 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
         left = segments[0]
         right = segments[-1]
         if float(right["center"]) - float(left["center"]) >= min_sep:
+            left_width = int(left.get("width", 0))
+            right_width = int(right.get("width", 0))
+            left_pixels += max(0, left_width) * area_scale
+            right_pixels += max(0, right_width) * area_scale
             split_rows.append({
                 "y": row["y"],
                 "segments": [left, right],
                 "separation": float(right["center"]) - float(left["center"]),
+                "left_pixels": max(0, left_width) * area_scale,
+                "right_pixels": max(0, right_width) * area_scale,
             })
+
+    branch_pixel_threshold = max(
+        FORK_MIN_BRANCH_PIXELS,
+        int(w * area_scale * max(1, FORK_MIN_SPLIT_ROWS) * 0.02),
+    )
+    total_pixel_threshold = max(
+        FORK_MIN_TOTAL_PIXELS,
+        branch_pixel_threshold * 2,
+    )
+    total_pixels = int(left_pixels + right_pixels)
+    pixel_stats = {
+        "left_pixels": int(left_pixels),
+        "right_pixels": int(right_pixels),
+        "total_pixels": int(total_pixels),
+        "branch_pixel_threshold": int(branch_pixel_threshold),
+        "total_pixel_threshold": int(total_pixel_threshold),
+    }
 
     if len(split_rows) < FORK_MIN_SPLIT_ROWS:
         return {
@@ -386,6 +414,20 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
             "reason": "few_split_rows",
             "split_rows": len(split_rows),
             "candidates": [],
+            **pixel_stats,
+        }
+
+    if (
+        left_pixels < branch_pixel_threshold
+        or right_pixels < branch_pixel_threshold
+        or total_pixels < total_pixel_threshold
+    ):
+        return {
+            "valid": False,
+            "reason": "few_fork_pixels",
+            "split_rows": len(split_rows),
+            "candidates": [],
+            **pixel_stats,
         }
 
     left_rows = _make_side_rows(rows, "left")
@@ -398,6 +440,7 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
             "reason": "short_branch",
             "split_rows": len(split_rows),
             "candidates": [],
+            **pixel_stats,
         }
 
     left_path = _smooth_path(left_path, w)
@@ -410,6 +453,7 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
             "reason": "no_lookahead",
             "split_rows": len(split_rows),
             "candidates": [],
+            **pixel_stats,
         }
 
     candidates = [
@@ -419,6 +463,7 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
             "path": [(int(x), int(y)) for x, y in left_path],
             "error": float(left_err),
             "score": float(left_score),
+            "pixels": int(left_pixels),
         },
         {
             "side": "right",
@@ -426,6 +471,7 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
             "path": [(int(x), int(y)) for x, y in right_path],
             "error": float(right_err),
             "score": float(right_score),
+            "pixels": int(right_pixels),
         },
     ]
     return {
@@ -433,6 +479,7 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
         "reason": "ok",
         "split_rows": len(split_rows),
         "candidates": candidates,
+        **pixel_stats,
     }
 
 
@@ -606,6 +653,11 @@ def _empty_centerline_info(frame, reason="lost"):
         },
         "fork_geometry_valid": False,
         "fork_split_rows": 0,
+        "fork_left_pixels": 0,
+        "fork_right_pixels": 0,
+        "fork_total_pixels": 0,
+        "fork_branch_pixel_threshold": FORK_MIN_BRANCH_PIXELS,
+        "fork_total_pixel_threshold": FORK_MIN_TOTAL_PIXELS,
         "fork_candidates": [],
         "fork_selected_side": None,
         "fork_reason": reason,
@@ -667,6 +719,11 @@ def draw_centerline_debug(frame, info):
     except Exception:
         fork_conf = 0.0
     split_rows = int(info.get("fork_split_rows") or 0)
+    left_pixels = int(info.get("fork_left_pixels") or 0)
+    right_pixels = int(info.get("fork_right_pixels") or 0)
+    total_pixels = int(info.get("fork_total_pixels") or 0)
+    branch_pixel_threshold = int(info.get("fork_branch_pixel_threshold") or 0)
+    total_pixel_threshold = int(info.get("fork_total_pixel_threshold") or 0)
     branch_count = int(info.get("branch_count") or 0)
     track_error = info.get("track_error")
     err_text = f"Track err: {float(track_error):.1f}" if track_error is not None else "Track err: N/A"
@@ -683,7 +740,16 @@ def draw_centerline_debug(frame, info):
         fork_color,
         2,
     )
-    cv2.putText(out, f"Branches: {branch_count}", (10, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+    cv2.putText(
+        out,
+        f"Fork pix L/R/T: {left_pixels}/{right_pixels}/{total_pixels}>{branch_pixel_threshold}/{total_pixel_threshold}",
+        (10, 172),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+    )
+    cv2.putText(out, f"Branches: {branch_count}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
     return out
 
 
@@ -761,12 +827,18 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         "fork_classifier": fork_cls,
         "fork_geometry_valid": bool(geometry.get("valid")),
         "fork_split_rows": int(geometry.get("split_rows", 0)),
+        "fork_left_pixels": int(geometry.get("left_pixels", 0)),
+        "fork_right_pixels": int(geometry.get("right_pixels", 0)),
+        "fork_total_pixels": int(geometry.get("total_pixels", 0)),
+        "fork_branch_pixel_threshold": int(geometry.get("branch_pixel_threshold", FORK_MIN_BRANCH_PIXELS)),
+        "fork_total_pixel_threshold": int(geometry.get("total_pixel_threshold", FORK_MIN_TOTAL_PIXELS)),
         "fork_candidates": [
             {
                 "side": str(c.get("side")),
                 "branch": str(c.get("branch") or ""),
                 "error": float(c.get("error", 0.0)),
                 "score": float(c.get("score", 0.0)),
+                "pixels": int(c.get("pixels", 0)),
                 "points": [(int(x), int(y)) for x, y in (c.get("path") or [])],
             }
             for c in fork_candidates

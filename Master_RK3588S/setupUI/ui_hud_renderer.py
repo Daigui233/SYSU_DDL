@@ -511,9 +511,15 @@ def draw_pose_status(
         fork_name = fork_cls.get("name") or "none"
         fork_conf = _safe_float(fork_cls.get("confidence"), None)
         split_rows = segmentation_status.get("fork_split_rows", 0)
+        left_pixels = int(segmentation_status.get("fork_left_pixels") or 0)
+        right_pixels = int(segmentation_status.get("fork_right_pixels") or 0)
+        branch_pixel_threshold = int(segmentation_status.get("fork_branch_pixel_threshold") or 0)
         selected_side = segmentation_status.get("fork_selected_side") or "-"
         conf_text = "N/A" if fork_conf is None else f"{fork_conf:.2f}"
-        fork_line = f"FORK {fork_state} {fork_mode} cls={fork_name}:{conf_text} split={split_rows} sel={selected_side}"
+        fork_line = (
+            f"FORK {fork_state} {fork_mode} cls={fork_name}:{conf_text} "
+            f"split={split_rows} pix={left_pixels}/{right_pixels}>{branch_pixel_threshold} sel={selected_side}"
+        )
 
     feedback = get_car_feedback() if get_car_feedback is not None else {"online": False, "error": "waiting"}
     car_lines = []
