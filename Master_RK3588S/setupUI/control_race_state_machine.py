@@ -40,9 +40,16 @@ RACE_STATE_DEFAULTS = {
     # 看到 EndSign 后不立刻停车；EndSign 消失超过该时间后进入 ENDSIGN_STOP。
     "ENDSIGN_LOST_STOP_DELAY": 0.45,
 
-    # 当前 BeginSign/EndSign 容易混淆，先禁用 EndSign 终点停车锁存。
-    # 仍保留 EndSign 检测和 HUD 状态观测，后续模型稳定后再重新打开。
-    "ENDSIGN_STOP_ENABLED": False,
+    # EndSign 终点停车启用；误识别时可在完全停车后手动搬动车体 1m 自动解除锁存。
+    "ENDSIGN_STOP_ENABLED": True,
+
+    # ENDSIGN_STOP 后，车完全停住再记录定位锚点；若 x/z 平面位移超过该值，视为手动拿走车并解除误识别停车。
+    "ENDSIGN_MANUAL_RESET_DISTANCE_M": 1.0,
+    "ENDSIGN_STOPPED_SPEED_THRESHOLD": 0.03,
+    "ENDSIGN_STOP_SETTLE_SECONDS": 0.80,
+    "ENDSIGN_FEEDBACK_MAX_AGE": 1.0,
+    "ENDSIGN_POSE_MAX_AGE": 1.0,
+    "ENDSIGN_MANUAL_RESET_COOLDOWN": 1.0,
 
     # EndSign 必须在比赛已经开始、且已经进入最后一圈后才允许触发。
     "ENDSIGN_REQUIRE_RACE_STARTED": True,
@@ -56,19 +63,19 @@ RACE_STATE_DEFAULTS = {
     "TRAFFIC_LIGHT_MIN_BOTTOM_RATIO": 0.26,
     "TRAFFIC_LIGHT_CENTER_LATERAL_RATIO": 0.42,
 
-    # 红灯只有进入更近的停车区才硬停；远处红灯只记录为 red_far，不抢占近处避障。
-    "TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO": 0.55,
+    # 红灯/黄灯只有进入更近的停车区才硬停；远处只记录为 *_far，不抢占近处避障。
+    "TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO": 0.50,
     "TRAFFIC_LIGHT_STOP_CENTER_LATERAL_RATIO": 0.34,
 
-    # OpenCV 框内红/绿识别置信度下限。
+    # OpenCV 框内红/黄/绿识别置信度下限。
     "TRAFFIC_LIGHT_MIN_COLOR_CONFIDENCE": 0.018,
 
-    # 红灯最近出现后的保持时间，防止红灯检测短时闪断；绿灯有效出现会立刻解除红灯保持。
+    # 红灯/黄灯最近停车后的保持时间，防止灯色检测短时闪断；有效绿灯会立刻解除保持。
     "TRAFFIC_LIGHT_RED_HOLD_TTL": 0.45,
 
-    # 红灯进入近处停车区后仍需连续确认，避免单帧红灯误识别导致硬停。
+    # 红灯/黄灯进入近处停车区后仍需连续确认，避免单帧误识别导致硬停。
     "TRAFFIC_LIGHT_RED_CONFIRM_SECONDS": 0.20,
-    "TRAFFIC_LIGHT_RED_CONFIRM_GAP": 0.15,
+    "TRAFFIC_LIGHT_RED_CONFIRM_GAP": 0.30,
 }
 
 
@@ -181,11 +188,19 @@ class RaceStateMachine:
         self.finish_stop = False
         self.end_confirm_first_ts = None
         self.last_end_seen_ts = None
+        self.end_stop_enter_ts = None
+        self.end_stop_pose_anchor = None
+        self.end_stop_pose_anchor_ts = None
+        self.end_stop_reset_armed = False
+        self.end_stop_reset_distance = 0.0
+        self.end_stop_reset_reason = "idle"
+        self.end_stop_reset_count = 0
+        self.end_stop_reset_cooldown_until = 0.0
         self.last_red_seen_ts = None
         self.red_confirm_first_ts = None
         self.last_red_stop_ts = None
 
-    def update(self, perception, now):
+    def update(self, perception, now, pose_packet=None, car_feedback=None):
         now = float(now)
         frame_shape = (perception or {}).get("frame_shape") or [0, 0]
         frame_h = int(frame_shape[0]) if len(frame_shape) >= 1 else 0
@@ -247,7 +262,13 @@ class RaceStateMachine:
             now,
         )
         if self._should_finish_stop(now):
+            if not self.finish_stop:
+                self._start_finish_stop(now)
             self.finish_stop = True
+        if self.finish_stop:
+            self._update_end_stop_manual_reset(pose_packet, car_feedback, now)
+        else:
+            self._clear_end_stop_anchor("not_stopping")
 
         return {
             "race_started": bool(self.race_started),
@@ -265,6 +286,10 @@ class RaceStateMachine:
             "end_confirm_age": float(end_confirm_age),
             "finish_armed": bool(self.finish_armed),
             "finish_stop": bool(self.finish_stop),
+            "end_stop_reset_armed": bool(self.end_stop_reset_armed),
+            "end_stop_reset_distance": float(self.end_stop_reset_distance),
+            "end_stop_reset_reason": self.end_stop_reset_reason,
+            "end_stop_reset_count": int(self.end_stop_reset_count),
             "traffic_light_visible": bool(traffic_light is not None),
             "traffic_light_state": traffic_state,
             "traffic_light_stop_zone": bool(traffic_stop_zone),
@@ -316,6 +341,10 @@ class RaceStateMachine:
 
     def _update_end_sign(self, end_under_door, end_sign_allowed, now):
         gap = float(self.params["ENDSIGN_CONFIRM_GAP"])
+        if now < float(self.end_stop_reset_cooldown_until):
+            self.end_confirm_first_ts = None
+            self.last_end_seen_ts = None
+            return 0.0
         if not end_under_door or not end_sign_allowed:
             if self.last_end_seen_ts is None or now - self.last_end_seen_ts > gap:
                 self.end_confirm_first_ts = None
@@ -333,6 +362,88 @@ class RaceStateMachine:
         if confirm_age >= float(self.params["ENDSIGN_CONFIRM_SECONDS"]):
             self.finish_armed = True
         return confirm_age
+
+    def _start_finish_stop(self, now):
+        self.end_stop_enter_ts = float(now)
+        self._clear_end_stop_anchor("waiting_stopped")
+
+    def _clear_end_stop_anchor(self, reason):
+        self.end_stop_pose_anchor = None
+        self.end_stop_pose_anchor_ts = None
+        self.end_stop_reset_armed = False
+        self.end_stop_reset_distance = 0.0
+        self.end_stop_reset_reason = str(reason)
+
+    def _pose_ground_xy(self, pose_packet, now):
+        if not isinstance(pose_packet, dict):
+            return None
+        timestamp = _finite_float(pose_packet.get("timestamp"), None)
+        max_age = float(self.params["ENDSIGN_POSE_MAX_AGE"])
+        if timestamp is not None and float(now) - timestamp > max_age:
+            return None
+        pos = pose_packet.get("pos")
+        if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+            return None
+        x = _finite_float(pos[0], None)
+        z_index = 2 if len(pos) >= 3 else 1
+        z = _finite_float(pos[z_index], None)
+        if x is None or z is None:
+            return None
+        return (float(x), float(z))
+
+    def _car_feedback_stopped(self, car_feedback, now):
+        if isinstance(car_feedback, dict) and car_feedback.get("online"):
+            age = _finite_float(car_feedback.get("age"), None)
+            speed = _finite_float(car_feedback.get("actual_speed"), None)
+            if age is not None and age <= float(self.params["ENDSIGN_FEEDBACK_MAX_AGE"]) and speed is not None:
+                return abs(speed) <= float(self.params["ENDSIGN_STOPPED_SPEED_THRESHOLD"])
+
+        if self.end_stop_enter_ts is None:
+            return False
+        return float(now) - float(self.end_stop_enter_ts) >= float(self.params["ENDSIGN_STOP_SETTLE_SECONDS"])
+
+    def _reset_finish_stop_after_manual_move(self, now, distance):
+        self.finish_stop = False
+        self.finish_armed = False
+        self.end_confirm_first_ts = None
+        self.last_end_seen_ts = None
+        self.end_stop_pose_anchor = None
+        self.end_stop_pose_anchor_ts = None
+        self.end_stop_reset_armed = False
+        self.end_stop_reset_distance = float(distance)
+        self.end_stop_reset_reason = "manual_pose_move_reset"
+        self.end_stop_reset_count += 1
+        self.end_stop_reset_cooldown_until = float(now) + float(self.params["ENDSIGN_MANUAL_RESET_COOLDOWN"])
+
+    def _update_end_stop_manual_reset(self, pose_packet, car_feedback, now):
+        pose_xy = self._pose_ground_xy(pose_packet, now)
+        if pose_xy is None:
+            self.end_stop_reset_reason = "waiting_pose"
+            return False
+
+        if not self._car_feedback_stopped(car_feedback, now):
+            self.end_stop_reset_reason = "waiting_stopped"
+            return False
+
+        if self.end_stop_pose_anchor is None:
+            self.end_stop_pose_anchor = pose_xy
+            self.end_stop_pose_anchor_ts = float(now)
+            self.end_stop_reset_armed = True
+            self.end_stop_reset_distance = 0.0
+            self.end_stop_reset_reason = "armed"
+            return False
+
+        dx = float(pose_xy[0]) - float(self.end_stop_pose_anchor[0])
+        dz = float(pose_xy[1]) - float(self.end_stop_pose_anchor[1])
+        distance = math.hypot(dx, dz)
+        self.end_stop_reset_distance = float(distance)
+        self.end_stop_reset_armed = True
+        threshold = float(self.params["ENDSIGN_MANUAL_RESET_DISTANCE_M"])
+        if distance >= threshold:
+            self._reset_finish_stop_after_manual_move(now, distance)
+            return True
+        self.end_stop_reset_reason = "holding"
+        return False
 
     def _update_traffic_light(self, traffic_light, frame_w, frame_h, now):
         state = "none"
@@ -358,8 +469,8 @@ class RaceStateMachine:
                 self.last_red_seen_ts = None
                 self.red_confirm_first_ts = None
                 self.last_red_stop_ts = None
-            elif seen_effective and color_state == "red":
-                state = "red_far"
+            elif seen_effective and color_state in ("red", "yellow"):
+                state = f"{color_state}_far"
                 if stop_zone:
                     gap = float(self.params["TRAFFIC_LIGHT_RED_CONFIRM_GAP"])
                     if (
@@ -371,10 +482,10 @@ class RaceStateMachine:
                     self.last_red_seen_ts = now
                     red_confirm_age = max(0.0, now - self.red_confirm_first_ts)
                     if red_confirm_age >= float(self.params["TRAFFIC_LIGHT_RED_CONFIRM_SECONDS"]):
-                        state = "red_stop_zone"
+                        state = f"{color_state}_stop_zone"
                         self.last_red_stop_ts = now
                     else:
-                        state = "red_confirming"
+                        state = f"{color_state}_confirming"
             elif seen_effective:
                 state = color_state
             else:
@@ -396,6 +507,7 @@ class RaceStateMachine:
         if not self.params["ENDSIGN_STOP_ENABLED"]:
             self.finish_armed = False
             self.finish_stop = False
+            self._clear_end_stop_anchor("disabled")
             return False
         if self.finish_stop or not self.finish_armed or self.last_end_seen_ts is None:
             return self.finish_stop

@@ -16,17 +16,21 @@ TRAFFIC_LIGHT_COLOR_DEFAULTS = {
     "RED_HUE_LOW_MAX": 12,
     "RED_HUE_HIGH_MIN": 165,
 
+    # 黄色阈值范围；如果现场黄灯偏橙或偏暗，优先微调这两个值。
+    "YELLOW_HUE_MIN": 15,
+    "YELLOW_HUE_MAX": 34,
+
     # 绿色阈值范围；如果现场灯偏青/偏黄，优先微调这两个值。
     "GREEN_HUE_MIN": 35,
     "GREEN_HUE_MAX": 92,
 
-    # 红/绿有效像素占 ROI 面积的最小比例，太小视为 unknown。
+    # 红/黄/绿有效像素占 ROI 面积的最小比例，太小视为 unknown。
     "MIN_COLOR_RATIO": 0.018,
 
-    # 红/绿有效像素数量下限，避免小框或噪点触发。
+    # 红/黄/绿有效像素数量下限，避免小框或噪点触发。
     "MIN_COLOR_PIXELS": 8,
 
-    # 主导颜色至少要比另一种颜色多这个倍数，减少红绿同时有噪声时的跳变。
+    # 主导颜色至少要比其他颜色多这个倍数，减少多颜色噪声时的跳变。
     "DOMINANCE_RATIO": 1.25,
 }
 
@@ -43,6 +47,7 @@ def classify_traffic_light_color(frame, bbox, params=None):
             "traffic_light_state": "unknown",
             "traffic_light_confidence": 0.0,
             "traffic_light_red_ratio": 0.0,
+            "traffic_light_yellow_ratio": 0.0,
             "traffic_light_green_ratio": 0.0,
         }
 
@@ -63,6 +68,7 @@ def classify_traffic_light_color(frame, bbox, params=None):
     if roi.size == 0:
         area = 1
         red_count = 0
+        yellow_count = 0
         green_count = 0
     else:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -74,26 +80,47 @@ def classify_traffic_light_color(frame, bbox, params=None):
             (hue <= int(params["RED_HUE_LOW_MAX"]))
             | (hue >= int(params["RED_HUE_HIGH_MIN"]))
         )
+        yellow_mask = valid & (
+            (hue >= int(params["YELLOW_HUE_MIN"]))
+            & (hue <= int(params["YELLOW_HUE_MAX"]))
+        )
         green_mask = valid & (
             (hue >= int(params["GREEN_HUE_MIN"]))
             & (hue <= int(params["GREEN_HUE_MAX"]))
         )
         area = max(1, int(roi.shape[0] * roi.shape[1]))
         red_count = int(np.count_nonzero(red_mask))
+        yellow_count = int(np.count_nonzero(yellow_mask))
         green_count = int(np.count_nonzero(green_mask))
 
     red_ratio = float(red_count) / float(area)
+    yellow_ratio = float(yellow_count) / float(area)
     green_ratio = float(green_count) / float(area)
     min_pixels = int(params["MIN_COLOR_PIXELS"])
     min_ratio = float(params["MIN_COLOR_RATIO"])
     dominance = float(params["DOMINANCE_RATIO"])
 
     state = "unknown"
-    confidence = max(red_ratio, green_ratio)
-    if red_count >= min_pixels and red_ratio >= min_ratio and red_ratio >= green_ratio * dominance:
+    confidence = max(red_ratio, yellow_ratio, green_ratio)
+    if (
+        red_count >= min_pixels
+        and red_ratio >= min_ratio
+        and red_ratio >= max(yellow_ratio, green_ratio) * dominance
+    ):
         state = "red"
         confidence = red_ratio
-    elif green_count >= min_pixels and green_ratio >= min_ratio and green_ratio >= red_ratio * dominance:
+    elif (
+        yellow_count >= min_pixels
+        and yellow_ratio >= min_ratio
+        and yellow_ratio >= max(red_ratio, green_ratio) * dominance
+    ):
+        state = "yellow"
+        confidence = yellow_ratio
+    elif (
+        green_count >= min_pixels
+        and green_ratio >= min_ratio
+        and green_ratio >= max(red_ratio, yellow_ratio) * dominance
+    ):
         state = "green"
         confidence = green_ratio
 
@@ -101,5 +128,6 @@ def classify_traffic_light_color(frame, bbox, params=None):
         "traffic_light_state": state,
         "traffic_light_confidence": float(confidence),
         "traffic_light_red_ratio": float(red_ratio),
+        "traffic_light_yellow_ratio": float(yellow_ratio),
         "traffic_light_green_ratio": float(green_ratio),
     }

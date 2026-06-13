@@ -4,7 +4,7 @@ import time
 import cv2
 
 from infer_wrap import InferWrap, PPSegInfer
-from infer_wrap.base.func import CLASSES, draw
+from infer_wrap.base.func import CLASSES
 from infer_wrap.base.seg_func import draw_centerline_debug, extract_centerline_info
 try:
     from infer_wrap.base.seg_infer import ForkMaskClsInfer
@@ -14,7 +14,6 @@ from vision_traffic_light import classify_traffic_light_color
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", "base", "model"))
-DEFAULT_DET_RESULT_TTL = float(os.environ.get("AR_DET_RESULT_TTL", "1.0"))
 
 
 def draw_waiting(frame):
@@ -28,17 +27,16 @@ class VisionPipeline:
 
     def __init__(self, model_dir=None, seg_result_ttl=None, det_result_ttl=None, log_func=None):
         self.model_dir = model_dir or DEFAULT_MODEL_DIR
-        # Constructor compatibility only: segmentation results must be current-frame.
+        # Constructor compatibility only: segmentation and detection results must be current-frame.
         _ = seg_result_ttl
+        _ = det_result_ttl
         self.seg_result_ttl = 0.0
-        self.det_result_ttl = float(DEFAULT_DET_RESULT_TTL if det_result_ttl is None else det_result_ttl)
+        self.det_result_ttl = 0.0
         self.log_func = log_func or print
 
         self.infer_det = None
         self.infer_seg = None
         self.infer_fork = None
-        self.last_det_res = None
-        self.last_det_ts = 0.0
         self._status = {
             "ok": False,
             "detector": "not initialized",
@@ -134,6 +132,20 @@ class VisionPipeline:
         }
 
     @staticmethod
+    def _empty_detection_status(now, source="missing", frame_id=None, reason=None):
+        frame_id_value = VisionPipeline._normalize_frame_id(frame_id)
+        return {
+            "timestamp": float(now),
+            "source": source,
+            "reason": reason or source,
+            "frame_id": frame_id_value,
+            "det_frame_id": None,
+            "det_lag_frames": None,
+            "det_age_ms": None,
+            "count": 0,
+        }
+
+    @staticmethod
     def _class_name(class_id):
         idx = int(class_id)
         if 0 <= idx < len(CLASSES):
@@ -161,7 +173,7 @@ class VisionPipeline:
         }
         return aliases.get(key, key)
 
-    def _build_detection_list(self, det_res, frame, timestamp, age):
+    def _build_detection_list(self, det_res, frame, timestamp, age, frame_id=None, det_frame_id=None):
         if det_res is None:
             return []
 
@@ -174,6 +186,11 @@ class VisionPipeline:
             return []
 
         h, w = frame.shape[:2]
+        frame_id_value = self._normalize_frame_id(frame_id)
+        det_frame_id_value = self._normalize_frame_id(det_frame_id)
+        det_lag_frames = None
+        if frame_id_value is not None and det_frame_id_value is not None:
+            det_lag_frames = frame_id_value - det_frame_id_value
         detections = []
         for box, score, class_id in zip(boxes, scores, classes):
             try:
@@ -198,6 +215,10 @@ class VisionPipeline:
             det = {
                 "timestamp": float(timestamp),
                 "age": float(age),
+                "frame_id": frame_id_value,
+                "det_frame_id": det_frame_id_value,
+                "det_lag_frames": det_lag_frames,
+                "det_age_ms": float(age * 1000.0),
                 "class_id": class_i,
                 "label": label,
                 "category": category,
@@ -282,7 +303,13 @@ class VisionPipeline:
 
     def process(self, frame, now, frame_id=None, draw_debug=False):
         final_frame = frame.copy() if draw_debug else frame
+        frame_id_value = self._normalize_frame_id(frame_id)
         segmentation = self._empty_segmentation(frame, now, frame_id=frame_id)
+        detection_status = self._empty_detection_status(
+            now,
+            source="disabled" if self.infer_det is None else "missing",
+            frame_id=frame_id_value,
+        )
         detections = []
 
         if self.infer_seg is not None:
@@ -296,7 +323,6 @@ class VisionPipeline:
                 else:
                     raise RuntimeError("segmenter does not support current-frame inference")
 
-                frame_id_value = self._normalize_frame_id(frame_id)
                 seg_frame_id = self._normalize_frame_id(seg_meta.get("frame_id"))
                 frame_matches = frame_id_value is None or seg_frame_id == frame_id_value
                 if seg_flag and seg_res is not None and frame_matches:
@@ -331,32 +357,63 @@ class VisionPipeline:
 
         if self.infer_det is not None:
             try:
-                det_res, det_flag = self.infer_det.infer(frame.copy())
-                if det_flag and det_res is not None:
-                    self.last_det_res = det_res
-                    self.last_det_ts = now
+                if hasattr(self.infer_det, "infer_current"):
+                    det_res, det_flag, det_meta = self.infer_det.infer_current(
+                        frame.copy(),
+                        frame_id=frame_id,
+                        timestamp=now,
+                    )
+                else:
+                    raise RuntimeError("detector does not support current-frame inference")
+
+                det_frame_id = self._normalize_frame_id((det_meta or {}).get("frame_id"))
+                det_done_ts = time.time()
+                det_age = max(0.0, det_done_ts - float((det_meta or {}).get("timestamp") or now))
+                det_matches = frame_id_value is None or det_frame_id == frame_id_value
+                detection_status = {
+                    "timestamp": float(now),
+                    "source": "current" if det_flag and det_res is not None and det_matches else "missing",
+                    "reason": "current" if det_flag and det_res is not None and det_matches else "no_result",
+                    "frame_id": frame_id_value,
+                    "det_frame_id": det_frame_id,
+                    "det_lag_frames": (
+                        frame_id_value - det_frame_id
+                        if frame_id_value is not None and det_frame_id is not None
+                        else None
+                    ),
+                    "det_age_ms": float(det_age * 1000.0),
+                    "count": 0,
+                }
+                if det_flag and det_res is not None and det_matches:
+                    detections = self._build_detection_list(
+                        det_res,
+                        frame,
+                        now,
+                        det_age,
+                        frame_id=frame_id_value,
+                        det_frame_id=det_frame_id,
+                    )
+                    detection_status["count"] = len(detections)
+                    if draw_debug:
+                        self._draw_detection_list(final_frame, detections)
+                        self._draw_detection_extras(final_frame, detections)
+                elif det_flag and det_res is not None and not det_matches:
+                    detection_status["source"] = "stale_rejected"
+                    detection_status["reason"] = "frame_id_mismatch"
             except Exception as exc:
                 self._log(f"det infer skip: {exc}")
-
-        if self.last_det_res is not None and (now - self.last_det_ts) <= self.det_result_ttl:
-            try:
-                detections = self._build_detection_list(
-                    self.last_det_res,
-                    frame,
-                    self.last_det_ts,
-                    now - self.last_det_ts,
+                detection_status = self._empty_detection_status(
+                    now,
+                    source="det_error",
+                    frame_id=frame_id_value,
+                    reason=str(exc),
                 )
-                if draw_debug:
-                    boxes, scores, classes = self.last_det_res
-                    draw(final_frame, boxes, scores, classes)
-                    self._draw_detection_extras(final_frame, detections)
-            except Exception as exc:
-                self._log(f"det draw skip: {exc}")
 
         perception = {
             "timestamp": float(now),
             "frame_shape": [int(v) for v in frame.shape[:2]],
             "segmentation": segmentation,
+            "detection_status": detection_status,
             "detections": detections,
         }
         return final_frame, perception

@@ -187,10 +187,23 @@ class RuntimeStatusStore:
             for k, v in segmentation.items()
             if isinstance(v, (str, int, float, bool, type(None), list, dict, tuple, np.generic))
         }
+        detection_status = dict((perception or {}).get("detection_status") or {})
+        detection_status = {
+            str(k): public_value(v)
+            for k, v in detection_status.items()
+            if isinstance(v, (str, int, float, bool, type(None), list, dict, tuple, np.generic))
+        }
+        detection_counts = {}
+        for det in (perception or {}).get("detections") or []:
+            category = str((det or {}).get("category") or (det or {}).get("label") or "unknown")
+            detection_counts[category] = detection_counts.get(category, 0) + 1
         return {
             "timestamp": float((perception or {}).get("timestamp", time.time())),
             "frame_shape": list((perception or {}).get("frame_shape") or []),
             "segmentation": segmentation,
+            "detection_status": detection_status,
+            "detection_count": int(len((perception or {}).get("detections") or [])),
+            "detection_counts": detection_counts,
         }
 
     def current_payload(self):

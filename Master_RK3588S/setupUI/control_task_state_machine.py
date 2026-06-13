@@ -733,7 +733,7 @@ class TaskStateMachine:
         self.last_risk_category = None
         self.last_risk_ts = None
 
-    def update(self, perception, now):
+    def update(self, perception, now, pose_packet=None, car_feedback=None):
         segmentation = (perception or {}).get("segmentation") or {}
         detections = list((perception or {}).get("detections") or [])
         frame_shape = (perception or {}).get("frame_shape") or [0, 0]
@@ -743,7 +743,12 @@ class TaskStateMachine:
         frame_h = max(frame_h, 1)
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)
         track_error = _finite_float(segmentation.get("track_error"))
-        race_state = self.race_state_machine.update(perception, now)
+        race_state = self.race_state_machine.update(
+            perception,
+            now,
+            pose_packet=pose_packet,
+            car_feedback=car_feedback,
+        )
         perception_quality = _segmentation_quality(
             segmentation,
             track_error,

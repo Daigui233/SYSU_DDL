@@ -48,6 +48,13 @@ class InferWrap:
     def infer(self, img):
         return self.rknn_pool.infer(img)
 
+    def infer_current(self, img, frame_id=None, timestamp=None):
+        meta = {
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+        }
+        return self.rknn_pool.infer_current(img, meta=meta)
+
     def __call__(self, *args, **kwargs):
         return self.infer(*args, **kwargs)
 

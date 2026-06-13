@@ -194,7 +194,14 @@ def main():
     ).start()
 
     def build_autonomy_command(now, perception):
-        task_decision = task_state_machine.update(perception, now)
+        car_feedback = get_car_feedback()
+        pose_packet = (pose_bridge.snapshot() or {}).get("last_packet")
+        task_decision = task_state_machine.update(
+            perception,
+            now,
+            pose_packet=pose_packet,
+            car_feedback=car_feedback,
+        )
         plan_result = local_planner.plan(perception, task_decision, now)
         final_track_error = plan_result["final_track_error"]
         desired_speed = task_decision["desired_speed"]
