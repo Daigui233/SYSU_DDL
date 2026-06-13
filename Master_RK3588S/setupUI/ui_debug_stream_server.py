@@ -31,7 +31,7 @@ DEBUG_STREAM_DEFAULTS = {
     "FPS": 0.0,
 
     # JPEG quality. Higher is clearer but costs more bandwidth and CPU.
-    "JPEG_QUALITY": 70,
+    "JPEG_QUALITY": 35,
 
     # Resize the published frame if it is wider than this value.
     # Use 0 or a negative value to disable resizing.
