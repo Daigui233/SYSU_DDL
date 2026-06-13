@@ -90,6 +90,9 @@ PLANNER_DEFAULTS = {
 
     # stone 路径走廊最小像素宽度。
     "STONE_PATH_HIT_MIN_PX": 32.0,
+
+    # Once a branch is selected, keep its identity while fork candidates remain visible.
+    "BRANCH_LOCK_RELEASE_FRAMES": 12,
 }
 
 
@@ -160,6 +163,7 @@ class LocalPlanner:
         self.stone_path_hit_lateral_ratio = float(self.params["STONE_PATH_HIT_LATERAL_RATIO"])
         self.stone_path_hit_box_gain = float(self.params["STONE_PATH_HIT_BOX_GAIN"])
         self.stone_path_hit_min_px = float(self.params["STONE_PATH_HIT_MIN_PX"])
+        self.branch_lock_release_frames = int(self.params["BRANCH_LOCK_RELEASE_FRAMES"])
         self.last_final_error = 0.0
         self.last_avoid_side = None
         self.last_avoid_category = None
@@ -168,6 +172,8 @@ class LocalPlanner:
         self.last_human_motion_ts = None
         self.last_human_motion_vx = 0.0
         self.last_valid_ts = 0.0
+        self.locked_branch = None
+        self.branch_lock_missing_frames = 0
 
     def plan(self, perception, task_decision, now=None):
         now = float(now if now is not None else (perception or {}).get("timestamp", 0.0))
@@ -194,8 +200,11 @@ class LocalPlanner:
         reason = "track_center"
         avoid_side = None
         avoid_motion = None
-        branch_candidates = []
-        selected_branch = None
+        branch_candidates = self._build_stone_branch_candidates(
+            segmentation, frame_w, frame_h, center_x, base_error
+        )
+        selected_branch = self.locked_branch
+        self._update_branch_lock_visibility(branch_candidates)
 
         if stop_state:
             final_error = None
@@ -254,11 +263,12 @@ class LocalPlanner:
         if line_valid and final_error is not None and not stop_state:
             if state == TaskState.AVOID_STONE.value:
                 target = intent.get("target") or {}
-                branch_candidates = self._build_stone_branch_candidates(segmentation, frame_w, frame_h, center_x, base_error)
                 branch_plan = self._select_stone_branch(branch_candidates, target, frame_w, frame_h)
                 if branch_plan is not None:
                     raw_target_path = list(branch_plan["path"])
                     selected_branch = branch_plan["branch"]
+                    self.locked_branch = selected_branch
+                    self.branch_lock_missing_frames = 0
                     reason = branch_plan["reason"]
                     raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
                 if not raw_target_path:
@@ -266,6 +276,17 @@ class LocalPlanner:
                     reason = "stone_branch_fallback"
                     if raw_target_path:
                         raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
+            elif self.locked_branch:
+                locked = self._candidate_for_branch(branch_candidates, self.locked_branch)
+                if locked is not None:
+                    raw_target_path = list(locked.get("path") or [])
+                    selected_branch = self.locked_branch
+                    reason = f"branch_locked_{self.locked_branch}"
+                    raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
+                if not raw_target_path:
+                    raw_target_path = self._build_target_path(segmentation, path_offset, frame_w, frame_h)
+                    raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
+                    reason = f"branch_locked_{self.locked_branch}_single_path"
             else:
                 raw_target_path = self._build_target_path(segmentation, path_offset, frame_w, frame_h)
                 raw_final_error = self._path_error_at_lookahead(raw_target_path, center_x, frame_h)
@@ -414,6 +435,11 @@ class LocalPlanner:
         return float(path[idx][0]) - float(center_x)
 
     def _build_stone_branch_candidates(self, segmentation, frame_w, frame_h, center_x, base_error):
+        # Early/candidate states are visual warnings only. Steering may branch
+        # only after the positive-Y classifier and strict geometry agree.
+        if str(segmentation.get("fork_state") or "") != "FORK_CONFIRMED":
+            return []
+
         direct_candidates = []
         for candidate in (segmentation.get("fork_candidates") or []):
             side = str(candidate.get("side") or "")
@@ -553,6 +579,25 @@ class LocalPlanner:
             "path": outer.get("path") or [],
             "reason": "stone_not_on_outer_keep_outer",
         }
+
+    @staticmethod
+    def _candidate_for_branch(branch_candidates, branch):
+        for candidate in branch_candidates or []:
+            if candidate.get("branch") == branch:
+                return candidate
+        return None
+
+    def _update_branch_lock_visibility(self, branch_candidates):
+        if not self.locked_branch:
+            self.branch_lock_missing_frames = 0
+            return
+        if self._candidate_for_branch(branch_candidates, self.locked_branch) is not None:
+            self.branch_lock_missing_frames = 0
+            return
+        self.branch_lock_missing_frames += 1
+        if self.branch_lock_missing_frames >= max(1, self.branch_lock_release_frames):
+            self.locked_branch = None
+            self.branch_lock_missing_frames = 0
 
     def _stone_hits_path(self, target, path, frame_w, frame_h):
         if not target or not path:

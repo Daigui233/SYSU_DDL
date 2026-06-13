@@ -123,6 +123,7 @@ class VisionPipeline:
             "mid_points": [],
             "fork_state": "MISS",
             "fork_mode": "single",
+            "channel_state": "TRACK",
             "fork_classifier": {"available": False, "name": "none", "confidence": 0.0},
             "fork_geometry_valid": False,
             "fork_split_rows": 0,

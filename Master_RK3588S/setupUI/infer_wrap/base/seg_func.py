@@ -27,6 +27,7 @@ MIN_MID_POINTS = 4
 SEGMENTATION_LOOKAHEAD_Y = 300
 
 FORK_CLASS_CONF = 0.48
+FORK_EARLY_CLASS_CONF = 0.32
 FORK_MISS_CONF = 0.58
 ENABLE_GEOMETRY_ONLY_FORK = os.environ.get("ENABLE_GEOMETRY_ONLY_FORK", "0") == "1"
 FORK_MIN_SPLIT_ROWS = 2
@@ -34,10 +35,68 @@ FORK_MIN_BRANCH_POINTS = 4
 FORK_MIN_BRANCH_SEPARATION_RATIO = 0.10
 FORK_MIN_BRANCH_PIXELS = 160
 FORK_MIN_TOTAL_PIXELS = 420
+FORK_EARLY_MIN_SPLIT_ROWS = 1
+FORK_EARLY_MIN_BRANCH_POINTS = 3
+FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO = 0.045
+FORK_EARLY_MIN_BRANCH_PIXELS = 72
+FORK_EARLY_MIN_TOTAL_PIXELS = 180
+FORK_EARLY_CONFIRM_FRAMES = 3
+FORK_CONFIRM_FRAMES = 2
+FORK_RELEASE_FRAMES = 5
+
+CHANNEL_EXPANSION_RATIO = 1.32
+CHANNEL_EXPANSION_MIN_ROWS = 3
+CHANNEL_PATH_DEVIATION_RATIO = 0.035
+CHANNEL_PATH_DEVIATION_MIN_ROWS = 3
+CHANNEL_HOLD_FRAMES = 7
+CHANNEL_HOLD_CORRECTION_RATIO = 0.018
+CHANNEL_NORMAL_BLEND = 0.72
+CHANNEL_RECOVERY_BLEND = 0.45
+CHANNEL_PREDICTION_GAIN = 0.55
+CHANNEL_RESET_LOST_FRAMES = 8
 
 FORK_CLASS_NAMES = ["normal", "fork", "miss"]
 
 _prev_branch_count = 0
+_prev_path = []
+_prev_prev_path = []
+_prev_row_widths = {}
+_channel_hold = 0
+_fork_votes = []
+_fork_hold = 0
+_prev_fork_candidates = {}
+_lost_frames = 0
+
+
+def reset_centerline_state():
+    """Reset temporal path state for tests and pipeline restarts."""
+    global _prev_branch_count, _prev_path, _prev_prev_path, _prev_row_widths
+    global _channel_hold, _fork_votes, _fork_hold, _prev_fork_candidates, _lost_frames
+    _prev_branch_count = 0
+    _prev_path = []
+    _prev_prev_path = []
+    _prev_row_widths = {}
+    _channel_hold = 0
+    _fork_votes = []
+    _fork_hold = 0
+    _prev_fork_candidates = {}
+    _lost_frames = 0
+
+
+def _update_lost_state(road_valid):
+    global _lost_frames, _prev_path, _prev_prev_path, _prev_row_widths
+    global _channel_hold, _prev_fork_candidates
+    if road_valid:
+        _lost_frames = 0
+        return
+    _lost_frames += 1
+    if _lost_frames < CHANNEL_RESET_LOST_FRAMES:
+        return
+    _prev_path = []
+    _prev_prev_path = []
+    _prev_row_widths = {}
+    _channel_hold = 0
+    _prev_fork_candidates = {}
 
 
 def _to_class_map(seg_map):
@@ -366,8 +425,18 @@ def _path_error(points, center_x, lookahead_y, w):
     return float(x - center_x)
 
 
-def _extract_fork_geometry(rows, center_x, lookahead_y, w):
-    min_sep = max(28.0, w * FORK_MIN_BRANCH_SEPARATION_RATIO)
+def _extract_fork_geometry(
+    rows,
+    center_x,
+    lookahead_y,
+    w,
+    min_split_rows=FORK_MIN_SPLIT_ROWS,
+    min_branch_points=FORK_MIN_BRANCH_POINTS,
+    min_separation_ratio=FORK_MIN_BRANCH_SEPARATION_RATIO,
+    min_branch_pixels=FORK_MIN_BRANCH_PIXELS,
+    min_total_pixels=FORK_MIN_TOTAL_PIXELS,
+):
+    min_sep = max(16.0, w * float(min_separation_ratio))
     split_rows = []
     left_pixels = 0
     right_pixels = 0
@@ -392,11 +461,11 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
             })
 
     branch_pixel_threshold = max(
-        FORK_MIN_BRANCH_PIXELS,
-        int(w * area_scale * max(1, FORK_MIN_SPLIT_ROWS) * 0.02),
+        int(min_branch_pixels),
+        int(w * area_scale * max(1, int(min_split_rows)) * 0.012),
     )
     total_pixel_threshold = max(
-        FORK_MIN_TOTAL_PIXELS,
+        int(min_total_pixels),
         branch_pixel_threshold * 2,
     )
     total_pixels = int(left_pixels + right_pixels)
@@ -408,7 +477,7 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
         "total_pixel_threshold": int(total_pixel_threshold),
     }
 
-    if len(split_rows) < FORK_MIN_SPLIT_ROWS:
+    if len(split_rows) < int(min_split_rows):
         return {
             "valid": False,
             "reason": "few_split_rows",
@@ -434,7 +503,7 @@ def _extract_fork_geometry(rows, center_x, lookahead_y, w):
     right_rows = _make_side_rows(rows, "right")
     left_path, left_score = _path_from_rows(left_rows, w, start_ref=center_x, side="left")
     right_path, right_score = _path_from_rows(right_rows, w, start_ref=center_x, side="right")
-    if len(left_path) < FORK_MIN_BRANCH_POINTS or len(right_path) < FORK_MIN_BRANCH_POINTS:
+    if len(left_path) < int(min_branch_points) or len(right_path) < int(min_branch_points):
         return {
             "valid": False,
             "reason": "short_branch",
@@ -554,8 +623,11 @@ def _run_fork_classifier(fork_classifier, road_mask):
         return {"label": 0, "confidence": 0.0, "error": str(exc)}
 
 
-def _update_fork_state(fork_cls, geometry, road_valid):
+def _update_fork_state(fork_cls, geometry, early_geometry, road_valid):
+    global _fork_votes, _fork_hold
     if not road_valid:
+        _fork_votes = []
+        _fork_hold = 0
         return "MISS"
 
     geometry_valid = bool(geometry.get("valid"))
@@ -564,18 +636,150 @@ def _update_fork_state(fork_cls, geometry, road_valid):
     cls_conf = float(fork_cls.get("confidence") or 0.0)
 
     if cls_available and cls_label == 2 and cls_conf >= FORK_MISS_CONF:
+        _fork_votes = []
+        _fork_hold = 0
         return "MISS"
 
     if cls_available:
-        if geometry_valid and cls_label == 1 and cls_conf >= FORK_CLASS_CONF:
+        early_vote = bool(early_geometry.get("valid")) and cls_label == 1 and cls_conf >= FORK_EARLY_CLASS_CONF
+        strict_vote = geometry_valid and cls_label == 1 and cls_conf >= FORK_CLASS_CONF
+        _fork_votes.append((early_vote, strict_vote))
+        _fork_votes = _fork_votes[-max(FORK_EARLY_CONFIRM_FRAMES, FORK_CONFIRM_FRAMES, 4):]
+        early_confirmed = sum(1 for early, _strict in _fork_votes[-FORK_EARLY_CONFIRM_FRAMES:] if early) >= FORK_EARLY_CONFIRM_FRAMES
+        strict_confirmed = sum(1 for _early, strict in _fork_votes[-FORK_CONFIRM_FRAMES:] if strict) >= FORK_CONFIRM_FRAMES
+        if strict_confirmed:
+            _fork_hold = FORK_RELEASE_FRAMES
             return "FORK_CONFIRMED"
-        if cls_label == 1:
+        if strict_vote or early_confirmed:
+            _fork_hold = max(_fork_hold, 1)
             return "FORK_CANDIDATE"
+        if early_vote or (cls_label == 1 and cls_conf >= FORK_EARLY_CLASS_CONF):
+            return "FORK_EARLY"
+        if _fork_hold > 0 and bool(early_geometry.get("valid")):
+            _fork_hold -= 1
+            return "FORK_CANDIDATE"
+        _fork_hold = max(0, _fork_hold - 1)
         return "NORMAL"
 
     if ENABLE_GEOMETRY_ONLY_FORK and geometry_valid:
         return "FORK_CONFIRMED"
     return "NORMAL"
+
+
+def _row_for_y(rows, y):
+    if not rows:
+        return None
+    return min(rows, key=lambda item: abs(int(item.get("y", 0)) - int(y)))
+
+
+def _path_row_widths(rows, points):
+    widths = {}
+    for x, y in points:
+        row = _row_for_y(rows, y)
+        if row is None:
+            continue
+        segments = row.get("segments") or []
+        if not segments:
+            continue
+        seg = min(
+            segments,
+            key=lambda item: 0.0
+            if float(item["left"]) <= float(x) <= float(item["right"])
+            else abs(float(item["center"]) - float(x)),
+        )
+        widths[int(y)] = float(seg.get("width", 0.0))
+    return widths
+
+
+def _predict_path_x(y, w):
+    previous = _point_x_at_y(_prev_path, y, w)
+    if previous is None:
+        return None
+    older = _point_x_at_y(_prev_prev_path, y, w)
+    if older is None:
+        return previous
+    return float(np.clip(previous + (previous - older) * CHANNEL_PREDICTION_GAIN, 0, w - 1))
+
+
+def _stabilize_single_path(points, rows, w, positive_y):
+    """Keep the current curved channel when an unconfirmed merge widens the mask."""
+    global _prev_path, _prev_prev_path, _prev_row_widths, _channel_hold
+    if not points:
+        return []
+    if not _prev_path:
+        _prev_path = list(points)
+        _prev_row_widths = _path_row_widths(rows, points)
+        return list(points)
+
+    current_widths = _path_row_widths(rows, points)
+    expanded_rows = 0
+    deviated_rows = 0
+    for _x, y in points:
+        current = current_widths.get(int(y))
+        previous = _prev_row_widths.get(int(y))
+        if current is not None and previous is not None and previous > 1.0:
+            expanded_rows += int(current > previous * CHANNEL_EXPANSION_RATIO)
+        predicted = _predict_path_x(y, w)
+        if predicted is not None:
+            deviated_rows += int(abs(float(_x) - predicted) > w * CHANNEL_PATH_DEVIATION_RATIO)
+
+    hold_trigger = (
+        expanded_rows >= CHANNEL_EXPANSION_MIN_ROWS
+        or deviated_rows >= CHANNEL_PATH_DEVIATION_MIN_ROWS
+    )
+    if not positive_y and hold_trigger:
+        _channel_hold = CHANNEL_HOLD_FRAMES
+    elif _channel_hold > 0:
+        _channel_hold -= 1
+
+    blend = CHANNEL_NORMAL_BLEND
+    max_correction = max(5.0, w * CHANNEL_HOLD_CORRECTION_RATIO)
+    if _channel_hold > 0 and not positive_y:
+        blend = 0.18
+    elif not positive_y:
+        blend = CHANNEL_RECOVERY_BLEND if expanded_rows else CHANNEL_NORMAL_BLEND
+
+    stabilized = []
+    for raw_x, y in points:
+        predicted = _predict_path_x(y, w)
+        if predicted is None:
+            stabilized.append((int(raw_x), int(y)))
+            continue
+        raw_x = float(raw_x)
+        if _channel_hold > 0 and not positive_y:
+            raw_x = float(np.clip(raw_x, predicted - max_correction, predicted + max_correction))
+        x = predicted * (1.0 - blend) + raw_x * blend
+        stabilized.append((int(np.clip(round(x), 0, w - 1)), int(y)))
+
+    stabilized = _smooth_path(stabilized, w)
+    _prev_prev_path = list(_prev_path)
+    _prev_path = list(stabilized)
+    if not positive_y and expanded_rows == 0:
+        _prev_row_widths = current_widths
+    return stabilized
+
+
+def _stabilize_fork_candidates(candidates, w):
+    global _prev_fork_candidates
+    result = []
+    next_paths = {}
+    for candidate in candidates:
+        item = dict(candidate)
+        side = str(item.get("side") or "")
+        path = list(item.get("path") or [])
+        previous = _prev_fork_candidates.get(side) or []
+        if previous and path:
+            blended = []
+            for x, y in path:
+                px = _point_x_at_y(previous, y, w)
+                bx = float(x) if px is None else float(x) * 0.68 + float(px) * 0.32
+                blended.append((int(np.clip(round(bx), 0, w - 1)), int(y)))
+            path = _smooth_path(blended, w)
+        item["path"] = path
+        next_paths[side] = list(path)
+        result.append(item)
+    _prev_fork_candidates = next_paths
+    return result
 
 
 def _choose_control_path(main_points, fork_candidates):
@@ -644,6 +848,7 @@ def _empty_centerline_info(frame, reason="lost"):
         "mid_points": [],
         "fork_state": "MISS",
         "fork_mode": "single",
+        "channel_state": "TRACK",
         "fork_classifier": {
             "available": False,
             "label": None,
@@ -652,6 +857,7 @@ def _empty_centerline_info(frame, reason="lost"):
             "error": None,
         },
         "fork_geometry_valid": False,
+        "fork_strict_geometry_valid": False,
         "fork_split_rows": 0,
         "fork_left_pixels": 0,
         "fork_right_pixels": 0,
@@ -771,6 +977,7 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
     raw_ratio = float((class_map == ROAD_CLASS_ID).sum()) / float(class_map.size) if class_map.size else 0.0
     selected, selected_valid = _select_road(raw_mask)
     road_mask, road_valid, ratio, reason = _valid_mask(selected, selected_valid, raw_ratio)
+    _update_lost_state(road_valid)
 
     h, w = road_mask.shape
     center_x = w // 2
@@ -784,11 +991,29 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         if road_valid and rows
         else {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
     )
-    fork_state = _update_fork_state(fork_cls, geometry, road_valid)
-    fork_candidates = geometry.get("candidates") or []
+    early_geometry = (
+        _extract_fork_geometry(
+            rows,
+            center_x,
+            lookahead_y,
+            w,
+            min_split_rows=FORK_EARLY_MIN_SPLIT_ROWS,
+            min_branch_points=FORK_EARLY_MIN_BRANCH_POINTS,
+            min_separation_ratio=FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO,
+            min_branch_pixels=FORK_EARLY_MIN_BRANCH_PIXELS,
+            min_total_pixels=FORK_EARLY_MIN_TOTAL_PIXELS,
+        )
+        if road_valid and rows
+        else {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
+    )
+    fork_state = _update_fork_state(fork_cls, geometry, early_geometry, road_valid)
+    positive_y = fork_state in ("FORK_EARLY", "FORK_CANDIDATE", "FORK_CONFIRMED")
+    mid_points = _stabilize_single_path(mid_points, rows, w, positive_y) if mid_ok else []
+    candidate_source = geometry if geometry.get("valid") else early_geometry
+    fork_candidates = _stabilize_fork_candidates(candidate_source.get("candidates") or [], w) if positive_y else []
     selected_points, selected_side = _choose_control_path(
         mid_points,
-        fork_candidates,
+        fork_candidates if fork_state == "FORK_CONFIRMED" else [],
     )
 
     selected_ok = len(selected_points) >= MIN_MID_POINTS
@@ -827,14 +1052,16 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         "midline_score": float(mid_score),
         "fork_state": fork_state,
         "fork_mode": "dual" if len(fork_candidates) >= 2 else "single",
+        "channel_state": "HOLD" if _channel_hold > 0 else "TRACK",
         "fork_classifier": fork_cls,
-        "fork_geometry_valid": bool(geometry.get("valid")),
-        "fork_split_rows": int(geometry.get("split_rows", 0)),
-        "fork_left_pixels": int(geometry.get("left_pixels", 0)),
-        "fork_right_pixels": int(geometry.get("right_pixels", 0)),
-        "fork_total_pixels": int(geometry.get("total_pixels", 0)),
-        "fork_branch_pixel_threshold": int(geometry.get("branch_pixel_threshold", FORK_MIN_BRANCH_PIXELS)),
-        "fork_total_pixel_threshold": int(geometry.get("total_pixel_threshold", FORK_MIN_TOTAL_PIXELS)),
+        "fork_geometry_valid": bool(candidate_source.get("valid")),
+        "fork_strict_geometry_valid": bool(geometry.get("valid")),
+        "fork_split_rows": int(candidate_source.get("split_rows", 0)),
+        "fork_left_pixels": int(candidate_source.get("left_pixels", 0)),
+        "fork_right_pixels": int(candidate_source.get("right_pixels", 0)),
+        "fork_total_pixels": int(candidate_source.get("total_pixels", 0)),
+        "fork_branch_pixel_threshold": int(candidate_source.get("branch_pixel_threshold", FORK_MIN_BRANCH_PIXELS)),
+        "fork_total_pixel_threshold": int(candidate_source.get("total_pixel_threshold", FORK_MIN_TOTAL_PIXELS)),
         "fork_candidates": [
             {
                 "side": str(c.get("side")),
@@ -847,7 +1074,7 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
             for c in fork_candidates
         ],
         "fork_selected_side": selected_side if selected_side != "main" else None,
-        "fork_reason": str(geometry.get("reason") or reason),
+        "fork_reason": str(candidate_source.get("reason") or reason),
     }
     out = draw_centerline_debug(frame, info) if draw_debug else frame
     return out, info
