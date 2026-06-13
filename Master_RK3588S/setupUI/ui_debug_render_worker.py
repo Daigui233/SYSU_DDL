@@ -164,6 +164,7 @@ class DebugRenderWorker:
                     final_frame,
                     item.get("task_decision"),
                     item.get("plan_result"),
+                    draw_text=False,
                 )
 
                 command = item.get("command") or {}
@@ -180,6 +181,9 @@ class DebugRenderWorker:
                     performance_status=performance_status,
                     target_speed=command.get("target_speed"),
                     segmentation_status=(item.get("perception") or {}).get("segmentation"),
+                    detection_status=(item.get("perception") or {}).get("detection_status"),
+                    task_decision=item.get("task_decision"),
+                    plan_result=item.get("plan_result"),
                     enabled=self.draw_pose_panel,
                 )
                 if final_frame is None or final_frame.size == 0:

@@ -815,7 +815,7 @@ class LocalPlanner:
     def _side_sign(side):
         return -1.0 if side == "left" else 1.0
 
-    def draw_debug(self, frame, task_decision, plan_result):
+    def draw_debug(self, frame, task_decision, plan_result, draw_text=True):
         if frame is None or plan_result is None:
             return frame
         out = frame
@@ -848,11 +848,12 @@ class LocalPlanner:
             x = int(_clamp(target_x, 0, w - 1))
             cv2.circle(out, (x, int(h * 0.68)), 8, (255, 0, 255), -1)
 
-        state = str((task_decision or {}).get("task_state") or "N/A")
-        err = plan_result.get("final_track_error")
-        err_text = "N/A" if err is None else f"{float(err):.1f}"
-        cv2.putText(out, f"Task: {state}", (10, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
-        cv2.putText(out, f"Final err: {err_text}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
-        if selected_branch:
-            cv2.putText(out, f"Branch: {selected_branch}", (10, 228), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
+        if draw_text:
+            state = str((task_decision or {}).get("task_state") or "N/A")
+            err = plan_result.get("final_track_error")
+            err_text = "N/A" if err is None else f"{float(err):.1f}"
+            cv2.putText(out, f"Task: {state}", (10, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
+            cv2.putText(out, f"Final err: {err_text}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
+            if selected_branch:
+                cv2.putText(out, f"Branch: {selected_branch}", (10, 228), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
         return out

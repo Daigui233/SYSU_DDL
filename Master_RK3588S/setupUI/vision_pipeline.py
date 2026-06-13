@@ -297,9 +297,7 @@ class VisionPipeline:
         perception = perception or {}
         segmentation = perception.get("segmentation") or {}
         if segmentation.get("source") == "current" or segmentation.get("road_mask") is not None:
-            out = draw_centerline_debug(out, segmentation)
-        else:
-            draw_waiting(out)
+            out = draw_centerline_debug(out, segmentation, draw_text=False)
 
         detections = list(perception.get("detections") or [])
         self._draw_detection_list(out, detections)

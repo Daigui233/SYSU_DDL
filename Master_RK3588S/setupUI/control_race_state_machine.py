@@ -200,6 +200,15 @@ class RaceStateMachine:
         self.red_confirm_first_ts = None
         self.last_red_stop_ts = None
 
+    def _sign_phase(self):
+        if self.finish_stop:
+            return "FINISHED"
+        if not self.race_started:
+            return "WAIT_BEGIN"
+        if self._end_sign_allowed():
+            return "WAIT_END"
+        return "RACING"
+
     def update(self, perception, now, pose_packet=None, car_feedback=None):
         now = float(now)
         frame_shape = (perception or {}).get("frame_shape") or [0, 0]
@@ -245,14 +254,18 @@ class RaceStateMachine:
         )
         door_cross_event = self._update_door_cross(door_active, now)
 
-        begin_under_door = _sign_under_door(begin, door, frame_w, frame_h, self.params)
-        end_under_door = _sign_under_door(end, door, frame_w, frame_h, self.params)
+        begin_visible_under_door = _sign_under_door(begin, door, frame_w, frame_h, self.params)
+        end_visible_under_door = _sign_under_door(end, door, frame_w, frame_h, self.params)
+        begin_sign_was_allowed = not self.race_started
+        begin_under_door = bool(begin_sign_was_allowed and begin_visible_under_door)
         if begin_under_door:
             self.last_begin_seen_ts = now
 
         lap_event = self._update_laps(door_cross_event, now)
+        begin_sign_allowed = not self.race_started
         end_stop_enabled = bool(self.params["ENDSIGN_STOP_ENABLED"])
         end_sign_allowed = self._end_sign_allowed()
+        end_under_door = bool(end_sign_allowed and end_visible_under_door)
         end_sign_can_stop = bool(end_stop_enabled and end_sign_allowed)
         end_confirm_age = self._update_end_sign(end_under_door, end_sign_can_stop, now)
         traffic_state, traffic_stop, traffic_stop_zone, red_confirm_age = self._update_traffic_light(
@@ -279,8 +292,14 @@ class RaceStateMachine:
             "door_active": bool(door_active),
             "door_cross_event": bool(door_cross_event),
             "lap_event": lap_event,
+            "sign_phase": self._sign_phase(),
+            "begin_sign_visible": bool(begin is not None),
+            "begin_sign_allowed": bool(begin_sign_allowed),
+            "begin_sign_ignored": bool(begin_visible_under_door and not begin_sign_was_allowed),
             "begin_under_door": bool(begin_under_door),
+            "end_sign_visible": bool(end is not None),
             "end_under_door": bool(end_under_door),
+            "end_sign_ignored": bool(end_visible_under_door and not end_sign_allowed),
             "end_sign_allowed": bool(end_sign_allowed),
             "end_sign_stop_enabled": bool(end_stop_enabled),
             "end_confirm_age": float(end_confirm_age),
@@ -331,7 +350,9 @@ class RaceStateMachine:
         return None
 
     def _end_sign_allowed(self):
-        if self.params["ENDSIGN_REQUIRE_RACE_STARTED"] and not self.race_started:
+        # BeginSign is the mandatory phase transition that unlocks all later
+        # EndSign handling. This ordering must not be bypassed by configuration.
+        if not self.race_started:
             return False
         if self.params["ENDSIGN_REQUIRE_FINAL_LAP"]:
             total_laps = max(1, int(self.params["TOTAL_LAPS"]))

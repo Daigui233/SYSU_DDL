@@ -664,7 +664,7 @@ def _empty_centerline_info(frame, reason="lost"):
     }
 
 
-def draw_centerline_debug(frame, info):
+def draw_centerline_debug(frame, info, draw_text=True):
     info = dict(info or {})
     road_mask = info.get("road_mask")
     if road_mask is None:
@@ -698,6 +698,9 @@ def draw_centerline_debug(frame, info):
     control_center_x = info.get("control_center_x")
     if control_center_x is not None:
         cv2.circle(out, (int(round(float(control_center_x))), lookahead_y), 6, (0, 255, 0), -1)
+
+    if not draw_text:
+        return out
 
     road_valid = bool(info.get("road_valid"))
     road_state = str(info.get("road_state") or ("OK" if road_valid else "LOST"))

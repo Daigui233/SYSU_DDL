@@ -371,6 +371,66 @@ def _format_feedback_float(feedback, key, digits=1, default="N/A"):
     return f"{value:.{digits}f}"
 
 
+def _draw_key_status_card(frame, lines, color):
+    lines = [short_text(_ascii_hud_text(line, "N/A"), 46) for line in lines if line]
+    if not lines:
+        return frame
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.56
+    thickness = 1
+    line_h = 25
+    pad_x = 10
+    pad_y = 8
+    text_width = max(cv2.getTextSize(line, font, font_scale, thickness)[0][0] for line in lines)
+    card_w = min(frame.shape[1] - 16, text_width + pad_x * 2)
+    card_h = min(frame.shape[0] - 16, len(lines) * line_h + pad_y * 2)
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (8, 8), (8 + card_w, 8 + card_h), (8, 12, 15), -1)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0.0, frame)
+    cv2.rectangle(frame, (8, 8), (8 + card_w, 8 + card_h), color, 1, cv2.LINE_AA)
+
+    y = 8 + pad_y + 17
+    for index, line in enumerate(lines):
+        line_color = color if index == 0 else (235, 245, 245)
+        cv2.putText(frame, line, (8 + pad_x, y), font, font_scale, line_color, thickness, cv2.LINE_AA)
+        y += line_h
+    return frame
+
+
+def _draw_grouped_status_panel(h, dtype, color, sections, panel_w=390):
+    panel = np.zeros((h, panel_w, 3), dtype=dtype)
+    panel[:, :] = (12, 16, 16)
+    cv2.rectangle(panel, (0, 0), (panel_w - 1, h - 1), color, 1)
+
+    row_count = sum(1 + len(lines) for _title, lines in sections)
+    line_h = max(16, min(21, (h - 18) // max(1, row_count)))
+    font_scale = 0.46 if line_h <= 17 else 0.49
+    y = 15
+    for title, section_lines in sections:
+        if y + line_h > h:
+            break
+        cv2.putText(panel, title, (12, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
+        cv2.line(panel, (10, y + 5), (panel_w - 12, y + 5), (55, 70, 70), 1, cv2.LINE_AA)
+        y += line_h
+        for line in section_lines:
+            if y + 3 > h:
+                break
+            cv2.putText(
+                panel,
+                short_text(_ascii_hud_text(line, "N/A"), 46),
+                (16, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (230, 245, 245),
+                1,
+                cv2.LINE_AA,
+            )
+            y += line_h
+    return panel
+
+
 def _load_hud_font(params):
     if _font_cache["tried"]:
         return _font_cache["font"]
@@ -454,6 +514,9 @@ def draw_pose_status(
     performance_status=None,
     target_speed=None,
     segmentation_status=None,
+    detection_status=None,
+    task_decision=None,
+    plan_result=None,
     enabled=True,
 ):
     if not enabled:
@@ -474,15 +537,12 @@ def draw_pose_status(
     pose_rx = int(info.get("datagram_count") or 0)
     pose_fwd_ms = _safe_float(info.get("last_forward_ms"), 0.0)
     pose_handle_ms = _safe_float(info.get("last_handle_ms"), 0.0)
-    pose_io_line = f"POSE_IO rx={pose_rx} drop={pose_drop} fwd={pose_fwd_ms:.1f} h={pose_handle_ms:.1f}"
+    pose_io_line = f"POSE_IO rx={pose_rx} drop={pose_drop} ms={pose_fwd_ms:.1f}/{pose_handle_ms:.1f}"
     if packet:
         pos = packet.get("pos", [0.0, 0.0, 0.0])
         euler = packet.get("euler", [0.0, 0.0, 0.0])
         age_text = f"{age:.1f}s" if age is not None else "N/A"
-        pose_line = (
-            f"POSE x={pos[0]:.2f} y={pos[1]:.2f} z={pos[2]:.2f} "
-            f"yaw={euler[1]:.1f} age={age_text}"
-        )
+        pose_line = f"POSE x={pos[0]:.2f} z={pos[2]:.2f} yaw={euler[1]:.1f} age={age_text}"
 
     if track_error is not None and np.isfinite(track_error):
         err_text = f"{track_error:.1f}"
@@ -494,6 +554,7 @@ def draw_pose_status(
     cmd_line = f"CMD v={speed_text} err={err_text}"
     seg_line = "SEG N/A"
     fork_line = "FORK N/A"
+    road_line = "ROAD N/A"
     if isinstance(segmentation_status, dict):
         seg_source = segmentation_status.get("source") or "N/A"
         frame_id = segmentation_status.get("frame_id")
@@ -505,9 +566,12 @@ def draw_pose_status(
         lag_text = "-" if lag_frames is None else str(lag_frames)
         age_text = "-" if seg_age_ms is None else f"{seg_age_ms:.0f}ms"
         seg_line = f"SEG {seg_source} fid={frame_text} sid={seg_frame_text} lag={lag_text} age={age_text}"
+        road_state = segmentation_status.get("road_state") or "N/A"
+        midline_state = segmentation_status.get("midline_state") or "N/A"
+        road_ratio = _safe_float(segmentation_status.get("road_ratio"), 0.0)
+        road_line = f"ROAD {road_state} mid={midline_state} ratio={road_ratio:.1%}"
         fork_cls = segmentation_status.get("fork_classifier") or {}
         fork_state = segmentation_status.get("fork_state") or "N/A"
-        fork_mode = segmentation_status.get("fork_mode") or "single"
         fork_name = fork_cls.get("name") or "none"
         fork_conf = _safe_float(fork_cls.get("confidence"), None)
         split_rows = segmentation_status.get("fork_split_rows", 0)
@@ -517,9 +581,28 @@ def draw_pose_status(
         selected_side = segmentation_status.get("fork_selected_side") or "-"
         conf_text = "N/A" if fork_conf is None else f"{fork_conf:.2f}"
         fork_line = (
-            f"FORK {fork_state} {fork_mode} cls={fork_name}:{conf_text} "
+            f"FORK {fork_state} cls={fork_name}:{conf_text} "
             f"split={split_rows} pix={left_pixels}/{right_pixels}>{branch_pixel_threshold} sel={selected_side}"
         )
+
+    det_source = (detection_status or {}).get("source") or "N/A"
+    det_count = int((detection_status or {}).get("count") or 0)
+    det_age_ms = _safe_float((detection_status or {}).get("det_age_ms"), None)
+    det_age_text = "-" if det_age_ms is None else f"{det_age_ms:.0f}ms"
+    det_line = f"DET {det_source} count={det_count} age={det_age_text}"
+
+    task_decision = task_decision or {}
+    plan_result = plan_result or {}
+    task_reason = task_decision.get("reason") or "N/A"
+    planner_reason = plan_result.get("planner_reason") or "N/A"
+    planner_mode = (task_decision.get("planner_intent") or {}).get("mode") or "N/A"
+    plan_line = f"PLAN {planner_mode}"
+    reason_line = f"WHY task={task_reason} plan={planner_reason}"
+    race_state = task_decision.get("race_state") or {}
+    race_line = (
+        f"RACE lap={race_state.get('current_lap', 0)}/{race_state.get('total_laps', 0)} "
+        f"phase={race_state.get('sign_phase', 'N/A')} light={race_state.get('traffic_light_state', 'none')}"
+    )
 
     feedback = get_car_feedback() if get_car_feedback is not None else {"online": False, "error": "waiting"}
     car_lines = []
@@ -581,35 +664,24 @@ def draw_pose_status(
         if err:
             car_lines.append(err)
 
-    lines = [
-        "RUN STATUS",
-        control_line,
-        cmd_line,
-        seg_line,
-        fork_line,
-        pose_line,
-        pose_io_line,
-    ]
-    lines.extend(car_lines)
-    lines.extend(_format_compact_perf_lines(performance_status, fps))
-
     h = frame.shape[0]
     left_panel = _draw_referee_panel(h, frame.dtype, now)
+    key_line = road_line
+    if race_state.get("traffic_light_stop"):
+        key_line = "STOP traffic light"
+    elif race_state.get("finish_stop"):
+        key_line = "STOP finish"
+    elif str(control_state) == "LINE_LOSS_SAFE_STOP":
+        key_line = "STOP line lost"
+    _draw_key_status_card(frame, [control_line, cmd_line, key_line], color)
 
-    panel_w = 340
-    panel = np.zeros((h, panel_w, 3), dtype=frame.dtype)
-    panel[:, :] = (12, 16, 16)
-    cv2.rectangle(panel, (0, 0), (panel_w - 1, h - 1), color, 1)
-
-    line_h = 24
-    y = 28
-    for i, line in enumerate(lines):
-        text_color = color if i == 0 else (230, 245, 245)
-        cv2.putText(panel, short_text(line, 42), (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, text_color, 1, cv2.LINE_AA)
-        y += line_h
-        if i in (0, 4):
-            cv2.line(panel, (10, y - 8), (panel_w - 12, y - 8), (55, 70, 70), 1, cv2.LINE_AA)
-
+    sections = [
+        ("CONTROL", [control_line, cmd_line, plan_line, reason_line, race_line]),
+        ("VISION", [road_line, seg_line, det_line, fork_line]),
+        ("LINK", [pose_line, pose_io_line] + car_lines),
+        ("PERF", _format_compact_perf_lines(performance_status, fps)),
+    ]
+    panel = _draw_grouped_status_panel(h, frame.dtype, color, sections)
     return np.hstack([left_panel, frame, panel])
 
 
