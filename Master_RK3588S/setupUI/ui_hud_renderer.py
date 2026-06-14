@@ -569,8 +569,9 @@ def draw_pose_status(
         road_state = segmentation_status.get("road_state") or "N/A"
         midline_state = segmentation_status.get("midline_state") or "N/A"
         channel_state = segmentation_status.get("channel_state") or "TRACK"
+        postproc_state = segmentation_status.get("postproc_state") or "OFF"
         road_ratio = _safe_float(segmentation_status.get("road_ratio"), 0.0)
-        road_line = f"ROAD {road_state} mid={midline_state} ch={channel_state} ratio={road_ratio:.1%}"
+        road_line = f"ROAD {road_state} mid={midline_state} ch={channel_state} pp={postproc_state} ratio={road_ratio:.1%}"
         fork_cls = segmentation_status.get("fork_classifier") or {}
         fork_state = segmentation_status.get("fork_state") or "N/A"
         fork_name = fork_cls.get("name") or "none"

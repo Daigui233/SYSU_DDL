@@ -57,6 +57,16 @@ CHANNEL_RESET_LOST_FRAMES = 8
 
 FORK_CLASS_NAMES = ["normal", "fork", "miss"]
 
+# Fork-strength ramp: late trigger, fast climb.
+# Strength 0.0 = OFF (NORMAL, no postproc). 1.0 = LOCK (strict confirmed).
+FORK_STRENGTH_ACTIVATE_EARLY_COUNT = 2   # need ≥ this many early votes to activate
+FORK_STRENGTH_HOLD_MIN = 0.6             # hold only when strength ≥ this
+FORK_STRENGTH_EARLY_TABLE = {            # early_count → strength (only ≥ ACTIVATE_EARLY_COUNT)
+    2: 0.60,
+    3: 0.85,
+    4: 0.95,
+}
+
 _prev_branch_count = 0
 _prev_path = []
 _prev_prev_path = []
@@ -666,6 +676,42 @@ def _update_fork_state(fork_cls, geometry, early_geometry, road_valid):
     return "NORMAL"
 
 
+def _compute_fork_strength():
+    """Late-trigger, fast-climb fork confidence strength 0.0–1.0.
+
+    0.0  = no postproc (NORMAL road, raw DP output).
+    0.60 = first activation (≥2 early votes).
+    0.85 = strong (≥3 early votes).
+    0.95 = near-lock (≥4 early votes).
+    1.0  = lock (≥2 strict votes).
+    """
+    if not _fork_votes:
+        return 0.0
+    window = _fork_votes[-4:]
+    strict_count = sum(1 for _, s in window if s)
+    early_count = sum(1 for e, _ in window if e)
+
+    if strict_count >= 2:
+        return 1.0
+
+    if early_count < FORK_STRENGTH_ACTIVATE_EARLY_COUNT:
+        return 0.0
+
+    return FORK_STRENGTH_EARLY_TABLE.get(early_count, 0.95)
+
+
+def _postproc_state_name(fork_strength, channel_hold):
+    if fork_strength <= 0.0:
+        return "OFF"
+    if fork_strength >= 1.0:
+        return "LOCK"
+    if channel_hold > 0:
+        return "HOLD"
+    if fork_strength >= 0.7:
+        return "ACTIVE"
+    return "WARM"
+
+
 def _row_for_y(rows, y):
     if not rows:
         return None
@@ -701,9 +747,14 @@ def _predict_path_x(y, w):
     return float(np.clip(previous + (previous - older) * CHANNEL_PREDICTION_GAIN, 0, w - 1))
 
 
-def _stabilize_single_path(points, rows, w, positive_y):
-    """Keep the current curved channel when an unconfirmed merge widens the mask."""
+def _stabilize_single_path(points, rows, w, fork_strength):
+    """Fork-aware midline temporal stabilization.  Only called when fork_strength > 0.
+
+    Blend and hold are both driven by fork_strength so protection ramps up smoothly
+    as fork evidence accumulates, instead of switching at a single binary threshold.
+    """
     global _prev_path, _prev_prev_path, _prev_row_widths, _channel_hold
+    # Caller guarantees points and _prev_path are non-empty when fork_strength > 0.
     if not points:
         return []
     if not _prev_path:
@@ -727,34 +778,38 @@ def _stabilize_single_path(points, rows, w, positive_y):
         expanded_rows >= CHANNEL_EXPANSION_MIN_ROWS
         or deviated_rows >= CHANNEL_PATH_DEVIATION_MIN_ROWS
     )
-    if not positive_y and hold_trigger:
+
+    # Hold only activates when fork confidence is high enough (late trigger).
+    if hold_trigger and fork_strength >= FORK_STRENGTH_HOLD_MIN:
         _channel_hold = CHANNEL_HOLD_FRAMES
     elif _channel_hold > 0:
         _channel_hold -= 1
 
-    blend = CHANNEL_NORMAL_BLEND
-    max_correction = max(5.0, w * CHANNEL_HOLD_CORRECTION_RATIO)
-    if _channel_hold > 0 and not positive_y:
-        blend = 0.18
-    elif not positive_y:
-        blend = CHANNEL_RECOVERY_BLEND if expanded_rows else CHANNEL_NORMAL_BLEND
+    # Blend: interpolated by fork_strength (no more binary on/off).
+    # No-hold: 1.0 (raw DP) → 0.72   Hold: 0.72 → 0.18
+    if _channel_hold > 0:
+        blend = 0.72 - fork_strength * (0.72 - 0.18)
+    else:
+        blend = 1.0 - fork_strength * (1.0 - 0.72)
 
+    max_correction = max(5.0, w * CHANNEL_HOLD_CORRECTION_RATIO)
     stabilized = []
     for raw_x, y in points:
         predicted = _predict_path_x(y, w)
         if predicted is None:
             stabilized.append((int(raw_x), int(y)))
             continue
-        raw_x = float(raw_x)
-        if _channel_hold > 0 and not positive_y:
-            raw_x = float(np.clip(raw_x, predicted - max_correction, predicted + max_correction))
-        x = predicted * (1.0 - blend) + raw_x * blend
+        raw_x_f = float(raw_x)
+        if _channel_hold > 0 and fork_strength >= FORK_STRENGTH_HOLD_MIN:
+            effective_correction = max_correction * fork_strength
+            raw_x_f = float(np.clip(raw_x_f, predicted - effective_correction, predicted + effective_correction))
+        x = predicted * (1.0 - blend) + raw_x_f * blend
         stabilized.append((int(np.clip(round(x), 0, w - 1)), int(y)))
 
     stabilized = _smooth_path(stabilized, w)
     _prev_prev_path = list(_prev_path)
     _prev_path = list(stabilized)
-    if not positive_y and expanded_rows == 0:
+    if expanded_rows == 0:
         _prev_row_widths = current_widths
     return stabilized
 
@@ -849,6 +904,9 @@ def _empty_centerline_info(frame, reason="lost"):
         "fork_state": "MISS",
         "fork_mode": "single",
         "channel_state": "TRACK",
+        "channel_hold": 0,
+        "postproc_state": "OFF",
+        "fork_strength": 0.0,
         "fork_classifier": {
             "available": False,
             "label": None,
@@ -939,6 +997,17 @@ def draw_centerline_debug(frame, info, draw_text=True):
 
     cv2.putText(out, f"Road seg: {road_state} {ratio:.1%} {reason}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
     cv2.putText(out, f"Midline: {mid_state}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
+    postproc_state = str(info.get("postproc_state") or "OFF")
+    fork_strength_info = float(info.get("fork_strength") or 0.0)
+    channel_hold_info = int(info.get("channel_hold") or 0)
+    pp_color = (0, 255, 0)
+    if postproc_state == "LOCK":
+        pp_color = (255, 0, 255)
+    elif postproc_state in ("HOLD", "ACTIVE"):
+        pp_color = (0, 255, 255)
+    elif postproc_state == "WARM":
+        pp_color = (0, 200, 200)
+
     cv2.putText(out, err_text, (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
     cv2.putText(
         out,
@@ -951,14 +1020,23 @@ def draw_centerline_debug(frame, info, draw_text=True):
     )
     cv2.putText(
         out,
-        f"Fork pix L/R/T: {left_pixels}/{right_pixels}/{total_pixels}>{branch_pixel_threshold}/{total_pixel_threshold}",
+        f"PostProc: {postproc_state} str={fork_strength_info:.2f} hold={channel_hold_info}",
         (10, 172),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        pp_color,
+        2,
+    )
+    cv2.putText(
+        out,
+        f"Fork pix L/R/T: {left_pixels}/{right_pixels}/{total_pixels}>{branch_pixel_threshold}/{total_pixel_threshold}",
+        (10, 200),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
         (0, 255, 255),
         2,
     )
-    cv2.putText(out, f"Branches: {branch_count}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+    cv2.putText(out, f"Branches: {branch_count}", (10, 228), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
     return out
 
 
@@ -1007,10 +1085,24 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         else {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
     )
     fork_state = _update_fork_state(fork_cls, geometry, early_geometry, road_valid)
-    positive_y = fork_state in ("FORK_EARLY", "FORK_CANDIDATE", "FORK_CONFIRMED")
-    mid_points = _stabilize_single_path(mid_points, rows, w, positive_y) if mid_ok else []
+    fork_strength = _compute_fork_strength()
     candidate_source = geometry if geometry.get("valid") else early_geometry
-    fork_candidates = _stabilize_fork_candidates(candidate_source.get("candidates") or [], w) if positive_y else []
+
+    if fork_strength > 0.0 and mid_ok:
+        # Fork post-processing: strength drives blend/hold ramping.
+        mid_points = _stabilize_single_path(mid_points, rows, w, fork_strength)
+        fork_candidates = _stabilize_fork_candidates(candidate_source.get("candidates") or [], w)
+    else:
+        # NORMAL road: raw DP output, no temporal overhead.
+        # Still record history so the first fork-activated frame has a warm start.
+        if mid_ok:
+            _prev_prev_path = list(_prev_path)
+            _prev_path = list(mid_points)
+            _prev_row_widths = _path_row_widths(rows, mid_points)
+        _channel_hold = 0
+        fork_candidates = []
+
+    postproc_state = _postproc_state_name(fork_strength, _channel_hold)
     selected_points, selected_side = _choose_control_path(
         mid_points,
         fork_candidates if fork_state == "FORK_CONFIRMED" else [],
@@ -1053,6 +1145,9 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         "fork_state": fork_state,
         "fork_mode": "dual" if len(fork_candidates) >= 2 else "single",
         "channel_state": "HOLD" if _channel_hold > 0 else "TRACK",
+        "channel_hold": int(_channel_hold),
+        "postproc_state": postproc_state,
+        "fork_strength": float(fork_strength),
         "fork_classifier": fork_cls,
         "fork_geometry_valid": bool(candidate_source.get("valid")),
         "fork_strict_geometry_valid": bool(geometry.get("valid")),
