@@ -6,6 +6,11 @@
     const pressedKeys = new Set();
     const poseZBase = 0.30;
     const wasdPose = { x: 0, y: 0.16, z: poseZBase, yaw: 0 };
+    let visionControls = {
+        enable_detection: true,
+        enable_segmentation: true,
+        enable_model_overlay: true,
+    };
 
     function byId(id) {
         return document.getElementById(id);
@@ -103,6 +108,48 @@
         const el = byId(id);
         const value = Number(el ? el.value : NaN);
         return Number.isFinite(value) ? value : fallback;
+    }
+
+    function renderVisionControls(controls) {
+        visionControls = {
+            ...visionControls,
+            ...(controls || {}),
+        };
+        all("[data-control-key]").forEach((button) => {
+            const key = button.dataset.controlKey;
+            const on = !!visionControls[key];
+            const shortName = key === "enable_detection" ? "DET" : key === "enable_segmentation" ? "SEG" : "OVL";
+            button.classList.toggle("on", on);
+            button.classList.toggle("off", !on);
+            button.textContent = `${shortName} ${on ? "ON" : "OFF"}`;
+        });
+        const note = byId("vision-control-note");
+        if (note) {
+            note.textContent = `DET ${visionControls.enable_detection ? "ON" : "OFF"} | SEG ${visionControls.enable_segmentation ? "ON" : "OFF"} | OVL ${visionControls.enable_model_overlay ? "ON" : "OFF"}`;
+        }
+    }
+
+    async function loadVisionControls() {
+        try {
+            const data = await fetchJson("/api/vision_controls");
+            renderVisionControls(data.controls || data);
+        } catch (err) {
+            setMessage(`Vision controls read failed: ${err.message}`, "bad");
+        }
+    }
+
+    async function toggleVisionControl(key) {
+        const nextValue = !visionControls[key];
+        try {
+            const data = await fetchJson("/api/vision_controls", {
+                method: "POST",
+                body: JSON.stringify({ [key]: nextValue }),
+            });
+            renderVisionControls(data.controls || { [key]: nextValue });
+            setMessage(`Vision ${key} = ${nextValue ? "ON" : "OFF"}`, "ok");
+        } catch (err) {
+            setMessage(`Vision control failed: ${err.message}`, "bad");
+        }
     }
 
     async function loadConfig() {
@@ -384,6 +431,9 @@
         byId("btn-copy-stream")?.addEventListener("click", copyStreamAddress);
         byId("btn-start-preview")?.addEventListener("click", () => setMessage("ar_receiver.py 正在提供状态服务；OpenCV 预览窗口由后端进程控制。", "ok"));
         byId("btn-stop-preview")?.addEventListener("click", () => setMessage("预览窗口需要在后端进程内关闭。"));
+        all("[data-control-key]").forEach((button) => {
+            button.addEventListener("click", () => toggleVisionControl(button.dataset.controlKey));
+        });
         byId("btn-toggle-wasd")?.addEventListener("click", () => setWasdActive(!wasdTimer));
         byId("btn-download-json")?.addEventListener("click", downloadJsonExample);
         byId("btn-refresh-records")?.addEventListener("click", refreshRecords);
@@ -419,6 +469,8 @@
         bindEvents();
         showStep(1);
         updateWasdText();
+        renderVisionControls(visionControls);
+        loadVisionControls();
         refreshRecords();
     });
 })();

@@ -200,6 +200,7 @@ class RuntimeStatusStore:
         return {
             "timestamp": float((perception or {}).get("timestamp", time.time())),
             "frame_shape": list((perception or {}).get("frame_shape") or []),
+            "vision_controls": dict((perception or {}).get("vision_controls") or {}),
             "segmentation": segmentation,
             "detection_status": detection_status,
             "detection_count": int(len((perception or {}).get("detections") or [])),

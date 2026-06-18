@@ -31,6 +31,7 @@ from ui_debug_stream_server import DebugStreamServer, apply_current_thread_affin
 from ui_debug_render_worker import DebugRenderWorker
 from vision_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
 from vision_pipeline import VisionPipeline
+from vision_runtime_controls import VisionRuntimeControls
 from webui_status_server import WebUIStatusServer
 
 SHM_NAME = "shm_ar_video"
@@ -92,6 +93,7 @@ def get_car_feedback():
 
 car_link = CarControlLink()
 vision_pipeline = None
+vision_controls = VisionRuntimeControls()
 
 
 def get_ai_status():
@@ -153,6 +155,7 @@ def main():
         status_payload_func=runtime_status.current_payload,
         pose_input_port=POSE_INPUT_PORT,
         gamepad_control_port=GAMEPAD_CONTROL_PORT,
+        vision_controls=vision_controls,
         log_func=write_debug_log,
     ).start()
     pose_bridge = ARPoseBridge(
@@ -176,6 +179,7 @@ def main():
     local_planner = LocalPlanner()
     vision_pipeline = VisionPipeline(
         log_func=write_debug_log,
+        runtime_controls=vision_controls,
     )
     performance_monitor = PerformanceMonitor(log_func=write_debug_log)
     debug_stream_server = DebugStreamServer(log_func=write_debug_log).start()

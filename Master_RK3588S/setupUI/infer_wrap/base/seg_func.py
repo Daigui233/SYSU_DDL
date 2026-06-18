@@ -701,12 +701,12 @@ def _compute_fork_strength():
 
 
 def _postproc_state_name(fork_strength, channel_hold):
+    if channel_hold > 0:
+        return "HOLD"
     if fork_strength <= 0.0:
         return "OFF"
     if fork_strength >= 1.0:
         return "LOCK"
-    if channel_hold > 0:
-        return "HOLD"
     if fork_strength >= 0.7:
         return "ACTIVE"
     return "WARM"
@@ -747,7 +747,7 @@ def _predict_path_x(y, w):
     return float(np.clip(previous + (previous - older) * CHANNEL_PREDICTION_GAIN, 0, w - 1))
 
 
-def _stabilize_single_path(points, rows, w, fork_strength):
+def _stabilize_single_path(points, rows, w, positive_y):
     """Fork-aware midline temporal stabilization.  Only called when fork_strength > 0.
 
     Blend and hold are both driven by fork_strength so protection ramps up smoothly
@@ -780,17 +780,19 @@ def _stabilize_single_path(points, rows, w, fork_strength):
     )
 
     # Hold only activates when fork confidence is high enough (late trigger).
-    if hold_trigger and fork_strength >= FORK_STRENGTH_HOLD_MIN:
+    if hold_trigger and not positive_y:
         _channel_hold = CHANNEL_HOLD_FRAMES
     elif _channel_hold > 0:
         _channel_hold -= 1
 
     # Blend: interpolated by fork_strength (no more binary on/off).
     # No-hold: 1.0 (raw DP) → 0.72   Hold: 0.72 → 0.18
-    if _channel_hold > 0:
-        blend = 0.72 - fork_strength * (0.72 - 0.18)
+    if _channel_hold > 0 and not positive_y:
+        blend = 0.18
+    elif not positive_y:
+        blend = CHANNEL_RECOVERY_BLEND if expanded_rows else CHANNEL_NORMAL_BLEND
     else:
-        blend = 1.0 - fork_strength * (1.0 - 0.72)
+        blend = CHANNEL_NORMAL_BLEND
 
     max_correction = max(5.0, w * CHANNEL_HOLD_CORRECTION_RATIO)
     stabilized = []
@@ -800,16 +802,15 @@ def _stabilize_single_path(points, rows, w, fork_strength):
             stabilized.append((int(raw_x), int(y)))
             continue
         raw_x_f = float(raw_x)
-        if _channel_hold > 0 and fork_strength >= FORK_STRENGTH_HOLD_MIN:
-            effective_correction = max_correction * fork_strength
-            raw_x_f = float(np.clip(raw_x_f, predicted - effective_correction, predicted + effective_correction))
+        if _channel_hold > 0 and not positive_y:
+            raw_x_f = float(np.clip(raw_x_f, predicted - max_correction, predicted + max_correction))
         x = predicted * (1.0 - blend) + raw_x_f * blend
         stabilized.append((int(np.clip(round(x), 0, w - 1)), int(y)))
 
     stabilized = _smooth_path(stabilized, w)
     _prev_prev_path = list(_prev_path)
     _prev_path = list(stabilized)
-    if expanded_rows == 0:
+    if not positive_y and expanded_rows == 0:
         _prev_row_widths = current_widths
     return stabilized
 
@@ -1041,6 +1042,7 @@ def draw_centerline_debug(frame, info, draw_text=True):
 
 
 def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=True):
+    global _prev_path, _prev_prev_path, _prev_row_widths, _channel_hold
     try:
         class_map = _to_class_map(seg_map)
     except ValueError as exc:
@@ -1088,17 +1090,11 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
     fork_strength = _compute_fork_strength()
     candidate_source = geometry if geometry.get("valid") else early_geometry
 
-    if fork_strength > 0.0 and mid_ok:
-        # Fork post-processing: strength drives blend/hold ramping.
-        mid_points = _stabilize_single_path(mid_points, rows, w, fork_strength)
+    positive_y = fork_state in ("FORK_EARLY", "FORK_CANDIDATE", "FORK_CONFIRMED")
+    if mid_ok:
+        mid_points = _stabilize_single_path(mid_points, rows, w, positive_y)
         fork_candidates = _stabilize_fork_candidates(candidate_source.get("candidates") or [], w)
     else:
-        # NORMAL road: raw DP output, no temporal overhead.
-        # Still record history so the first fork-activated frame has a warm start.
-        if mid_ok:
-            _prev_prev_path = list(_prev_path)
-            _prev_path = list(mid_points)
-            _prev_row_widths = _path_row_widths(rows, mid_points)
         _channel_hold = 0
         fork_candidates = []
 

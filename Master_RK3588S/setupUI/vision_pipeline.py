@@ -11,6 +11,7 @@ try:
 except Exception:
     ForkMaskClsInfer = None
 from vision_traffic_light import classify_traffic_light_color
+from vision_runtime_controls import DEFAULT_VISION_CONTROLS
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_DIR = os.environ.get("AR_MODEL_DIR", os.path.join(BASE_DIR, "infer_wrap", "base", "model"))
@@ -25,7 +26,14 @@ def draw_waiting(frame):
 class VisionPipeline:
     """Owns NPU inference and converts model outputs into overlays and perception."""
 
-    def __init__(self, model_dir=None, seg_result_ttl=None, det_result_ttl=None, log_func=None):
+    def __init__(
+        self,
+        model_dir=None,
+        seg_result_ttl=None,
+        det_result_ttl=None,
+        log_func=None,
+        runtime_controls=None,
+    ):
         self.model_dir = model_dir or DEFAULT_MODEL_DIR
         # Constructor compatibility only: segmentation and detection results must be current-frame.
         _ = seg_result_ttl
@@ -33,6 +41,7 @@ class VisionPipeline:
         self.seg_result_ttl = 0.0
         self.det_result_ttl = 0.0
         self.log_func = log_func or print
+        self.runtime_controls = runtime_controls
 
         self.infer_det = None
         self.infer_seg = None
@@ -84,7 +93,17 @@ class VisionPipeline:
         self._log("AI engines loaded")
 
     def status(self):
-        return dict(self._status)
+        status = dict(self._status)
+        status["controls"] = self._controls_snapshot()
+        return status
+
+    def _controls_snapshot(self):
+        if self.runtime_controls is None:
+            return dict(DEFAULT_VISION_CONTROLS)
+        try:
+            return self.runtime_controls.snapshot()
+        except Exception:
+            return dict(DEFAULT_VISION_CONTROLS)
 
     @staticmethod
     def _normalize_frame_id(frame_id):
@@ -299,6 +318,9 @@ class VisionPipeline:
     def draw_debug_frame(self, frame, perception):
         out = frame.copy()
         perception = perception or {}
+        controls = dict(perception.get("vision_controls") or self._controls_snapshot())
+        if not controls.get("enable_model_overlay", True):
+            return out
         segmentation = perception.get("segmentation") or {}
         if segmentation.get("source") == "current" or segmentation.get("road_mask") is not None:
             out = draw_centerline_debug(out, segmentation, draw_text=False)
@@ -311,15 +333,29 @@ class VisionPipeline:
     def process(self, frame, now, frame_id=None, draw_debug=False):
         final_frame = frame.copy() if draw_debug else frame
         frame_id_value = self._normalize_frame_id(frame_id)
+        controls = self._controls_snapshot()
+        enable_segmentation = bool(controls.get("enable_segmentation", True))
+        enable_detection = bool(controls.get("enable_detection", True))
+        enable_overlay = bool(controls.get("enable_model_overlay", True))
         segmentation = self._empty_segmentation(frame, now, frame_id=frame_id)
         detection_status = self._empty_detection_status(
             now,
-            source="disabled" if self.infer_det is None else "missing",
+            source="disabled" if self.infer_det is None or not enable_detection else "missing",
             frame_id=frame_id_value,
+            reason="control_disabled" if not enable_detection else None,
         )
         detections = []
 
-        if self.infer_seg is not None:
+        if not enable_segmentation:
+            segmentation = self._empty_segmentation(
+                frame,
+                now,
+                source="disabled",
+                frame_id=frame_id,
+            )
+            segmentation["reason"] = "control_disabled"
+            segmentation["postproc_state"] = "DISABLED"
+        elif self.infer_seg is not None:
             try:
                 if hasattr(self.infer_seg, "infer_current"):
                     seg_res, seg_flag, seg_meta = self.infer_seg.infer_current(
@@ -337,7 +373,7 @@ class VisionPipeline:
                         seg_res,
                         final_frame,
                         fork_classifier=self.infer_fork,
-                        draw_debug=draw_debug,
+                        draw_debug=draw_debug and enable_overlay,
                     )
                     seg_done_ts = time.time()
                     seg_age = max(0.0, seg_done_ts - float(seg_meta.get("timestamp") or now))
@@ -351,18 +387,25 @@ class VisionPipeline:
                 else:
                     if seg_flag and seg_res is not None and not frame_matches:
                         segmentation = self._empty_segmentation(frame, now, source="stale_rejected", frame_id=frame_id)
-                    if draw_debug:
+                    if draw_debug and enable_overlay:
                         draw_waiting(final_frame)
             except Exception as exc:
                 self._log(f"seg infer skip: {exc}")
                 segmentation = self._empty_segmentation(frame, now, source="seg_error", frame_id=frame_id)
-                if draw_debug:
+                if draw_debug and enable_overlay:
                     draw_waiting(final_frame)
         else:
-            if draw_debug:
+            if draw_debug and enable_overlay:
                 draw_waiting(final_frame)
 
-        if self.infer_det is not None:
+        if not enable_detection:
+            detection_status = self._empty_detection_status(
+                now,
+                source="disabled",
+                frame_id=frame_id_value,
+                reason="control_disabled",
+            )
+        elif self.infer_det is not None:
             try:
                 if hasattr(self.infer_det, "infer_current"):
                     det_res, det_flag, det_meta = self.infer_det.infer_current(
@@ -401,7 +444,7 @@ class VisionPipeline:
                         det_frame_id=det_frame_id,
                     )
                     detection_status["count"] = len(detections)
-                    if draw_debug:
+                    if draw_debug and enable_overlay:
                         self._draw_detection_list(final_frame, detections)
                         self._draw_detection_extras(final_frame, detections)
                 elif det_flag and det_res is not None and not det_matches:
@@ -419,6 +462,7 @@ class VisionPipeline:
         perception = {
             "timestamp": float(now),
             "frame_shape": [int(v) for v in frame.shape[:2]],
+            "vision_controls": dict(controls),
             "segmentation": segmentation,
             "detection_status": detection_status,
             "detections": detections,

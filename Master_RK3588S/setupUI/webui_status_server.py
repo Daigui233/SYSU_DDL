@@ -54,6 +54,7 @@ class WebUIStatusServer:
         status_payload_func,
         pose_input_port,
         gamepad_control_port,
+        vision_controls=None,
         log_func=None,
     ):
         self.host = host
@@ -65,6 +66,7 @@ class WebUIStatusServer:
         self.status_payload_func = status_payload_func
         self.pose_input_port = int(pose_input_port)
         self.gamepad_control_port = int(gamepad_control_port)
+        self.vision_controls = vision_controls
         self.log_func = log_func or print
         self.server = None
         self.thread = None
@@ -139,7 +141,7 @@ class WebUIStatusServer:
                     self._send_headers_only(200, os.path.getsize(local_path), content_type)
                     return
 
-                if path in ("/pose_status", "/pose_packet", "/health", "/main_config.json", "/api/config", "/objects.json"):
+                if path in ("/pose_status", "/pose_packet", "/health", "/main_config.json", "/api/config", "/objects.json", "/api/vision_controls"):
                     self._send_headers_only(200, 0, "application/json; charset=utf-8")
                     return
 
@@ -197,6 +199,18 @@ class WebUIStatusServer:
                     self._send_json({"ok": True, "bytes": byte_count, "target": f"127.0.0.1:{owner.gamepad_control_port}"})
                     return
 
+                if path == "/api/vision_controls":
+                    if owner.vision_controls is None:
+                        self._send_json({"error": "vision controls unavailable"}, status=503)
+                        return
+                    try:
+                        controls, changed = owner.vision_controls.update(payload)
+                    except Exception as exc:
+                        self._send_json({"error": str(exc)}, status=400)
+                        return
+                    self._send_json({"ok": True, "controls": controls, "changed": changed})
+                    return
+
                 self._send_json({"error": "not found", "path": path}, status=404)
 
             def do_GET(self):
@@ -224,6 +238,13 @@ class WebUIStatusServer:
 
                 if path == "/objects.json":
                     self._send_json(read_json_file(owner.objects_path, []))
+                    return
+
+                if path == "/api/vision_controls":
+                    if owner.vision_controls is None:
+                        self._send_json({"error": "vision controls unavailable"}, status=503)
+                        return
+                    self._send_json({"ok": True, "controls": owner.vision_controls.snapshot()})
                     return
 
                 self._send_json({"error": "not found", "path": path}, status=404)
