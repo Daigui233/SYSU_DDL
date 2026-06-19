@@ -48,7 +48,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> pose_ar_bridge.py -> 127.0.0.1:9
 调车时最常看的文件：
 
 - 改不同状态的 `target_speed`、人/车/金币状态触发和丢线 `3 s` 超时：看 `setupUI/control_task_state_machine.py` 开头的调车参数区。
-- 改避障绕行偏置、金币靠近偏置、最终虚线目标线：看 `setupUI/control_local_planner.py`。
+- 改避障绕行偏置、金币靠近偏置、行人 `yield_wait` 停等、最终虚线目标线：看 `setupUI/control_local_planner.py`。
 - 改上位机图像误差到 TC264D 输入的比例、重复下发间隔：看 `setupUI/control_arbitrator.py`。
 - 改模型输出、检测类别归一化、分割中线提取：看 `setupUI/vision_pipeline.py` 和 `setupUI/infer_wrap/base/seg_func.py`。
 - 改下位机 PID、限幅、保护和兜底速度：看 `../Slave_TC264D/code/Control.c`。

@@ -24,6 +24,16 @@ PLANNER_DEFAULTS = {
     # Predict the short-term occupied bbox for moving humans before scoring corridors.
     "HUMAN_MOTION_PREDICT_SECONDS": 0.45,
 
+    # Human yield/wait action.  If passing would require a large steering jump,
+    # or the car is already offset toward the requested passing side, stop and
+    # wait for the moving person to open a safer corridor.
+    "HUMAN_YIELD_ENABLE": True,
+    "HUMAN_YIELD_MIN_BOTTOM_RATIO": 0.58,
+    "HUMAN_YIELD_BODY_OFFSET_RATIO": 0.14,
+    "HUMAN_YIELD_MAX_REQUIRED_SHIFT_RATIO": 0.30,
+    "HUMAN_YIELD_MIN_SIDE_SHARE": 0.22,
+    "HUMAN_YIELD_HOLD_SECONDS": 0.35,
+
     # 障碍框越宽，额外绕行越大；实际偏置取 max(基础偏置, bbox_width * 该系数)。
     "AVOID_BOX_WIDTH_GAIN": 0.35,
 
@@ -154,6 +164,14 @@ class LocalPlanner:
         self.human_motion_max_dt = float(self.params["HUMAN_MOTION_MAX_DT"])
         self.human_motion_max_match_dx_ratio = float(self.params["HUMAN_MOTION_MAX_MATCH_DX_RATIO"])
         self.human_motion_predict_seconds = float(self.params.get("HUMAN_MOTION_PREDICT_SECONDS", 0.45))
+        self.human_yield_enable = bool(self.params.get("HUMAN_YIELD_ENABLE", True))
+        self.human_yield_min_bottom_ratio = float(self.params.get("HUMAN_YIELD_MIN_BOTTOM_RATIO", 0.58))
+        self.human_yield_body_offset_ratio = float(self.params.get("HUMAN_YIELD_BODY_OFFSET_RATIO", 0.14))
+        self.human_yield_max_required_shift_ratio = float(
+            self.params.get("HUMAN_YIELD_MAX_REQUIRED_SHIFT_RATIO", 0.30)
+        )
+        self.human_yield_min_side_share = float(self.params.get("HUMAN_YIELD_MIN_SIDE_SHARE", 0.22))
+        self.human_yield_hold_seconds = float(self.params.get("HUMAN_YIELD_HOLD_SECONDS", 0.35))
         self.road_side_roi_min_y_ratio = float(self.params["ROAD_SIDE_ROI_MIN_Y_RATIO"])
         self.road_side_roi_top_box_gain = float(self.params["ROAD_SIDE_ROI_TOP_BOX_GAIN"])
         self.road_side_roi_bottom_box_gain = float(self.params["ROAD_SIDE_ROI_BOTTOM_BOX_GAIN"])
@@ -168,6 +186,7 @@ class LocalPlanner:
         self.last_avoid_side = None
         self.last_avoid_category = None
         self.last_avoid_side_ts = None
+        self.last_human_yield_ts = None
         self.last_human_motion_x = None
         self.last_human_motion_ts = None
         self.last_human_motion_vx = 0.0
@@ -200,6 +219,8 @@ class LocalPlanner:
         reason = "track_center"
         avoid_side = None
         avoid_motion = None
+        speed_override = None
+        yield_wait = False
         branch_candidates = self._build_stone_branch_candidates(
             segmentation, frame_w, frame_h, center_x, base_error
         )
@@ -232,13 +253,34 @@ class LocalPlanner:
                 now=now,
                 held=bool(intent.get("held")),
             )
-            path_offset = self._side_sign(avoid_side) * self._avoid_offset(
+            avoid_offset = self._avoid_offset(target, self.human_avoid_offset, width_gain=self.human_box_width_gain)
+            yield_wait, yield_reason = self._should_yield_for_human(
+                segmentation,
                 target,
-                self.human_avoid_offset,
-                width_gain=self.human_box_width_gain,
+                frame_w,
+                frame_h,
+                center_x,
+                base_error,
+                avoid_side,
+                avoid_offset,
+                avoid_motion,
+                now,
             )
-            motion_source = (avoid_motion or {}).get("source") or "static"
-            reason = f"avoid_human_{avoid_side}_{motion_source}"
+            if yield_wait:
+                speed_override = 0.0
+                final_error = 0.0
+                raw_final_error = 0.0
+                path_offset = 0.0
+                self.last_human_yield_ts = float(now)
+                if avoid_motion is None:
+                    avoid_motion = {}
+                avoid_motion["yield_wait"] = True
+                avoid_motion["yield_reason"] = yield_reason
+                reason = f"yield_human_{yield_reason}"
+            else:
+                path_offset = self._side_sign(avoid_side) * avoid_offset
+                motion_source = (avoid_motion or {}).get("source") or "static"
+                reason = f"avoid_human_{avoid_side}_{motion_source}"
         elif state == TaskState.AVOID_CAR.value:
             target = intent.get("target") or {}
             avoid_side = self._choose_avoid_side(
@@ -260,7 +302,7 @@ class LocalPlanner:
             reason = "stone_branch_select"
 
         raw_target_path = []
-        if line_valid and final_error is not None and not stop_state:
+        if line_valid and final_error is not None and not stop_state and not yield_wait:
             if state == TaskState.AVOID_STONE.value:
                 target = intent.get("target") or {}
                 branch_plan = self._select_stone_branch(branch_candidates, target, frame_w, frame_h)
@@ -302,7 +344,7 @@ class LocalPlanner:
 
         effective_path_offset = path_offset
         target_path = raw_target_path
-        if stop_state:
+        if stop_state or yield_wait:
             target_path = []
         elif line_valid and final_error is not None and state == TaskState.AVOID_STONE.value:
             target_path = raw_target_path
@@ -328,6 +370,8 @@ class LocalPlanner:
             "track_error_limit": None,
             "avoid_side": avoid_side,
             "avoid_motion": dict(avoid_motion or {}),
+            "speed_override": speed_override,
+            "yield_wait": bool(yield_wait),
             "branch_candidates": branch_candidates,
             "selected_branch": selected_branch,
             "planner_reason": reason,
@@ -790,6 +834,58 @@ class LocalPlanner:
         info["vx"] = float(vx)
         info["reliable"] = abs(vx) >= max(1.0, self.human_motion_min_vx)
         return info
+
+    def _should_yield_for_human(
+        self,
+        segmentation,
+        target,
+        frame_w,
+        frame_h,
+        center_x,
+        base_error,
+        avoid_side,
+        avoid_offset,
+        motion,
+        now,
+    ):
+        if not self.human_yield_enable or avoid_side not in ("left", "right"):
+            return False, "disabled"
+
+        if (
+            self.last_human_yield_ts is not None
+            and float(now) - float(self.last_human_yield_ts) <= self.human_yield_hold_seconds
+        ):
+            return True, "hold"
+
+        bbox = target.get("bbox") or [0.0, frame_h * 0.35, frame_w, frame_h * 0.75]
+        bottom = _finite_float(bbox[3], frame_h * 0.5)
+        bottom_ratio = float(bottom) / float(max(1, frame_h))
+        if bottom_ratio < self.human_yield_min_bottom_ratio:
+            return False, "far"
+
+        side_sign = self._side_sign(avoid_side)
+        current_error = _finite_float(base_error, 0.0)
+        body_offset_limit = max(1.0, float(frame_w) * self.human_yield_body_offset_ratio)
+        if abs(current_error) >= body_offset_limit and current_error * side_sign > 0.0:
+            return True, "body_offset"
+
+        lookahead_y = self._control_lookahead_y(frame_h)
+        lookahead_gain = self._path_bias_gain(lookahead_y, frame_h)
+        planned_error = current_error + side_sign * float(avoid_offset) * lookahead_gain
+        max_required_shift = max(1.0, float(frame_w) * self.human_yield_max_required_shift_ratio)
+        if abs(planned_error) >= max_required_shift:
+            return True, "large_shift"
+
+        motion = dict(motion or {})
+        left_score = _finite_float(motion.get("corridor_left_score"), 0.0)
+        right_score = _finite_float(motion.get("corridor_right_score"), 0.0)
+        total = max(0.0, left_score + right_score)
+        if total > 0.0:
+            selected_score = left_score if avoid_side == "left" else right_score
+            if selected_score / total < _clamp(self.human_yield_min_side_share, 0.0, 1.0):
+                return True, "narrow_corridor"
+
+        return False, "pass"
 
     def _choose_avoid_side(self, segmentation, target, frame_w, frame_h, prefer_away, category, now):
         center_x = _finite_float(segmentation.get("center_x"), frame_w * 0.5)

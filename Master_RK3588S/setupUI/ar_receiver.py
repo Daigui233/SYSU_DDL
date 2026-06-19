@@ -1,6 +1,7 @@
 import time
 import atexit
 import os
+import math
 import cv2
 from struct import error as StructError
 from multiprocessing import shared_memory
@@ -209,6 +210,14 @@ def main():
         plan_result = local_planner.plan(perception, task_decision, now)
         final_track_error = plan_result["final_track_error"]
         desired_speed = task_decision["desired_speed"]
+        speed_override = plan_result.get("speed_override")
+        if speed_override is not None:
+            try:
+                speed_override = float(speed_override)
+            except (TypeError, ValueError):
+                speed_override = None
+            if speed_override is not None and math.isfinite(speed_override):
+                desired_speed = speed_override
         task_state = task_decision["task_state"]
         task_state_cmd = int(task_state_to_tc264_state(task_state))
         task_safe_stop = task_state == TaskState.LINE_LOSS_SAFE_STOP.value
