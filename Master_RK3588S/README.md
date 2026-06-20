@@ -19,7 +19,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> pose_ar_bridge.py -> 127.0.0.1:9
 | `setupUI/ar_receiver.py` | 上位机主入口：启动模块、读取帧、调度视觉/仲裁/发送/显示 |
 | `setupUI/pose_ar_bridge.py` | 独立接收 Windows `robot_position`，校验、记录并转发给官方 AR |
 | `setupUI/control_gamepad_receiver.py` | 独立接收 `9010` 手柄遥控包，供 `ar_receiver.py` 临时覆盖视觉控制 |
-| `setupUI/vision_pipeline.py` | 分割/检测模型初始化、推理、后处理，输出结构化 `segmentation + detections` 并绘制基础视觉结果 |
+| `setupUI/vision_pipeline.py` | 分割/检测模型初始化、同帧并行推理、结果同步和后处理，输出结构化 `segmentation + detections` 并绘制基础视觉结果 |
 | `setupUI/control_states.py` | 状态契约：定义 RK 任务状态、TC264D 状态码、局部规划模式和映射关系 |
 | `setupUI/control_task_state_machine.py` | 上位机任务状态机：判断 `NORMAL_TRACK / AVOID_* / COLLECT_GOLD / RECOVER_LINE / LINE_LOSS_SAFE_STOP`，维护状态速度表和掉线/滞回参数 |
 | `setupUI/control_local_planner.py` | 图像坐标局部规划：根据状态机意图输出最终 `final_track_error`，并绘制最终目标线 |
@@ -28,7 +28,7 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> pose_ar_bridge.py -> 127.0.0.1:9
 | `setupUI/status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
 | `setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
 | `setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
-| `setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
+| `setupUI/vision_frame_source.py` | 从 `shm_ar_video` 读取一致帧快照，复制前后校验 `fid/尺寸` 并转换图像 |
 | `setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
 | `setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
 | `setupUI/infer_wrap/base/seg_func.py` | 从分割结果提取路线中心和 `track_error` |

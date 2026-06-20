@@ -38,7 +38,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Master_RK3588S/setupUI/ar_receiver.py` | 上位机主入口：启动模块、读取帧、调度视觉/仲裁/发送/显示 |
 | `Master_RK3588S/setupUI/pose_ar_bridge.py` | 接收 Windows `robot_position`，校验、记录并转发到官方 AR `127.0.0.1:9006` |
 | `Master_RK3588S/setupUI/control_gamepad_receiver.py` | 接收可选 `9010` 手柄遥控包，提供给 `ar_receiver.py` 做控制源仲裁 |
-| `Master_RK3588S/setupUI/vision_pipeline.py` | 分割/检测模型初始化、推理、后处理，输出结构化 `segmentation + detections` 并绘制基础视觉结果 |
+| `Master_RK3588S/setupUI/vision_pipeline.py` | 分割/检测模型初始化、同帧并行推理、结果同步和后处理，输出结构化 `segmentation + detections` 并绘制基础视觉结果 |
 | `Master_RK3588S/setupUI/vision_traffic_light.py` | 在 `TrafficLight` 检测框内用 OpenCV HSV 判断红/绿/未知 |
 | `Master_RK3588S/setupUI/control_states.py` | 上位机任务状态、TC264D 状态码、局部规划模式和状态映射契约 |
 | `Master_RK3588S/setupUI/control_race_state_machine.py` | 比赛事件状态机：只基于图像检测框跟踪 Door、BeginSign、EndSign、红绿灯和圈数 |
@@ -52,7 +52,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Master_RK3588S/setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
 | `Master_RK3588S/setupUI/ui_debug_render_worker.py` | latest-only 调试画面渲染线程：绘制分割/检测/规划/HUD，慢时丢 debug 帧，不阻塞控车主循环 |
 | `Master_RK3588S/setupUI/ui_debug_stream_server.py` | 独立调试视频流服务，把完整 HUD 调试画面发布到浏览器可访问的 MJPEG 端口 |
-| `Master_RK3588S/setupUI/vision_frame_source.py` | 从 `shm_ar_video` 共享内存读取并转换帧 |
+| `Master_RK3588S/setupUI/vision_frame_source.py` | 从 `shm_ar_video` 读取一致帧快照，复制前后校验 `fid/尺寸` 并转换图像 |
 | `Master_RK3588S/setupUI/debug_tools.py` | 调试日志轮转和定位链路分段打印 |
 | `Master_RK3588S/setupUI/standalone_control_bridge.py` | 手动备用桥：不启动 `ar_receiver.py` 时接收定位和手柄，并可用手柄控车 |
 | `Master_RK3588S/setupUI/control_serial_comm.py` | 向 TC264D 下发控制帧并接收反馈 |
@@ -89,6 +89,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - TC264D 保留现有串口协议，本地输入超时为 `0.5 s`；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。舵机转向已关闭大误差 boost，当前使用 `FULL_STEER_ERROR_PX=320` 的线性 P 映射，再经 `Servo.h` 硬限幅。
 - TC264D 反馈帧已扩展到 v3：HUD 会显示 `ERR cmd/tc/d`、`SERVO pwm/raw/lim`、`MOTOR tgt/act/out`、`MOTOR ff/pid`、`SAFE to/st/ss/ms/db` 和 `FB seq/bad/drop/fmt`，用于录视频后判断问题在上位机命令、串口传输、下位机限幅/PID 还是机械响应。
 - `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、控制主循环、debug 渲染/JPEG 编码还是硬件降频。
+- `vision_pipeline.py` 对每个源 `fid` 先同时提交分割（NPU core 1）和检测（NPU core 0），再汇合并严格校验结果 `frame_id`；fork 分类器继续使用 core 2。帧间只保留一个正在处理的源帧，处理结束后直接读取共享内存最新帧，不建立历史帧队列，因此不会为了同步积压旧结果。
 - `ui_debug_render_worker.py` 和 `ui_debug_stream_server.py` 已接入 `ar_receiver.py`：发布的是完整调试画面，即分割/检测/局部规划目标线 + 左侧裁判事件 + 右侧调试 HUD；debug 画面渲染和 MJPEG 编码在独立线程中 latest-only 处理，慢时丢 debug 帧，不阻塞控车主循环。
 - HUD 右侧性能行含义：`FPS ctrl/raw/loop` 分别表示控车循环统计值、共享内存输入帧率估计、性能监控主循环帧率；`DBG r/enc/pub/drop` 分别表示 debug 渲染 FPS、JPEG 编码 FPS、debug 发布 FPS、渲染/编码前丢弃的 debug 帧数。若 `ctrl/loop` 高但 `DBG` 低，是显示链路慢，不代表实际控车低帧。
 

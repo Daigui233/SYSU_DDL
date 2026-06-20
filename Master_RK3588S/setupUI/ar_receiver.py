@@ -30,7 +30,7 @@ from control_task_state_machine import TaskStateMachine
 from performance_monitor import PerformanceMonitor
 from ui_debug_stream_server import DebugStreamServer, apply_current_thread_affinity
 from ui_debug_render_worker import DebugRenderWorker
-from vision_frame_source import read_frame_from_shm, remove_shm_from_resource_tracker
+from vision_frame_source import FrameSnapshotChanged, read_frame_from_shm, remove_shm_from_resource_tracker
 from vision_pipeline import VisionPipeline
 from vision_runtime_controls import VisionRuntimeControls
 from webui_status_server import WebUIStatusServer
@@ -363,6 +363,9 @@ def main():
                         control_fps=cur_fps,
                     )
 
+                except FrameSnapshotChanged:
+                    time.sleep(0.001)
+                    continue
                 except (ValueError, StructError, BufferError):
                     raise FileNotFoundError
 

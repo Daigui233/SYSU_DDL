@@ -1,5 +1,6 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 
@@ -46,6 +47,7 @@ class VisionPipeline:
         self.infer_det = None
         self.infer_seg = None
         self.infer_fork = None
+        self._inference_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vision-current")
         self._status = {
             "ok": False,
             "detector": "not initialized",
@@ -104,6 +106,23 @@ class VisionPipeline:
             return self.runtime_controls.snapshot()
         except Exception:
             return dict(DEFAULT_VISION_CONTROLS)
+
+    def _current_inference_executor(self):
+        executor = getattr(self, "_inference_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vision-current")
+            self._inference_executor = executor
+        return executor
+
+    def _submit_current_inference(self, engine, frame, frame_id, timestamp):
+        if not hasattr(engine, "infer_current"):
+            raise RuntimeError("vision engine does not support current-frame inference")
+        return self._current_inference_executor().submit(
+            engine.infer_current,
+            frame,
+            frame_id=frame_id,
+            timestamp=timestamp,
+        )
 
     @staticmethod
     def _normalize_frame_id(frame_id):
@@ -346,6 +365,37 @@ class VisionPipeline:
         )
         detections = []
 
+        seg_future = None
+        det_future = None
+        if enable_segmentation and self.infer_seg is not None:
+            try:
+                seg_future = self._submit_current_inference(
+                    self.infer_seg,
+                    frame,
+                    frame_id,
+                    now,
+                )
+            except Exception as exc:
+                self._log(f"seg infer submit skip: {exc}")
+                segmentation = self._empty_segmentation(frame, now, source="seg_error", frame_id=frame_id)
+
+        if enable_detection and self.infer_det is not None:
+            try:
+                det_future = self._submit_current_inference(
+                    self.infer_det,
+                    frame,
+                    frame_id,
+                    now,
+                )
+            except Exception as exc:
+                self._log(f"det infer submit skip: {exc}")
+                detection_status = self._empty_detection_status(
+                    now,
+                    source="det_error",
+                    frame_id=frame_id_value,
+                    reason=str(exc),
+                )
+
         if not enable_segmentation:
             segmentation = self._empty_segmentation(
                 frame,
@@ -355,17 +405,11 @@ class VisionPipeline:
             )
             segmentation["reason"] = "control_disabled"
             segmentation["postproc_state"] = "DISABLED"
-        elif self.infer_seg is not None:
+        elif seg_future is not None:
             try:
-                if hasattr(self.infer_seg, "infer_current"):
-                    seg_res, seg_flag, seg_meta = self.infer_seg.infer_current(
-                        frame.copy(),
-                        frame_id=frame_id,
-                        timestamp=now,
-                    )
-                else:
-                    raise RuntimeError("segmenter does not support current-frame inference")
+                seg_res, seg_flag, seg_meta = seg_future.result()
 
+                seg_meta = dict(seg_meta or {})
                 seg_frame_id = self._normalize_frame_id(seg_meta.get("frame_id"))
                 frame_matches = frame_id_value is None or seg_frame_id == frame_id_value
                 if seg_flag and seg_res is not None and frame_matches:
@@ -405,20 +449,14 @@ class VisionPipeline:
                 frame_id=frame_id_value,
                 reason="control_disabled",
             )
-        elif self.infer_det is not None:
+        elif det_future is not None:
             try:
-                if hasattr(self.infer_det, "infer_current"):
-                    det_res, det_flag, det_meta = self.infer_det.infer_current(
-                        frame.copy(),
-                        frame_id=frame_id,
-                        timestamp=now,
-                    )
-                else:
-                    raise RuntimeError("detector does not support current-frame inference")
+                det_res, det_flag, det_meta = det_future.result()
 
-                det_frame_id = self._normalize_frame_id((det_meta or {}).get("frame_id"))
+                det_meta = dict(det_meta or {})
+                det_frame_id = self._normalize_frame_id(det_meta.get("frame_id"))
                 det_done_ts = time.time()
-                det_age = max(0.0, det_done_ts - float((det_meta or {}).get("timestamp") or now))
+                det_age = max(0.0, det_done_ts - float(det_meta.get("timestamp") or now))
                 det_matches = frame_id_value is None or det_frame_id == frame_id_value
                 detection_status = {
                     "timestamp": float(now),
@@ -470,6 +508,10 @@ class VisionPipeline:
         return final_frame, perception
 
     def release(self):
+        executor = getattr(self, "_inference_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._inference_executor = None
         if self.infer_seg is not None:
             self.infer_seg.release()
         if self.infer_det is not None:

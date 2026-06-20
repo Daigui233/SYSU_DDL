@@ -28,6 +28,8 @@ seg_func.py segmentation track_error
 - TC264D 反馈帧已扩展到 v3，HUD 会显示下位机实际收到的 error、输入年龄、舵机/电机输出、限幅标志、前馈/PID 修正和反馈序号。
 - 当前 `EndSign` 终点停车默认禁用：`control_race_state_machine.py` 中 `ENDSIGN_STOP_ENABLED=False`，只观测 EndSign 状态，不进入 `ENDSIGN_STOP`，避免 BeginSign 误识别后卡死。
 - 调试画面已从控车主循环拆到 `ui_debug_render_worker.py`：debug 仍显示完整分割/检测/规划/HUD 信息，但渲染/JPEG 慢时只丢 debug 帧，不阻塞串口控车。
+- 视觉推理已改为单帧内并行：同一 `fid` 的分割提交到 NPU core 1、检测提交到 core 0，两个任务都提交后才等待结果；返回结果必须与源 `fid` 一致，错帧结果直接拒绝。帧间不排队，当前帧处理结束后重新读取共享内存最新帧。
+- `vision_frame_source.py` 复制共享内存图像前后会核对 `fid/width/height`；若生产者正在覆盖帧则重试，连续不一致只跳过本轮读取，不把可能撕裂的图像交给模型。
 - HUD 性能行中 `FPS ctrl/raw/loop` 表示实际控车循环、共享内存输入帧率估计和性能监控主循环帧率；`DBG r/enc/pub/drop` 表示 debug 渲染、JPEG 编码、debug 发布和 debug 丢帧情况。
 - 定位 UDP 转发采用低延迟热路径：`pose_ar_bridge.py` 收到有效 `robot_position` 后先转发到 AR，再降频写状态 JSON；默认丢弃输入队列旧定位包、保留最新包，HUD `POSE_IO rx/drop/fwd/h` 用于判断定位是否在排队或转发变慢。
 
