@@ -13,8 +13,10 @@ class _ForkClassifier:
     def __init__(self, label, confidence):
         self.label = int(label)
         self.confidence = float(confidence)
+        self.calls = 0
 
     def infer_mask(self, _mask):
+        self.calls += 1
         return {"label": self.label, "confidence": self.confidence}
 
 
@@ -92,6 +94,15 @@ class SegForkChannelTrackingTest(unittest.TestCase):
         self.assertEqual(info["fork_state"], "FORK_EARLY")
         self.assertGreaterEqual(len(info["fork_candidates"]), 2)
         self.assertIsNone(info["fork_selected_side"])
+
+    def test_normal_road_skips_fork_classifier(self):
+        classifier = _ForkClassifier(1, 0.90)
+        _out, info = seg_func.extract_centerline_info(
+            _normal_mask(), self.frame, fork_classifier=classifier, draw_debug=False
+        )
+
+        self.assertEqual(classifier.calls, 0)
+        self.assertEqual(info["road_topology"], "SINGLE")
 
     def test_strict_positive_y_requires_temporal_confirmation(self):
         classifier = _ForkClassifier(1, 0.90)

@@ -1,6 +1,7 @@
 import os
 import cv2
 import numpy as np
+import time
 
 
 IMG_SIZE = (256, 256)
@@ -1353,11 +1354,13 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
     previous_control_path = list(_prev_path)
 
     mid_points, mid_ok, rows, mid_score = _build_midline(road_mask) if road_valid else ([], False, [], 0.0)
-    fork_raw = _run_fork_classifier(fork_classifier, road_mask) if road_valid else None
-    fork_cls = _parse_fork_result(fork_raw)
     # Topology belongs to road-mask geometry. The fork classifier may later
     # authorize a lane-choice task, but it must not create or suppress a split.
     fork_scan_requested = bool(road_valid and rows and _has_branch_geometry_hint(rows, w))
+    # The classifier cannot create a fork without a geometry hint, so running
+    # its NPU model on every normal road frame only adds latency.
+    fork_raw = _run_fork_classifier(fork_classifier, road_mask) if fork_scan_requested else None
+    fork_cls = _parse_fork_result(fork_raw)
     geometry_rows = (
         _scan_rows_with_params(road_mask, FORK_DENSE_SCAN_STEP, FORK_DENSE_SCAN_ROW_WINDOW)
         if fork_scan_requested
@@ -1581,5 +1584,7 @@ def myFunc(rknn_lite, img_bgr):
     original_size = img_bgr.shape[:2]
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     img_in = cv2.resize(img_rgb, IMG_SIZE, interpolation=cv2.INTER_LINEAR)
+    npu_started = time.perf_counter()
     outputs = rknn_lite.inference(inputs=[np.expand_dims(img_in, axis=0)])
+    rknn_lite._last_inference_ms = (time.perf_counter() - npu_started) * 1000.0
     return _extract_class_map(outputs, original_size)

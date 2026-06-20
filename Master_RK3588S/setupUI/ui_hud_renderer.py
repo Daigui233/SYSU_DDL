@@ -378,8 +378,10 @@ def _performance_diagnostic_sections(performance_status, fps):
         f"DROP {render_drop}/{encode_drop}",
     ]
     latency_lines = [
-        f"SEG infer={fmt(stages.get('seg_infer_ms'))} post={fmt(stages.get('seg_post_ms'))}",
-        f"DET infer={fmt(stages.get('det_infer_ms'))} post={fmt(stages.get('det_post_ms'))}",
+        f"SEG total={fmt(stages.get('seg_infer_ms'))} npu={fmt(stages.get('seg_npu_ms'))} "
+        f"path={fmt(stages.get('seg_post_ms'))}",
+        f"DET total={fmt(stages.get('det_infer_ms'))} npu={fmt(stages.get('det_npu_ms'))} "
+        f"cpu={fmt(stages.get('det_cpu_ms'))}",
         f"VISION={fmt(stages.get('vision_total_ms') or stages.get('vision_ms'))} "
         f"FRAME={fmt(performance_status.get('total_ms'))}",
         f"DEBUG render={fmt(debug_render.get('render_ms'))} jpeg={fmt(debug_stream.get('encode_ms'))}",

@@ -87,7 +87,11 @@ class rknnPoolExecutor:
         rknn = self.rknnPool[self.submit_index % self.TPEs]
         self.submit_index += 1
         try:
-            return self.func(rknn, frame.copy()), True, meta
+            result = self.func(rknn, frame.copy())
+            npu_inference_ms = getattr(rknn, "_last_inference_ms", None)
+            if npu_inference_ms is not None:
+                meta["npu_inference_ms"] = float(npu_inference_ms)
+            return result, True, meta
         except Exception as exc:
             print(f"RKNN current inference failed: {exc}")
             return None, False, meta

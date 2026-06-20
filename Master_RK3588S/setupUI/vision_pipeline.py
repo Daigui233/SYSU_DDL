@@ -4,6 +4,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 
+# OpenCV defaults to one worker per CPU core. The detector and segmenter run
+# concurrently, while the AR compositor is also CPU-heavy, so that default
+# oversubscribes all eight RK3588S cores and makes inference latency unstable.
+try:
+    cv2.setNumThreads(max(1, int(os.environ.get("AR_OPENCV_THREADS", "1"))))
+except (TypeError, ValueError):
+    cv2.setNumThreads(1)
+
 from infer_wrap import InferWrap, PPSegInfer
 from infer_wrap.base.func import CLASSES
 from infer_wrap.base.seg_func import draw_centerline_debug, extract_centerline_info
@@ -388,8 +396,12 @@ class VisionPipeline:
         detections = []
         timings_ms = {
             "seg_infer_ms": None,
+            "seg_npu_ms": None,
+            "seg_cpu_ms": None,
             "seg_post_ms": None,
             "det_infer_ms": None,
+            "det_npu_ms": None,
+            "det_cpu_ms": None,
             "det_post_ms": None,
             "vision_total_ms": None,
         }
@@ -440,6 +452,12 @@ class VisionPipeline:
                 seg_res, seg_flag, seg_meta = seg_payload
 
                 seg_meta = dict(seg_meta or {})
+                timings_ms["seg_npu_ms"] = seg_meta.get("npu_inference_ms")
+                if timings_ms["seg_npu_ms"] is not None:
+                    timings_ms["seg_cpu_ms"] = max(
+                        0.0,
+                        timings_ms["seg_infer_ms"] - float(timings_ms["seg_npu_ms"]),
+                    )
                 seg_frame_id = self._normalize_frame_id(seg_meta.get("frame_id"))
                 frame_matches = frame_id_value is None or seg_frame_id == frame_id_value
                 if seg_flag and seg_res is not None and frame_matches:
@@ -487,6 +505,12 @@ class VisionPipeline:
                 det_res, det_flag, det_meta = det_payload
 
                 det_meta = dict(det_meta or {})
+                timings_ms["det_npu_ms"] = det_meta.get("npu_inference_ms")
+                if timings_ms["det_npu_ms"] is not None:
+                    timings_ms["det_cpu_ms"] = max(
+                        0.0,
+                        timings_ms["det_infer_ms"] - float(timings_ms["det_npu_ms"]),
+                    )
                 det_frame_id = self._normalize_frame_id(det_meta.get("frame_id"))
                 det_done_ts = time.time()
                 det_age = max(0.0, det_done_ts - float(det_meta.get("timestamp") or now))

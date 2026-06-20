@@ -37,6 +37,12 @@ PERF_MONITOR_DEFAULTS = {
     # RK NPU load path. Some kernels require root/debugfs access; missing files
     # are handled as N/A.
     "NPU_LOAD_PATH": "/sys/kernel/debug/rknpu/load",
+    # Non-root processes usually cannot read debugfs. This devfreq node exposes
+    # aggregate load as "load@frequency" and is readable on the target board.
+    "NPU_LOAD_PATHS": [
+        "/sys/kernel/debug/rknpu/load",
+        "/sys/class/devfreq/fdab0000.npu/load",
+    ],
 
     # Common RK3588/RK3588S NPU devfreq path. Missing files are handled as N/A.
     "NPU_FREQ_PATH": "/sys/class/devfreq/fdab0000.npu/cur_freq",
@@ -126,6 +132,9 @@ def _read_first_text(paths):
 def _parse_npu_load(text):
     if not text:
         return None
+    devfreq_match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*@\s*\d+", text)
+    if devfreq_match:
+        return [_safe_float(devfreq_match.group(1), 0.0)]
     percent_values = re.findall(r"([-+]?\d+(?:\.\d+)?)\s*%", text)
     if percent_values:
         return [_safe_float(v, 0.0) for v in percent_values[:3]]
@@ -370,7 +379,12 @@ class PerformanceMonitor:
         self._previous_cpu_stat = current_cpu_stat
         core_usage = [value for name, value in cpu_usage.items() if name != "cpu"]
         self.system_status = {
-            "npu_load": _parse_npu_load(_read_text(self.params["NPU_LOAD_PATH"])),
+            "npu_load": _parse_npu_load(
+                _read_first_text(
+                    self.params.get("NPU_LOAD_PATHS")
+                    or [self.params.get("NPU_LOAD_PATH")]
+                )
+            ),
             "npu_freq_mhz": _read_freq_mhz(self.params["NPU_FREQ_PATH"]),
             "cpu_usage_percent": cpu_usage.get("cpu"),
             "cpu_max_core_percent": max(core_usage) if core_usage else None,
