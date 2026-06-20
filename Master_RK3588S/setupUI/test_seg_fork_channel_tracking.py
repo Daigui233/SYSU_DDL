@@ -43,6 +43,22 @@ def _negative_y_mask(h=480, w=640):
     return mask
 
 
+def _right_merge_entry_mask(h=480, w=640):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(mask, (270, 160), (370, 320), 1, -1)
+    right = np.array([[310, 300], [370, 300], [485, h - 1], [405, h - 1]], np.int32)
+    cv2.fillPoly(mask, [right], 1)
+    return mask
+
+
+def _left_merge_entry_mask(h=480, w=640):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(mask, (270, 160), (370, 320), 1, -1)
+    left = np.array([[270, 300], [330, 300], [235, h - 1], [155, h - 1]], np.int32)
+    cv2.fillPoly(mask, [left], 1)
+    return mask
+
+
 def _candidate_x(candidate, target_y):
     points = candidate.get("points") or candidate.get("path") or []
     point = min(points, key=lambda item: abs(int(item[1]) - int(target_y)))
@@ -127,6 +143,45 @@ class SegForkChannelTrackingTest(unittest.TestCase):
         split_y = min(mask.shape[0] - 10, fork_y + 90)
         self.assertLess(abs(_candidate_x(candidates["left"], common_y) - _candidate_x(candidates["right"], common_y)), 24)
         self.assertGreater(abs(_candidate_x(candidates["left"], split_y) - _candidate_x(candidates["right"], split_y)), 60)
+
+    def test_merge_geometry_does_not_depend_on_fork_classifier(self):
+        classifier = _ForkClassifier(0, 0.95)
+        for _ in range(2):
+            seg_func.extract_centerline_info(
+                _right_merge_entry_mask(), self.frame, fork_classifier=classifier, draw_debug=False
+            )
+
+        _out, info = seg_func.extract_centerline_info(
+            _negative_y_mask(), self.frame, fork_classifier=classifier, draw_debug=False
+        )
+
+        self.assertEqual(info["fork_state"], "NORMAL")
+        self.assertEqual(info["road_topology"], "MERGE")
+        self.assertTrue(info["fork_partition_valid"])
+        self.assertEqual(info["fork_partition_side"], "lower")
+        self.assertEqual(info["fork_selected_side"], "right")
+
+    def test_merge_branch_mask_stays_locked_after_selection(self):
+        classifier = _ForkClassifier(0, 0.95)
+        for _ in range(2):
+            seg_func.extract_centerline_info(
+                _right_merge_entry_mask(), self.frame, fork_classifier=classifier, draw_debug=False
+            )
+        _out, selected = seg_func.extract_centerline_info(
+            _negative_y_mask(), self.frame, fork_classifier=classifier, draw_debug=False
+        )
+        self.assertEqual(selected["merge_locked_side"], "right")
+
+        seg_func.extract_centerline_info(
+            _left_merge_entry_mask(), self.frame, fork_classifier=classifier, draw_debug=False
+        )
+        _out, locked = seg_func.extract_centerline_info(
+            _negative_y_mask(), self.frame, fork_classifier=classifier, draw_debug=False
+        )
+
+        self.assertEqual(locked["road_topology"], "MERGE")
+        self.assertEqual(locked["merge_locked_side"], "right")
+        self.assertEqual(locked["fork_selected_side"], "right")
 
     def test_unconfirmed_merge_expansion_holds_previous_channel(self):
         classifier = _ForkClassifier(0, 0.95)

@@ -134,7 +134,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 3. `ar_receiver.py` 仍承担较多运行调度：它现在保持主入口名称不变，负责帧循环、无新帧重复下发、状态写入和模块生命周期；HUD/调试画面绘制已拆到 `ui_debug_render_worker.py`，后续还可以继续把控制循环和运行状态组装拆成更小模块。
 4. WebUI/HUD 调车信息还可以更完整：当前能看到控制状态、误差、速度和串口反馈，但对状态机 `reason`、`perception_quality`、`planner_reason`、`line_loss_age`、检测目标摘要等信息展示不足。后续应把 `task_decision` 和 `plan_result` 写入 `/pose_status`。
 5. 缺少离线回放和单元测试：状态切换、丢线恢复、避人/避车/金币偏置、串口状态码映射都适合用保存下来的 perception 数据做回放测试。后续应补充最小测试集，先验证不改协议、不误触发、不在短时丢线时过早停车。
-6. 岔路识别语义需要重构：当前 HUD 中的 `Branches` 实际表示 `road_mask` 连通域数量，很多真实岔路在分割上仍是一个连通域，因此 `Branches=1` 不代表没有岔路。后续应新增独立的 `road_topology` 或 `road_path_state`，用多条采样行的横向 segment 数量、segment 宽度、间距和连续帧稳定性判断 `ROAD_SINGLE / ROAD_FORK / ROAD_MERGE / ROAD_UNKNOWN`，再把 `AVOID_STONE` 分岔选择建立在该路况状态上。
+6. 岔路识别语义：HUD 中的 `Branches` 仍只表示 `road_mask` 连通域数量，`Branches=1` 不代表没有岔路。当前已新增独立 `road_topology=SINGLE/FORK/MERGE`，由扫描行和拟合边界判断；fork 分类器不负责识别 `MERGE`，只用于确认可选道岔路是否需要进入后续 stone 内/外道决策。后续仍需用真实分割画面调扫描、分叉点和拟合残差阈值。
 7. 控制链路已轻量化：局部规划输出的 `final_track_error` 直通到串口 `track_error`，TC264D 反馈中的 `input_track_error` 应与 HUD 的 CMD err 对齐；若不对齐，优先查串口帧、反馈解析或显示延迟。
 
 ## 当前实测风险与关注点
@@ -142,7 +142,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 当前主链路已经闭环，但还不能简单认为只剩分割模型和目标检测模型问题。实车效果还会受到阈值、路径规划平滑、下位机舵机响应、车模机械状态和光照的共同影响。后续实测时优先关注下面几类问题：
 
 1. 分割中线稳定性：`NORMAL_TRACK` 和所有局部规划都依赖红色分割中线作为基础路径。如果 `road_mask` 抖动、断裂、把岔路粘成一大片，紫色目标线会跟着不稳定。分割相关问题先看 `vision_pipeline.py` 的 `road_ratio / line_valid` 和 HUD 中红线是否合理；当前 `branch_count / Branches` 只表示连通域数量，不应作为岔路是否存在的唯一依据。
-2. 岔路与 `stone`：当前 `seg_func.py` 在 fork 分类器给出疑似岔路后启用密集扫描，使用已确认的左右分支内边界点拟合分割线并估计分叉点；再根据双区域位于分叉点上方还是下方，只切对应一侧的连通 `road_mask`，共同区域保持不切，最后分别提取左右候选中线。拟合点跨度或残差不合格时不会强行切分。`AVOID_STONE` 仍只做图像坐标局部选择，不使用 AR 地图坐标；默认跟随一支，stone 落在默认路径附近时切换另一支。当前 `inner / outer` 仍是图像局部意义，后续还应将拓扑结果上升为独立 `road_path_state`。
+2. 岔路与 `stone`：当前 `seg_func.py` 先由粗扫描点独立发现双区域几何，再启用密集扫描；它使用已确认的左右分支内边界点拟合分割线并估计分叉点，根据双区域位于分叉点上方还是下方输出 `road_topology=FORK/MERGE`，只切对应一侧的连通 `road_mask`，共同区域保持不切。拟合点跨度或残差不合格时不会强行切分。fork 分类器只确认可选道岔路和后续 stone 变道需求，不参与 `MERGE` 识别；`MERGE` 第一次根据上一帧当前支路连续性选择一个分支 mask，随后锁定该 side，只沿对应 mask 中线汇入，不再被另一支路评分带偏。`AVOID_STONE` 仍只做图像坐标局部选择，不使用 AR 地图坐标。
 3. 检测框远近判断：`human / car / stone` 目前进入风险池后按距离等级、路径遮挡等级和状态保持奖励组成 `risk_score` 排序，类别只保留很小的 tie-break；`gold` 属于奖励池，只有无风险目标且金币足够近时才处理。如果目标已经很近但状态没有切换，优先调 `control_task_state_machine.py` 顶部的 `RISK_*` 阈值；如果远处目标提前切换，说明底边触发带或路径横向范围过宽。
 4. 避障转向激进程度：紫色线已经改成连续规划线，`AVOID_CAR / AVOID_HUMAN / AVOID_STONE` 的偏置、ramp、前瞻点 `lookahead_y=300` 和 road mask 走廊评分仍需实车调。`AVOID_HUMAN` 使用行人横向速度预测短时占用区，再在 road mask 内选择左右走廊；若计划绕行侧过激，会触发 `yield_wait` 停等并由 planner 临时覆盖速度为 `0.0`。若人运动方向误判或绕行侧不合理，优先调 `HUMAN_MOTION_*`、`HUMAN_MOTION_PREDICT_SECONDS`、`HUMAN_YIELD_*` 和 `ROAD_SIDE_*`。若 final/CMD err 已经足够大但转不过来，再看 TC264D 舵机线性 P 映射、硬限幅和机械舵机。
 5. 红绿灯识别：`TrafficLight` 先由目标检测给框，再由 `vision_traffic_light.py` 在框内用 HSV 判断红/绿。曝光、灯光颜色、AR 画面压缩和检测框偏移都会影响判断。当前远处红灯只记录为 `red_far`，进入 `TRAFFIC_LIGHT_STOP_MIN_BOTTOM_RATIO` 定义的近处停车区后还要连续确认，确认完成才进入 `TRAFFIC_LIGHT_STOP`；有效绿灯会立即清除红灯保持并恢复通行。若红灯不停或绿灯误停，先看 HUD/日志里的 `traffic_light_state / traffic_light_stop_zone / traffic_light_red_confirm_age` 和置信度，再调 `vision_traffic_light.py` 顶部的 HSV、面积阈值以及 `control_race_state_machine.py` 顶部的停车区和确认阈值。

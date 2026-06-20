@@ -55,6 +55,7 @@ FORK_PARTITION_MAX_DIVIDER_RMSE_RATIO = 0.035
 FORK_PARTITION_DEFAULT_EXTENSION_PX = 12
 FORK_PARTITION_MAX_EXTENSION_PX = 48
 FORK_PARTITION_DRAW_STEP = 8
+MERGE_BRANCH_LOCK_RELEASE_FRAMES = 5
 
 CHANNEL_EXPANSION_RATIO = 1.32
 CHANNEL_EXPANSION_MIN_ROWS = 3
@@ -88,12 +89,16 @@ _fork_votes = []
 _fork_hold = 0
 _prev_fork_candidates = {}
 _lost_frames = 0
+_merge_locked_side = None
+_merge_lock_missing_frames = 0
+_merge_locked_path = []
 
 
 def reset_centerline_state():
     """Reset temporal path state for tests and pipeline restarts."""
     global _prev_branch_count, _prev_path, _prev_prev_path, _prev_row_widths
     global _channel_hold, _fork_votes, _fork_hold, _prev_fork_candidates, _lost_frames
+    global _merge_locked_side, _merge_lock_missing_frames, _merge_locked_path
     _prev_branch_count = 0
     _prev_path = []
     _prev_prev_path = []
@@ -103,6 +108,9 @@ def reset_centerline_state():
     _fork_hold = 0
     _prev_fork_candidates = {}
     _lost_frames = 0
+    _merge_locked_side = None
+    _merge_lock_missing_frames = 0
+    _merge_locked_path = []
 
 
 def _update_lost_state(road_valid):
@@ -289,6 +297,17 @@ def _scan_rows_with_params(mask, step, row_window):
 
 def _scan_rows(mask):
     return _scan_rows_with_params(mask, SCAN_STEP, SCAN_ROW_WINDOW)
+
+
+def _has_branch_geometry_hint(rows, w):
+    min_sep = max(16.0, float(w) * FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO)
+    for row in rows:
+        segments = row.get("segments") or []
+        if len(segments) < 2:
+            continue
+        if float(segments[-1]["center"]) - float(segments[0]["center"]) >= min_sep:
+            return True
+    return False
 
 
 def _bottom_reference_x(mask, w):
@@ -1064,6 +1083,41 @@ def _choose_control_path(main_points, fork_candidates):
     return candidate.get("path") or main_points, str(candidate.get("side") or "fork")
 
 
+def _choose_merge_control_path(main_points, merge_candidates, previous_points, center_x, h, w):
+    if len(merge_candidates) < 2:
+        return main_points, "main"
+
+    reference_y = int(np.clip(round(float(h) * 0.88), 0, h - 1))
+    reference_x = _point_x_at_y(previous_points, reference_y, w)
+    if reference_x is None:
+        reference_x = float(center_x)
+
+    best = None
+    best_cost = float("inf")
+    for candidate in merge_candidates:
+        path = candidate.get("path") or []
+        candidate_x = _point_x_at_y(path, reference_y, w)
+        if candidate_x is None:
+            continue
+        cost = abs(float(candidate_x) - float(reference_x))
+        if cost < best_cost:
+            best = candidate
+            best_cost = cost
+
+    if best is None:
+        return main_points, "main"
+    return best.get("path") or main_points, str(best.get("side") or "merge")
+
+
+def _candidate_path_for_side(candidates, side):
+    for candidate in candidates or []:
+        if str(candidate.get("side") or "") == str(side):
+            path = candidate.get("path") or []
+            if path:
+                return path
+    return None
+
+
 def _draw_path(frame, points, color, thickness=4):
     if not points:
         return
@@ -1109,6 +1163,9 @@ def _empty_centerline_info(frame, reason="lost"):
         "road_state": "LOST",
         "midline_valid": False,
         "midline_state": "LOST",
+        "road_topology": "UNKNOWN",
+        "merge_locked_side": None,
+        "merge_lock_missing_frames": 0,
         "road_ratio": 0.0,
         "reason": reason,
         "branch_count": 0,
@@ -1273,6 +1330,7 @@ def draw_centerline_debug(frame, info, draw_text=True):
 
 def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=True):
     global _prev_path, _prev_prev_path, _prev_row_widths, _channel_hold
+    global _merge_locked_side, _merge_lock_missing_frames, _merge_locked_path
     try:
         class_map = _to_class_map(seg_map)
     except ValueError as exc:
@@ -1292,22 +1350,14 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
     h, w = road_mask.shape
     center_x = w // 2
     lookahead_y = int(np.clip(SEGMENTATION_LOOKAHEAD_Y, 0, h - 1))
+    previous_control_path = list(_prev_path)
 
     mid_points, mid_ok, rows, mid_score = _build_midline(road_mask) if road_valid else ([], False, [], 0.0)
     fork_raw = _run_fork_classifier(fork_classifier, road_mask) if road_valid else None
     fork_cls = _parse_fork_result(fork_raw)
-    fork_scan_requested = bool(
-        road_valid
-        and rows
-        and (
-            (
-                fork_cls.get("available")
-                and fork_cls.get("label") == 1
-                and float(fork_cls.get("confidence") or 0.0) >= FORK_EARLY_CLASS_CONF
-            )
-            or ENABLE_GEOMETRY_ONLY_FORK
-        )
-    )
+    # Topology belongs to road-mask geometry. The fork classifier may later
+    # authorize a lane-choice task, but it must not create or suppress a split.
+    fork_scan_requested = bool(road_valid and rows and _has_branch_geometry_hint(rows, w))
     geometry_rows = (
         _scan_rows_with_params(road_mask, FORK_DENSE_SCAN_STEP, FORK_DENSE_SCAN_ROW_WINDOW)
         if fork_scan_requested
@@ -1376,6 +1426,15 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
     fork_state = _update_fork_state(fork_cls, geometry, early_geometry, road_valid)
     fork_strength = _compute_fork_strength()
     candidate_source = geometry if geometry.get("valid") else early_geometry
+    partition_side = str(candidate_source.get("partition_side") or "")
+    if candidate_source.get("partition_valid") and partition_side == "upper":
+        road_topology = "FORK"
+    elif candidate_source.get("partition_valid") and partition_side == "lower":
+        road_topology = "MERGE"
+    elif fork_state in ("FORK_EARLY", "FORK_CANDIDATE", "FORK_CONFIRMED"):
+        road_topology = "FORK_CANDIDATE"
+    else:
+        road_topology = "SINGLE"
 
     positive_y = fork_state in ("FORK_EARLY", "FORK_CANDIDATE", "FORK_CONFIRMED")
     if mid_ok:
@@ -1386,12 +1445,47 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         fork_candidates = []
 
     postproc_state = _postproc_state_name(fork_strength, _channel_hold)
-    selected_points, selected_side = _choose_control_path(
-        mid_points,
-        fork_candidates if fork_state == "FORK_CONFIRMED" else [],
-    )
+    if road_topology == "MERGE":
+        locked_path = _candidate_path_for_side(fork_candidates, _merge_locked_side)
+        if _merge_locked_side in ("left", "right") and locked_path:
+            selected_points = locked_path
+            selected_side = _merge_locked_side
+            _merge_locked_path = list(locked_path)
+            _merge_lock_missing_frames = 0
+        elif _merge_locked_side in ("left", "right") and _merge_locked_path:
+            selected_points = list(_merge_locked_path)
+            selected_side = _merge_locked_side
+            _merge_lock_missing_frames += 1
+        else:
+            selected_points, selected_side = _choose_merge_control_path(
+                mid_points,
+                fork_candidates,
+                previous_control_path,
+                center_x,
+                h,
+                w,
+            )
+            if selected_side in ("left", "right"):
+                _merge_locked_side = selected_side
+                _merge_locked_path = list(selected_points)
+                _merge_lock_missing_frames = 0
+    else:
+        if _merge_locked_side is not None:
+            _merge_lock_missing_frames += 1
+            if road_topology == "FORK" or _merge_lock_missing_frames >= MERGE_BRANCH_LOCK_RELEASE_FRAMES:
+                _merge_locked_side = None
+                _merge_locked_path = []
+                _merge_lock_missing_frames = 0
+        selected_points, selected_side = _choose_control_path(
+            mid_points,
+            fork_candidates if fork_state == "FORK_CONFIRMED" else [],
+        )
 
     selected_ok = len(selected_points) >= MIN_MID_POINTS
+    if selected_ok and road_topology == "MERGE":
+        _prev_prev_path = previous_control_path
+        _prev_path = list(selected_points)
+        _prev_row_widths = _path_row_widths(rows, selected_points)
     draw_points = selected_points if selected_ok else []
     target_x = _point_x_at_y(draw_points, lookahead_y, w) if selected_ok else None
     track_error = None
@@ -1414,6 +1508,9 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         "road_state": road_state,
         "midline_valid": bool(selected_ok),
         "midline_state": mid_state,
+        "road_topology": road_topology,
+        "merge_locked_side": _merge_locked_side,
+        "merge_lock_missing_frames": int(_merge_lock_missing_frames),
         "road_ratio": float(ratio),
         "reason": reason,
         "branch_count": int(_prev_branch_count),
