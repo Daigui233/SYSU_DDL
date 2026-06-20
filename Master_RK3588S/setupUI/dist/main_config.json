@@ -33,7 +33,7 @@
   "network": {
     "object_update_port": 9002,
     "stream_port": 8080,
-    "control_port": 9005,
+    "control_port": 9006,
     "udp_target_ip": "192.168.123.36",
     "udp_target_port": 9000,
     "unity_sync_port": 9003,

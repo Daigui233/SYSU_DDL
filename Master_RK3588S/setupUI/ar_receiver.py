@@ -4,12 +4,10 @@ import numpy as np
 import cv2
 from multiprocessing import shared_memory, resource_tracker
 from infer_wrap import InferWrap
+from control_runtime import ControlRuntime
 
 SHM_NAME = "shm_ar_video"
 SHM_HEADER_SIZE = 16
-
-#detecrion init
-infer = InferWrap(TPEs=3)
 
 # ¡¾¹Ø¼üÐÞ¸´¡¿·ÀÖ¹¿Í»§¶ËÍË³öÊ±ÎóÉ¾·þÎñÆ÷µÄ SHM
 def remove_shm_from_resource_tracker():
@@ -18,7 +16,8 @@ def remove_shm_from_resource_tracker():
     except:
         pass
 
-def main():
+def run_receiver():
+    infer = InferWrap(TPEs=3)
     print("?? Client Ready. Waiting for Server...")
     
     while True: # ¶ÏÏßÖØÁ¬Ñ­»·
@@ -97,6 +96,15 @@ def main():
                 except: pass
 
     cv2.destroyAllWindows()
+
+
+def main():
+    control_runtime = ControlRuntime()
+    control_runtime.start()
+    try:
+        run_receiver()
+    finally:
+        control_runtime.stop()
 
 if __name__ == "__main__":
     main()

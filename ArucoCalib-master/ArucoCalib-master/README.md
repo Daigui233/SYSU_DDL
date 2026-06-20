@@ -6,10 +6,10 @@ Windows 顶置相机定位程序负责检测 AprilTag 36h11，解算小车坐标
 
 ## 系统当前状态
 
-- 当前小车默认使用 RK3588S 上位机状态机中的 `NORMAL_TRACK` 低速视觉巡线。
-- 分割模型提供基础中线，检测模型提供 `gold / car / human` 等结构化感知输入；RK3588S 状态机再决定避人、避车、金币和丢线恢复等状态。
-- 检测结果不直接控车，AprilTag 定位也不参与 `track_error` 或路径规划；OCR/API 尚未接入。
-- 手柄遥控默认关闭；只有前端勾选 `Gamepad Mode` 并持续发出 `gamepad_control` 包时，RK3588S 才临时覆盖视觉控车。
+- RK3588S 当前已切换到 X-Verse 1.0.7 干净基线，旧分割、检测后处理、状态机和路径规划没有迁移。
+- 新的单 RKNN 多任务模型仍在训练与架构开发阶段；当前没有启用视觉自动控车。
+- AprilTag 定位不参与 `track_error` 或路径规划，只用于官方 AR 融合、显示和记录。
+- 手柄遥控默认关闭；只有前端勾选 `Gamepad Mode` 并持续发出 `gamepad_control` 包时，RK3588S 才向 TC264D 下发手动控制。
 - `Gamepad Mode` 使用定位 EXE 内部独立定时器发送，频率与当前相机/视频帧率一致；它不依赖固定 Tag、车载 Tag、标定状态或 `robot_position` 是否成功发送。
 - 遥控模式下定位 `robot_position` 仍正常发送到 `9005`，不会影响 AR 融合和轨迹显示。
 
@@ -20,6 +20,8 @@ Windows 顶置相机定位程序负责检测 AprilTag 36h11，解算小车坐标
 ```text
 dist/ArucoCalibLocator.exe
 ```
+
+当前 EXE 已按本分支源码重新打包，包含 Windows 发送端 `[z,height,x]` 坐标映射。
 
 前端必要操作：
 
@@ -64,10 +66,10 @@ EXE 使用 `dist/config.yaml`。源码运行使用根目录 `config.yaml`。
 定位包：
 
 ```json
-{"type":"robot_position","pos":[x,0.16,z],"euler":[0.0,yaw,0.0]}
+{"type":"robot_position","pos":[z,0.16,x],"euler":[0.0,yaw,0.0]}
 ```
 
-坐标单位为米，Yaw 单位为度。目标地址应填写 RK3588S 的局域网 IP，不要填写 Windows 自己的 `127.0.0.1`。
+Windows 定位内部、预览、滤波和轨迹记录仍使用 `(x,z)`；仅在 UDP 组包时交换为官方 AR 轴顺序 `[z,height,x]`。RK3588S 不再二次交换坐标，只把该 JSON 原样转发到 `127.0.0.1:9006`。坐标单位为米，Yaw 单位为度。目标地址应填写 RK3588S 的局域网 IP，不要填写 Windows 自己的 `127.0.0.1`。
 
 手柄遥控包仅在 `Gamepad Mode` 勾选时发送，端口为 `9010`，类型为 `gamepad_control`。它与定位包 `9005` 是独立链路；没有定位数据时仍可控车。映射关系：
 
@@ -75,7 +77,7 @@ EXE 使用 `dist/config.yaml`。源码运行使用根目录 `config.yaml`。
 - `LX`：`track_error`，默认比例 `210`。
 - `B` 键或手柄断连：`STATE_SAFE_STOP`。
 - 手柄读取优先使用 XInput；蓝牙手柄若不是 XInput，会尝试 pygame/DirectInput 兜底。
-- 取消 `Gamepad Mode` 或关闭程序时，会发送一次 `gamepad_mode=false`，RK3588S 随后回到视觉控车。
+- 取消 `Gamepad Mode`、遥控包超时或关闭程序时，RK3588S 会结束手柄控制并发送安全停车；新视觉控制链路接入后再统一控制源仲裁。
 
 这条遥控链路只覆盖 TC264D 控制帧，不改变定位输出、AR 转发或 WebUI 端口。
 

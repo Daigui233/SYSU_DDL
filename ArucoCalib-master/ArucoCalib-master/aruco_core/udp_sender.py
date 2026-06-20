@@ -4,7 +4,7 @@ import socket
 
 
 class UdpPoseSender:
-    """Send localized vehicle pose to the RK3588S AR receiver."""
+    """Send Windows localization poses in the official AR axis order."""
 
     def __init__(self, target_ip="127.0.0.1", target_port=9005, enabled=False):
         self.target_ip = str(target_ip)
@@ -26,9 +26,11 @@ class UdpPoseSender:
             self.enabled = bool(enabled)
 
     def make_packet(self, x_m, z_m, yaw_deg, height_m=0.16):
+        # Map only at the Windows network boundary. The preview, filtering,
+        # history, and calibration code continue using Windows (x, z).
         return {
             "type": "robot_position",
-            "pos": [float(x_m), float(height_m), float(z_m)],
+            "pos": [float(z_m), float(height_m), float(x_m)],
             "euler": [0.0, float(yaw_deg), 0.0],
         }
 
