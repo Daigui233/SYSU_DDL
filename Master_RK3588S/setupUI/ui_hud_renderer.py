@@ -349,6 +349,56 @@ def _format_compact_perf_lines(performance_status, fps):
     return lines
 
 
+def _performance_diagnostic_sections(performance_status, fps):
+    control_fps = _safe_float(fps, None)
+
+    def fmt(value, suffix=""):
+        value = _safe_float(value, None)
+        return "N/A" if value is None else f"{value:.1f}{suffix}"
+
+    if not performance_status or not performance_status.get("enabled"):
+        return [("FPS", [f"CTRL {fmt(control_fps)}", "MONITOR DISABLED"])]
+
+    stages = performance_status.get("stages_ms") or {}
+    system = performance_status.get("system") or {}
+    debug_render = performance_status.get("debug_render") or {}
+    debug_stream = performance_status.get("debug_stream") or {}
+    npu_load = system.get("npu_load")
+    if isinstance(npu_load, (list, tuple)) and npu_load:
+        npu_text = "/".join(fmt(value, "%") for value in npu_load[:3])
+    else:
+        npu_text = "N/A"
+
+    render_drop = int(debug_render.get("drop_before_render") or 0)
+    encode_drop = int(debug_stream.get("drop_before_encode") or 0)
+    fps_lines = [
+        f"CTRL {fmt(control_fps)}  RAW {fmt(performance_status.get('raw_fps'))}  "
+        f"LOOP {fmt(performance_status.get('loop_fps'))}",
+        f"DEBUG {fmt(debug_render.get('render_fps'))}  JPEG {fmt(debug_stream.get('encode_fps'))}  "
+        f"DROP {render_drop}/{encode_drop}",
+    ]
+    latency_lines = [
+        f"SEG infer={fmt(stages.get('seg_infer_ms'))} post={fmt(stages.get('seg_post_ms'))}",
+        f"DET infer={fmt(stages.get('det_infer_ms'))} post={fmt(stages.get('det_post_ms'))}",
+        f"VISION={fmt(stages.get('vision_total_ms') or stages.get('vision_ms'))} "
+        f"FRAME={fmt(performance_status.get('total_ms'))}",
+        f"DEBUG render={fmt(debug_render.get('render_ms'))} jpeg={fmt(debug_stream.get('encode_ms'))}",
+    ]
+    compute_lines = [
+        f"CPU avg={fmt(system.get('cpu_usage_percent'), '%')} "
+        f"max={fmt(system.get('cpu_max_core_percent'), '%')} "
+        f"temp={fmt(system.get('cpu_temp_c'), 'C')}",
+        f"NPU {npu_text}  freq={fmt(system.get('npu_freq_mhz'), 'MHz')}",
+        f"GPU load={fmt(system.get('gpu_load_percent'), '%')} "
+        f"freq={fmt(system.get('gpu_freq_mhz'), 'MHz')}",
+    ]
+    return [
+        ("FPS", fps_lines),
+        ("LATENCY MS", latency_lines),
+        ("COMPUTE", compute_lines),
+    ]
+
+
 def _tc264_state_name(value):
     try:
         state_value = int(value)
@@ -523,6 +573,41 @@ def draw_pose_status(
         return frame
 
     now = time.time()
+    if track_error is not None and np.isfinite(track_error):
+        err_text = f"{track_error:.1f}"
+    else:
+        err_text = "N/A"
+    speed_text = "N/A" if target_speed is None else f"{float(target_speed):.2f}"
+    control_line = f"CTRL {control_state}"
+    cmd_line = f"CMD v={speed_text} err={err_text}"
+
+    segmentation_status = segmentation_status or {}
+    road_state = segmentation_status.get("road_state") or "N/A"
+    midline_state = segmentation_status.get("midline_state") or "N/A"
+    road_topology = segmentation_status.get("road_topology") or "UNKNOWN"
+    key_line = f"ROAD {road_state} mid={midline_state} topo={road_topology}"
+
+    race_state = (task_decision or {}).get("race_state") or {}
+    stop_active = False
+    if race_state.get("traffic_light_stop"):
+        key_line = "STOP traffic light"
+        stop_active = True
+    elif race_state.get("finish_stop"):
+        key_line = "STOP finish"
+        stop_active = True
+    elif str(control_state) == "LINE_LOSS_SAFE_STOP":
+        key_line = "STOP line lost"
+        stop_active = True
+
+    color = (0, 220, 255) if stop_active else (70, 240, 70)
+    _draw_key_status_card(frame, [control_line, cmd_line, key_line], color)
+    h = frame.shape[0]
+    left_panel = _draw_referee_panel(h, frame.dtype, now)
+    sections = _performance_diagnostic_sections(performance_status, fps)
+    panel = _draw_grouped_status_panel(h, frame.dtype, color, sections)
+    return np.hstack([left_panel, frame, panel])
+
+    now = time.time()
     info = pose_bridge.snapshot()
     age = now - info["last_ts"] if info["last_ts"] else None
     fresh = age is not None and age < 1.0
@@ -681,12 +766,7 @@ def draw_pose_status(
         key_line = "STOP line lost"
     _draw_key_status_card(frame, [control_line, cmd_line, key_line], color)
 
-    sections = [
-        ("CONTROL", [control_line, cmd_line, plan_line, reason_line, race_line]),
-        ("VISION", [road_line, seg_line, det_line, fork_line]),
-        ("LINK", [pose_line, pose_io_line] + car_lines),
-        ("PERF", _format_compact_perf_lines(performance_status, fps)),
-    ]
+    sections = _performance_diagnostic_sections(performance_status, fps)
     panel = _draw_grouped_status_panel(h, frame.dtype, color, sections)
     return np.hstack([left_panel, frame, panel])
 

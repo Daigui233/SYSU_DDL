@@ -119,6 +119,9 @@ class VisionRuntimeControlsTest(unittest.TestCase):
         self.assertLess(abs(seg.started_at - det.started_at), 0.05)
         self.assertEqual(perception["segmentation"]["seg_frame_id"], 17)
         self.assertEqual(perception["detection_status"]["det_frame_id"], 17)
+        self.assertGreater(perception["timings_ms"]["seg_infer_ms"], 0.0)
+        self.assertGreater(perception["timings_ms"]["det_infer_ms"], 0.0)
+        self.assertGreater(perception["timings_ms"]["vision_total_ms"], 0.0)
         pipeline.release()
 
     def test_mismatched_detection_frame_is_rejected(self):

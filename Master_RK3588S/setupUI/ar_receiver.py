@@ -310,6 +310,7 @@ def main():
                     perf_token = performance_monitor.start()
                     _, perception = vision_pipeline.process(frame, now, frame_id=fid, draw_debug=False)
                     performance_monitor.stop("vision_ms", perf_token)
+                    performance_monitor.record_stages((perception or {}).get("timings_ms"))
                     perf_token = performance_monitor.start()
                     command, gamepad_status, task_decision, plan_result = build_autonomy_command(now, perception)
                     performance_monitor.stop("command_ms", perf_token)

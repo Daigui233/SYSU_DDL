@@ -30,7 +30,7 @@ seg_func.py segmentation track_error
 - 调试画面已从控车主循环拆到 `ui_debug_render_worker.py`：debug 仍显示完整分割/检测/规划/HUD 信息，但渲染/JPEG 慢时只丢 debug 帧，不阻塞串口控车。
 - 视觉推理已改为单帧内并行：同一 `fid` 的分割提交到 NPU core 1、检测提交到 core 0，两个任务都提交后才等待结果；返回结果必须与源 `fid` 一致，错帧结果直接拒绝。帧间不排队，当前帧处理结束后重新读取共享内存最新帧。
 - `vision_frame_source.py` 复制共享内存图像前后会核对 `fid/width/height`；若生产者正在覆盖帧则重试，连续不一致只跳过本轮读取，不把可能撕裂的图像交给模型。
-- HUD 性能行中 `FPS ctrl/raw/loop` 表示实际控车循环、共享内存输入帧率估计和性能监控主循环帧率；`DBG r/enc/pub/drop` 表示 debug 渲染、JPEG 编码、debug 发布和 debug 丢帧情况。
+- HUD 右侧已收缩为低帧率诊断面板：只显示 `FPS`、分割/检测 `infer/post` 与视觉/整帧耗时、CPU/NPU/GPU 负载和温度。视觉模型使用 NPU，OpenCV/NumPy 后处理使用 CPU，GPU仅作官方 AR/显示链路的可选负载参考。
 - 定位 UDP 转发采用低延迟热路径：`pose_ar_bridge.py` 收到有效 `robot_position` 后先转发到 AR，再降频写状态 JSON；默认丢弃输入队列旧定位包、保留最新包，HUD `POSE_IO rx/drop/fwd/h` 用于判断定位是否在排队或转发变慢。
 
 ## 当前保留的软件处理

@@ -47,7 +47,7 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 | `Master_RK3588S/setupUI/control_arbitrator.py` | 最终控制仲裁：合成状态机/局部规划结果和可选手柄覆盖，生成串口控制帧 |
 | `Master_RK3588S/setupUI/control_car_link.py` | 封装 RK3588S 到 TC264D 的串口控制链路 |
 | `Master_RK3588S/setupUI/status_runtime.py` | 写入 `/pose_status` 所需的定位、控制、AI 和 TC264D 状态 |
-| `Master_RK3588S/setupUI/performance_monitor.py` | 运行时性能探针：统计 AR 帧率、主循环耗时、HUD/显示耗时、NPU/温度信息，并写入 CSV |
+| `Master_RK3588S/setupUI/performance_monitor.py` | 轻量性能探针：统计帧率、分割/检测推理与后处理耗时、CPU/NPU/GPU负载和温度，并写入 CSV |
 | `Master_RK3588S/setupUI/webui_status_server.py` | WebUI 状态 HTTP 服务、配置接口和轻量调试 API |
 | `Master_RK3588S/setupUI/ui_hud_renderer.py` | OpenCV 预览窗口 HUD 绘制：左侧裁判事件提示，中间 AR 视频，右侧链路调试栏 |
 | `Master_RK3588S/setupUI/ui_debug_render_worker.py` | latest-only 调试画面渲染线程：绘制分割/检测/规划/HUD，慢时丢 debug 帧，不阻塞控车主循环 |
@@ -88,10 +88,10 @@ AprilTag 定位只服务于 AR 融合、坐标显示和记录，不直接规划�
 - 如果采集数据时只打开纯净 AR 融合流、没有启动 `ar_receiver.py`，但仍需要定位转发和手柄控车，可在 RK3588S 手动运行 `python3 Master_RK3588S/setupUI/standalone_control_bridge.py`；该备用脚本不要和 `ar_receiver.py` 同时运行。
 - TC264D 保留现有串口协议，本地输入超时为 `0.5 s`；若上位机进程崩溃导致串口帧停止，下位机会自行进入 `STATE_SAFE_STOP`。舵机转向已关闭大误差 boost，当前使用 `FULL_STEER_ERROR_PX=320` 的线性 P 映射，再经 `Servo.h` 硬限幅。
 - TC264D 反馈帧已扩展到 v3：HUD 会显示 `ERR cmd/tc/d`、`SERVO pwm/raw/lim`、`MOTOR tgt/act/out`、`MOTOR ff/pid`、`SAFE to/st/ss/ms/db` 和 `FB seq/bad/drop/fmt`，用于录视频后判断问题在上位机命令、串口传输、下位机限幅/PID 还是机械响应。
-- `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：HUD 显示关键性能摘要，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`，用于判断瓶颈在 AR 源头、视觉推理、控制主循环、debug 渲染/JPEG 编码还是硬件降频。
+- `performance_monitor.py` 已接入 `ar_receiver.py` 主循环：右侧 HUD 只显示用于定位低帧率的 `FPS / LATENCY / COMPUTE`，完整样本默认写入 `Master_RK3588S/setupUI/performance_debug.csv`。
 - `vision_pipeline.py` 对每个源 `fid` 先同时提交分割（NPU core 1）和检测（NPU core 0），再汇合并严格校验结果 `frame_id`；fork 分类器继续使用 core 2。帧间只保留一个正在处理的源帧，处理结束后直接读取共享内存最新帧，不建立历史帧队列，因此不会为了同步积压旧结果。
 - `ui_debug_render_worker.py` 和 `ui_debug_stream_server.py` 已接入 `ar_receiver.py`：发布的是完整调试画面，即分割/检测/局部规划目标线 + 左侧裁判事件 + 右侧调试 HUD；debug 画面渲染和 MJPEG 编码在独立线程中 latest-only 处理，慢时丢 debug 帧，不阻塞控车主循环。
-- HUD 右侧性能行含义：`FPS ctrl/raw/loop` 分别表示控车循环统计值、共享内存输入帧率估计、性能监控主循环帧率；`DBG r/enc/pub/drop` 分别表示 debug 渲染 FPS、JPEG 编码 FPS、debug 发布 FPS、渲染/编码前丢弃的 debug 帧数。若 `ctrl/loop` 高但 `DBG` 低，是显示链路慢，不代表实际控车低帧。
+- HUD 右侧性能行含义：`FPS` 区分共享内存输入、控车循环和 debug/JPEG；`LATENCY` 分开显示分割与检测的 `infer/post`、视觉总耗时和整帧耗时；`COMPUTE` 显示 CPU 平均/最忙核心、NPU 三核以及可选 GPU 负载。Python 视觉模型通过 RKNN 运行在 NPU，OpenCV/NumPy 后处理运行在 CPU；GPU 数值只用于观察官方 AR 合成或桌面显示负载，不代表模型使用 GPU。
 
 ## 当前仍保留的软件处理
 

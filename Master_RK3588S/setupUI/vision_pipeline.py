@@ -118,11 +118,22 @@ class VisionPipeline:
         if not hasattr(engine, "infer_current"):
             raise RuntimeError("vision engine does not support current-frame inference")
         return self._current_inference_executor().submit(
-            engine.infer_current,
+            self._timed_current_inference,
+            engine,
+            frame,
+            frame_id,
+            timestamp,
+        )
+
+    @staticmethod
+    def _timed_current_inference(engine, frame, frame_id, timestamp):
+        started = time.perf_counter()
+        result = engine.infer_current(
             frame,
             frame_id=frame_id,
             timestamp=timestamp,
         )
+        return result, (time.perf_counter() - started) * 1000.0
 
     @staticmethod
     def _normalize_frame_id(frame_id):
@@ -360,6 +371,7 @@ class VisionPipeline:
         return out
 
     def process(self, frame, now, frame_id=None, draw_debug=False):
+        process_started = time.perf_counter()
         final_frame = frame.copy() if draw_debug else frame
         frame_id_value = self._normalize_frame_id(frame_id)
         controls = self._controls_snapshot()
@@ -374,6 +386,13 @@ class VisionPipeline:
             reason="control_disabled" if not enable_detection else None,
         )
         detections = []
+        timings_ms = {
+            "seg_infer_ms": None,
+            "seg_post_ms": None,
+            "det_infer_ms": None,
+            "det_post_ms": None,
+            "vision_total_ms": None,
+        }
 
         seg_future = None
         det_future = None
@@ -417,18 +436,21 @@ class VisionPipeline:
             segmentation["postproc_state"] = "DISABLED"
         elif seg_future is not None:
             try:
-                seg_res, seg_flag, seg_meta = seg_future.result()
+                seg_payload, timings_ms["seg_infer_ms"] = seg_future.result()
+                seg_res, seg_flag, seg_meta = seg_payload
 
                 seg_meta = dict(seg_meta or {})
                 seg_frame_id = self._normalize_frame_id(seg_meta.get("frame_id"))
                 frame_matches = frame_id_value is None or seg_frame_id == frame_id_value
                 if seg_flag and seg_res is not None and frame_matches:
+                    post_started = time.perf_counter()
                     final_frame, segmentation = extract_centerline_info(
                         seg_res,
                         final_frame,
                         fork_classifier=self.infer_fork,
                         draw_debug=draw_debug and enable_overlay,
                     )
+                    timings_ms["seg_post_ms"] = (time.perf_counter() - post_started) * 1000.0
                     seg_done_ts = time.time()
                     seg_age = max(0.0, seg_done_ts - float(seg_meta.get("timestamp") or now))
                     segmentation["timestamp"] = float(now)
@@ -461,7 +483,8 @@ class VisionPipeline:
             )
         elif det_future is not None:
             try:
-                det_res, det_flag, det_meta = det_future.result()
+                det_payload, timings_ms["det_infer_ms"] = det_future.result()
+                det_res, det_flag, det_meta = det_payload
 
                 det_meta = dict(det_meta or {})
                 det_frame_id = self._normalize_frame_id(det_meta.get("frame_id"))
@@ -483,6 +506,7 @@ class VisionPipeline:
                     "count": 0,
                 }
                 if det_flag and det_res is not None and det_matches:
+                    post_started = time.perf_counter()
                     detections = self._build_detection_list(
                         det_res,
                         frame,
@@ -491,6 +515,7 @@ class VisionPipeline:
                         frame_id=frame_id_value,
                         det_frame_id=det_frame_id,
                     )
+                    timings_ms["det_post_ms"] = (time.perf_counter() - post_started) * 1000.0
                     detection_status["count"] = len(detections)
                     if draw_debug and enable_overlay:
                         self._draw_detection_list(final_frame, detections)
@@ -507,6 +532,7 @@ class VisionPipeline:
                     reason=str(exc),
                 )
 
+        timings_ms["vision_total_ms"] = (time.perf_counter() - process_started) * 1000.0
         perception = {
             "timestamp": float(now),
             "frame_shape": [int(v) for v in frame.shape[:2]],
@@ -514,6 +540,7 @@ class VisionPipeline:
             "segmentation": segmentation,
             "detection_status": detection_status,
             "detections": detections,
+            "timings_ms": timings_ms,
         }
         return final_frame, perception
 

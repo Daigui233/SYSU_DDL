@@ -41,6 +41,17 @@ PERF_MONITOR_DEFAULTS = {
     # Common RK3588/RK3588S NPU devfreq path. Missing files are handled as N/A.
     "NPU_FREQ_PATH": "/sys/class/devfreq/fdab0000.npu/cur_freq",
 
+    # GPU is not used by the Python RKNN vision pipeline. These optional nodes
+    # help reveal load from the official AR compositor or desktop rendering.
+    "GPU_LOAD_PATHS": [
+        "/sys/class/devfreq/fb000000.gpu/load",
+        "/sys/devices/platform/fb000000.gpu/devfreq/fb000000.gpu/load",
+    ],
+    "GPU_FREQ_PATHS": [
+        "/sys/class/devfreq/fb000000.gpu/cur_freq",
+        "/sys/devices/platform/fb000000.gpu/devfreq/fb000000.gpu/cur_freq",
+    ],
+
     # Thermal paths checked in order. Values are usually millidegree Celsius.
     "TEMP_PATHS": [
         "/sys/class/thermal/thermal_zone0/temp",
@@ -57,6 +68,11 @@ CSV_FIELDS = [
     "total_ms",
     "read_ms",
     "vision_ms",
+    "vision_total_ms",
+    "seg_infer_ms",
+    "seg_post_ms",
+    "det_infer_ms",
+    "det_post_ms",
     "command_ms",
     "planner_draw_ms",
     "serial_ms",
@@ -65,6 +81,10 @@ CSV_FIELDS = [
     "display_ms",
     "npu_load",
     "npu_freq_mhz",
+    "cpu_usage_percent",
+    "cpu_max_core_percent",
+    "gpu_load_percent",
+    "gpu_freq_mhz",
     "cpu_temp_c",
     "loadavg_1m",
 ]
@@ -95,6 +115,14 @@ def _read_text(path):
         return None
 
 
+def _read_first_text(paths):
+    for path in paths or []:
+        text = _read_text(path)
+        if text:
+            return text
+    return None
+
+
 def _parse_npu_load(text):
     if not text:
         return None
@@ -120,6 +148,60 @@ def _read_freq_mhz(path):
     if value > 1_000:
         return value / 1_000.0
     return value
+
+
+def _read_first_freq_mhz(paths):
+    for path in paths or []:
+        value = _read_freq_mhz(path)
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_device_load(text):
+    if not text:
+        return None
+    match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*%", text)
+    if match is None:
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    value = _safe_float(match.group(0).rstrip("%")) if match is not None else None
+    if value is None:
+        return None
+    return max(0.0, min(100.0, value))
+
+
+def _parse_cpu_stat(text):
+    samples = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if not parts or not re.fullmatch(r"cpu\d*", parts[0]):
+            continue
+        values = []
+        for item in parts[1:]:
+            try:
+                values.append(int(item))
+            except Exception:
+                break
+        if len(values) < 4:
+            continue
+        total = sum(values)
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        samples[parts[0]] = (total, idle)
+    return samples
+
+
+def _cpu_usage_percent(previous, current):
+    usage = {}
+    for name, (total, idle) in (current or {}).items():
+        if name not in (previous or {}):
+            continue
+        prev_total, prev_idle = previous[name]
+        total_delta = total - prev_total
+        idle_delta = idle - prev_idle
+        if total_delta <= 0:
+            continue
+        usage[name] = max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta))
+    return usage
 
 
 def _read_temp_c(paths):
@@ -164,6 +246,10 @@ class PerformanceMonitor:
         self.system_status = {
             "npu_load": None,
             "npu_freq_mhz": None,
+            "cpu_usage_percent": None,
+            "cpu_max_core_percent": None,
+            "gpu_load_percent": None,
+            "gpu_freq_mhz": None,
             "cpu_temp_c": None,
             "loadavg_1m": None,
         }
@@ -184,6 +270,7 @@ class PerformanceMonitor:
         self._csv_file = None
         self._csv_writer = None
         self._csv_error_logged = False
+        self._previous_cpu_stat = None
 
     def close(self):
         if self._csv_file is not None:
@@ -205,6 +292,12 @@ class PerformanceMonitor:
         elapsed_ms = (time.perf_counter() - token) * 1000.0
         self.stage_ms[str(name)] = elapsed_ms
         return elapsed_ms
+
+    def record_stages(self, values):
+        if not self.enabled or not isinstance(values, dict):
+            return
+        for name, value in values.items():
+            self.stage_ms[str(name)] = _safe_float(value)
 
     def begin_frame(self, fid, now=None):
         if not self.enabled:
@@ -272,9 +365,17 @@ class PerformanceMonitor:
         if now < self._next_system_probe_ts:
             return
         self._next_system_probe_ts = now + float(self.params["SYSTEM_PROBE_INTERVAL"])
+        current_cpu_stat = _parse_cpu_stat(_read_text("/proc/stat"))
+        cpu_usage = _cpu_usage_percent(self._previous_cpu_stat, current_cpu_stat)
+        self._previous_cpu_stat = current_cpu_stat
+        core_usage = [value for name, value in cpu_usage.items() if name != "cpu"]
         self.system_status = {
             "npu_load": _parse_npu_load(_read_text(self.params["NPU_LOAD_PATH"])),
             "npu_freq_mhz": _read_freq_mhz(self.params["NPU_FREQ_PATH"]),
+            "cpu_usage_percent": cpu_usage.get("cpu"),
+            "cpu_max_core_percent": max(core_usage) if core_usage else None,
+            "gpu_load_percent": _parse_device_load(_read_first_text(self.params["GPU_LOAD_PATHS"])),
+            "gpu_freq_mhz": _read_first_freq_mhz(self.params["GPU_FREQ_PATHS"]),
             "cpu_temp_c": _read_temp_c(self.params["TEMP_PATHS"]),
             "loadavg_1m": _read_loadavg_1m(),
         }
@@ -311,6 +412,11 @@ class PerformanceMonitor:
             "total_ms": _format_float(self.total_ms, 2),
             "read_ms": _format_float(stages.get("read_ms"), 2),
             "vision_ms": _format_float(stages.get("vision_ms"), 2),
+            "vision_total_ms": _format_float(stages.get("vision_total_ms"), 2),
+            "seg_infer_ms": _format_float(stages.get("seg_infer_ms"), 2),
+            "seg_post_ms": _format_float(stages.get("seg_post_ms"), 2),
+            "det_infer_ms": _format_float(stages.get("det_infer_ms"), 2),
+            "det_post_ms": _format_float(stages.get("det_post_ms"), 2),
             "command_ms": _format_float(stages.get("command_ms"), 2),
             "planner_draw_ms": _format_float(stages.get("planner_draw_ms"), 2),
             "serial_ms": _format_float(stages.get("serial_ms"), 2),
@@ -319,6 +425,10 @@ class PerformanceMonitor:
             "display_ms": _format_float(stages.get("display_ms"), 2),
             "npu_load": _join_npu_load(system.get("npu_load")),
             "npu_freq_mhz": _format_float(system.get("npu_freq_mhz"), 1),
+            "cpu_usage_percent": _format_float(system.get("cpu_usage_percent"), 1),
+            "cpu_max_core_percent": _format_float(system.get("cpu_max_core_percent"), 1),
+            "gpu_load_percent": _format_float(system.get("gpu_load_percent"), 1),
+            "gpu_freq_mhz": _format_float(system.get("gpu_freq_mhz"), 1),
             "cpu_temp_c": _format_float(system.get("cpu_temp_c"), 1),
             "loadavg_1m": _format_float(system.get("loadavg_1m"), 2),
         }
@@ -334,4 +444,3 @@ class PerformanceMonitor:
                     self.log_func(f"performance CSV write failed: {exc}")
                 except Exception:
                     pass
-
