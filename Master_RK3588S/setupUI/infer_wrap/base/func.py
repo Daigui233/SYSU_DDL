@@ -1,44 +1,18 @@
 #以下代码改自https://github.com/rockchip-linux/rknn-toolkit2/tree/master/examples/onnx/yolov5
-from pathlib import Path
-
-import os
-import time
-
 import cv2
 import numpy as np
 
 OBJ_THRESH, NMS_THRESH = 0.5, 0.45
 IMG_SIZE = (640, 640)
 
-_DEFAULT_CLASSES = (
-    "Door",
-    "SpeedSign",
-    "TurnSign",
-    "Stone",
-    "BeginSign",
-    "EndSign",
-    "Crosswalk",
-    "TrafficLight",
-    "Coin",
-    "Human",
-    "Car",
-)
-
-def _load_classes():
-    names_path = Path(__file__).resolve().parent / "model" / "coco.names"
-    try:
-        if names_path.is_file():
-            text = names_path.read_text(encoding="utf-8")
-            classes = tuple(line.strip() for line in text.splitlines() if line.strip())
-            if classes:
-                return classes
-    except OSError:
-        pass
-    return _DEFAULT_CLASSES
-
-
-CLASSES = _load_classes()
-NUM_CLASSES = len(CLASSES)
+CLASSES = ("person", "bicycle", "car", "motorbike ", "aeroplane ", "bus ", "train", "truck ", "boat", "traffic light",
+            "fire hydrant", "stop sign ", "parking meter", "bench", "bird", "cat", "dog ", "horse ", "sheep", "cow", "elephant",
+           "bear", "zebra ", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", 
+           "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass",
+            "cup", "fork", "knife ", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza ", 
+            "donut", "cake", "chair", "sofa", "pottedplant", "bed", "diningtable", "toilet ", "tvmonitor", "laptop", "mouse", 
+            "remote ", "keyboard ", "cell phone", "microwave ", "oven ", "toaster", "sink", "refrigerator ", "book", "clock", "vase", 
+            "scissors ", "teddy bear ", "hair drier", "toothbrush ")
 
 
 # 
@@ -186,90 +160,38 @@ def box_process(position, size_im=IMG_SIZE):
     return xyxy
 
 
-def _decode_branch_candidates(position, class_output, size_im):
-    """Filter cheap class scores before the comparatively expensive DFL decode."""
-    position = np.asarray(position)
-    class_output = np.asarray(class_output)
-    if position.ndim != 4 or class_output.ndim != 4:
-        raise ValueError("detection outputs must be NCHW tensors")
-
-    n, channels, grid_h, grid_w = position.shape
-    if n != 1 or class_output.shape[0] != 1:
-        raise ValueError("only batch size 1 detection outputs are supported")
-    if channels % 4 != 0:
-        raise ValueError(f"invalid DFL channel count: {channels}")
-    if class_output.shape[1] != NUM_CLASSES:
-        raise ValueError(
-            f"detection model outputs {class_output.shape[1]} classes, "
-            f"but {NUM_CLASSES} labels are configured"
-        )
-    if class_output.shape[2:] != (grid_h, grid_w):
-        raise ValueError("detection position/class grid shapes do not match")
-
-    class_flat = class_output[0].reshape(NUM_CLASSES, -1)
-    classes = np.argmax(class_flat, axis=0)
-    scores = np.max(class_flat, axis=0)
-    candidate_indices = np.flatnonzero(scores >= OBJ_THRESH)
-    if candidate_indices.size == 0:
-        return None, None, None
-
-    distribution_bins = channels // 4
-    distribution = position[0].reshape(4, distribution_bins, -1)[:, :, candidate_indices]
-    distribution = np.asarray(distribution, dtype=np.float32)
-    distribution -= np.max(distribution, axis=1, keepdims=True)
-    np.exp(distribution, out=distribution)
-    distribution /= np.sum(distribution, axis=1, keepdims=True)
-    distances = np.sum(
-        distribution * np.arange(distribution_bins, dtype=np.float32)[None, :, None],
-        axis=1,
-    )
-
-    rows, cols = np.divmod(candidate_indices, grid_w)
-    center_x = cols.astype(np.float32) + 0.5
-    center_y = rows.astype(np.float32) + 0.5
-    stride_x = float(size_im[1] // grid_w)
-    stride_y = float(size_im[0] // grid_h)
-    boxes = np.stack(
-        (
-            (center_x - distances[0]) * stride_x,
-            (center_y - distances[1]) * stride_y,
-            (center_x + distances[2]) * stride_x,
-            (center_y + distances[3]) * stride_y,
-        ),
-        axis=1,
-    )
-    return boxes, classes[candidate_indices], scores[candidate_indices]
-
-
 def post_process(input_data, img_shape=(640, 640)):
     """后处理（纯NumPy实现，适配RK3588输出格式）"""
-    boxes, scores, classes = [], [], []
+    boxes, scores, classes_conf = [], [], []
     defualt_branch = 3
     pair_per_branch = len(input_data) // defualt_branch
 
-    # The class tensors are much cheaper to inspect than the 68-channel DFL
-    # tensors. Real frames normally contain only a handful of candidates, so
-    # reject background locations before DFL instead of decoding all 8400.
+    # 解析每个分支的输出
     for i in range(defualt_branch):
-        branch_boxes, branch_classes, branch_scores = _decode_branch_candidates(
-            input_data[pair_per_branch * i],
-            input_data[pair_per_branch * i + 1],
-            img_shape,
-        )
-        if branch_boxes is not None:
-            boxes.append(branch_boxes)
-            classes.append(branch_classes)
-            scores.append(branch_scores)
+        boxes.append(box_process(input_data[pair_per_branch * i], img_shape))
+        classes_conf.append(input_data[pair_per_branch * i + 1])
+        scores.append(np.ones_like(input_data[pair_per_branch * i + 1][:, :1, :, :], dtype=np.float32))
+
+    # 展平特征图
+    def sp_flatten(_in):
+        ch = _in.shape[1]
+        _in = _in.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+        return _in.reshape(-1, ch)
+
+    boxes = [sp_flatten(_v) for _v in boxes]
+    classes_conf = [sp_flatten(_v) for _v in classes_conf]
+    scores = [sp_flatten(_v) for _v in scores]
 
     # 合并所有尺度的结果
-    if not boxes:
-        return None, None, None
     boxes = np.concatenate(boxes)
-    classes = np.concatenate(classes)
+    classes_conf = np.concatenate(classes_conf)
     scores = np.concatenate(scores)
 
-    # Candidates are already thresholded above; preserve the original NMS
-    # ordering and output contract (boxes, classes, scores).
+    # 过滤和NMS
+    boxes, classes, scores = filter_boxes(boxes, scores, classes_conf)
+    if boxes.size == 0:
+        return None, None, None
+
     # 按类别进行NMS
     nboxes, nclasses, nscores = [], [], []
     for c in set(classes):
@@ -292,49 +214,35 @@ def post_process(input_data, img_shape=(640, 640)):
 
     return boxes, classes, scores
 
-
-def _class_name(class_id):
-    idx = int(class_id)
-    if 0 <= idx < len(CLASSES):
-        return CLASSES[idx]
-    return f"cls_{idx}"
-
-
 def draw(image, boxes, scores, classes):
-    if boxes is None or scores is None or classes is None:
-        return image
-    if len(boxes) == 0:
-        return image
-
-    h, w = image.shape[:2]
+    """绘制结果（适配RK3588的显示输出）"""
     for box, score, cl in zip(boxes, scores, classes):
         left, top, right, bottom = [int(_b) for _b in box]
-        left = max(0, min(w - 1, left))
-        right = max(0, min(w - 1, right))
-        top = max(0, min(h - 1, top))
-        bottom = max(0, min(h - 1, bottom))
-        if right <= left or bottom <= top:
-            continue
-        cv2.rectangle(image, (left, top), (right, bottom), (0, 255, 0), 2)
-        cv2.putText(
-            image,
-            f"{_class_name(cl)} {float(score):.2f}",
-            (left, max(20, top - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
-    return image
+        # print(f'class: {CLASSES[cl]}, score: {score:.2f}')
+        # print(f'box coordinate: [left={left}, top={top}, right={right}, bottom={bottom}]')
 
+        cv2.rectangle(image, (left, top), (right, bottom), (0, 255, 0), 2)  # RK3588屏幕显示优化颜色
+        cv2.putText(image, f'{CLASSES[cl]} {score:.2f}',
+                    (left, bottom - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 0, 255), 2)
 
 def myFunc(rknn_lite, img_orin):
     img_rgb_orin = cv2.cvtColor(img_orin, cv2.COLOR_BGR2RGB)
+    # print(img_rgb_orin.shape)
     size_orin = img_orin.shape[:2]
+    # print(size_orin)
+    # 等比例缩放
+    # IMG = letterbox(IMG)
+    # 强制放缩
     img_rgb_in = cv2.resize(img_rgb_orin, IMG_SIZE)
     img_rgb_in = np.expand_dims(img_rgb_in, 0)
-    npu_started = time.perf_counter()
+    # print(img_rgb_in.shape)
     outputs = rknn_lite.inference(inputs=[img_rgb_in])
-    rknn_lite._last_inference_ms = (time.perf_counter() - npu_started) * 1000.0
+    # boxes, classes, scores = post_process(outputs)
     boxes, classes, scores = post_process(outputs, size_orin)
-    return boxes, scores, classes
+
+    # IMG = cv2.cvtColor(IMG, cv2.COLOR_RGB2BGR)
+    if boxes is not None:
+        draw(img_orin, boxes, scores, classes)
+    return img_orin

@@ -3,8 +3,8 @@
   "width": 640,
   "height": 480,
   "video_flip": {
-    "horizontal": true,
-    "vertical": true
+    "horizontal": false,
+    "vertical": false
   },
   "K": [
     [
@@ -33,20 +33,20 @@
   "network": {
     "object_update_port": 9002,
     "stream_port": 8080,
-    "control_port": 9006,
-    "udp_target_ip": "127.0.0.1",
-    "udp_target_port": 9006,
+    "control_port": 9005,
+    "udp_target_ip": "192.168.123.36",
+    "udp_target_port": 9000,
     "unity_sync_port": 9003,
-    "unity_target_ip": "127.0.0.1",
+    "unity_target_ip": "192.168.123.36",
     "sync_rate": 30,
     "imu_send_rate": 50,
     "pos_offset": [
       0.0,
-      0.1,
+      0.16,
       0.12
     ],
     "euler_offset": [
-      -8.0,
+      0.0,
       0.0,
       0.0
     ],

@@ -5,182 +5,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统引导设置 - X-Verse™ WebUI</title>
+    <!-- Modern Tech Fonts -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Roboto:wght@300;400;500&display=swap"
+        rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
-    <style>
-        .ar-debug-layout {
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) minmax(270px, 330px);
-            gap: 14px;
-            align-items: start;
-            margin-top: 12px;
-        }
-
-        .ar-debug-panel {
-            min-width: 0;
-            padding: 11px 12px;
-            border: 1px solid rgba(0, 255, 170, 0.25);
-            border-radius: 10px;
-            background: rgba(0, 0, 0, 0.24);
-        }
-
-        .ar-preview-actions {
-            min-width: 0;
-        }
-
-        .ar-debug-head {
-            display: flex;
-            justify-content: space-between;
-            gap: 10px;
-            align-items: center;
-            margin-bottom: 6px;
-        }
-
-        .ar-debug-title {
-            margin: 0;
-            font-size: 1rem;
-        }
-
-        .ar-debug-pill {
-            padding: 2px 8px;
-            border-radius: 999px;
-            font-size: 0.74rem;
-            border: 1px solid rgba(255, 255, 255, 0.18);
-            color: #d8fff4;
-            white-space: nowrap;
-        }
-
-        .ar-debug-pill.ok {
-            border-color: rgba(0, 255, 140, 0.45);
-            color: #55ff99;
-        }
-
-        .ar-debug-pill.warn {
-            border-color: rgba(255, 190, 60, 0.55);
-            color: #ffd06a;
-        }
-
-        .ar-debug-pill.bad {
-            border-color: rgba(255, 80, 80, 0.6);
-            color: #ff7474;
-        }
-
-        .ar-debug-row {
-            display: grid;
-            grid-template-columns: 64px minmax(0, 1fr);
-            gap: 8px;
-            padding: 5px 0;
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
-            font-size: 0.78rem;
-        }
-
-        .ar-debug-row:first-of-type {
-            border-top: none;
-        }
-
-        .ar-debug-label {
-            color: var(--text-muted);
-            white-space: nowrap;
-        }
-
-        .ar-debug-value {
-            color: #eef;
-            font-family: Consolas, Monaco, monospace;
-            overflow-wrap: anywhere;
-        }
-
-        .ar-debug-hint {
-            margin-top: 6px;
-            padding-top: 7px;
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
-            color: var(--text-muted);
-            font-size: 0.76rem;
-            line-height: 1.35;
-        }
-
-        .ar-debug-details {
-            margin-top: 8px;
-            font-size: 0.78rem;
-            color: var(--text-muted);
-        }
-
-        .ar-debug-details summary {
-            cursor: pointer;
-            color: #8df7d2;
-        }
-
-        .ar-debug-detail-line {
-            margin-top: 7px;
-            font-family: Consolas, Monaco, monospace;
-            overflow-wrap: anywhere;
-        }
-
-        .ar-debug-json {
-            max-height: 160px;
-            overflow: auto;
-            margin-top: 8px;
-            padding: 8px;
-            border-radius: 8px;
-            background: rgba(0, 0, 0, 0.28);
-            color: #d9fff2;
-            font-size: 0.72rem;
-            white-space: pre-wrap;
-        }
-
-        @media (max-width: 980px) {
-            .ar-debug-layout {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        .vision-control-box {
-            margin-top: 14px;
-            padding: 12px;
-            border: 1px solid rgba(80, 200, 255, 0.24);
-            border-radius: 10px;
-            background: rgba(0, 0, 0, 0.18);
-        }
-
-        .vision-control-title {
-            margin: 0 0 8px;
-            font-size: 0.92rem;
-            color: #d8fff4;
-        }
-
-        .vision-toggle-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            align-items: center;
-        }
-
-        .vision-toggle {
-            min-height: 34px;
-            padding: 6px 10px;
-            border: 1px solid rgba(255, 255, 255, 0.18);
-            border-radius: 999px;
-            color: #edf8f4;
-            background: rgba(255, 255, 255, 0.06);
-            cursor: pointer;
-        }
-
-        .vision-toggle.on {
-            border-color: rgba(70, 242, 143, 0.55);
-            color: #061512;
-            background: #46f28f;
-        }
-
-        .vision-toggle.off {
-            border-color: rgba(255, 90, 99, 0.45);
-            color: #ffb0b5;
-        }
-
-        .vision-control-note {
-            margin-top: 8px;
-            color: var(--text-muted);
-            font-size: 0.76rem;
-            line-height: 1.35;
-        }
-    </style>
 </head>
 
 <body>
@@ -195,7 +24,7 @@
             <div class="logo">
                 <span class="cyber-text">X-Verse™</span> 系统初始化
             </div>
-            <div class="ip-info">🌐 {{ ip }}:{{ http_port }}</div>
+            <div class="ip-info">🌐 {{ ip }}:5000</div>
         </header>
 
         <!-- Progress Indicator (Hidden on Step 1) -->
@@ -299,11 +128,11 @@
                     <div class="form-group row">
                         <div class="col">
                             <label for="udp_target_ip">定位数据地址</label>
-                            <input type="text" id="udp_target_ip" name="udp_target_ip" placeholder="127.0.0.1" />
+                            <input type="text" id="udp_target_ip" name="udp_target_ip" placeholder="192.168.123.5" />
                         </div>
                         <div class="col">
                             <label for="udp_target_port">端口号</label>
-                            <input type="number" id="udp_target_port" name="udp_target_port" placeholder="9006" />
+                            <input type="number" id="udp_target_port" name="udp_target_port" placeholder="9000" />
                         </div>
                     </div>
 
@@ -432,8 +261,8 @@
 
             <!-- Step 5: Dashboard (AR Preview) -->
             <div class="step-page" id="step-5">
-                <h2>🟢 AR 融合视频与链路监控</h2>
-                <p class="subtitle">预览控制在左侧，运行状态与问题定位在右侧。</p>
+                <h2>🟢 AR 融合视频流与配置监控</h2>
+                <p class="subtitle">✅ 融合流端口已成功生成，系统已就绪。</p>
 
                 <div class="code-snippet-box">
                     <strong>生成的融合流端口地址：</strong><br><br>
@@ -441,76 +270,16 @@
                     <button class="btn-copy" id="btn-copy-stream">复制</button>
                 </div>
 
-                <div class="ar-debug-layout">
-                    <div class="ar-preview-actions">
-                        <h3>本地预览</h3>
-                        <p style="font-size: 0.9rem; color: var(--text-muted)">
-                            在 RK3588 上启动或关闭 <code>ar_receiver.py</code> 预览窗口。
-                        </p>
-                        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                            <button class="btn btn-glow btn-ar-launch" id="btn-start-preview">🖥️ 打开预览窗口</button>
-                            <button class="btn btn-secondary" id="btn-stop-preview"
-                                style="display: none; border-color: #ff4d4f; color: #ff4d4f;">⏹️ 关闭预览窗口</button>
-                        </div>
-                        <div class="vision-control-box">
-                            <h3 class="vision-control-title">Vision runtime switches</h3>
-                            <div class="vision-toggle-row">
-                                <button class="vision-toggle" id="toggle-detection" data-control-key="enable_detection">DET</button>
-                                <button class="vision-toggle" id="toggle-segmentation" data-control-key="enable_segmentation">SEG</button>
-                                <button class="vision-toggle" id="toggle-overlay" data-control-key="enable_model_overlay">OVL</button>
-                            </div>
-                            <div class="vision-control-note" id="vision-control-note">
-                                DET/SEG OFF will skip model inference. OVL OFF only disables debug drawing.
-                            </div>
-                        </div>
+                <div>
+                    <h3>本地 AR 融合预览</h3>
+                    <p style="font-size: 0.9rem; color: var(--text-muted)">
+                        点击下方按钮将会在 RK3588 后台唤起 <code>ar_receiver.py</code> 进行本地流预览，若已在运行请勿重复点击。
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <button class="btn btn-glow btn-ar-launch" id="btn-start-preview">🖥️ 打开 RK3588端的AR
+                            融合预览窗口</button>
+                        <button class="btn btn-secondary" id="btn-stop-preview"
+                            style="display: none; border-color: #ff4d4f; color: #ff4d4f;">⏹️ 关闭预览窗口</button>
                     </div>
-
-                    <section class="ar-debug-panel" aria-label="AR control debug status">
-                        <div class="ar-debug-head">
-                            <h3 class="ar-debug-title">链路调试状态</h3>
-                            <span class="ar-debug-pill warn" id="debug-overall">等待数据</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">WIN-UDP</span>
-                            <span class="ar-debug-value" id="debug-win-udp">等待 9005</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">AR-FWD</span>
-                            <span class="ar-debug-value" id="debug-ar-fwd">等待 9006</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">CTRL</span>
-                            <span class="ar-debug-value" id="debug-ctrl">等待控制状态</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">FORK</span>
-                            <span class="ar-debug-value" id="debug-fork">N/A</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">VISION</span>
-                            <span class="ar-debug-value" id="debug-vision-controls">DET ON | SEG ON | OVL ON</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">GAMEPAD</span>
-                            <span class="ar-debug-value" id="debug-gamepad">默认视觉控车</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">SERIAL</span>
-                            <span class="ar-debug-value" id="debug-serial">等待发送</span>
-                        </div>
-                        <div class="ar-debug-row">
-                            <span class="ar-debug-label">TC264D</span>
-                            <span class="ar-debug-value" id="debug-tc264">等待反馈</span>
-                        </div>
-                        <div class="ar-debug-hint" id="debug-hint">
-                            正在读取 <code>9105/pose_status</code> 判断异常环节。
-                        </div>
-                        <details class="ar-debug-details">
-                            <summary>坐标与详细状态</summary>
-                            <div class="ar-debug-detail-line" id="debug-pose">POSE N/A</div>
-                            <pre class="ar-debug-json" id="debug-json">{}</pre>
-                        </details>
-                    </section>
                 </div>
 
                 <div class="info-card" style="margin-top: 20px;">
@@ -552,9 +321,9 @@
                             <h3 style="margin-bottom: 5px;">外部投递数据规范 (发往 RK3588)</h3>
                             <p style="font-size: 0.85rem; line-height: 1.5; margin-bottom: 0;">
                                 如果您不使用上述网页键盘，而是通过外部程序投递定位数据到 RK3588，<strong>数据链路必须遵循平台统一的 JSON 通信标准</strong>。<br>
-                                当前定位以 Windows AprilTag 程序为准：场地 4m × 3m，定位预览右下角基准点为 (x=0,z=0.30m)，底边 z=0.30m，+X 向左，+Z 向上。Windows 输入包包含
-                                <code>pos=[x,0.16,z]</code> 与 <code>euler=[0,yaw,0]</code>，其中 <code>yaw=euler[1]</code>，
-                                <code>0° -> +X</code>、<code>+90° -> +Z</code>。RK 转发给官方 AR 时只交换平移轴为 <code>pos=[z,0.16,x]</code>，Yaw 保持不变。
+                                主要用于同步相机/车体的实时位姿供 AR 追踪渲染，数据扁平化，必须直接包含 <code>pos</code> (三维坐标 XYZ) 与 <code>euler</code>
+                                (俯仰/偏航角)
+                                等基础字段，引擎不支持多层嵌套的 JSON 结构。
                             </p>
                             <button class="btn-ghost" id="btn-download-json"
                                 style="margin-top: 10px; border-color: rgba(255,255,255,0.2);">⬇️ 下载标准通信 JSON
@@ -628,185 +397,6 @@
     </div>
 
     <script src="/static/js/main.js"></script>
-    <script>
-        (function () {
-            const DEBUG_POLL_MS = 1000;
-            const poseStatusHost = window.location.hostname || "{{ ip }}";
-            const poseStatusUrl = `http://${poseStatusHost}:9105/pose_status`;
-
-            function byId(id) {
-                return document.getElementById(id);
-            }
-
-            function setText(id, value) {
-                const el = byId(id);
-                if (el) {
-                    el.textContent = value == null || value === "" ? "N/A" : String(value);
-                }
-            }
-
-            function setOverall(text, level) {
-                const el = byId("debug-overall");
-                if (!el) {
-                    return;
-                }
-                el.textContent = text;
-                el.className = `ar-debug-pill ${level || "warn"}`;
-            }
-
-            function fmtNum(value, digits) {
-                const n = Number(value);
-                return Number.isFinite(n) ? n.toFixed(digits) : "N/A";
-            }
-
-            function fmtAge(ts) {
-                const n = Number(ts);
-                if (!Number.isFinite(n) || n <= 0) {
-                    return "N/A";
-                }
-                return `${Math.max(0, Date.now() / 1000 - n).toFixed(1)}s`;
-            }
-
-            function fmtBool(value) {
-                if (value === true) {
-                    return "OK";
-                }
-                if (value === false) {
-                    return "FAIL";
-                }
-                return "N/A";
-            }
-
-            function buildHint(data) {
-                const packetCount = Number(data.packet_count || 0);
-                const udpOk = Number(data.udp_send_count || 0);
-                const udpFail = Number(data.udp_fail_count || 0);
-                const control = data.control || {};
-                const serialSend = control.serial_send || {};
-                const feedback = data.car_feedback || {};
-                const status = String(data.status || "").toLowerCase();
-
-                if (status.includes("udp error")) {
-                    return ["BAD", "9005 监听失败，检查端口占用或 ar_receiver 启动日志。"];
-                }
-                if (packetCount <= 0) {
-                    return ["WARN", "尚未收到 Windows robot_position，优先检查定位程序目标 IP 是否为 RK3588S、端口是否为 9005。"];
-                }
-                if (udpOk <= 0 || udpFail > 0) {
-                    return ["WARN", "定位已进入 RK，但 AR 转发异常，检查 127.0.0.1:9006 和官方 AR 引擎配置。"];
-                }
-                if (!control.state) {
-                    return ["WARN", "定位链路正常，但还没有控制状态，可能尚未接入 shm_ar_video 或视觉主循环未进入发送段。"];
-                }
-                if (control.state === "LINE_LOSS_SAFE_STOP") {
-                    return ["BAD", "连续未识别到语义分割中线，RK 正在下发 SAFE_STOP；把车放回赛道并重新识别到中线后会恢复 TRACK。"];
-                }
-                if (control.state === "GAMEPAD_SAFE_STOP") {
-                    return ["BAD", "手柄遥控模式正在下发 SAFE_STOP；松开 LT 或关闭定位 EXE 的 Gamepad Mode 后会回到视觉控车。"];
-                }
-                if (control.state === "GAMEPAD_TRACK") {
-                    return ["OK", "手柄遥控模式正在接管控车；定位仍继续进入 RK 并转发给 AR。"];
-                }
-                if (serialSend.ok === false) {
-                    return ["BAD", `串口发送失败：${serialSend.error || "未知错误"}。检查 /dev/ttyUSB0、权限、接线和波特率。`];
-                }
-                if (!feedback.online) {
-                    return ["WARN", "上位机正在发控制帧，但暂未收到 TC264D 反馈；检查下位机供电、TX/RX 交叉、共地和串口。"];
-                }
-                return ["OK", "定位、AR 转发、视觉控制、串口发送和 TC264D 反馈均有状态。"];
-            }
-
-            function renderDebugStatus(data) {
-                const packet = data.packet || {};
-                const arPacket = data.ar_packet || {};
-                const pos = Array.isArray(packet.pos) ? packet.pos : [];
-                const arPos = Array.isArray(arPacket.pos) ? arPacket.pos : [];
-                const euler = Array.isArray(packet.euler) ? packet.euler : [];
-                const control = data.control || {};
-                const serialSend = control.serial_send || {};
-                const gamepad = control.gamepad || {};
-                const feedback = data.car_feedback || {};
-                const vision = data.vision || {};
-                const controls = vision.vision_controls || (data.ai && data.ai.controls) || {};
-                const segmentation = vision.segmentation || {};
-                const forkCls = segmentation.fork_classifier || {};
-
-                setText(
-                    "debug-win-udp",
-                    `ok ${data.packet_count || 0} · bad ${data.invalid_count || 0}`
-                );
-                setText(
-                    "debug-ar-fwd",
-                    `ok ${data.udp_send_count || 0} · fail ${data.udp_fail_count || 0} · drop ${data.input_drop_count || 0} · fwd ${fmtNum(data.last_forward_ms, 1)}ms`
-                );
-                setText(
-                    "debug-pose",
-                    `POSE raw x=${fmtNum(pos[0], 2)} z=${fmtNum(pos[2], 2)} -> AR x=${fmtNum(arPos[0], 2)} z=${fmtNum(arPos[2], 2)} · yaw=${fmtNum(euler[1], 1)} age=${fmtAge(packet.timestamp || data.timestamp)}`
-                );
-                setText(
-                    "debug-ctrl",
-                    `${control.state || "N/A"} · err ${fmtNum(control.track_error, 1)} · v ${fmtNum(control.target_speed, 2)}m/s`
-                );
-                setText(
-                    "debug-fork",
-                    `${segmentation.fork_state || "N/A"} ${segmentation.fork_mode || "single"} · cls ${forkCls.name || "none"} ${fmtNum(forkCls.confidence, 2)} · split ${segmentation.fork_split_rows ?? "N/A"} · sel ${segmentation.fork_selected_side || "-"}`
-                );
-                setText(
-                    "debug-vision-controls",
-                    `DET ${controls.enable_detection === false ? "OFF" : "ON"} src=${(vision.detection_status || {}).source || "N/A"} · SEG ${controls.enable_segmentation === false ? "OFF" : "ON"} src=${segmentation.source || "N/A"} · OVL ${controls.enable_model_overlay === false ? "OFF" : "ON"}`
-                );
-                setText(
-                    "debug-gamepad",
-                    `${gamepad.active ? "ACTIVE" : "idle"} · ok ${gamepad.packet_count || 0} · bad ${gamepad.invalid_count || 0} · age ${gamepad.age == null ? "N/A" : `${Number(gamepad.age).toFixed(1)}s`}`
-                );
-                setText(
-                    "debug-serial",
-                    `send ${fmtBool(serialSend.ok)}${serialSend.error ? ` · ${serialSend.error}` : ""}`
-                );
-                setText(
-                    "debug-tc264",
-                    feedback.online
-                        ? `${feedback.state_name || feedback.state || "ONLINE"} · fb ${feedback.count || 0} · age ${fmtAge((Date.now() / 1000) - Number(feedback.age || 0))}`
-                        : `offline · fb ${feedback.count || 0} · bad ${feedback.bad || 0}`
-                );
-                setText("debug-json", JSON.stringify(data, null, 2));
-
-                const [level, hint] = buildHint(data);
-                setText("debug-hint", hint);
-                setOverall(level === "OK" ? "链路正常" : level === "BAD" ? "需要处理" : "等待/警告", level.toLowerCase());
-            }
-
-            async function pollDebugStatus() {
-                if (!byId("debug-overall")) {
-                    return;
-                }
-                try {
-                    const response = await fetch(`${poseStatusUrl}?t=${Date.now()}`, { cache: "no-store" });
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-                    renderDebugStatus(await response.json());
-                } catch (err) {
-                    setOverall("9105 不可达", "bad");
-                    setText("debug-win-udp", "ar_receiver 未运行或 9105 不可访问");
-                    setText("debug-ar-fwd", "N/A");
-                    setText("debug-pose", "N/A");
-                    setText("debug-ctrl", "N/A");
-                    setText("debug-fork", "N/A");
-                    setText("debug-vision-controls", "N/A");
-                    setText("debug-gamepad", "N/A");
-                    setText("debug-serial", "N/A");
-                    setText("debug-tc264", "N/A");
-                    setText("debug-hint", `无法读取 ${poseStatusUrl}：${err.message}`);
-                }
-            }
-
-            window.addEventListener("DOMContentLoaded", function () {
-                pollDebugStatus();
-                window.setInterval(pollDebugStatus, DEBUG_POLL_MS);
-            });
-        })();
-    </script>
 </body>
 
 </html>

@@ -1,62 +1,69 @@
-import glob
-import os
-import sys
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+import cv2, sys, os, glob
+import numpy as np
+import platform
+# from synset_label import labels
+from rknnlite.api import RKNNLite
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))) 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-try:
-    from .func import myFunc
-    from .rknnpool import rknnPoolExecutor
-except ImportError:
-    from func import myFunc
-    from rknnpool import rknnPoolExecutor
-
+# from camera import Camera
+from rknnpool import rknnPoolExecutor
+from func import myFunc
 
 def get_current_dir():
-    return os.path.dirname(os.path.abspath(__file__))
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    return current_dir
 
 
-class InferWrap:
-    def __init__(self, model_dir="model", TPEs=1, core_ids=None, max_inflight=None):
-        model_dir = model_dir if os.path.isabs(model_dir) else os.path.join(get_current_dir(), model_dir)
+class InferWrap():
+    def __init__(self, model_dir="model", TPEs=1):
+        model_dir = os.path.join(get_current_dir(), model_dir)
         model_path = self.get_model_path(model_dir)
-        if core_ids is None:
-            core_ids = [0] if int(TPEs) <= 1 else [0, 1, 2]
-        core_ids = list(core_ids) or [0]
-        self.TPEs = min(max(1, int(TPEs)), len(core_ids))
+        self.TPEs = TPEs
         self.rknn_pool = rknnPoolExecutor(
             rknnModel=model_path,
             TPEs=self.TPEs,
-            func=myFunc,
-            core_ids=core_ids,
-            max_inflight=max_inflight or self.TPEs,
-        )
+            func=myFunc)
+        self.pool_flag = False
+
+    def pool_init(self, img):
+        # 初始化线程池加载数据
+        for i in range(self.TPEs + 1):
+            self.rknn_pool.put(img)
 
     def get_model_path(self, model_dir):
-        preferred = os.path.join(model_dir, "rknn_lt.rknn")
-        if os.path.exists(preferred):
-            return preferred
-        files = sorted(
-            f for f in glob.glob(os.path.join(model_dir, "*.rknn"))
-            if "seg" not in os.path.basename(f).lower() and "pp" not in os.path.basename(f).lower()
-        )
-        if not files:
-            raise FileNotFoundError(f"detection model not found in {model_dir}")
-        return files[0]
+        model_path  = glob.glob(model_dir + "/*.rknn")[0]
+        # cfg_path = glob.glob(model_dir + "/*.names")[0]
+        # return model_path, params_path
+        return model_path
 
     def infer(self, img):
-        return self.rknn_pool.infer(img)
-
-    def infer_current(self, img, frame_id=None, timestamp=None):
-        meta = {
-            "frame_id": frame_id,
-            "timestamp": timestamp,
-        }
-        return self.rknn_pool.infer_current(img, meta=meta)
-
-    def __call__(self, *args, **kwargs):
-        return self.infer(*args, **kwargs)
-
+        if not self.pool_flag:
+            self.pool_init(img)
+            self.pool_flag = True
+        self.rknn_pool.put(img)
+        return self.rknn_pool.get()
+    
+    def __call__(self, *args, **kwds):
+        return self.infer(*args, **kwds)
+    
     def release(self):
         self.rknn_pool.release()
+
+if __name__ == '__main__':
+
+
+    # cap = Camera(0)
+    infer = InferWrap("model", TPEs=1)
+
+    ori_img = cv2.imread('./bus.jpg')
+    
+
+    import time
+    # time_ls = time.time()
+    # frame
+    frames, loopTime, initTime = 0, time.time(), time.time()
+    cnt_end = 1000
+    result, flag = infer.infer(ori_img)
+    cv2.imwrite("result.jpg", result)
+    infer.release()

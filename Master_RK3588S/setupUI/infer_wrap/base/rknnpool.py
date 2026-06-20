@@ -1,105 +1,63 @@
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from rknnlite.api import RKNNLite
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import cloudpickle
 import sys
 
-import cloudpickle
-from rknnlite.api import RKNNLite
 
-
-CORE_MASKS = {
-    0: RKNNLite.NPU_CORE_0,
-    1: RKNNLite.NPU_CORE_1,
-    2: RKNNLite.NPU_CORE_2,
-    -1: RKNNLite.NPU_CORE_0_1_2,
-}
-
-
-def initRKNN(rknnModel="model.rknn", core_id=0):
+def initRKNN(rknnModel="yolov.rknn", id=0):
     rknn_lite = RKNNLite()
     ret = rknn_lite.load_rknn(rknnModel)
     if ret != 0:
-        raise RuntimeError(f"load RKNN failed: {rknnModel}, ret={ret}")
-
-    core_mask = CORE_MASKS.get(core_id)
-    ret = rknn_lite.init_runtime(core_mask=core_mask) if core_mask is not None else rknn_lite.init_runtime()
+        print("Load RKNN rknnModel failed")
+        exit(ret)
+    if id == 0:
+        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_0)
+    elif id == 1:
+        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_1)
+    elif id == 2:
+        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_2)
+    elif id == -1:
+        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
+    else:
+        ret = rknn_lite.init_runtime()
     if ret != 0:
-        raise RuntimeError(f"init RKNN runtime failed: {rknnModel}, core={core_id}, ret={ret}")
-
-    print(f"{rknnModel}\tdone(core={core_id})")
+        print("Init runtime environment failed")
+        exit(ret)
+    print(rknnModel, "\t\tdone")
     return rknn_lite
 
 
-def initRKNNs(rknnModel="model.rknn", TPEs=1, core_ids=None):
-    sys.modules["pickle"] = cloudpickle
-    core_ids = list(core_ids or [0]) or [0]
-    return [initRKNN(rknnModel, core_ids[i % len(core_ids)]) for i in range(max(1, int(TPEs)))]
+def initRKNNs(rknnModel="yolo.rknn", TPEs=1):
+    sys.modules['pickle'] = cloudpickle
+    rknn_list = []
+    for i in range(TPEs):
+        rknn_list.append(initRKNN(rknnModel, i % 3))
+    return rknn_list
 
 
-class rknnPoolExecutor:
-    def __init__(self, rknnModel, TPEs, func, core_ids=None, max_inflight=None):
-        self.TPEs = max(1, int(TPEs))
-        self.max_inflight = max(1, min(int(max_inflight or self.TPEs), self.TPEs))
-        self.rknnPool = initRKNNs(rknnModel, self.TPEs, core_ids=core_ids)
-        self.pool = ThreadPoolExecutor(max_workers=self.TPEs)
+class rknnPoolExecutor():
+    def __init__(self, rknnModel, TPEs, func):
+        self.TPEs = TPEs
+        self.queue = Queue()
+        self.rknnPool = initRKNNs(rknnModel, TPEs)
+        self.pool = ThreadPoolExecutor(max_workers=TPEs)
+        # self.pool = ProcessPoolExecutor(max_workers=TPEs)
         self.func = func
-        self.futures = deque()
-        self.submit_index = 0
-
-    def _submit(self, frame):
-        if len(self.futures) >= self.max_inflight:
-            return False
-        rknn = self.rknnPool[self.submit_index % self.TPEs]
-        self.futures.append(self.pool.submit(self.func, rknn, frame.copy()))
-        self.submit_index += 1
-        return True
+        self.num = 0
 
     def put(self, frame):
-        return self._submit(frame)
+        self.queue.put(self.pool.submit(
+            self.func, self.rknnPool[self.num % self.TPEs], frame))
+        self.num += 1
 
-    def get(self, block=False):
-        if not self.futures:
+    def get(self):
+        if self.queue.empty():
             return None, False
-        idx = None
-        if block:
-            idx = 0
-        else:
-            for i, fut in enumerate(self.futures):
-                if fut.done():
-                    idx = i
-                    break
-            if idx is None:
-                return None, False
-        fut = self.futures[idx]
-        del self.futures[idx]
-        try:
-            return fut.result(), True
-        except Exception as exc:
-            print(f"RKNN worker failed: {exc}")
-            return None, False
-
-    def infer(self, frame):
-        result, flag = self.get(block=False)
-        self._submit(frame)
-        return result, flag
-
-    def infer_current(self, frame, meta=None):
-        meta = dict(meta or {})
-        rknn = self.rknnPool[self.submit_index % self.TPEs]
-        self.submit_index += 1
-        try:
-            result = self.func(rknn, frame.copy())
-            npu_inference_ms = getattr(rknn, "_last_inference_ms", None)
-            if npu_inference_ms is not None:
-                meta["npu_inference_ms"] = float(npu_inference_ms)
-            return result, True, meta
-        except Exception as exc:
-            print(f"RKNN current inference failed: {exc}")
-            return None, False, meta
+        fut = self.queue.get()
+        return fut.result(), True
 
     def release(self):
-        self.pool.shutdown(wait=True)
+        self.pool.shutdown()
         for rknn_lite in self.rknnPool:
-            try:
-                rknn_lite.release()
-            except Exception:
-                pass
+            rknn_lite.release()
