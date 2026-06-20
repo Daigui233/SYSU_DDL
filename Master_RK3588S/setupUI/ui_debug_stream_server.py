@@ -41,7 +41,7 @@ DEBUG_STREAM_DEFAULTS = {
     "STALE_SECONDS": 2.0,
 
     # Optional Linux CPU affinity for debug HTTP/encoder threads, e.g. "0-3".
-    "CPUSET": os.environ.get("AR_DEBUG_STREAM_CPUSET", ""),
+    "CPUSET": os.environ.get("AR_DEBUG_STREAM_CPUSET", "0-3"),
 }
 
 

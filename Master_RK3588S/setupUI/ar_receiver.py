@@ -69,8 +69,11 @@ DEBUG_PACKET_PATH = os.environ.get("AR_POSE_PACKET_PATH", os.path.join(BASE_DIR,
 DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEBUG_DRAW_POSE_PANEL = True
 DEBUG_LOCAL_PREVIEW = os.environ.get("AR_LOCAL_PREVIEW", "0").strip().lower() not in ("0", "false", "no", "off")
-MAIN_CPUSET = os.environ.get("AR_MAIN_CPUSET", "").strip()
-DEBUG_RENDER_CPUSET = os.environ.get("AR_DEBUG_RENDER_CPUSET", "").strip()
+# Keep latency-sensitive inference/path extraction on the two fastest RK3588S
+# cores. Debug drawing/JPEG use the little cores so they cannot evict control
+# work. Both defaults remain overridable for other boards.
+MAIN_CPUSET = os.environ.get("AR_MAIN_CPUSET", "6-7").strip()
+DEBUG_RENDER_CPUSET = os.environ.get("AR_DEBUG_RENDER_CPUSET", "0-3").strip()
 POSE_STATUS_HTTP_HOST = os.environ.get("AR_POSE_STATUS_HOST", "0.0.0.0")
 POSE_STATUS_HTTP_PORT = int(os.environ.get("AR_POSE_STATUS_PORT", "9105"))
 

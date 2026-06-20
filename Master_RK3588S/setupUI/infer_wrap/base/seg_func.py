@@ -955,8 +955,11 @@ def _row_for_y(rows, y):
 
 def _path_row_widths(rows, points):
     widths = {}
+    rows_by_y = {int(row.get("y", 0)): row for row in rows}
     for x, y in points:
-        row = _row_for_y(rows, y)
+        row = rows_by_y.get(int(y))
+        if row is None:
+            row = _row_for_y(rows, y)
         if row is None:
             continue
         segments = row.get("segments") or []
@@ -982,6 +985,30 @@ def _predict_path_x(y, w):
     return float(np.clip(previous + (previous - older) * CHANNEL_PREDICTION_GAIN, 0, w - 1))
 
 
+def _predict_path_xs(target_ys, w):
+    """Vector form of _predict_path_x without sorting paths for every point."""
+    if not _prev_path:
+        return None
+
+    def interpolate(points):
+        if not points:
+            return None
+        ordered = sorted(points, key=lambda point: point[1])
+        ys = np.asarray([point[1] for point in ordered], dtype=np.float32)
+        xs = np.asarray([point[0] for point in ordered], dtype=np.float32)
+        if len(ordered) == 1:
+            return np.full(len(target_ys), xs[0], dtype=np.float32)
+        return np.interp(np.asarray(target_ys, dtype=np.float32), ys, xs)
+
+    previous = interpolate(_prev_path)
+    if previous is None:
+        return None
+    older = interpolate(_prev_prev_path)
+    if older is None:
+        return np.clip(previous, 0, w - 1)
+    return np.clip(previous + (previous - older) * CHANNEL_PREDICTION_GAIN, 0, w - 1)
+
+
 def _stabilize_single_path(points, rows, w, positive_y):
     """Fork-aware midline temporal stabilization.  Only called when fork_strength > 0.
 
@@ -998,14 +1025,15 @@ def _stabilize_single_path(points, rows, w, positive_y):
         return list(points)
 
     current_widths = _path_row_widths(rows, points)
+    predicted_xs = _predict_path_xs([y for _x, y in points], w)
     expanded_rows = 0
     deviated_rows = 0
-    for _x, y in points:
+    for index, (_x, y) in enumerate(points):
         current = current_widths.get(int(y))
         previous = _prev_row_widths.get(int(y))
         if current is not None and previous is not None and previous > 1.0:
             expanded_rows += int(current > previous * CHANNEL_EXPANSION_RATIO)
-        predicted = _predict_path_x(y, w)
+        predicted = None if predicted_xs is None else float(predicted_xs[index])
         if predicted is not None:
             deviated_rows += int(abs(float(_x) - predicted) > w * CHANNEL_PATH_DEVIATION_RATIO)
 
@@ -1031,8 +1059,8 @@ def _stabilize_single_path(points, rows, w, positive_y):
 
     max_correction = max(5.0, w * CHANNEL_HOLD_CORRECTION_RATIO)
     stabilized = []
-    for raw_x, y in points:
-        predicted = _predict_path_x(y, w)
+    for index, (raw_x, y) in enumerate(points):
+        predicted = None if predicted_xs is None else float(predicted_xs[index])
         if predicted is None:
             stabilized.append((int(raw_x), int(y)))
             continue
@@ -1398,28 +1426,33 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
             strict_branch_points,
             FORK_MIN_BRANCH_SEPARATION_RATIO,
         )
-        early_geometry = _extract_fork_geometry(
-            geometry_rows,
-            center_x,
-            lookahead_y,
-            w,
-            min_split_rows=early_split_rows,
-            min_branch_points=early_branch_points,
-            min_separation_ratio=FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO,
-            min_branch_pixels=FORK_EARLY_MIN_BRANCH_PIXELS,
-            min_total_pixels=FORK_EARLY_MIN_TOTAL_PIXELS,
-            row_step=geometry_step,
-        )
-        early_geometry = _partition_fork_geometry(
-            road_mask,
-            geometry_rows,
-            early_geometry,
-            center_x,
-            lookahead_y,
-            w,
-            early_branch_points,
-            FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO,
-        )
+        if geometry.get("valid"):
+            # Strict validity implies early validity. Reusing the already
+            # partitioned result avoids rebuilding two masks and two midlines.
+            early_geometry = geometry
+        else:
+            early_geometry = _extract_fork_geometry(
+                geometry_rows,
+                center_x,
+                lookahead_y,
+                w,
+                min_split_rows=early_split_rows,
+                min_branch_points=early_branch_points,
+                min_separation_ratio=FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO,
+                min_branch_pixels=FORK_EARLY_MIN_BRANCH_PIXELS,
+                min_total_pixels=FORK_EARLY_MIN_TOTAL_PIXELS,
+                row_step=geometry_step,
+            )
+            early_geometry = _partition_fork_geometry(
+                road_mask,
+                geometry_rows,
+                early_geometry,
+                center_x,
+                lookahead_y,
+                w,
+                early_branch_points,
+                FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO,
+            )
     else:
         geometry = {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
         early_geometry = {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}

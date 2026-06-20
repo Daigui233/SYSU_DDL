@@ -123,6 +123,22 @@ Windows AprilTag 定位 -> UDP 板卡IP:9005 -> pose_ar_bridge.py -> 127.0.0.1:9
 
 ## 调试重点
 
+### RK3588S 性能模式
+
+主视觉线程默认固定到 CPU 6-7，大核；debug 绘制和 MJPEG 编码默认固定到 CPU 0-3，均可分别用
+`AR_MAIN_CPUSET`、`AR_DEBUG_RENDER_CPUSET`、`AR_DEBUG_STREAM_CPUSET` 覆盖。
+
+板卡 DDR 默认可能长期停在 528 MHz。需要低延迟模式时执行：
+
+```bash
+cd Master_RK3588S/setupUI
+sudo ./rk3588_performance_mode.sh install
+```
+
+该命令会立即将 DDR 固定为板卡最高频率并创建开机服务。用
+`./rk3588_performance_mode.sh status` 查看当前频率；需要恢复动态调频时执行
+`sudo ./rk3588_performance_mode.sh uninstall`。
+
 WebUI/HUD 优先确认：
 
 - `WIN-UDP ok` 和 `AR-FWD ok` 持续增长，AR 画面随定位变化。
