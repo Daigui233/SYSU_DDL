@@ -44,6 +44,18 @@ FORK_EARLY_CONFIRM_FRAMES = 3
 FORK_CONFIRM_FRAMES = 2
 FORK_RELEASE_FRAMES = 5
 
+# Connected-mask fork partitioning. Normal tracking keeps SCAN_STEP=8; a
+# classifier-confirmed fork uses denser rows only while branch geometry is needed.
+FORK_DENSE_SCAN_STEP = 3
+FORK_DENSE_SCAN_ROW_WINDOW = 3
+FORK_PARTITION_MIN_DIVIDER_POINTS = 3
+FORK_PARTITION_POLY_DEGREE = 2
+FORK_PARTITION_MIN_SAMPLE_SPAN_PX = 18
+FORK_PARTITION_MAX_DIVIDER_RMSE_RATIO = 0.035
+FORK_PARTITION_DEFAULT_EXTENSION_PX = 12
+FORK_PARTITION_MAX_EXTENSION_PX = 48
+FORK_PARTITION_DRAW_STEP = 8
+
 CHANNEL_EXPANSION_RATIO = 1.32
 CHANNEL_EXPANSION_MIN_ROWS = 3
 CHANNEL_PATH_DEVIATION_RATIO = 0.035
@@ -259,12 +271,13 @@ def _row_segments(row, min_width=MIN_SEGMENT_WIDTH):
     return result
 
 
-def _scan_rows(mask):
+def _scan_rows_with_params(mask, step, row_window):
     h, _ = mask.shape
     top = int(h * TOP_CROP_RATIO)
-    half = max(1, SCAN_ROW_WINDOW // 2)
+    step = max(1, int(step))
+    half = max(0, int(row_window) // 2)
     rows = []
-    for y in range(h - 8, top, -SCAN_STEP):
+    for y in range(h - 8, top, -step):
         y0 = max(0, y - half)
         y1 = min(h, y + half + 1)
         row = np.max(mask[y0:y1], axis=0)
@@ -272,6 +285,10 @@ def _scan_rows(mask):
         if segments:
             rows.append({"y": int(y), "segments": segments})
     return rows
+
+
+def _scan_rows(mask):
+    return _scan_rows_with_params(mask, SCAN_STEP, SCAN_ROW_WINDOW)
 
 
 def _bottom_reference_x(mask, w):
@@ -445,12 +462,13 @@ def _extract_fork_geometry(
     min_separation_ratio=FORK_MIN_BRANCH_SEPARATION_RATIO,
     min_branch_pixels=FORK_MIN_BRANCH_PIXELS,
     min_total_pixels=FORK_MIN_TOTAL_PIXELS,
+    row_step=SCAN_STEP,
 ):
     min_sep = max(16.0, w * float(min_separation_ratio))
     split_rows = []
     left_pixels = 0
     right_pixels = 0
-    area_scale = max(1, int(SCAN_STEP))
+    area_scale = max(1, int(row_step))
     for row in rows:
         segments = row["segments"]
         if len(segments) < 2:
@@ -562,6 +580,195 @@ def _extract_fork_geometry(
     }
 
 
+def _fork_divider_samples(rows, w, min_separation_ratio):
+    min_sep = max(16.0, float(w) * float(min_separation_ratio))
+    samples = []
+    for row in rows:
+        segments = row.get("segments") or []
+        if len(segments) < 2:
+            continue
+        left = segments[0]
+        right = segments[-1]
+        center_sep = float(right["center"]) - float(left["center"])
+        if center_sep < min_sep:
+            continue
+        inner_left = float(left["right"])
+        inner_right = float(right["left"])
+        samples.append({
+            "y": int(row["y"]),
+            "x": (inner_left + inner_right) * 0.5,
+            "gap": max(1.0, inner_right - inner_left - 1.0),
+        })
+    return samples
+
+
+def _fit_fork_divider(samples, rows, h, w):
+    if len(samples) < FORK_PARTITION_MIN_DIVIDER_POINTS:
+        return None
+
+    ys = np.asarray([item["y"] for item in samples], dtype=np.float32)
+    xs = np.asarray([item["x"] for item in samples], dtype=np.float32)
+    if float(np.max(ys) - np.min(ys)) < float(FORK_PARTITION_MIN_SAMPLE_SPAN_PX):
+        return None
+    all_ys = [int(row.get("y", 0)) for row in rows]
+    if not all_ys:
+        return None
+    split_min_y = int(round(float(np.min(ys))))
+    split_max_y = int(round(float(np.max(ys))))
+    common_above_span = max(0, split_min_y - min(all_ys))
+    common_below_span = max(0, max(all_ys) - split_max_y)
+    if max(common_above_span, common_below_span) < max(1, int(FORK_DENSE_SCAN_STEP)):
+        return None
+    split_side = "upper" if common_below_span >= common_above_span else "lower"
+
+    degree = min(max(1, int(FORK_PARTITION_POLY_DEGREE)), len(samples) - 1)
+    try:
+        coeff = np.polyfit(ys, xs, degree)
+    except Exception:
+        return None
+    fit_xs = np.polyval(coeff, ys)
+    fit_rmse = float(np.sqrt(np.mean((fit_xs - xs) ** 2)))
+    if fit_rmse > max(4.0, float(w) * float(FORK_PARTITION_MAX_DIVIDER_RMSE_RATIO)):
+        return None
+
+    boundary_split_y = split_max_y if split_side == "upper" else split_min_y
+    direction = 1 if split_side == "upper" else -1
+    fork_y = boundary_split_y + direction * int(FORK_PARTITION_DEFAULT_EXTENSION_PX)
+    if len(samples) >= 2:
+        gaps = np.asarray([item["gap"] for item in samples], dtype=np.float32)
+        try:
+            gap_coeff = np.polyfit(ys, gaps, 1)
+            slope = float(gap_coeff[0])
+            slope_matches = slope < -1e-3 if split_side == "upper" else slope > 1e-3
+            if slope_matches:
+                zero_y = -float(gap_coeff[1]) / slope
+                low_y = boundary_split_y if split_side == "upper" else boundary_split_y - float(FORK_PARTITION_MAX_EXTENSION_PX)
+                high_y = boundary_split_y + float(FORK_PARTITION_MAX_EXTENSION_PX) if split_side == "upper" else boundary_split_y
+                if low_y <= zero_y <= high_y:
+                    fork_y = int(round(zero_y))
+        except Exception:
+            pass
+
+    if split_side == "upper":
+        fork_y = int(np.clip(
+            fork_y,
+            boundary_split_y,
+            min(h - 1, boundary_split_y + int(FORK_PARTITION_MAX_EXTENSION_PX)),
+        ))
+    else:
+        fork_y = int(np.clip(
+            fork_y,
+            max(0, boundary_split_y - int(FORK_PARTITION_MAX_EXTENSION_PX)),
+            boundary_split_y,
+        ))
+
+    def divider_x(y):
+        return float(np.clip(np.polyval(coeff, float(y)), 0, w - 1))
+
+    top_y = max(0, int(h * TOP_CROP_RATIO))
+    draw_start = top_y if split_side == "upper" else fork_y
+    draw_stop = fork_y if split_side == "upper" else h - 1
+    divider_points = [
+        (int(round(divider_x(y))), int(y))
+        for y in range(draw_start, draw_stop + 1, max(1, int(FORK_PARTITION_DRAW_STEP)))
+    ]
+    end_y = fork_y if split_side == "upper" else h - 1
+    if not divider_points or divider_points[-1][1] != end_y:
+        divider_points.append((int(round(divider_x(end_y))), end_y))
+
+    return {
+        "coeff": coeff,
+        "fork_y": fork_y,
+        "fork_x": int(round(divider_x(fork_y))),
+        "split_side": split_side,
+        "fit_rmse": fit_rmse,
+        "divider_points": divider_points,
+    }
+
+
+def _partition_connected_fork_mask(mask, divider):
+    left_mask = np.asarray(mask, dtype=np.uint8).copy()
+    right_mask = np.asarray(mask, dtype=np.uint8).copy()
+    h, w = left_mask.shape
+    fork_y = int(np.clip(divider["fork_y"], 0, h - 1))
+    coeff = divider["coeff"]
+    split_side = str(divider.get("split_side") or "upper")
+
+    split_rows = range(0, fork_y + 1) if split_side == "upper" else range(fork_y, h)
+    for y in split_rows:
+        split_x = int(np.clip(round(float(np.polyval(coeff, float(y)))), 0, w - 1))
+        left_mask[y, split_x + 1:] = 0
+        right_mask[y, :split_x + 1] = 0
+    return left_mask, right_mask
+
+
+def _partition_fork_geometry(
+    mask,
+    rows,
+    geometry,
+    center_x,
+    lookahead_y,
+    w,
+    min_branch_points,
+    min_separation_ratio,
+):
+    result = dict(geometry or {})
+    result.setdefault("partition_valid", False)
+    result.setdefault("partition_method", "row_segments")
+    result.setdefault("partition_side", None)
+    result.setdefault("partition_fit_rmse", None)
+    result.setdefault("fork_point", None)
+    result.setdefault("divider_points", [])
+    if not result.get("valid"):
+        return result
+
+    samples = _fork_divider_samples(rows, w, min_separation_ratio)
+    divider = _fit_fork_divider(samples, rows, mask.shape[0], w)
+    if divider is None:
+        return result
+
+    left_mask, right_mask = _partition_connected_fork_mask(mask, divider)
+    left_path, left_ok, _left_rows, left_score = _build_midline(left_mask)
+    right_path, right_ok, _right_rows, right_score = _build_midline(right_mask)
+    if not left_ok or not right_ok:
+        return result
+    if len(left_path) < int(min_branch_points) or len(right_path) < int(min_branch_points):
+        return result
+
+    left_err = _path_error(left_path, center_x, lookahead_y, w)
+    right_err = _path_error(right_path, center_x, lookahead_y, w)
+    if left_err is None or right_err is None:
+        return result
+
+    result.update({
+        "partition_valid": True,
+        "partition_method": "fitted_divider",
+        "partition_side": str(divider["split_side"]),
+        "partition_fit_rmse": float(divider["fit_rmse"]),
+        "fork_point": (int(divider["fork_x"]), int(divider["fork_y"])),
+        "divider_points": [(int(x), int(y)) for x, y in divider["divider_points"]],
+        "candidates": [
+            {
+                "side": "left",
+                "branch": "outer",
+                "path": [(int(x), int(y)) for x, y in left_path],
+                "error": float(left_err),
+                "score": float(left_score),
+                "pixels": int(np.count_nonzero(left_mask)),
+            },
+            {
+                "side": "right",
+                "branch": "inner",
+                "path": [(int(x), int(y)) for x, y in right_path],
+                "error": float(right_err),
+                "score": float(right_score),
+                "pixels": int(np.count_nonzero(right_mask)),
+            },
+        ],
+    })
+    return result
+
+
 def _softmax(logits):
     arr = np.asarray(logits, dtype=np.float32).reshape(-1)
     if arr.size == 0:
@@ -631,6 +838,14 @@ def _run_fork_classifier(fork_classifier, road_mask):
         return fork_classifier(road_mask)
     except Exception as exc:
         return {"label": 0, "confidence": 0.0, "error": str(exc)}
+
+
+def _scaled_dense_row_count(coarse_count):
+    coarse_count = max(1, int(coarse_count))
+    if coarse_count <= 1:
+        return 1
+    span = float(coarse_count - 1) * float(SCAN_STEP)
+    return max(2, int(np.ceil(span / float(max(1, FORK_DENSE_SCAN_STEP)))) + 1)
 
 
 def _update_fork_state(fork_cls, geometry, early_geometry, road_valid):
@@ -923,6 +1138,13 @@ def _empty_centerline_info(frame, reason="lost"):
         "fork_total_pixels": 0,
         "fork_branch_pixel_threshold": FORK_MIN_BRANCH_PIXELS,
         "fork_total_pixel_threshold": FORK_MIN_TOTAL_PIXELS,
+        "fork_partition_valid": False,
+        "fork_partition_method": "none",
+        "fork_partition_side": None,
+        "fork_partition_fit_rmse": None,
+        "fork_point": None,
+        "fork_divider_points": [],
+        "fork_scan_step": int(SCAN_STEP),
         "fork_candidates": [],
         "fork_selected_side": None,
         "fork_reason": reason,
@@ -957,6 +1179,13 @@ def draw_centerline_debug(frame, info, draw_text=True):
         info.get("fork_selected_side") or "main",
     )
 
+    if info.get("fork_partition_valid"):
+        divider_points = [(int(x), int(y)) for x, y in (info.get("fork_divider_points") or [])]
+        _draw_path(out, divider_points, (0, 255, 255), 2)
+        fork_point = info.get("fork_point")
+        if fork_point is not None and len(fork_point) >= 2:
+            cv2.circle(out, (int(fork_point[0]), int(fork_point[1])), 7, (0, 165, 255), -1)
+
     if DRAW_CAMERA_CENTER_REFERENCE:
         cv2.line(out, (center_x, h - 1), (center_x, int(h * 0.55)), (255, 255, 0), 1)
 
@@ -987,6 +1216,7 @@ def draw_centerline_debug(frame, info, draw_text=True):
     except Exception:
         fork_conf = 0.0
     split_rows = int(info.get("fork_split_rows") or 0)
+    partition_side = str(info.get("fork_partition_side") or "-")
     left_pixels = int(info.get("fork_left_pixels") or 0)
     right_pixels = int(info.get("fork_right_pixels") or 0)
     total_pixels = int(info.get("fork_total_pixels") or 0)
@@ -1012,7 +1242,7 @@ def draw_centerline_debug(frame, info, draw_text=True):
     cv2.putText(out, err_text, (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
     cv2.putText(
         out,
-        f"Fork: {fork_state} cls={fork_name} {fork_conf:.2f} split={split_rows}",
+        f"Fork: {fork_state} cls={fork_name} {fork_conf:.2f} split={split_rows} cut={partition_side}",
         (10, 144),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -1066,26 +1296,83 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
     mid_points, mid_ok, rows, mid_score = _build_midline(road_mask) if road_valid else ([], False, [], 0.0)
     fork_raw = _run_fork_classifier(fork_classifier, road_mask) if road_valid else None
     fork_cls = _parse_fork_result(fork_raw)
-    geometry = (
-        _extract_fork_geometry(rows, center_x, lookahead_y, w)
-        if road_valid and rows
-        else {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
+    fork_scan_requested = bool(
+        road_valid
+        and rows
+        and (
+            (
+                fork_cls.get("available")
+                and fork_cls.get("label") == 1
+                and float(fork_cls.get("confidence") or 0.0) >= FORK_EARLY_CLASS_CONF
+            )
+            or ENABLE_GEOMETRY_ONLY_FORK
+        )
     )
-    early_geometry = (
-        _extract_fork_geometry(
-            rows,
+    geometry_rows = (
+        _scan_rows_with_params(road_mask, FORK_DENSE_SCAN_STEP, FORK_DENSE_SCAN_ROW_WINDOW)
+        if fork_scan_requested
+        else rows
+    )
+    geometry_step = FORK_DENSE_SCAN_STEP if fork_scan_requested else SCAN_STEP
+    strict_split_rows = _scaled_dense_row_count(FORK_MIN_SPLIT_ROWS) if fork_scan_requested else FORK_MIN_SPLIT_ROWS
+    strict_branch_points = (
+        _scaled_dense_row_count(FORK_MIN_BRANCH_POINTS) if fork_scan_requested else FORK_MIN_BRANCH_POINTS
+    )
+    early_split_rows = (
+        _scaled_dense_row_count(FORK_EARLY_MIN_SPLIT_ROWS) if fork_scan_requested else FORK_EARLY_MIN_SPLIT_ROWS
+    )
+    early_branch_points = (
+        _scaled_dense_row_count(FORK_EARLY_MIN_BRANCH_POINTS) if fork_scan_requested else FORK_EARLY_MIN_BRANCH_POINTS
+    )
+
+    if road_valid and geometry_rows:
+        geometry = _extract_fork_geometry(
+            geometry_rows,
             center_x,
             lookahead_y,
             w,
-            min_split_rows=FORK_EARLY_MIN_SPLIT_ROWS,
-            min_branch_points=FORK_EARLY_MIN_BRANCH_POINTS,
+            min_split_rows=strict_split_rows,
+            min_branch_points=strict_branch_points,
+            row_step=geometry_step,
+        )
+        geometry = _partition_fork_geometry(
+            road_mask,
+            geometry_rows,
+            geometry,
+            center_x,
+            lookahead_y,
+            w,
+            strict_branch_points,
+            FORK_MIN_BRANCH_SEPARATION_RATIO,
+        )
+        early_geometry = _extract_fork_geometry(
+            geometry_rows,
+            center_x,
+            lookahead_y,
+            w,
+            min_split_rows=early_split_rows,
+            min_branch_points=early_branch_points,
             min_separation_ratio=FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO,
             min_branch_pixels=FORK_EARLY_MIN_BRANCH_PIXELS,
             min_total_pixels=FORK_EARLY_MIN_TOTAL_PIXELS,
+            row_step=geometry_step,
         )
-        if road_valid and rows
-        else {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
-    )
+        early_geometry = _partition_fork_geometry(
+            road_mask,
+            geometry_rows,
+            early_geometry,
+            center_x,
+            lookahead_y,
+            w,
+            early_branch_points,
+            FORK_EARLY_MIN_BRANCH_SEPARATION_RATIO,
+        )
+    else:
+        geometry = {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
+        early_geometry = {"valid": False, "reason": "no_midline", "split_rows": 0, "candidates": []}
+
+    geometry["scan_step"] = int(geometry_step)
+    early_geometry["scan_step"] = int(geometry_step)
     fork_state = _update_fork_state(fork_cls, geometry, early_geometry, road_valid)
     fork_strength = _compute_fork_strength()
     candidate_source = geometry if geometry.get("valid") else early_geometry
@@ -1153,6 +1440,23 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         "fork_total_pixels": int(candidate_source.get("total_pixels", 0)),
         "fork_branch_pixel_threshold": int(candidate_source.get("branch_pixel_threshold", FORK_MIN_BRANCH_PIXELS)),
         "fork_total_pixel_threshold": int(candidate_source.get("total_pixel_threshold", FORK_MIN_TOTAL_PIXELS)),
+        "fork_partition_valid": bool(candidate_source.get("partition_valid")),
+        "fork_partition_method": str(candidate_source.get("partition_method") or "row_segments"),
+        "fork_partition_side": candidate_source.get("partition_side"),
+        "fork_partition_fit_rmse": (
+            float(candidate_source["partition_fit_rmse"])
+            if candidate_source.get("partition_fit_rmse") is not None
+            else None
+        ),
+        "fork_point": (
+            [int(candidate_source["fork_point"][0]), int(candidate_source["fork_point"][1])]
+            if candidate_source.get("fork_point") is not None
+            else None
+        ),
+        "fork_divider_points": [
+            (int(x), int(y)) for x, y in (candidate_source.get("divider_points") or [])
+        ],
+        "fork_scan_step": int(candidate_source.get("scan_step") or geometry_step),
         "fork_candidates": [
             {
                 "side": str(c.get("side")),

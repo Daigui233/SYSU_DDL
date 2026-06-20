@@ -34,6 +34,21 @@ def _positive_y_mask(h=480, w=640):
     return mask
 
 
+def _negative_y_mask(h=480, w=640):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(mask, (270, 160), (370, 320), 1, -1)
+    left = np.array([[270, 300], [330, 300], [235, h - 1], [155, h - 1]], np.int32)
+    right = np.array([[310, 300], [370, 300], [485, h - 1], [405, h - 1]], np.int32)
+    cv2.fillPoly(mask, [left, right], 1)
+    return mask
+
+
+def _candidate_x(candidate, target_y):
+    points = candidate.get("points") or candidate.get("path") or []
+    point = min(points, key=lambda item: abs(int(item[1]) - int(target_y)))
+    return float(point[0])
+
+
 def _curved_channel_mask(with_merge=False, h=480, w=640):
     mask = np.zeros((h, w), dtype=np.uint8)
     ys = np.arange(h - 1, 155, -8)
@@ -74,6 +89,44 @@ class SegForkChannelTrackingTest(unittest.TestCase):
         self.assertNotEqual(first["fork_state"], "FORK_CONFIRMED")
         self.assertEqual(second["fork_state"], "FORK_CONFIRMED")
         self.assertGreaterEqual(len(second["fork_candidates"]), 2)
+
+    def test_connected_upper_fork_is_partitioned_above_fork_point(self):
+        mask = _positive_y_mask()
+        self.assertEqual(cv2.connectedComponents(mask)[0] - 1, 1)
+        classifier = _ForkClassifier(1, 0.90)
+        seg_func.extract_centerline_info(mask, self.frame, fork_classifier=classifier, draw_debug=False)
+        _out, info = seg_func.extract_centerline_info(
+            mask, self.frame, fork_classifier=classifier, draw_debug=False
+        )
+
+        self.assertTrue(info["fork_partition_valid"])
+        self.assertEqual(info["fork_partition_side"], "upper")
+        self.assertIsNotNone(info["fork_point"])
+        candidates = {item["side"]: item for item in info["fork_candidates"]}
+        fork_y = int(info["fork_point"][1])
+        common_y = min(mask.shape[0] - 10, fork_y + 70)
+        split_y = max(int(mask.shape[0] * seg_func.TOP_CROP_RATIO) + 10, fork_y - 90)
+        self.assertLess(abs(_candidate_x(candidates["left"], common_y) - _candidate_x(candidates["right"], common_y)), 24)
+        self.assertGreater(abs(_candidate_x(candidates["left"], split_y) - _candidate_x(candidates["right"], split_y)), 60)
+
+    def test_connected_lower_fork_is_partitioned_below_fork_point(self):
+        mask = _negative_y_mask()
+        self.assertEqual(cv2.connectedComponents(mask)[0] - 1, 1)
+        classifier = _ForkClassifier(1, 0.90)
+        seg_func.extract_centerline_info(mask, self.frame, fork_classifier=classifier, draw_debug=False)
+        _out, info = seg_func.extract_centerline_info(
+            mask, self.frame, fork_classifier=classifier, draw_debug=False
+        )
+
+        self.assertTrue(info["fork_partition_valid"])
+        self.assertEqual(info["fork_partition_side"], "lower")
+        self.assertIsNotNone(info["fork_point"])
+        candidates = {item["side"]: item for item in info["fork_candidates"]}
+        fork_y = int(info["fork_point"][1])
+        common_y = max(int(mask.shape[0] * seg_func.TOP_CROP_RATIO) + 10, fork_y - 70)
+        split_y = min(mask.shape[0] - 10, fork_y + 90)
+        self.assertLess(abs(_candidate_x(candidates["left"], common_y) - _candidate_x(candidates["right"], common_y)), 24)
+        self.assertGreater(abs(_candidate_x(candidates["left"], split_y) - _candidate_x(candidates["right"], split_y)), 60)
 
     def test_unconfirmed_merge_expansion_holds_previous_channel(self):
         classifier = _ForkClassifier(0, 0.95)
