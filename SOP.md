@@ -1,64 +1,78 @@
 ## LabelMe 标注 SOP
 
-所有图片使用 LabelMe 标注。原图不得缩放、裁剪、加框或覆盖保存。图片与 JSON 必须同名，例如：
+所有图片使用 LabelMe 标注。原图不得缩放、裁剪、加框或覆盖保存。图片与 JSON 必须同名，例如 `000001.jpg` / `000001.json`。训练以 JSON 为准，预览图只用于验收。
 
-```text
-000001.jpg
-000001.json
-```
-
-训练以 JSON 为准，预览图只用于验收。
-
-## 一、标注内容
+## 一、标注标签
 
 ### 1. 赛道区域
 
 - 标签：`track`
 - 类型：Polygon
-- 只使用一个赛道类别。
-- 普通路、岔路、汇入处都标出全部可行驶区域。
+- 只使用这一个赛道类别。
+- 普通路、分岔、汇入处都标出全部可行驶区域。
 - 障碍物遮挡处不要在赛道 mask 中挖洞。
 
 ### 2. 中线
 
 - 标签：`centerline`
 - 类型：LineStrip
-- 所有中线只用这一类标签。
-- 普通路画一条中线。
-- 分岔或汇入时，把画面中可见的候选路径都画出来。
-- 不区分 `line1/line2`、左线/右线、内圈/外圈。
+- 所有中线只用这一个标签。
+- 普通路画一条；分岔/汇入时把可见候选路径都画出来。
+- 不区分左/右、内/外圈、`line1/line2`。
 - 公共路段允许多条中线重合。
-- 中线表示无障碍情况下的基准行驶路径，不因为临时障碍物绕行。
 
 ### 3. 目标检测框
 
 - 类型：Rectangle
-- 类别名按我提供的固定类别表标注。
-- 画面中符合标准的目标必须全部标注。
-- 类别名必须完全一致，禁止同义词、中文英文混用或临时新增类别。
-
-### 4. 整图拓扑状态
-
-每张图必须额外标一个整图状态，四选一：
+- 类别只能使用以下 11 类，大小写必须完全一致：
 
 ```text
-normal   单一路径
-fork     前方出现分岔
-merge    多条路径正在汇入
-unknown  看不清或无法判断
+Door
+SpeedSign
+TurnSign
+Stone
+BeginSign
+EndSign
+Crosswalk
+TrafficLight
+Coin
+Human
+Car
 ```
 
-## 二、三类数据
+要求：画面中符合标准的目标必须全部标注；禁止同义词、中文标签、临时新增类别。
 
-### A 类：完整多任务标注，约 400 张
+## 二、整图状态和任务开关
 
-每张图包含：
+每张 JSON 的 `flags` 必须包含两类信息。
+
+### 1. 拓扑状态，四选一
 
 ```text
-目标框 + track + centerline + topology
+topology_normal   单一路径
+topology_fork     前方出现分岔
+topology_merge    多条路径正在汇入
+topology_unknown  看不清或无法判断
 ```
 
-任务开关：
+四个字段必须且只能有一个为 `true`。如果某组数据不要求判断拓扑，也仍然保留这四个字段，并统一填 `topology_unknown=true`，同时把 `has_topology=false`。
+
+### 2. 任务开关
+
+```text
+has_det       是否完成目标检测标注
+has_road      是否完成赛道分割标注
+has_path      是否完成中线标注
+has_topology  是否完成拓扑状态标注
+```
+
+注意：`has_det=true` 且没有目标框，表示人工确认无目标；`has_det=false` 且没有目标框，表示未做目标检测标注，训练时不能当成无目标。
+
+## 三、三类数据
+
+### A 类：完整标注
+
+包含：目标框 + `track` + `centerline` + 拓扑状态。
 
 ```json
 "has_det": true,
@@ -67,37 +81,27 @@ unknown  看不清或无法判断
 "has_topology": true
 ```
 
-### B 类：仅目标检测，约 900 张
+### B 类：仅目标检测
 
 只画目标 Rectangle，不画赛道和中线。
 
-任务开关：
-
 ```json
+"topology_normal": false,
+"topology_fork": false,
+"topology_merge": false,
+"topology_unknown": true,
+
 "has_det": true,
 "has_road": false,
 "has_path": false,
 "has_topology": false
 ```
 
-注意：
+B 类不需要人工判断 `normal/fork/merge`。这里的 `topology_unknown=true` 只是为了保持 JSON 结构统一，训练时不会计算拓扑 loss。
 
-- `has_det=true` 且没有目标框，表示人工确认这张图没有目标，是有效负样本。
-- `has_det=false` 且没有目标框，表示没有做目标检测标注，训练时不能当成无目标。
+### C 类：赛道 + 中线
 
-### C 类：赛道 + 中线标注，约 900 张
-
-可以复用旧赛道数据。
-
-每张图包含：
-
-```text
-track + centerline + topology
-```
-
-不需要标目标框。
-
-任务开关：
+包含：`track` + `centerline` + 拓扑状态，不需要目标框。
 
 ```json
 "has_det": false,
@@ -106,16 +110,9 @@ track + centerline + topology
 "has_topology": true
 ```
 
-旧数据处理规则：
+旧数据复用时：原 `track` 保留，原 `fork` Polygon 统一改成 `track`，再补 `centerline` 和 `flags`。旧 Polygon 标成 `fork` 不等于整图一定是 fork，拓扑状态必须重新人工判断。
 
-- 原来的 `track` 保留。
-- 原来的 `fork` Polygon 统一改成 `track`。
-- 不重新绘制已经合格的赛道边界。
-- 旧 Polygon 标成 `fork` 不等于整图一定是 fork，拓扑状态必须根据画面重新判断。
-
-## 三、JSON 必须包含的字段示例
-
-下面是完整标注样例。实际点位只作示意。
+## 四、JSON 示例
 
 ```json
 {
@@ -167,26 +164,12 @@ track + centerline + topology
 }
 ```
 
-拓扑状态要求：
-
-```text
-topology_normal
-topology_fork
-topology_merge
-topology_unknown
-```
-
-四个字段必须且只能有一个为 `true`。
-
-## 四、交付内容
-
-每组分别交付：
+## 五、交付内容
 
 - 未修改的原图
 - 同名 LabelMe JSON
 - 分割预览图
 - 检测框预览图
-- 每种 shape 和标签数量统计
+- 每类标签数量统计
 - `normal/fork/merge/unknown` 数量统计
-- 各检测类别实例数量统计
-
+- 各目标检测类别实例数量统计
