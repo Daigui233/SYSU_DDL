@@ -6,6 +6,7 @@
     "horizontal": false,
     "vertical": false
   },
+  "fov": 0,
   "K": [
     [
       316.34668831,
@@ -33,7 +34,7 @@
   "network": {
     "object_update_port": 9002,
     "stream_port": 8080,
-    "control_port": 9006,
+    "control_port": 9005,
     "udp_target_ip": "192.168.123.36",
     "udp_target_port": 9000,
     "unity_sync_port": 9003,
@@ -42,8 +43,8 @@
     "imu_send_rate": 50,
     "pos_offset": [
       0.0,
-      0.16,
-      0.12
+      0.15,
+      -0.06
     ],
     "euler_offset": [
       0.0,
@@ -51,6 +52,48 @@
       0.0
     ],
     "movement_delay_ms": 0,
-    "video_delay_ms": 0
+    "video_delay_ms": 0,
+    "axis_map_x": "+x",
+    "axis_map_y": "+y",
+    "axis_map_z": "+z",
+    "axis_map_pitch": "+pitch",
+    "axis_map_yaw": "+yaw",
+    "axis_map_roll": "+roll",
+    "ros_key": "530C4E5AC7AD8BFF9E706F513E0E903B"
+  },
+  "camera_fps": 60,
+  "render_fps": 60,
+  "http_stream_fps": 60,
+  "output_fps": 60,
+  "opencv_threads": 2,
+  "ai_stream": {
+    "zmq_jpeg_quality": 40,
+    "zmq_poll_sleep_ms": 0.1,
+    "opencv_threads": 2,
+    "enable_raw_zmq": true,
+    "raw_zmq_port": 9009,
+    "source": "ar",
+    "enable_jpeg_zmq": false,
+    "zmq_format": "yuv420",
+    "max_fps": 60,
+    "process_nice": 8,
+    "send_buffer_bytes": 4194304,
+    "zmq_sndhwm": 1,
+    "raw_width": 480,
+    "raw_height": 360
+  },
+  "effects": {
+    "fire_enabled": false,
+    "fire_particle_count": 850,
+    "smoke_particle_count": 520,
+    "fire_half_width": 2.25,
+    "fire_half_depth": 2.25
+  },
+  "ar_output_fps": 60,
+  "map": {
+    "world_width": 4.0,
+    "world_height": 5.0,
+    "offset_x": 0.0,
+    "offset_z": 0.0
   }
 }
