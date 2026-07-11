@@ -79,6 +79,7 @@ CSV_FIELDS = [
     "seg_post_ms",
     "det_infer_ms",
     "det_post_ms",
+    "ocr_ms",
     "command_ms",
     "planner_draw_ms",
     "serial_ms",
@@ -402,6 +403,21 @@ class PerformanceMonitor:
         if folder:
             os.makedirs(folder, exist_ok=True)
         file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+        if file_exists:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as old_file:
+                    old_header = old_file.readline().strip().split(",")
+                if old_header != CSV_FIELDS:
+                    suffix = time.strftime("%Y%m%d_%H%M%S")
+                    backup_path = f"{path}.old_{suffix}"
+                    os.replace(path, backup_path)
+                    file_exists = False
+                    try:
+                        self.log_func(f"performance CSV schema changed; old file moved to {backup_path}")
+                    except Exception:
+                        pass
+            except Exception:
+                file_exists = False
         self._csv_file = open(path, "a", newline="", encoding="utf-8")
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=CSV_FIELDS)
         if not file_exists:
@@ -431,6 +447,7 @@ class PerformanceMonitor:
             "seg_post_ms": _format_float(stages.get("seg_post_ms"), 2),
             "det_infer_ms": _format_float(stages.get("det_infer_ms"), 2),
             "det_post_ms": _format_float(stages.get("det_post_ms"), 2),
+            "ocr_ms": _format_float(stages.get("ocr_ms"), 2),
             "command_ms": _format_float(stages.get("command_ms"), 2),
             "planner_draw_ms": _format_float(stages.get("planner_draw_ms"), 2),
             "serial_ms": _format_float(stages.get("serial_ms"), 2),

@@ -349,7 +349,78 @@ def _format_compact_perf_lines(performance_status, fps):
     return lines
 
 
-def _performance_diagnostic_sections(performance_status, fps):
+def _format_ocr_api_section(ocr_result):
+    if not ocr_result:
+        return ("OCR / API", ["OCR: no data"])
+
+    status = str(ocr_result.get("status") or "unknown")
+    active = bool(ocr_result.get("active", False))
+    worker_ready = ocr_result.get("worker_ready")
+    ocr_data = ocr_result.get("ocr") or {}
+    text = str(ocr_data.get("text") or "")
+    conf = _safe_float(ocr_data.get("confidence"), None)
+    detection = ocr_result.get("detection") or {}
+    instruction = ocr_result.get("instruction") or {}
+    latest = ocr_result.get("latest_instruction") or {}
+    current = bool(ocr_result.get("instruction_current", False))
+    api_done = current and status in ("api_done", "api_done_recent", "cache_hit")
+    api_waiting = status in ("worker_starting", "ocr_submitted", "ocr_pending", "api_pending")
+    api_cooldown = status in ("ocr_throttled", "api_throttled")
+    api_error = (
+        ocr_result.get("error")
+        or instruction.get("api_error")
+        or instruction.get("api_parse_error")
+        or instruction.get("install_hint")
+    )
+
+    det_score = _safe_float(detection.get("score") or detection.get("confidence"), None)
+    det_label = detection.get("label") or detection.get("category") or "-"
+    worker_text = "N/A" if worker_ready is None else ("Y" if worker_ready else "N")
+
+    lines = [
+        f"CHAIN det={'Y' if active else 'N'} worker={worker_text} status={status}",
+        f"DET label={det_label} score={'N/A' if det_score is None else f'{det_score:.2f}'}",
+        f"OCR stable={'Y' if ocr_result.get('stable') else 'N'} text={text or '-'}",
+        f"OCR conf={'N/A' if conf is None else f'{conf:.2f}'}",
+    ]
+    if instruction:
+        api_state = (
+            "DONE" if api_done
+            else "WAIT" if api_waiting
+            else "COOLDOWN" if api_cooldown
+            else "ERR" if api_error
+            else "NO_CURRENT"
+        )
+        lines.extend([
+            f"API state={api_state} current={'Y' if current else 'N'} valid={instruction.get('valid')}",
+            f"API type={instruction.get('instruction_type', '-')} action={instruction.get('action', '-')}",
+            f"API pref={instruction.get('preferred_branch', '-')} avoid={','.join(instruction.get('avoid_branches') or []) or '-'}",
+            f"API conf={_safe_float(instruction.get('confidence'), 0.0):.2f} timing={instruction.get('execute_timing', '-')}",
+            f"API reason={instruction.get('reason', '-')}",
+        ])
+        if api_error:
+            lines.append(f"API error={api_error}")
+        raw = instruction.get("api_raw_content")
+        if raw:
+            raw = " ".join(str(raw).replace("\n", " ").split())
+            lines.append(f"API raw={raw}")
+        elif isinstance(instruction.get("api_payload"), dict):
+            try:
+                payload = json.dumps(instruction.get("api_payload"), ensure_ascii=False, separators=(",", ":"))
+                lines.append(f"API payload={payload}")
+            except Exception:
+                pass
+    if latest and not current:
+        lines.append(
+            "LAST "
+            f"valid={latest.get('valid')} action={latest.get('action', '-')} "
+            f"pref={latest.get('preferred_branch', '-')} "
+            f"avoid={','.join(latest.get('avoid_branches') or []) or '-'}"
+        )
+    return ("OCR / API", lines)
+
+
+def _performance_diagnostic_sections(performance_status, fps, ocr_result=None):
     control_fps = _safe_float(fps, None)
 
     def fmt(value, suffix=""):
@@ -357,7 +428,10 @@ def _performance_diagnostic_sections(performance_status, fps):
         return "N/A" if value is None else f"{value:.1f}{suffix}"
 
     if not performance_status or not performance_status.get("enabled"):
-        return [("FPS", [f"CTRL {fmt(control_fps)}", "MONITOR DISABLED"])]
+        sections = [("FPS", [f"CTRL {fmt(control_fps)}", "MONITOR DISABLED"])]
+        if ocr_result is not None:
+            sections.append(_format_ocr_api_section(ocr_result))
+        return sections
 
     stages = performance_status.get("stages_ms") or {}
     system = performance_status.get("system") or {}
@@ -394,11 +468,14 @@ def _performance_diagnostic_sections(performance_status, fps):
         f"GPU load={fmt(system.get('gpu_load_percent'), '%')} "
         f"freq={fmt(system.get('gpu_freq_mhz'), 'MHz')}",
     ]
-    return [
+    sections = [
         ("FPS", fps_lines),
         ("LATENCY MS", latency_lines),
         ("COMPUTE", compute_lines),
     ]
+    if ocr_result is not None:
+        sections.append(_format_ocr_api_section(ocr_result))
+    return sections
 
 
 def _tc264_state_name(value):
@@ -451,6 +528,138 @@ def _draw_key_status_card(frame, lines, color):
     return frame
 
 
+def _draw_ocr_status_card(frame, ocr_result):
+    """在帧左上角绘制 OCR 识别内容和 API 解析结果卡片。"""
+    if ocr_result is None:
+        return
+
+    active = ocr_result.get("active", False)
+    status = ocr_result.get("status", "?")
+    instruction = ocr_result.get("instruction") or {}
+    instruction_current = bool(ocr_result.get("instruction_current", False))
+    latest_instruction = ocr_result.get("latest_instruction") or {}
+    ocr_data = ocr_result.get("ocr") or {}
+    ocr_text = ocr_data.get("text", "")
+    ocr_conf = ocr_data.get("confidence", 0.0)
+    stable = ocr_result.get("stable", False)
+
+    lines = []
+    if active:
+        lines.append(f"OCR {status}")
+    else:
+        lines.append("OCR WAITING")
+
+    if ocr_text:
+        display_text = short_text(ocr_text, 28)
+        lines.append(f"TXT: {display_text}")
+        lines.append(f"OCR conf={ocr_conf:.2f} stable={'Y' if stable else 'N'}")
+    elif status not in ("no_turnsign",):
+        lines.append("TXT: (waiting)")
+
+    if instruction_current and instruction.get("valid"):
+        action = instruction.get("action", "?")
+        preferred = instruction.get("preferred_branch", "?")
+        avoid = instruction.get("avoid_branches") or []
+        confidence = instruction.get("confidence", 0.0)
+        reason = instruction.get("reason", "")
+        lines.append(f"API: {action} pref={preferred}")
+        if avoid:
+            lines.append(f"AVOID: {','.join(avoid)}")
+        lines.append(f"conf={confidence:.2f} {short_text(reason, 20)}")
+    elif status in ("api_pending", "ocr_pending", "ocr_submitted", "worker_starting"):
+        lines.append("API: pending...")
+    elif status in ("api_throttled",):
+        lines.append("API: throttled")
+    elif status == "ocr_unavailable":
+        lines.append(f"OCR ERR: {short_text(ocr_result.get('error', 'not ready'), 30)}")
+    elif status in ("cache_hit",):
+        action = instruction.get("action", "?")
+        lines.append(f"API: {action} (cached)")
+    elif latest_instruction.get("valid"):
+        lines.append(f"API last: {latest_instruction.get('action', '?')} stale")
+
+    if not lines:
+        return
+
+    if instruction_current and instruction.get("valid"):
+        color = (70, 240, 70)        # 绿色：API 返回有效结果
+    elif status in ("api_pending", "ocr_pending", "ocr_submitted", "worker_starting"):
+        color = (255, 220, 60)       # 黄色：API 请求中
+    elif status == "ocr_unavailable":
+        color = (40, 70, 255)        # 红色：OCR 依赖或模型不可用
+    elif active:
+        color = (60, 200, 255)       # 亮蓝：OCR 识别中
+    else:
+        color = (0, 220, 255)        # 青色：等待 TurnSign（醒目）
+
+    pad_x = 10
+    pad_y = 8
+    line_h = 22
+    offset_y = 96
+
+    # 尝试加载中文字体（PIL），显示 OCR 识别到的中文
+    hud_font = _load_hud_font(REFEREE_PANEL_DEFAULTS)
+    if hud_font is not None:
+        # === PIL 中文渲染路径 ===
+        panel_h = len(lines) * line_h + pad_y * 2
+        panel_w = 320
+        panel = np.zeros((panel_h, panel_w, 3), dtype=frame.dtype)
+        panel[:, :] = (8, 12, 15)
+
+        image = Image.fromarray(cv2.cvtColor(panel, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(image)
+        max_width = panel_w - 24
+        y = pad_y
+        for i, line in enumerate(lines):
+            line_color = color if i == 0 else (235, 245, 245)
+            rgb = (int(line_color[2]), int(line_color[1]), int(line_color[0]))
+            fitted = _fit_text_for_pil(draw, line, hud_font, max_width)
+            draw.text((pad_x, y), fitted, font=hud_font, fill=rgb)
+            y += line_h
+        panel = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+
+        # 缩小卡片宽度到文字实际宽度
+        text_widths = [draw.textlength(line, font=hud_font) for line in lines]
+        actual_w = min(frame.shape[1] - 16, int(max(text_widths) + pad_x * 2))
+        panel = panel[:, :actual_w]
+        card_h = panel.shape[0]
+        card_w = panel.shape[1]
+
+        if card_h <= 0 or card_w <= 0 or offset_y + card_h > frame.shape[0]:
+            return
+
+        roi = frame[offset_y:offset_y + card_h, 8:8 + card_w]
+        blended = cv2.addWeighted(panel, 0.78, roi, 0.22, 0.0)
+        frame[offset_y:offset_y + card_h, 8:8 + card_w] = blended
+        cv2.rectangle(frame, (8, offset_y), (8 + card_w, offset_y + card_h), color, 1, cv2.LINE_AA)
+    else:
+        # === OpenCV ASCII 回退路径（中文会变成空白） ===
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.52
+        thickness = 1
+        text_width = 0
+        for line in lines:
+            text_width = max(text_width, cv2.getTextSize(
+                _ascii_hud_text(line, "N/A"), font, font_scale, thickness)[0][0])
+        card_w = min(frame.shape[1] - 16, text_width + pad_x * 2)
+        card_h = min(frame.shape[0] - offset_y - 8, len(lines) * line_h + pad_y * 2)
+
+        if card_h <= 0 or card_w <= 0:
+            return
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (8, offset_y), (8 + card_w, offset_y + card_h), (8, 12, 15), -1)
+        cv2.addWeighted(overlay, 0.78, frame, 0.22, 0.0, frame)
+        cv2.rectangle(frame, (8, offset_y), (8 + card_w, offset_y + card_h), color, 1, cv2.LINE_AA)
+
+        y = offset_y + pad_y + 16
+        for index, line in enumerate(lines):
+            line_color = color if index == 0 else (235, 245, 245)
+            cv2.putText(frame, _ascii_hud_text(line, "N/A"),
+                        (8 + pad_x, y), font, font_scale, line_color, thickness, cv2.LINE_AA)
+            y += line_h
+
+
 def _draw_grouped_status_panel(h, dtype, color, sections, panel_w=390):
     panel = np.zeros((h, panel_w, 3), dtype=dtype)
     panel[:, :] = (12, 16, 16)
@@ -459,6 +668,29 @@ def _draw_grouped_status_panel(h, dtype, color, sections, panel_w=390):
     row_count = sum(1 + len(lines) for _title, lines in sections)
     line_h = max(16, min(21, (h - 18) // max(1, row_count)))
     font_scale = 0.46 if line_h <= 17 else 0.49
+    font = _load_hud_font(REFEREE_PANEL_DEFAULTS)
+    if font is not None and Image is not None and ImageDraw is not None:
+        image = Image.fromarray(cv2.cvtColor(panel, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(image)
+        title_rgb = (int(color[2]), int(color[1]), int(color[0]))
+        text_rgb = (245, 245, 230)
+        line_h = max(line_h, 19)
+        y = 6
+        max_width = panel_w - 30
+        for title, section_lines in sections:
+            if y + line_h > h:
+                break
+            draw.text((12, y), _fit_text_for_pil(draw, title, font, max_width), font=font, fill=title_rgb)
+            y += line_h
+            draw.line((10, y - 2, panel_w - 12, y - 2), fill=(70, 70, 55), width=1)
+            for line in section_lines:
+                if y + line_h > h:
+                    break
+                draw.text((16, y), _fit_text_for_pil(draw, str(line), font, max_width), font=font, fill=text_rgb)
+                y += line_h
+        panel[:, :] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+        return panel
+
     y = 15
     for title, section_lines in sections:
         if y + line_h > h:
@@ -569,6 +801,7 @@ def draw_pose_status(
     detection_status=None,
     task_decision=None,
     plan_result=None,
+    ocr_result=None,
     enabled=True,
 ):
     if not enabled:
@@ -603,9 +836,13 @@ def draw_pose_status(
 
     color = (0, 220, 255) if stop_active else (70, 240, 70)
     _draw_key_status_card(frame, [control_line, cmd_line, key_line], color)
+
+    # ---- TurnSign OCR 状态卡片（显示在关键状态卡片下方） ----
+    _draw_ocr_status_card(frame, ocr_result)
+
     h = frame.shape[0]
     left_panel = _draw_referee_panel(h, frame.dtype, now)
-    sections = _performance_diagnostic_sections(performance_status, fps)
+    sections = _performance_diagnostic_sections(performance_status, fps, ocr_result=ocr_result)
     panel = _draw_grouped_status_panel(h, frame.dtype, color, sections)
     return np.hstack([left_panel, frame, panel])
 
@@ -768,7 +1005,7 @@ def draw_pose_status(
         key_line = "STOP line lost"
     _draw_key_status_card(frame, [control_line, cmd_line, key_line], color)
 
-    sections = _performance_diagnostic_sections(performance_status, fps)
+    sections = _performance_diagnostic_sections(performance_status, fps, ocr_result=ocr_result)
     panel = _draw_grouped_status_panel(h, frame.dtype, color, sections)
     return np.hstack([left_panel, frame, panel])
 

@@ -14,7 +14,7 @@ except (TypeError, ValueError):
 
 from infer_wrap import InferWrap, PPSegInfer
 from infer_wrap.base.func import CLASSES
-from infer_wrap.base.seg_func import draw_centerline_debug, extract_centerline_info
+from infer_wrap.base.seg_func import ENABLE_FORK_POSTPROC, draw_centerline_debug, extract_centerline_info
 try:
     from infer_wrap.base.seg_infer import ForkMaskClsInfer
 except Exception:
@@ -68,39 +68,105 @@ class VisionPipeline:
     def _log(self, message):
         self.log_func(message)
 
-    def _init_engines(self):
-        self._log("initializing NPU AI...")
+    def _ensure_detection_engine(self):
+        if self.infer_det is not None:
+            return True
+        if self._status.get("detector") not in ("disabled", "not initialized"):
+            return False
         try:
+            self._log("lazy init detector...")
             self.infer_det = InferWrap(model_dir=self.model_dir, TPEs=1, core_ids=[0], max_inflight=1)
-            self.infer_seg = PPSegInfer(model_dir=self.model_dir, TPEs=1, core_ids=[1], max_inflight=1)
-            if ForkMaskClsInfer is not None:
-                try:
-                    self.infer_fork = ForkMaskClsInfer(model_dir=self.model_dir, core_id=2)
-                except FileNotFoundError as exc:
-                    self.infer_fork = None
-                    self._log(f"fork classifier disabled: {exc}")
+            self._status["detector"] = "ready"
+            self._status["ok"] = True
+            return True
         except Exception as exc:
             self.infer_det = None
+            self._status["detector"] = "error"
+            self._status["error"] = f"detector: {exc}"
+            self._log(f"detector lazy init failed: {exc}")
+            return False
+
+    def _ensure_segmentation_engine(self):
+        if self.infer_seg is not None:
+            return True
+        if self._status.get("segmenter") not in ("disabled", "not initialized"):
+            return False
+        try:
+            self._log("lazy init segmenter...")
+            self.infer_seg = PPSegInfer(model_dir=self.model_dir, TPEs=1, core_ids=[1], max_inflight=1)
+            self._status["segmenter"] = "ready"
+            self._status["ok"] = True
+        except Exception as exc:
             self.infer_seg = None
-            self.infer_fork = None
-            self._status = {
-                "ok": False,
-                "detector": "disabled",
-                "segmenter": "disabled",
-                "fork_classifier": "disabled",
-                "error": str(exc),
-            }
-            self._log(f"NPU AI init failed: {exc}; WebUI and pose forwarding continue without vision inference")
-            return
+            self._status["segmenter"] = "error"
+            self._status["error"] = f"segmenter: {exc}"
+            self._log(f"segmenter lazy init failed: {exc}")
+            return False
+
+        if ENABLE_FORK_POSTPROC and ForkMaskClsInfer is not None and self.infer_fork is None:
+            try:
+                self.infer_fork = ForkMaskClsInfer(model_dir=self.model_dir, core_id=2)
+                self._status["fork_classifier"] = "ready"
+            except FileNotFoundError as exc:
+                self.infer_fork = None
+                self._status["fork_classifier"] = "disabled"
+                self._log(f"fork classifier disabled: {exc}")
+            except Exception as exc:
+                self.infer_fork = None
+                self._status["fork_classifier"] = "error"
+                self._status["error"] = f"fork_classifier: {exc}"
+                self._log(f"fork classifier lazy init failed: {exc}")
+        return True
+
+    def _init_engines(self):
+        self._log("initializing NPU AI...")
+        controls = self._controls_snapshot()
+        want_detection = bool(controls.get("enable_detection", True))
+        want_segmentation = bool(controls.get("enable_segmentation", True))
+        errors = []
+
+        if want_detection:
+            try:
+                self.infer_det = InferWrap(model_dir=self.model_dir, TPEs=1, core_ids=[0], max_inflight=1)
+            except Exception as exc:
+                self.infer_det = None
+                errors.append(f"detector: {exc}")
+                self._log(f"detector init failed: {exc}")
+
+        if want_segmentation:
+            try:
+                self.infer_seg = PPSegInfer(model_dir=self.model_dir, TPEs=1, core_ids=[1], max_inflight=1)
+            except Exception as exc:
+                self.infer_seg = None
+                errors.append(f"segmenter: {exc}")
+                self._log(f"segmenter init failed: {exc}")
+
+        if want_segmentation and ENABLE_FORK_POSTPROC and ForkMaskClsInfer is not None:
+            try:
+                self.infer_fork = ForkMaskClsInfer(model_dir=self.model_dir, core_id=2)
+            except FileNotFoundError as exc:
+                self.infer_fork = None
+                self._log(f"fork classifier disabled: {exc}")
+            except Exception as exc:
+                self.infer_fork = None
+                errors.append(f"fork_classifier: {exc}")
+                self._log(f"fork classifier init failed: {exc}")
 
         self._status = {
-            "ok": True,
-            "detector": "ready",
-            "segmenter": "ready",
-            "fork_classifier": "ready" if self.infer_fork is not None else "not found",
-            "error": None,
+            "ok": self.infer_det is not None or self.infer_seg is not None,
+            "detector": "ready" if self.infer_det is not None else ("disabled" if not want_detection else "error"),
+            "segmenter": "ready" if self.infer_seg is not None else ("disabled" if not want_segmentation else "error"),
+            "fork_classifier": (
+                "ready"
+                if self.infer_fork is not None
+                else ("disabled" if not (want_segmentation and ENABLE_FORK_POSTPROC) else "not found")
+            ),
+            "error": "; ".join(errors) if errors else None,
         }
-        self._log("AI engines loaded")
+        self._log(
+            "AI engines loaded "
+            f"(det={self._status['detector']}, seg={self._status['segmenter']}, fork={self._status['fork_classifier']})"
+        )
 
     def status(self):
         status = dict(self._status)
@@ -386,6 +452,10 @@ class VisionPipeline:
         enable_segmentation = bool(controls.get("enable_segmentation", True))
         enable_detection = bool(controls.get("enable_detection", True))
         enable_overlay = bool(controls.get("enable_model_overlay", True))
+        if enable_detection and self.infer_det is None:
+            self._ensure_detection_engine()
+        if enable_segmentation and self.infer_seg is None:
+            self._ensure_segmentation_engine()
         segmentation = self._empty_segmentation(frame, now, frame_id=frame_id)
         detection_status = self._empty_detection_status(
             now,

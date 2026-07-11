@@ -1,6 +1,8 @@
 # TurnSign OCR/API Module
 
-`turnsign_ocr_api.py` is a standalone module. It is not wired into `ar_receiver.py` yet.
+`turnsign_ocr_api.py` is wired into `ar_receiver.py` as a read-only OCR/API
+pipeline. Its latest status is shown in the debug HUD and exposed as
+`turnsign_ocr` in the status API payload; it does not alter vehicle control.
 
 ## What It Does
 

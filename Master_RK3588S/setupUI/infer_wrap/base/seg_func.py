@@ -11,6 +11,13 @@ ROAD_CLASS_ID = int(os.environ.get("ROAD_CLASS_ID", "1"))
 ROAD_ALPHA = 0.32
 ROAD_COLOR = np.array([0, 255, 80], dtype=np.uint8)
 
+
+def _env_flag(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
 # Camera center is only the image reference used to compute track_error.
 DRAW_CAMERA_CENTER_REFERENCE = False
 
@@ -30,6 +37,13 @@ SEGMENTATION_LOOKAHEAD_Y = 300
 FORK_CLASS_CONF = 0.48
 FORK_EARLY_CLASS_CONF = 0.32
 FORK_MISS_CONF = 0.58
+# Heavy fork/branch post-processing is useful for final fork handling, but it is
+# not required for basic line following.  Keep it off by default while chasing
+# FPS; enable with AR_ENABLE_FORK_POSTPROC=1 when we tune fork logic again.
+ENABLE_FORK_POSTPROC = _env_flag("AR_ENABLE_FORK_POSTPROC", False)
+ENABLE_CENTERLINE_POSTPROC = _env_flag("AR_ENABLE_CENTERLINE_POSTPROC", False)
+ENABLE_FORK_CANDIDATES = _env_flag("AR_ENABLE_FORK_CANDIDATES", False)
+ENABLE_SEG_STABILIZATION = _env_flag("AR_ENABLE_SEG_STABILIZATION", False)
 ENABLE_GEOMETRY_ONLY_FORK = os.environ.get("ENABLE_GEOMETRY_ONLY_FORK", "0") == "1"
 FORK_MIN_SPLIT_ROWS = 2
 FORK_MIN_BRANCH_POINTS = 4
@@ -706,6 +720,82 @@ def _fit_fork_divider(samples, rows, h, w):
     }
 
 
+def _segment_from_bounds(left, right):
+    left = int(round(float(left)))
+    right = int(round(float(right)))
+    width = int(right - left + 1)
+    if width < MIN_SEGMENT_WIDTH:
+        return None
+    return {
+        "left": left,
+        "right": right,
+        "center": (float(left) + float(right)) * 0.5,
+        "width": width,
+    }
+
+
+def _copy_segments(segments):
+    return [
+        {
+            "left": int(seg["left"]),
+            "right": int(seg["right"]),
+            "center": float(seg["center"]),
+            "width": int(seg["width"]),
+        }
+        for seg in (segments or [])
+    ]
+
+
+def _partition_rows_by_divider(rows, divider, w):
+    """Split already-scanned rows by the fitted divider.
+
+    The old path rebuilt two full-size masks and ran _build_midline twice.  That
+    was robust but expensive on RK3588S under load.  The row scan already has the
+    exact information the path tracker needs, so split those segments directly.
+    """
+
+    left_rows = []
+    right_rows = []
+    fork_y = int(divider["fork_y"])
+    coeff = divider["coeff"]
+    split_side = str(divider.get("split_side") or "upper")
+    for row in rows:
+        y = int(row.get("y", 0))
+        segments = _copy_segments(row.get("segments") or [])
+        if not segments:
+            continue
+        split_applies = y <= fork_y if split_side == "upper" else y >= fork_y
+        if not split_applies:
+            left_rows.append({"y": y, "segments": _copy_segments(segments)})
+            right_rows.append({"y": y, "segments": _copy_segments(segments)})
+            continue
+
+        split_x = int(np.clip(round(float(np.polyval(coeff, float(y)))), 0, w - 1))
+        left_segments = []
+        right_segments = []
+        for seg in segments:
+            left_seg = _segment_from_bounds(seg["left"], min(int(seg["right"]), split_x))
+            right_seg = _segment_from_bounds(max(int(seg["left"]), split_x + 1), seg["right"])
+            if left_seg is not None:
+                left_segments.append(left_seg)
+            if right_seg is not None:
+                right_segments.append(right_seg)
+        if left_segments:
+            left_rows.append({"y": y, "segments": left_segments})
+        if right_segments:
+            right_rows.append({"y": y, "segments": right_segments})
+    return left_rows, right_rows
+
+
+def _rows_pixel_estimate(rows, row_step):
+    scale = max(1, int(row_step))
+    total = 0
+    for row in rows or []:
+        for seg in row.get("segments") or []:
+            total += int(seg.get("width", 0)) * scale
+    return int(total)
+
+
 def _partition_connected_fork_mask(mask, divider):
     left_mask = np.asarray(mask, dtype=np.uint8).copy()
     right_mask = np.asarray(mask, dtype=np.uint8).copy()
@@ -747,13 +837,13 @@ def _partition_fork_geometry(
     if divider is None:
         return result
 
-    left_mask, right_mask = _partition_connected_fork_mask(mask, divider)
-    left_path, left_ok, _left_rows, left_score = _build_midline(left_mask)
-    right_path, right_ok, _right_rows, right_score = _build_midline(right_mask)
-    if not left_ok or not right_ok:
-        return result
+    left_rows, right_rows = _partition_rows_by_divider(rows, divider, w)
+    left_path, left_score = _path_from_rows(left_rows, w, start_ref=center_x, side="left")
+    right_path, right_score = _path_from_rows(right_rows, w, start_ref=center_x, side="right")
     if len(left_path) < int(min_branch_points) or len(right_path) < int(min_branch_points):
         return result
+    left_path = _smooth_path(left_path, w)
+    right_path = _smooth_path(right_path, w)
 
     left_err = _path_error(left_path, center_x, lookahead_y, w)
     right_err = _path_error(right_path, center_x, lookahead_y, w)
@@ -774,7 +864,7 @@ def _partition_fork_geometry(
                 "path": [(int(x), int(y)) for x, y in left_path],
                 "error": float(left_err),
                 "score": float(left_score),
-                "pixels": int(np.count_nonzero(left_mask)),
+                "pixels": _rows_pixel_estimate(left_rows, FORK_DENSE_SCAN_STEP),
             },
             {
                 "side": "right",
@@ -782,7 +872,7 @@ def _partition_fork_geometry(
                 "path": [(int(x), int(y)) for x, y in right_path],
                 "error": float(right_err),
                 "score": float(right_score),
-                "pixels": int(np.count_nonzero(right_mask)),
+                "pixels": _rows_pixel_estimate(right_rows, FORK_DENSE_SCAN_STEP),
             },
         ],
     })
@@ -1360,6 +1450,9 @@ def draw_centerline_debug(frame, info, draw_text=True):
 def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=True):
     global _prev_path, _prev_prev_path, _prev_row_widths, _channel_hold
     global _merge_locked_side, _merge_lock_missing_frames, _merge_locked_path
+    if not ENABLE_CENTERLINE_POSTPROC:
+        return frame, _empty_centerline_info(frame, reason="centerline_postproc_disabled")
+
     try:
         class_map = _to_class_map(seg_map)
     except ValueError as exc:
@@ -1384,7 +1477,13 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
     mid_points, mid_ok, rows, mid_score = _build_midline(road_mask) if road_valid else ([], False, [], 0.0)
     # Topology belongs to road-mask geometry. The fork classifier may later
     # authorize a lane-choice task, but it must not create or suppress a split.
-    fork_scan_requested = bool(road_valid and rows and _has_branch_geometry_hint(rows, w))
+    fork_scan_requested = bool(
+        ENABLE_FORK_CANDIDATES
+        and ENABLE_FORK_POSTPROC
+        and road_valid
+        and rows
+        and _has_branch_geometry_hint(rows, w)
+    )
     # The classifier cannot create a fork without a geometry hint, so running
     # its NPU model on every normal road frame only adds latency.
     fork_raw = _run_fork_classifier(fork_classifier, road_mask) if fork_scan_requested else None
@@ -1406,7 +1505,7 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
         _scaled_dense_row_count(FORK_EARLY_MIN_BRANCH_POINTS) if fork_scan_requested else FORK_EARLY_MIN_BRANCH_POINTS
     )
 
-    if road_valid and geometry_rows:
+    if ENABLE_FORK_CANDIDATES and ENABLE_FORK_POSTPROC and road_valid and geometry_rows:
         geometry = _extract_fork_geometry(
             geometry_rows,
             center_x,
@@ -1474,8 +1573,13 @@ def extract_centerline_info(seg_map, frame, fork_classifier=None, draw_debug=Tru
 
     positive_y = fork_state in ("FORK_EARLY", "FORK_CANDIDATE", "FORK_CONFIRMED")
     if mid_ok:
-        mid_points = _stabilize_single_path(mid_points, rows, w, positive_y)
-        fork_candidates = _stabilize_fork_candidates(candidate_source.get("candidates") or [], w)
+        if ENABLE_SEG_STABILIZATION:
+            mid_points = _stabilize_single_path(mid_points, rows, w, positive_y)
+        fork_candidates = (
+            _stabilize_fork_candidates(candidate_source.get("candidates") or [], w)
+            if ENABLE_FORK_CANDIDATES
+            else []
+        )
     else:
         _channel_hold = 0
         fork_candidates = []

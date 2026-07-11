@@ -26,16 +26,16 @@ DEBUG_STREAM_DEFAULTS = {
     # Single JPEG snapshot endpoint, useful for quick checks.
     "SNAPSHOT_PATH": "/snapshot.jpg",
 
-    # Legacy stream frame rate cap. 0 disables the cap so Windows sees every
-    # encoded debug frame the board can produce.
-    "FPS": 0.0,
+    # Debug video must never throttle control.  Limit JPEG encoding by default;
+    # set AR_DEBUG_STREAM_FPS=0 if you really want every rendered debug frame.
+    "FPS": float(os.environ.get("AR_DEBUG_STREAM_FPS", "4")),
 
     # JPEG quality. Higher is clearer but costs more bandwidth and CPU.
-    "JPEG_QUALITY": 35,
+    "JPEG_QUALITY": int(os.environ.get("AR_DEBUG_STREAM_JPEG_QUALITY", "25")),
 
     # Resize the published frame if it is wider than this value.
     # Use 0 or a negative value to disable resizing.
-    "MAX_WIDTH": 1280,
+    "MAX_WIDTH": int(os.environ.get("AR_DEBUG_STREAM_MAX_WIDTH", "720")),
 
     # If no frame arrives for this many seconds, /health reports stale.
     "STALE_SECONDS": 2.0,
@@ -304,6 +304,7 @@ class DebugStreamServer:
     def _encode_loop(self):
         apply_current_thread_affinity(self.cpu_set, self._log, "debug-stream-encoder")
         last_encoded_source_id = -1
+        last_encode_ts = 0.0
         while self.enabled:
             with self._condition:
                 self._condition.wait_for(
@@ -317,6 +318,12 @@ class DebugStreamServer:
 
             if frame is None:
                 frame = _waiting_frame()
+            if self.fps > 0.0:
+                now = time.time()
+                wait_s = (1.0 / self.fps) - (now - last_encode_ts)
+                if wait_s > 0.0:
+                    time.sleep(min(wait_s, 0.05))
+                    continue
             if last_encoded_source_id >= 0 and frame_id > last_encoded_source_id + 1:
                 with self._condition:
                     self._dropped_before_encode += frame_id - last_encoded_source_id - 1
@@ -339,6 +346,7 @@ class DebugStreamServer:
                 self._mark_encode_locked(now)
                 self._condition.notify_all()
             last_encoded_source_id = frame_id
+            last_encode_ts = now
 
     def _mark_publish_locked(self, now):
         self._publish_window_count += 1
@@ -396,8 +404,8 @@ class DebugStreamServer:
                 last_sent_id = -1
                 with owner._condition:
                     owner._client_count += 1
-                # No sleep or FPS cap here: browser FPS tracks the latest
-                # encoded debug frame, and slow clients naturally drop old frames.
+                # Browser FPS tracks the latest encoded debug frame. Encoding is
+                # capped in _encode_loop so slow debug video cannot throttle control.
                 try:
                     while owner.enabled:
                         jpg, frame_id = owner._wait_encoded_after(last_sent_id)

@@ -5,6 +5,10 @@ import sys
 import cv2
 import numpy as np
 
+os.environ["AR_ENABLE_FORK_POSTPROC"] = "1"
+os.environ["AR_ENABLE_CENTERLINE_POSTPROC"] = "1"
+os.environ["AR_ENABLE_FORK_CANDIDATES"] = "1"
+os.environ["AR_ENABLE_SEG_STABILIZATION"] = "1"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "infer_wrap", "base"))
 import seg_func
 

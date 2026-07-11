@@ -44,6 +44,7 @@ __pycache__/
 Master_RK3588S/setupUI/*.log
 Master_RK3588S/setupUI/ar_pose_status.json
 Master_RK3588S/setupUI/xverse_control_live.json
+Master_RK3588S/setupUI/ocr_live_status.json
 
 # Local capture/debug data
 Master_RK3588S/setupUI/capture_sessions/
@@ -60,3 +61,4 @@ ArucoCalib-master/ArucoCalib-master/*.spec
 
 # Local license file
 Master_RK3588S/setupUI/license.lic
+Master_RK3588S/setupUI/ocr_env.sh

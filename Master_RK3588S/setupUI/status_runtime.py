@@ -110,6 +110,7 @@ class RuntimeStatusStore:
         gamepad_status=None,
         performance_status=None,
         perception=None,
+        ocr_result=None,
     ):
         pose_info = pose_bridge.snapshot()
         vision_info = self._public_vision_status(perception)
@@ -152,6 +153,24 @@ class RuntimeStatusStore:
         }
         if performance_status is not None:
             info["performance"] = performance_status
+        if ocr_result is not None:
+            # This is deliberately small and JSON-safe: WebUI/status consumers need
+            # OCR/API progress, not an image crop or full model response.
+            instruction = dict(ocr_result.get("instruction") or {})
+            latest_instruction = dict(ocr_result.get("latest_instruction") or {})
+            error_value = ocr_result.get("error")
+            info["turnsign_ocr"] = {
+                "active": bool(ocr_result.get("active", False)),
+                "status": str(ocr_result.get("status", "unknown")),
+                "stable": bool(ocr_result.get("stable", False)),
+                "worker_ready": ocr_result.get("worker_ready"),
+                "instruction_current": bool(ocr_result.get("instruction_current", False)),
+                "error": str(error_value)[:240] if error_value else None,
+                "ocr": dict(ocr_result.get("ocr") or {}),
+                "instruction": instruction,
+                "latest_instruction": latest_instruction,
+                "timestamp": time.time(),
+            }
         if self.latest_vision_status is not None:
             info["vision"] = dict(self.latest_vision_status)
         self.write_status_json(info, "runtime status", control_info=control_info)

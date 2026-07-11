@@ -1,10 +1,123 @@
+import os
 import threading
 import time
 
 import cv2
+import numpy as np
 
 from ui_debug_stream_server import apply_current_thread_affinity
 from ui_hud_renderer import draw_pose_status
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
+# 中文字体路径（与 ui_hud_renderer 保持一致）
+_OCR_FONT_PATHS = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+]
+_ocr_font = None
+
+def _get_ocr_font():
+    global _ocr_font
+    if _ocr_font is not None:
+        return _ocr_font
+    if ImageFont is None:
+        return None
+    for path in _OCR_FONT_PATHS:
+        if not path:
+            continue
+        try:
+            if __import__('os').path.exists(path):
+                _ocr_font = ImageFont.truetype(path, 16)
+                return _ocr_font
+        except Exception:
+            continue
+    return None
+
+
+def _draw_ocr_on_debug_frame(final_frame, ocr_result):
+    """直接在 debug_feed 帧上绘制 OCR 信息（cv2 英文 + PIL 中文双保险）。"""
+    if ocr_result is None:
+        return final_frame
+
+    active = ocr_result.get("active", False)
+    status = ocr_result.get("status", "?")
+    instruction = ocr_result.get("instruction") or {}
+    instruction_current = bool(ocr_result.get("instruction_current", False))
+    latest_instruction = ocr_result.get("latest_instruction") or {}
+    ocr_data = ocr_result.get("ocr") or {}
+    ocr_text = ocr_data.get("text", "")
+    ocr_conf = ocr_data.get("confidence", 0.0)
+    stable = ocr_result.get("stable", False)
+
+    h, w = final_frame.shape[:2]
+    left_panel_w = 300
+    right_panel_w = 390
+    x_start = left_panel_w + 10
+    x_end = w - right_panel_w - 10
+    if x_end <= x_start:
+        return final_frame
+
+    # === 第一行：cv2 英文状态（100% 可靠） ===
+    parts = []
+    if active:
+        parts.append(f"OCR:{status}")
+    else:
+        parts.append("OCR:WAITING")
+    if ocr_text:
+        parts.append(f"conf={ocr_conf:.2f}")
+        parts.append(f"stable={'Y' if stable else 'N'}")
+    if instruction_current and instruction.get("valid"):
+        parts.append(f"API:{instruction.get('action')}")
+        parts.append(f"pref:{instruction.get('preferred_branch')}")
+        avoid = instruction.get("avoid_branches") or []
+        if avoid:
+            parts.append(f"avoid:{','.join(avoid)}")
+        parts.append(f"api_c={instruction.get('confidence',0):.2f}")
+    elif status in ("api_pending", "ocr_pending", "ocr_submitted", "worker_starting"):
+        parts.append("API:pending")
+    elif latest_instruction.get("valid"):
+        parts.append(f"API:last:{latest_instruction.get('action')}")
+
+    cv2_line = " | ".join(parts)
+
+    bar_h = 22
+    y_start = h - bar_h - 6
+
+    # 背景条
+    bar = final_frame[y_start:y_start + bar_h, x_start:x_end].copy()
+    overlay = np.zeros_like(bar)
+    overlay[:, :] = (8, 12, 16)
+    cv2.addWeighted(overlay, 0.85, bar, 0.15, 0.0, bar)
+    final_frame[y_start:y_start + bar_h, x_start:x_end] = bar
+
+    # cv2 英文行（永远能渲染）
+    cv2.putText(final_frame, cv2_line, (x_start + 6, y_start + 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 255), 1, cv2.LINE_AA)
+
+    # === 第二行：PIL 中文文字（如果有） ===
+    if ocr_text:
+        font = _get_ocr_font()
+        bar2_h = 22
+        y2_start = y_start - bar2_h - 2
+        if y2_start >= 0 and font is not None:
+            bar2 = final_frame[y2_start:y2_start + bar2_h, x_start:x_end].copy()
+            overlay2 = np.zeros_like(bar2)
+            overlay2[:, :] = (8, 12, 16)
+            cv2.addWeighted(overlay2, 0.85, bar2, 0.15, 0.0, bar2)
+
+            pil_img = Image.fromarray(cv2.cvtColor(bar2, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+            draw.text((6, 3), f"TXT: {ocr_text}", font=font, fill=(240, 235, 0))
+            bar2 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            final_frame[y2_start:y2_start + bar2_h, x_start:x_end] = bar2
+
+    return final_frame
 
 
 class DebugRenderWorker:
@@ -40,6 +153,8 @@ class DebugRenderWorker:
         self.local_preview = bool(local_preview)
         self.cpu_set = str(cpu_set or "").strip()
         self.log_func = log_func or print
+        self.max_render_fps = float(os.environ.get("AR_DEBUG_RENDER_FPS", "4"))
+        self._last_publish_accept_ts = 0.0
 
         self._condition = threading.Condition()
         self._latest = None
@@ -91,9 +206,18 @@ class DebugRenderWorker:
         command,
         gamepad_status,
         control_fps,
+        ocr_result=None,
     ):
         if not self._enabled or frame is None:
             return
+        now = time.time()
+        if self.max_render_fps > 0.0:
+            min_interval = 1.0 / max(0.1, self.max_render_fps)
+            if now - self._last_publish_accept_ts < min_interval:
+                with self._condition:
+                    self._dropped_before_render += 1
+                return
+            self._last_publish_accept_ts = now
         try:
             if frame.size == 0:
                 return
@@ -108,7 +232,8 @@ class DebugRenderWorker:
             "command": command,
             "gamepad_status": gamepad_status,
             "control_fps": control_fps,
-            "timestamp": time.time(),
+            "ocr_result": ocr_result,
+            "timestamp": now,
         }
         with self._condition:
             self._latest = item
@@ -184,10 +309,14 @@ class DebugRenderWorker:
                     detection_status=(item.get("perception") or {}).get("detection_status"),
                     task_decision=item.get("task_decision"),
                     plan_result=item.get("plan_result"),
+                    ocr_result=item.get("ocr_result"),
                     enabled=self.draw_pose_panel,
                 )
                 if final_frame is None or final_frame.size == 0:
                     final_frame = item["frame"]
+
+                # ---- OCR 信息叠加到 debug_feed 底部 ----
+                final_frame = _draw_ocr_on_debug_frame(final_frame, item.get("ocr_result"))
 
                 self.debug_stream_server.publish(final_frame)
                 if self.local_preview:
