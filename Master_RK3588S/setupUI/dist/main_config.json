@@ -3,8 +3,8 @@
   "width": 640,
   "height": 480,
   "video_flip": {
-    "horizontal": false,
-    "vertical": false
+    "horizontal": true,
+    "vertical": true
   },
   "fov": 0,
   "K": [

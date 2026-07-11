@@ -1,18 +1,41 @@
 #以下代码改自https://github.com/rockchip-linux/rknn-toolkit2/tree/master/examples/onnx/yolov5
+from pathlib import Path
+
 import cv2
 import numpy as np
 
 OBJ_THRESH, NMS_THRESH = 0.5, 0.45
 IMG_SIZE = (640, 640)
 
-CLASSES = ("person", "bicycle", "car", "motorbike ", "aeroplane ", "bus ", "train", "truck ", "boat", "traffic light",
-            "fire hydrant", "stop sign ", "parking meter", "bench", "bird", "cat", "dog ", "horse ", "sheep", "cow", "elephant",
-           "bear", "zebra ", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", 
-           "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass",
-            "cup", "fork", "knife ", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza ", 
-            "donut", "cake", "chair", "sofa", "pottedplant", "bed", "diningtable", "toilet ", "tvmonitor", "laptop", "mouse", 
-            "remote ", "keyboard ", "cell phone", "microwave ", "oven ", "toaster", "sink", "refrigerator ", "book", "clock", "vase", 
-            "scissors ", "teddy bear ", "hair drier", "toothbrush ")
+_DEFAULT_CLASSES = (
+    "Door",
+    "SpeedSign",
+    "TurnSign",
+    "Stone",
+    "BeginSign",
+    "EndSign",
+    "Crosswalk",
+    "TrafficLight",
+    "Coin",
+    "Human",
+    "Car",
+)
+
+
+def _load_classes():
+    names_path = Path(__file__).resolve().parent / "model" / "coco.names"
+    try:
+        classes = tuple(
+            line.strip()
+            for line in names_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    except OSError:
+        classes = ()
+    return classes or _DEFAULT_CLASSES
+
+
+CLASSES = _load_classes()
 
 
 # 
@@ -168,9 +191,15 @@ def post_process(input_data, img_shape=(640, 640)):
 
     # 解析每个分支的输出
     for i in range(defualt_branch):
+        class_output = input_data[pair_per_branch * i + 1]
+        if class_output.shape[1] != len(CLASSES):
+            raise ValueError(
+                f"detection model outputs {class_output.shape[1]} classes, "
+                f"but {len(CLASSES)} labels are configured"
+            )
         boxes.append(box_process(input_data[pair_per_branch * i], img_shape))
-        classes_conf.append(input_data[pair_per_branch * i + 1])
-        scores.append(np.ones_like(input_data[pair_per_branch * i + 1][:, :1, :, :], dtype=np.float32))
+        classes_conf.append(class_output)
+        scores.append(np.ones_like(class_output[:, :1, :, :], dtype=np.float32))
 
     # 展平特征图
     def sp_flatten(_in):
@@ -227,6 +256,37 @@ def draw(image, boxes, scores, classes):
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0, 0, 255), 2)
 
+
+def build_detections(image_shape, boxes, scores, classes):
+    """Expose the existing detector result without changing its post-process."""
+    if boxes is None or scores is None or classes is None:
+        return []
+
+    height, width = image_shape[:2]
+    image_area = max(1.0, float(width * height))
+    detections = []
+    for box, score, class_id in zip(boxes, scores, classes):
+        class_id = int(class_id)
+        if not 0 <= class_id < len(CLASSES):
+            continue
+        left, top, right, bottom = [float(value) for value in box]
+        left = max(0.0, min(float(width - 1), left))
+        top = max(0.0, min(float(height - 1), top))
+        right = max(left + 1.0, min(float(width), right))
+        bottom = max(top + 1.0, min(float(height), bottom))
+        label = CLASSES[class_id]
+        detections.append(
+            {
+                "class_id": class_id,
+                "label": label,
+                "category": label,
+                "score": float(score),
+                "bbox": [left, top, right, bottom],
+                "area_ratio": ((right - left) * (bottom - top)) / image_area,
+            }
+        )
+    return detections
+
 def myFunc(rknn_lite, img_orin):
     img_rgb_orin = cv2.cvtColor(img_orin, cv2.COLOR_BGR2RGB)
     # print(img_rgb_orin.shape)
@@ -243,6 +303,12 @@ def myFunc(rknn_lite, img_orin):
     boxes, classes, scores = post_process(outputs, size_orin)
 
     # IMG = cv2.cvtColor(IMG, cv2.COLOR_RGB2BGR)
+    detections = build_detections(img_orin.shape, boxes, scores, classes)
+    ocr_frame = img_orin.copy() if any(det["label"] == "TurnSign" for det in detections) else None
     if boxes is not None:
         draw(img_orin, boxes, scores, classes)
-    return img_orin
+    return {
+        "frame": img_orin,
+        "detections": detections,
+        "ocr_frame": ocr_frame,
+    }

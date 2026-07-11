@@ -65,5 +65,6 @@ if __name__ == '__main__':
     frames, loopTime, initTime = 0, time.time(), time.time()
     cnt_end = 1000
     result, flag = infer.infer(ori_img)
-    cv2.imwrite("result.jpg", result)
+    if flag and result:
+        cv2.imwrite("result.jpg", result["frame"])
     infer.release()

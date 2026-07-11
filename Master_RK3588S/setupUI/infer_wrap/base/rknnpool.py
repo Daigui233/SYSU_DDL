@@ -9,8 +9,8 @@ def initRKNN(rknnModel="yolov.rknn", id=0):
     rknn_lite = RKNNLite()
     ret = rknn_lite.load_rknn(rknnModel)
     if ret != 0:
-        print("Load RKNN rknnModel failed")
-        exit(ret)
+        rknn_lite.release()
+        raise RuntimeError(f"load RKNN model failed: {rknnModel}, ret={ret}")
     if id == 0:
         ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_0)
     elif id == 1:
@@ -22,8 +22,8 @@ def initRKNN(rknnModel="yolov.rknn", id=0):
     else:
         ret = rknn_lite.init_runtime()
     if ret != 0:
-        print("Init runtime environment failed")
-        exit(ret)
+        rknn_lite.release()
+        raise RuntimeError(f"init RKNN runtime failed: {rknnModel}, core={id}, ret={ret}")
     print(rknnModel, "\t\tdone")
     return rknn_lite
 
