@@ -7,17 +7,6 @@ import numpy as np
 OBJ_THRESH, NMS_THRESH = 0.5, 0.45
 IMG_SIZE = (640, 640)
 
-_DEFAULT_CLASSES = (
-    "Door",
-    "TurnSign",
-    "BeginSign",
-    "EndSign",
-    "Coin",
-    "Human",
-    "Car",
-)
-
-
 def _load_classes():
     names_path = Path(__file__).resolve().parent / "model" / "coco.names"
     try:
@@ -26,9 +15,11 @@ def _load_classes():
             for line in names_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         )
-    except OSError:
-        classes = ()
-    return classes or _DEFAULT_CLASSES
+    except OSError as exc:
+        raise RuntimeError(f"failed to read detector labels: {names_path}") from exc
+    if not classes:
+        raise RuntimeError(f"detector label file is empty: {names_path}")
+    return classes
 
 
 CLASSES = _load_classes()

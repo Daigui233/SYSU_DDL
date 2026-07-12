@@ -557,8 +557,8 @@ def main():
         from infer_wrap import InferWrap
         from infer_wrap.base.func import CLASSES
 
-        if len(CLASSES) != 11:
-            raise RuntimeError(f"expected 11 detector classes, got {len(CLASSES)}")
+        if not CLASSES:
+            raise RuntimeError("detector class list is empty")
         infer = InferWrap(TPEs=3)
         print(f"[DETECT] enabled with {len(CLASSES)} classes: {', '.join(CLASSES)}")
     except Exception as exc:
