@@ -4,6 +4,7 @@ import time
 
 from control_car_link import (
     CONTROL_FLAG_USE_TARGET_SPEED,
+    STATE_SAFE_STOP,
     STATE_TRACK,
     CarControlLink,
 )
@@ -21,6 +22,16 @@ def _finite_float(value):
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _safe_stop_command():
+    return {
+        "track_error": 0.0,
+        "target_speed": 0.0,
+        "state_cmd": STATE_SAFE_STOP,
+        "flags": 0,
+        "safe_stop": True,
+    }
 
 
 class ControlRuntime:
@@ -88,12 +99,18 @@ class ControlRuntime:
         if error is None or speed is None:
             self.clear_vision_command()
             return False
+        try:
+            state_cmd = int(state_cmd)
+            flags = int(flags)
+        except (TypeError, ValueError):
+            self.clear_vision_command()
+            return False
         with self._lock:
             self._vision_command = {
                 "track_error": error,
                 "target_speed": speed,
-                "state_cmd": int(state_cmd),
-                "flags": int(flags),
+                "state_cmd": state_cmd,
+                "flags": flags,
             }
             self._vision_timestamp = time.monotonic()
         return True
@@ -112,6 +129,11 @@ class ControlRuntime:
             )
             source = self._control_source
             command = dict(self._last_command) if self._last_command else None
+        serial_status = self.car_link.get_feedback()
+        try:
+            serial_status["tx"] = self.car_link.get_send_status()
+        except AttributeError:
+            pass
         return {
             "source": source,
             "last_command": command,
@@ -119,7 +141,7 @@ class ControlRuntime:
             "vision_ttl": self.vision_ttl,
             "pose": self.pose_bridge.snapshot(),
             "gamepad": self.gamepad_receiver.snapshot(),
-            "serial": self.car_link.get_feedback(),
+            "serial": serial_status,
         }
 
     def _run(self):
@@ -130,16 +152,18 @@ class ControlRuntime:
             vision_command = self._fresh_vision_command()
 
             if gamepad_command is not None:
-                command = gamepad_command
+                command = self._normalize_command(gamepad_command)
                 source = "GAMEPAD"
             elif vision_command is not None:
-                command = vision_command
+                command = self._normalize_command(vision_command)
                 source = "VISION"
             else:
                 command = None
                 source = "IDLE"
 
             if command is not None:
+                if command.get("safe_stop") and source in {"GAMEPAD", "VISION"}:
+                    source = f"{source}_SAFE_STOP"
                 self.car_link.send_cmd(
                     track_error=command["track_error"],
                     target_speed=command["target_speed"],
@@ -156,6 +180,26 @@ class ControlRuntime:
                 self._control_source = source
                 self._last_command = dict(command) if command else None
             self._stop_event.wait(max(0.01, self.control_interval))
+
+    def _normalize_command(self, command):
+        if not isinstance(command, dict):
+            return _safe_stop_command()
+        error = _finite_float(command.get("track_error"))
+        speed = _finite_float(command.get("target_speed"))
+        try:
+            state_cmd = int(command.get("state_cmd"))
+            flags = int(command.get("flags"))
+        except (TypeError, ValueError):
+            return _safe_stop_command()
+        if error is None or speed is None:
+            return _safe_stop_command()
+        return {
+            "track_error": error,
+            "target_speed": speed,
+            "state_cmd": state_cmd,
+            "flags": flags,
+            "safe_stop": bool(command.get("safe_stop")),
+        }
 
     def _fresh_vision_command(self):
         with self._lock:

@@ -46,6 +46,7 @@ class RuntimeState:
         self._api_reason = ""
         self._ocr_worker_ready = False
         self._ocr_error = ""
+        self._control_status = {"enabled": False, "status": "not_started"}
 
     def preview_enabled(self):
         with self._lock:
@@ -82,6 +83,10 @@ class RuntimeState:
             self._ocr_worker_ready = bool(response.get("worker_ready", self._ocr_worker_ready))
             self._ocr_error = str(response.get("error") or instruction.get("api_error") or "")[:240]
 
+    def update_control(self, status):
+        with self._lock:
+            self._control_status = status if isinstance(status, dict) else {"enabled": False, "status": str(status)}
+
     def snapshot(self):
         with self._lock:
             return {
@@ -94,6 +99,7 @@ class RuntimeState:
                 "api_reason": self._api_reason,
                 "ocr_worker_ready": self._ocr_worker_ready,
                 "ocr_error": self._ocr_error,
+                "control": self._control_status,
             }
 
 
@@ -146,7 +152,14 @@ async function refresh() {
     document.getElementById('state').textContent = data.preview_enabled
       ? (data.preview_running ? '弹窗已开启' : '已开启，等待视频帧')
       : '弹窗已关闭';
-    document.getElementById('ocr').textContent = `OCR：${data.ocr_status || '-'}　Worker：${data.ocr_worker_ready ? 'ready' : 'not ready'}　API：${data.api_choice || '-'}`;
+    const control = data.control || {};
+    const pose = control.pose || {};
+    const gamepad = control.gamepad || {};
+    const serial = control.serial || {};
+    document.getElementById('ocr').textContent =
+      `OCR：${data.ocr_status || '-'}　Worker：${data.ocr_worker_ready ? 'ready' : 'not ready'}　API：${data.api_choice || '-'}`
+      + `　控制：${control.enabled ? (control.source || '-') : 'off'}`
+      + `　定位包：${pose.packet_count ?? '-'}　手柄：${gamepad.active ? 'active' : 'idle'}　串口：${serial.online ? 'ON' : 'OFF'}`;
     document.getElementById('error').textContent = data.preview_error || data.ocr_error || '';
   } catch (error) {
     document.getElementById('state').textContent = '状态读取失败';
@@ -262,12 +275,14 @@ class FfplayPreview:
     def __init__(self, state, fps=30.0):
         self.state = state
         self.fps = max(1.0, float(fps))
+        self.frame_interval = 1.0 / self.fps
         self.ffplay = shutil.which("ffplay")
         self.process = None
         self.writer = None
         self.frames = None
         self.stop_event = None
         self.frame_size = None
+        self.next_frame_ts = 0.0
         self._lock = threading.Lock()
         self._intentional_stop = False
 
@@ -318,6 +333,7 @@ class FfplayPreview:
             self.frames = queue.Queue(maxsize=1)
             self.stop_event = threading.Event()
             self.frame_size = (width, height)
+            self.next_frame_ts = 0.0
             self._intentional_stop = False
             self.writer = threading.Thread(
                 target=self._write_frames,
@@ -368,8 +384,12 @@ class FfplayPreview:
         if process is None or process.poll() is not None or frame_size != (width, height):
             if not self._start(width, height):
                 return
+        now = time.monotonic()
         with self._lock:
             frames = self.frames
+            if now < self.next_frame_ts:
+                return
+            self.next_frame_ts = now + self.frame_interval
         if frames is None:
             return
         try:
@@ -398,6 +418,7 @@ class FfplayPreview:
             self.frames = None
             self.stop_event = None
             self.frame_size = None
+            self.next_frame_ts = 0.0
         if stop_event is not None:
             stop_event.set()
         if frames is not None:
@@ -451,6 +472,30 @@ def create_ocr_processor():
         return processor
     except Exception as exc:
         print(f"[OCR] unavailable: {exc}")
+        return None
+
+
+def create_control_runtime(state):
+    if not env_flag("AR_CONTROL_RUNTIME_ENABLED", True):
+        status = {"enabled": False, "status": "disabled"}
+        state.update_control(status)
+        print("[CONTROL] disabled by AR_CONTROL_RUNTIME_ENABLED=0")
+        return None
+    try:
+        from control_runtime import ControlRuntime
+
+        runtime = ControlRuntime(log_func=lambda message: print(f"[CONTROL] {message}"))
+        runtime.start()
+        status = runtime.snapshot()
+        status["enabled"] = True
+        status["status"] = "running"
+        state.update_control(status)
+        print("[CONTROL] runtime enabled: pose UDP, gamepad UDP, serial bridge")
+        return runtime
+    except Exception as exc:
+        status = {"enabled": False, "status": "unavailable", "error": str(exc)}
+        state.update_control(status)
+        print(f"[CONTROL] unavailable: {exc}")
         return None
 
 
@@ -521,7 +566,7 @@ def main():
         print(f"[DETECT] unavailable; preview-only mode: {exc}")
 
     state = RuntimeState(preview_enabled=env_flag("AR_LOCAL_PREVIEW", True))
-    preview = FfplayPreview(state, fps=env_float("AR_PREVIEW_FPS", 30.0))
+    preview = FfplayPreview(state, fps=env_float("AR_PREVIEW_FPS", 60.0))
     web = PreviewControlServer(
         state,
         host=os.environ.get("AR_PREVIEW_CONTROL_HOST", "0.0.0.0"),
@@ -529,6 +574,7 @@ def main():
     )
     web.start()
     ocr_processor = create_ocr_processor()
+    control_runtime = create_control_runtime(state)
 
     print("[AR_RECEIVER] ready; waiting for camera shared memory...")
     print(f"[AR_RECEIVER] DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}")
@@ -536,8 +582,28 @@ def main():
 
     shm = None
     last_ocr_log_key = None
+    next_control_status_ts = 0.0
+
+    def refresh_control_status(force=False):
+        nonlocal next_control_status_ts
+        if control_runtime is None:
+            return
+        now = time.time()
+        if not force and now < next_control_status_ts:
+            return
+        try:
+            control_status = control_runtime.snapshot()
+            control_status["enabled"] = True
+            control_status["status"] = "running"
+            state.update_control(control_status)
+        except Exception as exc:
+            state.update_control({"enabled": True, "status": "snapshot_error", "error": str(exc)})
+        next_control_status_ts = now + 0.5
+
     try:
         while True:
+            refresh_control_status()
+
             if shm is None:
                 try:
                     shm = shared_memory.SharedMemory(name=SHM_NAME)
@@ -556,6 +622,7 @@ def main():
             latest_ocr_response = None
 
             while shm is not None:
+                refresh_control_status()
                 if not state.preview_enabled():
                     preview.stop(disable=False)
                 try:
@@ -641,6 +708,8 @@ def main():
     finally:
         preview.stop(disable=False)
         web.stop()
+        if control_runtime is not None:
+            control_runtime.stop()
         if ocr_processor is not None and hasattr(ocr_processor, "close"):
             ocr_processor.close()
         if infer is not None:

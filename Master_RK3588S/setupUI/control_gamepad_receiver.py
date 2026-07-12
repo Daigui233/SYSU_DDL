@@ -1,15 +1,16 @@
 import json
 import math
+import os
 import socket
 import threading
 import time
 
 
-GAMEPAD_HOST = "0.0.0.0"
-GAMEPAD_PORT = 9010
-GAMEPAD_PACKET_TTL_SECONDS = 3.0
-GAMEPAD_MAX_SPEED_MPS = 1.0
-GAMEPAD_MAX_TRACK_ERROR = 240.0
+GAMEPAD_HOST = os.environ.get("AR_GAMEPAD_CONTROL_HOST", "0.0.0.0")
+GAMEPAD_PORT = int(os.environ.get("AR_GAMEPAD_CONTROL_PORT", "9010"))
+GAMEPAD_PACKET_TTL_SECONDS = float(os.environ.get("AR_GAMEPAD_CONTROL_TTL", "3.0"))
+GAMEPAD_MAX_SPEED_MPS = float(os.environ.get("AR_GAMEPAD_MAX_SPEED_MPS", "1.0"))
+GAMEPAD_MAX_TRACK_ERROR = float(os.environ.get("AR_GAMEPAD_MAX_TRACK_ERROR", "240.0"))
 
 STATE_TRACK = 1
 STATE_SAFE_STOP = 7
@@ -36,11 +37,15 @@ class GamepadControlReceiver:
         host=GAMEPAD_HOST,
         port=GAMEPAD_PORT,
         ttl=GAMEPAD_PACKET_TTL_SECONDS,
+        max_speed_mps=GAMEPAD_MAX_SPEED_MPS,
+        max_track_error=GAMEPAD_MAX_TRACK_ERROR,
         log_func=print,
     ):
         self.host = str(host)
         self.port = int(port)
         self.ttl = float(ttl)
+        self.max_speed_mps = float(max_speed_mps)
+        self.max_track_error = float(max_track_error)
         self.log_func = log_func
 
         self._stop_event = threading.Event()
@@ -131,13 +136,13 @@ class GamepadControlReceiver:
                     "gamepad_mode": True,
                     "track_error": _clamp(
                         packet.get("track_error", 0.0),
-                        -GAMEPAD_MAX_TRACK_ERROR,
-                        GAMEPAD_MAX_TRACK_ERROR,
+                        -self.max_track_error,
+                        self.max_track_error,
                     ),
                     "target_speed": _clamp(
                         packet.get("target_speed", 0.0),
-                        -GAMEPAD_MAX_SPEED_MPS,
-                        GAMEPAD_MAX_SPEED_MPS,
+                        -self.max_speed_mps,
+                        self.max_speed_mps,
                     ),
                     "state_cmd": STATE_TRACK,
                     "flags": CONTROL_FLAG_USE_TARGET_SPEED,

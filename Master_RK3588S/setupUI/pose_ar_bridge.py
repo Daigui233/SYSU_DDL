@@ -9,20 +9,40 @@ import time
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "dist", "main_config.json")
 
-POSE_INPUT_HOST = "0.0.0.0"
-POSE_INPUT_PORT = 9005
-AR_TARGET_HOST = "127.0.0.1"
-AR_TARGET_PORT = 9006
-POSE_RX_BUFFER_BYTES = 65536
+POSE_INPUT_HOST = os.environ.get("AR_POSE_INPUT_HOST", "0.0.0.0")
+POSE_INPUT_PORT = int(os.environ.get("AR_POSE_INPUT_PORT", "9005"))
+AR_TARGET_HOST = os.environ.get("AR_UDP_IP", "127.0.0.1")
+AR_TARGET_PORT = int(os.environ.get("AR_UDP_PORT", "9006"))
+POSE_RX_BUFFER_BYTES = int(os.environ.get("AR_POSE_RX_BUFFER_BYTES", "65536"))
 
 
-def _load_ar_port(config_path):
+def _add_target(targets, host, port):
+    target = (str(host).strip(), int(port))
+    if target[0] and target not in targets:
+        targets.append(target)
+
+
+def _load_ar_targets(config_path):
+    targets = []
+    fallback_host = AR_TARGET_HOST
+    fallback_port = AR_TARGET_PORT
     try:
         with open(config_path, "r", encoding="utf-8") as file:
             config = json.load(file)
-        return int(config.get("network", {}).get("control_port", AR_TARGET_PORT))
+        network = config.get("network", {})
+        udp_host = str(network.get("udp_target_ip", fallback_host))
+        udp_port = int(network.get("udp_target_port", fallback_port))
+        control_port = int(network.get("control_port", udp_port))
+        _add_target(targets, udp_host, udp_port)
+        _add_target(targets, "127.0.0.1", control_port)
     except Exception:
-        return AR_TARGET_PORT
+        _add_target(targets, fallback_host, fallback_port)
+
+    env_host = os.environ.get("AR_UDP_IP")
+    env_port = os.environ.get("AR_UDP_PORT")
+    if env_host or env_port:
+        _add_target(targets, env_host or fallback_host, int(env_port or fallback_port))
+    return targets or [(fallback_host, fallback_port)]
 
 
 def parse_pose_datagram(data):
@@ -76,15 +96,18 @@ class ARPoseBridge:
         self,
         input_host=POSE_INPUT_HOST,
         input_port=POSE_INPUT_PORT,
-        target_host=AR_TARGET_HOST,
+        target_host=None,
         target_port=None,
         config_path=CONFIG_PATH,
         log_func=print,
     ):
         self.input_host = str(input_host)
         self.input_port = int(input_port)
-        self.target_host = str(target_host)
-        self.target_port = int(_load_ar_port(config_path) if target_port is None else target_port)
+        if target_host is not None or target_port is not None:
+            self.targets = [(str(target_host or AR_TARGET_HOST), int(target_port or AR_TARGET_PORT))]
+        else:
+            self.targets = _load_ar_targets(config_path)
+        self.target_host, self.target_port = self.targets[0]
         self.log_func = log_func
 
         self._stop_event = threading.Event()
@@ -129,7 +152,7 @@ class ARPoseBridge:
             age = time.time() - self.last_timestamp if self.last_timestamp else None
             return {
                 "input": f"{self.input_host}:{self.input_port}",
-                "target": f"{self.target_host}:{self.target_port}",
+                "target": ",".join(f"{host}:{port}" for host, port in self.targets),
                 "packet_count": self.packet_count,
                 "invalid_count": self.invalid_count,
                 "drop_count": self.drop_count,
@@ -170,6 +193,8 @@ class ARPoseBridge:
                     raise exc
 
                 packet = parse_pose_datagram(data)
+                if source[0] in {"127.0.0.1", "::1"}:
+                    continue
                 if packet is None:
                     with self._lock:
                         self.invalid_count += 1
@@ -178,13 +203,17 @@ class ARPoseBridge:
 
                 ar_packet = copy_official_pose(packet)
                 payload = json.dumps(ar_packet, separators=(",", ":")).encode("utf-8")
-                try:
-                    self._output_socket.sendto(payload, (self.target_host, self.target_port))
-                    error = ""
-                except OSError as exc:
-                    error = str(exc)
+                error = ""
+                send_fail = 0
+                for target in self.targets:
+                    try:
+                        self._output_socket.sendto(payload, target)
+                    except OSError as exc:
+                        error = str(exc)
+                        send_fail += 1
+                if send_fail:
                     with self._lock:
-                        self.send_fail_count += 1
+                        self.send_fail_count += send_fail
 
                 with self._lock:
                     self.packet_count += 1
