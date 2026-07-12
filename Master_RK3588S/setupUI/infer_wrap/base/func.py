@@ -9,13 +9,9 @@ IMG_SIZE = (640, 640)
 
 _DEFAULT_CLASSES = (
     "Door",
-    "SpeedSign",
     "TurnSign",
-    "Stone",
     "BeginSign",
     "EndSign",
-    "Crosswalk",
-    "TrafficLight",
     "Coin",
     "Human",
     "Car",

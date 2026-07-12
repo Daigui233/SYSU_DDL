@@ -28,7 +28,7 @@
 
 ```text
 Door
-SpeedSign
+SpeedSign     
 TurnSign
 Stone
 BeginSign
