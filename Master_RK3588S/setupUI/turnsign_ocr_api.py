@@ -13,7 +13,7 @@ import numpy as np
 
 
 DEFAULT_API_TYPE = "aistudio"
-DEFAULT_MODEL = "ernie-3.5"
+DEFAULT_MODEL = "ernie-4.0-turbo-8k"
 API_CACHE_VERSION = os.environ.get("AR_TURNSIGN_API_CACHE_VERSION", "api_v3_left_right")
 
 DEFAULT_SYSTEM_PROMPT = """你是智能车路牌语义决策器。赛道在每个决策点只有左、右两条实际道路，不存在第三条可选道路。
@@ -514,6 +514,8 @@ class TurnSignOcrApiProcessor:
         min_area_ratio=0.001,
         min_ocr_confidence=0.45,
         stable_frames=2,
+        stable_bypass_confidence=0.90,
+        stable_bypass_min_text_len=6,
         text_similarity=0.86,
         ocr_interval=0.25,
         api_cooldown=2.0,
@@ -527,6 +529,13 @@ class TurnSignOcrApiProcessor:
         self.min_area_ratio = float(min_area_ratio)
         self.min_ocr_confidence = float(min_ocr_confidence)
         self.stable_frames = int(stable_frames)
+        self.stable_bypass_confidence = float(
+            os.environ.get("AR_TURNSIGN_STABLE_BYPASS_CONFIDENCE", stable_bypass_confidence)
+        )
+        self.stable_bypass_min_text_len = max(
+            1,
+            int(os.environ.get("AR_TURNSIGN_STABLE_BYPASS_MIN_TEXT_LEN", stable_bypass_min_text_len)),
+        )
         self.text_similarity = float(text_similarity)
         self.ocr_interval = float(ocr_interval)
         self.api_cooldown = float(api_cooldown)
@@ -775,6 +784,13 @@ class TurnSignOcrApiProcessor:
             self.stable_count = 0
             self.last_text = ""
             return False
+        if (
+            confidence >= self.stable_bypass_confidence
+            and len(text) >= self.stable_bypass_min_text_len
+        ):
+            self.stable_count = max(self.stable_count, self.stable_frames)
+            self.last_text = text
+            return True
         if self.last_text and SequenceMatcher(None, self.last_text, text).ratio() >= self.text_similarity:
             self.stable_count += 1
         else:
