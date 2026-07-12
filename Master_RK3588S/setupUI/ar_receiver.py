@@ -501,6 +501,8 @@ def create_ocr_processor():
             min_det_score=env_float("AR_TURNSIGN_MIN_DET_SCORE", 0.35),
             min_ocr_confidence=env_float("AR_TURNSIGN_MIN_OCR_CONFIDENCE", 0.45),
             stable_frames=max(1, int(env_float("AR_TURNSIGN_STABLE_FRAMES", 2))),
+            stable_bypass_confidence=env_float("AR_TURNSIGN_STABLE_BYPASS_CONFIDENCE", 0.90),
+            stable_bypass_min_text_len=max(1, int(env_float("AR_TURNSIGN_STABLE_BYPASS_MIN_TEXT_LEN", 6))),
             ocr_interval=env_float("AR_TURNSIGN_OCR_INTERVAL", 0.25),
             api_cooldown=env_float("AR_TURNSIGN_API_COOLDOWN", 1.0),
             cache_ttl=0.0,
