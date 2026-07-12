@@ -1,70 +1,81 @@
-import cv2, sys, os, glob
-import numpy as np
-import platform
-# from synset_label import labels
-from rknnlite.api import RKNNLite
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))) 
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+import os
+from pathlib import Path
 
-# from camera import Camera
-from rknnpool import rknnPoolExecutor
-from func import myFunc
+from .func import myFunc
+
 
 def get_current_dir():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    return current_dir
+    return Path(__file__).resolve().parent
 
 
-class InferWrap():
-    def __init__(self, model_dir="model", TPEs=1):
-        model_dir = os.path.join(get_current_dir(), model_dir)
-        model_path = self.get_model_path(model_dir)
-        self.TPEs = TPEs
+class InferWrap:
+    """Threaded single-RKNN multi-task inference wrapper."""
+
+    def __init__(self, model_dir="model", TPEs=1, model_path=None):
+        # Keep rknnlite board-only: NumPy post-processing can still be imported
+        # and tested on a development PC without the RKNN runtime installed.
+        from .rknnpool import rknnPoolExecutor
+
+        model_dir = get_current_dir() / model_dir
+        selected_model = self.get_model_path(model_dir, model_path)
+        self.model_path = str(selected_model)
+        self.TPEs = max(1, int(TPEs))
+        try:
+            requested_depth = int(os.environ.get("MULTITASK_PIPELINE_DEPTH", "1"))
+        except ValueError:
+            requested_depth = 1
+        self.pipeline_depth = max(1, min(requested_depth, self.TPEs))
         self.rknn_pool = rknnPoolExecutor(
-            rknnModel=model_path,
-            TPEs=self.TPEs,
-            func=myFunc)
-        self.pool_flag = False
+            rknnModel=self.model_path, TPEs=self.TPEs, func=myFunc)
+        self.pending = 0
 
-    def pool_init(self, img):
-        # 初始化线程池加载数据
-        for i in range(self.TPEs + 1):
-            self.rknn_pool.put(img)
+    @staticmethod
+    def get_model_path(model_dir, model_path=None):
+        explicit = model_path or os.environ.get("MULTITASK_RKNN_MODEL", "")
+        if explicit:
+            path = Path(explicit).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError("configured RKNN model not found: {}".format(path))
+            return path
 
-    def get_model_path(self, model_dir):
-        model_path  = glob.glob(model_dir + "/*.rknn")[0]
-        # cfg_path = glob.glob(model_dir + "/*.names")[0]
-        # return model_path, params_path
-        return model_path
+        model_dir = Path(model_dir)
+        variant = os.environ.get("MULTITASK_RKNN_VARIANT", "fp16").strip().lower()
+        if variant not in {"fp16", "int8"}:
+            raise ValueError("MULTITASK_RKNN_VARIANT must be fp16 or int8")
+        preferred = model_dir / "multitask_ppyoloe_{}.rknn".format(variant)
+        if preferred.is_file():
+            return preferred.resolve()
+        available = sorted(model_dir.glob("multitask_ppyoloe_*.rknn"))
+        if len(available) == 1:
+            return available[0].resolve()
+        raise FileNotFoundError(
+            "missing {}; place the exported model in {} or set "
+            "MULTITASK_RKNN_MODEL. Available multitask models: {}".format(
+                preferred.name, model_dir,
+                ", ".join(item.name for item in available) or "none"))
 
     def infer(self, img):
-        if not self.pool_flag:
-            self.pool_init(img)
-            self.pool_flag = True
         self.rknn_pool.put(img)
-        return self.rknn_pool.get()
-    
-    def __call__(self, *args, **kwds):
-        return self.infer(*args, **kwds)
-    
+        self.pending += 1
+        if self.pending < self.pipeline_depth:
+            return None, False
+        result = self.rknn_pool.get()
+        self.pending -= 1
+        return result
+
+    def __call__(self, *args, **kwargs):
+        return self.infer(*args, **kwargs)
+
     def release(self):
         self.rknn_pool.release()
 
-if __name__ == '__main__':
 
+if __name__ == "__main__":
+    import cv2
 
-    # cap = Camera(0)
     infer = InferWrap("model", TPEs=1)
-
-    ori_img = cv2.imread('./bus.jpg')
-    
-
-    import time
-    # time_ls = time.time()
-    # frame
-    frames, loopTime, initTime = 0, time.time(), time.time()
-    cnt_end = 1000
-    result, flag = infer.infer(ori_img)
-    if flag and result:
+    image = cv2.imread("./bus.jpg")
+    result, ready = infer.infer(image)
+    if ready and result:
         cv2.imwrite("result.jpg", result["frame"])
     infer.release()

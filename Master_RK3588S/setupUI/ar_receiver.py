@@ -34,6 +34,13 @@ def env_float(name, default):
         return float(default)
 
 
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 class RuntimeState:
     def __init__(self, preview_enabled=True):
         self._lock = threading.Lock()
@@ -47,6 +54,7 @@ class RuntimeState:
         self._ocr_worker_ready = False
         self._ocr_error = ""
         self._control_status = {"enabled": False, "status": "not_started"}
+        self._perception_status = {"enabled": False, "status": "not_started"}
 
     def preview_enabled(self):
         with self._lock:
@@ -87,6 +95,36 @@ class RuntimeState:
         with self._lock:
             self._control_status = status if isinstance(status, dict) else {"enabled": False, "status": str(status)}
 
+    def update_perception(self, result=None, error=""):
+        result = result if isinstance(result, dict) else {}
+        detections = result.get("detections") or []
+        road = result.get("road") or {}
+        centerline = result.get("centerline") or {}
+        topology = result.get("topology") or {}
+        labels = {}
+        for detection in detections:
+            label = str(detection.get("label") or "unknown")
+            labels[label] = labels.get(label, 0) + 1
+        road_mask = road.get("mask")
+        road_coverage = float(np.mean(road_mask)) if isinstance(road_mask, np.ndarray) and road_mask.size else 0.0
+        paths = centerline.get("paths") or []
+        primary = centerline.get("primary") or []
+        summary = {
+            "enabled": not bool(error),
+            "status": "error" if error else ("ready" if result else "not_started"),
+            "error": str(error or "")[:240],
+            "detection_count": len(detections),
+            "detection_labels": labels,
+            "road_coverage": road_coverage,
+            "path_count": len(paths),
+            "primary_point_count": len(primary),
+            "topology": str(topology.get("label") or ""),
+            "topology_confidence": float(topology.get("confidence") or 0.0),
+            "topology_reliable": bool(topology.get("reliable", False)),
+        }
+        with self._lock:
+            self._perception_status = summary
+
     def snapshot(self):
         with self._lock:
             return {
@@ -100,6 +138,7 @@ class RuntimeState:
                 "ocr_worker_ready": self._ocr_worker_ready,
                 "ocr_error": self._ocr_error,
                 "control": self._control_status,
+                "perception": self._perception_status,
             }
 
 
@@ -559,11 +598,14 @@ def main():
 
         if not CLASSES:
             raise RuntimeError("detector class list is empty")
-        infer = InferWrap(TPEs=3)
-        print(f"[DETECT] enabled with {len(CLASSES)} classes: {', '.join(CLASSES)}")
+        infer = InferWrap(TPEs=max(1, env_int("MULTITASK_RKNN_TPES", 1)))
+        print(
+            f"[PERCEPTION] enabled model={infer.model_path} "
+            f"classes={len(CLASSES)}: {', '.join(CLASSES)}"
+        )
     except Exception as exc:
         infer = None
-        print(f"[DETECT] unavailable; preview-only mode: {exc}")
+        print(f"[PERCEPTION] unavailable; preview-only mode: {exc}")
 
     state = RuntimeState(preview_enabled=env_flag("AR_LOCAL_PREVIEW", True))
     preview = FfplayPreview(state, fps=env_float("AR_PREVIEW_FPS", 60.0))
@@ -653,11 +695,13 @@ def main():
                             inferred_frame = infer_result.get("frame")
                             display_frame = inferred_frame if inferred_frame is not None else frame
                             detections = infer_result.get("detections") or []
+                            state.update_perception(infer_result)
                             ocr_source_frame = infer_result.get("ocr_frame")
                             if ocr_source_frame is None:
                                 ocr_source_frame = display_frame
                     except Exception as exc:
-                        print(f"[DETECT] disabled after runtime error: {exc}")
+                        print(f"[PERCEPTION] disabled after runtime error: {exc}")
+                        state.update_perception(error=exc)
                         try:
                             infer.release()
                         except Exception:

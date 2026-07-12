@@ -1,0 +1,57 @@
+# 多任务 RKNN 板端放置说明
+
+此目录只使用新单 RKNN 多任务模型。旧的 `rknn_lt.rknn` 不会被自动选择。
+
+## 模型文件名
+
+- FP16：`multitask_ppyoloe_fp16.rknn`
+- INT8：`multitask_ppyoloe_int8.rknn`
+
+默认加载 FP16。选择 INT8：
+
+```bash
+export MULTITASK_RKNN_VARIANT=int8
+```
+
+也可直接指定绝对路径：
+
+```bash
+export MULTITASK_RKNN_MODEL=/path/to/model.rknn
+```
+
+## 固定模型契约
+
+- 输入：RGB uint8，`[1,480,640,3]`；RKNN 内部执行训练时的均值方差归一化。
+- 输出 0：`det_boxes [1,6300,4]`，模型输入坐标中的 xyxy。
+- 输出 1：`det_scores [1,6300,8]`，NMS 前类别概率。
+- 输出 2：`pixel_logits [1,2,120,160]`，道路和候选中线。
+- 输出 3：`topology_logits [1,4]`，normal/fork/merge/unknown。
+
+检测类别顺序由 `coco.names` 固定，不可自行交换。
+
+## 运行参数
+
+```bash
+export MULTITASK_DET_THRESHOLD=0.25
+export MULTITASK_NMS_THRESHOLD=0.60
+export MULTITASK_ROAD_THRESHOLD=0.50
+export MULTITASK_CENTERLINE_THRESHOLD=0.25
+export MULTITASK_TOPOLOGY_THRESHOLD=0.45
+```
+
+智能车默认采用低延迟模式：`MULTITASK_RKNN_TPES=1`、
+`MULTITASK_PIPELINE_DEPTH=1`。只有实测确认允许增加帧延迟时，才提高并行实例数和
+流水深度；流水深度为 3 意味着结果大约落后 2 帧。
+
+## Python 结果接口
+
+`InferWrap.infer(frame)` 返回 `(result, ready)`。`result` 包含：
+
+- `frame`：绘制检测框、候选中线和拓扑摘要后的 BGR 图。
+- `detections`：NMS 后检测列表，坐标已映射到原图。
+- `ocr_frame`：检测到 `TurnSign` 时提供给现有 OCR 的未绘制原图。
+- `road`：`probability`、二值 `mask`、阈值和 stride。
+- `centerline`：热图、道路软约束得分、最多两条 `paths` 和 `primary`。
+- `topology`：类别、置信度、是否达到可靠阈值及四类概率。
+
+NMS、道路阈值、中线峰值/动态规划和拓扑解析都在 CPU，不进入 RKNN 图。
