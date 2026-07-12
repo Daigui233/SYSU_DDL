@@ -39,7 +39,7 @@ class InferWrap:
             return path
 
         model_dir = Path(model_dir)
-        variant = os.environ.get("MULTITASK_RKNN_VARIANT", "fp16").strip().lower()
+        variant = os.environ.get("MULTITASK_RKNN_VARIANT", "int8").strip().lower()
         if variant not in {"fp16", "int8"}:
             raise ValueError("MULTITASK_RKNN_VARIANT must be fp16 or int8")
         preferred = model_dir / "multitask_ppyoloe_{}.rknn".format(variant)

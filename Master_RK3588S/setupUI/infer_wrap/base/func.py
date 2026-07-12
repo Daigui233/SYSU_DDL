@@ -27,6 +27,7 @@ def _env_float(name, default):
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.25)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.60)
 ROAD_THRESHOLD = _env_float("MULTITASK_ROAD_THRESHOLD", 0.50)
+ROAD_OVERLAY_ALPHA = _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28)
 CENTERLINE_THRESHOLD = _env_float("MULTITASK_CENTERLINE_THRESHOLD", 0.25)
 TOPOLOGY_THRESHOLD = _env_float("MULTITASK_TOPOLOGY_THRESHOLD", 0.45)
 MAX_DETECTIONS = 100
@@ -173,7 +174,7 @@ def build_detections(image_shape, nms_results):
     return detections
 
 
-def _row_peaks(values, threshold, max_peaks):
+def _row_peaks(values, threshold, max_peaks=None, min_distance=3):
     if len(values) < 3:
         return []
     mask = ((values[1:-1] >= values[:-2]) &
@@ -181,68 +182,76 @@ def _row_peaks(values, threshold, max_peaks):
             (values[1:-1] >= threshold))
     indices = np.flatnonzero(mask) + 1
     indices = sorted(indices, key=lambda x: values[x], reverse=True)
-    return [(int(x), float(values[x])) for x in indices[:max_peaks]]
+    selected = []
+    for index in indices:
+        if all(abs(int(index) - previous) >= min_distance
+               for previous, _ in selected):
+            selected.append((int(index), float(values[index])))
+            if max_peaks is not None and len(selected) >= max_peaks:
+                break
+    return selected
 
 
-def _best_path(rows, candidates):
-    if not rows:
-        return []
-    costs = []
-    parents = []
-    for row_index, row_candidates in enumerate(candidates):
-        row_cost = np.full(len(row_candidates), np.inf, dtype=np.float32)
-        row_parent = np.full(len(row_candidates), -1, dtype=np.int32)
-        for index, (x, confidence) in enumerate(row_candidates):
-            node_cost = -np.log(max(confidence, 1e-6))
-            if row_index == 0:
-                row_cost[index] = node_cost
+def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
+                     min_points=3):
+    """Connect every row peak into a path without selecting a driving route."""
+    tracks = []
+    for row_index, (row, peaks) in enumerate(zip(rows, candidates)):
+        active = [
+            index for index, track in enumerate(tracks)
+            if row_index - track["last_row_index"] <= max_missing_rows + 1
+        ]
+        pairs = []
+        for track_index in active:
+            previous_x = tracks[track_index]["points"][-1][0]
+            for peak_index, (x, confidence) in enumerate(peaks):
+                distance = abs(x - previous_x)
+                if distance <= max_jump:
+                    pairs.append((distance, track_index, peak_index))
+
+        used_tracks = set()
+        used_peaks = set()
+        for _, track_index, peak_index in sorted(pairs):
+            if track_index in used_tracks or peak_index in used_peaks:
                 continue
-            for previous_index, (previous_x, _) in enumerate(candidates[row_index - 1]):
-                transition = 0.035 * abs(x - previous_x)
-                value = costs[-1][previous_index] + transition + node_cost
-                if value < row_cost[index]:
-                    row_cost[index] = value
-                    row_parent[index] = previous_index
-        costs.append(row_cost)
-        parents.append(row_parent)
-    index = int(np.argmin(costs[-1]))
-    path = []
-    for row_index in range(len(rows) - 1, -1, -1):
-        x, confidence = candidates[row_index][index]
-        path.append((x, rows[row_index], confidence))
-        index = int(parents[row_index][index])
-        if row_index and index < 0:
-            return []
-    return path[::-1]
+            x, confidence = peaks[peak_index]
+            tracks[track_index]["points"].append((x, row, confidence))
+            tracks[track_index]["last_row_index"] = row_index
+            used_tracks.add(track_index)
+            used_peaks.add(peak_index)
+
+        # A newly visible branch becomes another path at the row where it splits.
+        for peak_index, (x, confidence) in enumerate(peaks):
+            if peak_index not in used_peaks:
+                tracks.append({
+                    "points": [(x, row, confidence)],
+                    "last_row_index": row_index,
+                })
+
+    paths = [track["points"] for track in tracks
+             if len(track["points"]) >= min_points]
+    paths.sort(
+        key=lambda path: (len(path), sum(point[2] for point in path)),
+        reverse=True)
+    return paths
 
 
 def candidate_centerlines(road_probability, center_probability,
                           peak_threshold=CENTERLINE_THRESHOLD,
-                          max_peaks_per_row=3, row_step=3, road_floor=0.25):
-    """Extract at most two continuous path candidates without skeletonization."""
+                          max_peaks_per_row=None, row_step=3, road_floor=0.25):
+    """Extract all visible centerline paths without choosing a route."""
     score = center_probability * (
         road_floor + (1.0 - road_floor) * road_probability)
     rows = list(range(score.shape[0] - 2,
                       max(score.shape[0] // 5, 1), -row_step))
-    valid_rows = []
+    sampled_rows = []
     candidates = []
     for row in rows:
         peaks = _row_peaks(score[row], peak_threshold, max_peaks_per_row)
         if peaks:
-            valid_rows.append(row)
+            sampled_rows.append(row)
             candidates.append(peaks)
-    first = _best_path(valid_rows, candidates)
-    paths = [first] if first else []
-    if first:
-        suppressed = [list(items) for items in candidates]
-        for row_index, point in enumerate(first):
-            suppressed[row_index] = [
-                item for item in suppressed[row_index]
-                if abs(item[0] - point[0]) >= 4]
-        if all(suppressed):
-            second = _best_path(valid_rows, suppressed)
-            if second:
-                paths.append(second)
+    paths = _trace_all_paths(sampled_rows, candidates)
     return [[(int(x * PIXEL_STRIDE), int(y * PIXEL_STRIDE), float(confidence))
              for x, y, confidence in path] for path in paths], score
 
@@ -279,7 +288,6 @@ def decode_outputs(outputs, image_shape):
             "probability": center_probability,
             "score": path_score,
             "paths": paths,
-            "primary": paths[0] if paths else [],
             "stride": PIXEL_STRIDE,
         },
         "topology": decode_topology(topology_logits),
@@ -287,6 +295,19 @@ def decode_outputs(outputs, image_shape):
 
 
 def _draw_result(image, result):
+    road_mask = result["road"]["mask"]
+    if ROAD_OVERLAY_ALPHA > 0.0 and road_mask.size:
+        resized_mask = cv2.resize(
+            road_mask, (image.shape[1], image.shape[0]),
+            interpolation=cv2.INTER_NEAREST).astype(bool)
+        if np.any(resized_mask):
+            overlay_color = np.asarray((70, 70, 210), dtype=np.float32)
+            pixels = image[resized_mask].astype(np.float32)
+            image[resized_mask] = np.clip(
+                pixels * (1.0 - ROAD_OVERLAY_ALPHA) +
+                overlay_color * ROAD_OVERLAY_ALPHA,
+                0, 255).astype(np.uint8)
+
     for detection in result["detections"]:
         left, top, right, bottom = [int(value) for value in detection["bbox"]]
         cv2.rectangle(image, (left, top), (right, bottom), (0, 220, 0), 2)
@@ -295,7 +316,8 @@ def _draw_result(image, result):
             (left, max(18, top - 6)), cv2.FONT_HERSHEY_SIMPLEX,
             0.55, (0, 0, 255), 2)
 
-    colors = ((0, 255, 255), (255, 128, 0))
+    colors = ((0, 255, 255), (255, 128, 0), (255, 0, 255),
+              (0, 255, 0), (255, 255, 0), (0, 128, 255))
     scale_x = float(image.shape[1]) / MODEL_WIDTH
     scale_y = float(image.shape[0]) / MODEL_HEIGHT
     for path_index, path in enumerate(result["centerline"]["paths"]):
@@ -303,7 +325,8 @@ def _draw_result(image, result):
             [[int(x * scale_x), int(y * scale_y)] for x, y, _ in path],
             dtype=np.int32)
         if len(points) >= 2:
-            cv2.polylines(image, [points], False, colors[path_index], 2,
+            cv2.polylines(image, [points], False,
+                          colors[path_index % len(colors)], 2,
                           cv2.LINE_AA)
     topology = result["topology"]
     topology_text = "TOPO {} {:.2f}".format(

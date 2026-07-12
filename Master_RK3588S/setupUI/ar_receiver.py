@@ -108,7 +108,6 @@ class RuntimeState:
         road_mask = road.get("mask")
         road_coverage = float(np.mean(road_mask)) if isinstance(road_mask, np.ndarray) and road_mask.size else 0.0
         paths = centerline.get("paths") or []
-        primary = centerline.get("primary") or []
         summary = {
             "enabled": not bool(error),
             "status": "error" if error else ("ready" if result else "not_started"),
@@ -117,7 +116,7 @@ class RuntimeState:
             "detection_labels": labels,
             "road_coverage": road_coverage,
             "path_count": len(paths),
-            "primary_point_count": len(primary),
+            "path_point_counts": [len(path) for path in paths],
             "topology": str(topology.get("label") or ""),
             "topology_confidence": float(topology.get("confidence") or 0.0),
             "topology_reliable": bool(topology.get("reliable", False)),
@@ -540,10 +539,10 @@ def create_control_runtime(state):
         return None
 
 
-def add_runtime_overlay(frame, fps, ocr_response):
+def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     cv2.putText(
         frame,
-        f"Client FPS: {fps:.1f}",
+        f"Actual FPS: {process_fps:.1f}  AI FPS: {inference_fps:.1f}",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -663,6 +662,8 @@ def main():
             fps_started = time.time()
             fps_frames = 0
             current_fps = 0.0
+            inference_frames = 0
+            current_inference_fps = 0.0
             latest_ocr_response = None
 
             while shm is not None:
@@ -694,6 +695,7 @@ def main():
                     try:
                         infer_result, ready = infer.infer(frame)
                         if ready and isinstance(infer_result, dict):
+                            inference_frames += 1
                             inferred_frame = infer_result.get("frame")
                             display_frame = inferred_frame if inferred_frame is not None else frame
                             detections = infer_result.get("detections") or []
@@ -743,10 +745,14 @@ def main():
                 now = time.time()
                 if now - fps_started >= 1.0:
                     current_fps = fps_frames / max(1e-6, now - fps_started)
+                    current_inference_fps = inference_frames / max(1e-6, now - fps_started)
                     fps_frames = 0
+                    inference_frames = 0
                     fps_started = now
 
-                add_runtime_overlay(display_frame, current_fps, latest_ocr_response)
+                add_runtime_overlay(
+                    display_frame, current_fps, current_inference_fps,
+                    latest_ocr_response)
                 if state.preview_enabled():
                     preview.show(display_frame)
     except KeyboardInterrupt:
