@@ -1,0 +1,45 @@
+查完后的明确结论是：**最成熟、最适合 RK3588 部署借鉴的是 UFLD-v2，但不能直接套在当前单通道热图上，需要重新训练中线输出头。**
+
+| 方案 | 开源情况 | 当前模型能否直接接入 | 评价 |
+|---|---|---:|---|
+| UFLD-v2 | 作者官方、MIT、提供 ONNX/TensorRT 部署 | 需要换中线 Head 并重训 | 最推荐 |
+| LaneDet | Apache-2.0，集成 SCNN/RESA/UFLD/CondLane | 需要独立路径通道 | 很适合参考源码 |
+| CondLaneNet | 作者官方、Apache-2.0、支持复杂曲线 | 需要整个模型输出配合 | 分叉能力强，但 RKNN 适配复杂 |
+| CLRNet | 作者官方、Apache-2.0 | 需要替换整个中线模型 | 准确率高，但比 UFLD 更重 |
+| scikit-image MCP | 成熟最小代价路径库 | 可直接处理当前概率图 | 端点和双路径仍需自己设计 |
+
+**推荐：UFLD-v2**
+
+[UFLD-v2 官方仓库](https://github.com/cfzd/Ultra-Fast-Lane-Detection-v2)已经包含：
+
+- 固定行锚点预测；
+- 每个锚点的位置分类和存在性判断；
+- 可配置 `num_lanes`；
+- ONNX 导出；
+- TensorRT 部署和完整坐标解码代码；
+- MIT 许可证。
+
+它不再依赖中线像素必须连续，而是每条路径拥有固定身份，并在每个采样行直接输出横坐标。某几个采样行识别失败，只会让该路径缺少几个点，不会把后半段创建成“第二条线”。官方解码可以直接参考 [trt_infer.py](https://github.com/cfzd/Ultra-Fast-Lane-Detection-v2/blob/master/deploy/trt_infer.py)。
+
+适配当前系统时建议只借用它的行锚点分支：
+
+```text
+path_location: [1, 横向格数, 采样行数, 2]
+path_existence: [1, 2, 采样行数, 2]
+```
+
+这里最后一维的 `2` 就是最多两条中心路径。只有一条时第二个槽位不存在；分叉时两条路径可以先共享相同坐标，再分别向左右展开。
+
+**为什么其他源码不能直接搬**
+
+LaneDet 的成熟分割解码确实会做 `9×9` 平滑、逐行取最大值和样条插值，但它要求每条线分别拥有一个概率通道。[LaneSeg 源码](https://github.com/Turoad/lanedet/blob/master/lanedet/models/heads/lane_seg.py) 不能可靠拆分当前共享热图中的两个分支。[LaneDet](https://github.com/Turoad/lanedet) 本身采用 Apache-2.0，可以作为训练和后处理参考。
+
+[CondLaneNet](https://github.com/aliyun/conditional-lane-detection)能够处理复杂曲线和可变数量路径，也有官方模型和 Apache-2.0 代码，但依赖种子、实例掩码、位置偏移和动态卷积，转换成当前单一 RKNN 多任务模型更困难。
+
+[CLRNet](https://github.com/Turoad/CLRNet)也是成熟方案，但需要整套车道提案、逐层细化和 NMS，不适合作为现有热图的简单后处理替换。
+
+**现实限制**
+
+当前工作区只有编译好的 `.rknn` 模型，没有 Pixel Head、Loss、数据加载和训练源码。因此现在只能继续修改 CPU 后处理，无法直接把 UFLD-v2 Head 加进模型并重新导出。
+
+生产方案应当是：取得原多任务模型训练工程，把共享中线热图 Head 换成 UFLD-v2 的双路径行锚点 Head，再重新训练并导出 RKNN。继续修补当前单通道热图很难从根本上区分“同一条线的断段”和“真正的第二条分支”。

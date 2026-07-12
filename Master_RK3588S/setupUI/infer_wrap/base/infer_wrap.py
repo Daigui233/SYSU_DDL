@@ -9,9 +9,9 @@ def get_current_dir():
 
 
 class InferWrap:
-    """Threaded single-RKNN multi-task inference wrapper."""
+    """Three-core pipelined wrapper for the multi-task RKNN model."""
 
-    def __init__(self, model_dir="model", TPEs=1, model_path=None):
+    def __init__(self, model_dir="model", TPEs=3, model_path=None):
         # Keep rknnlite board-only: NumPy post-processing can still be imported
         # and tested on a development PC without the RKNN runtime installed.
         from .rknnpool import rknnPoolExecutor
@@ -19,14 +19,20 @@ class InferWrap:
         model_dir = get_current_dir() / model_dir
         selected_model = self.get_model_path(model_dir, model_path)
         self.model_path = str(selected_model)
-        self.TPEs = max(1, int(TPEs))
+        # RK3588S exposes three NPU cores. Keep one runtime on each core and
+        # three frames in flight to maximize throughput without oversubscription.
+        self.TPEs = max(1, min(int(TPEs), 3))
         try:
-            requested_depth = int(os.environ.get("MULTITASK_PIPELINE_DEPTH", "1"))
+            requested_depth = int(os.environ.get(
+                "MULTITASK_PIPELINE_DEPTH", str(self.TPEs)))
         except ValueError:
-            requested_depth = 1
+            requested_depth = self.TPEs
         self.pipeline_depth = max(1, min(requested_depth, self.TPEs))
         self.rknn_pool = rknnPoolExecutor(
-            rknnModel=self.model_path, TPEs=self.TPEs, func=myFunc)
+            rknnModel=self.model_path,
+            TPEs=self.TPEs,
+            func=myFunc,
+        )
         self.pending = 0
 
     @staticmethod

@@ -36,12 +36,17 @@ export MULTITASK_DET_THRESHOLD=0.25
 export MULTITASK_NMS_THRESHOLD=0.60
 export MULTITASK_ROAD_THRESHOLD=0.50
 export MULTITASK_CENTERLINE_THRESHOLD=0.25
+export MULTITASK_CENTERLINE_MIN_POINTS=8
+export MULTITASK_CENTERLINE_MAX_PEAKS_PER_ROW=3
+export MULTITASK_CENTERLINE_MAX_JUMP=8
+export MULTITASK_CENTERLINE_ROAD_FLOOR=0.10
+export MULTITASK_CENTERLINE_FIT_BLEND=0.45
 export MULTITASK_TOPOLOGY_THRESHOLD=0.45
 ```
 
-智能车默认采用低延迟模式：`MULTITASK_RKNN_TPES=1`、
-`MULTITASK_PIPELINE_DEPTH=1`。只有实测确认允许增加帧延迟时，才提高并行实例数和
-流水深度；流水深度为 3 意味着结果大约落后 2 帧。
+智能车默认创建 3 个 RKNN 运行时并分别绑定 RK3588S 的 3 个 NPU 核：
+`MULTITASK_RKNN_TPES=3`、`MULTITASK_PIPELINE_DEPTH=3`。这样会保持 3 帧并行推理，
+结果大约落后 2 帧；如需最低延迟可将两个参数同时设为 1。
 
 ## Python 结果接口
 
@@ -51,7 +56,9 @@ export MULTITASK_TOPOLOGY_THRESHOLD=0.45
 - `detections`：NMS 后检测列表，坐标已映射到原图。
 - `ocr_frame`：检测到 `TurnSign` 时提供给现有 OCR 的未绘制原图。
 - `road`：`probability`、二值 `mask`、阈值和 stride。
-- `centerline`：热图、道路软约束得分、最多两条 `paths` 和 `primary`。
+- `centerline`：热图、道路软约束得分，以及长度达标且平均置信度最高的两条 `paths`。
+  路径解码会限制横向跳变和空白行续接，峰值使用邻域加权中心，最终路径使用置信度
+  加权二次拟合平滑；这些处理均为单帧空间处理，不增加帧间延迟。
 - `topology`：类别、置信度、是否达到可靠阈值及四类概率。
 
 NMS、道路阈值、中线峰值/动态规划和拓扑解析都在 CPU，不进入 RKNN 图。

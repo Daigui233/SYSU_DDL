@@ -53,6 +53,8 @@ class RuntimeState:
         self._api_reason = ""
         self._ocr_worker_ready = False
         self._ocr_error = ""
+        self._process_fps = 0.0
+        self._inference_fps = 0.0
         self._control_status = {"enabled": False, "status": "not_started"}
         self._perception_status = {"enabled": False, "status": "not_started"}
 
@@ -95,6 +97,11 @@ class RuntimeState:
         with self._lock:
             self._control_status = status if isinstance(status, dict) else {"enabled": False, "status": str(status)}
 
+    def update_performance(self, process_fps, inference_fps):
+        with self._lock:
+            self._process_fps = float(process_fps)
+            self._inference_fps = float(inference_fps)
+
     def update_perception(self, result=None, error=""):
         result = result if isinstance(result, dict) else {}
         detections = result.get("detections") or []
@@ -136,6 +143,8 @@ class RuntimeState:
                 "api_reason": self._api_reason,
                 "ocr_worker_ready": self._ocr_worker_ready,
                 "ocr_error": self._ocr_error,
+                "process_fps": self._process_fps,
+                "inference_fps": self._inference_fps,
                 "control": self._control_status,
                 "perception": self._perception_status,
             }
@@ -599,10 +608,12 @@ def main():
 
         if not CLASSES:
             raise RuntimeError("detector class list is empty")
-        infer = InferWrap(TPEs=max(1, env_int("MULTITASK_RKNN_TPES", 1)))
+        infer = InferWrap(TPEs=max(1, env_int("MULTITASK_RKNN_TPES", 3)))
         print(
             f"[PERCEPTION] enabled model={infer.model_path} "
-            f"classes={len(CLASSES)}: {', '.join(CLASSES)}"
+            f"classes={len(CLASSES)}: {', '.join(CLASSES)} "
+            f"npu_workers={infer.TPEs} "
+            f"pipeline_depth={infer.pipeline_depth}"
         )
     except Exception as exc:
         infer = None
@@ -749,6 +760,8 @@ def main():
                     fps_frames = 0
                     inference_frames = 0
                     fps_started = now
+                    state.update_performance(
+                        current_fps, current_inference_fps)
 
                 add_runtime_overlay(
                     display_frame, current_fps, current_inference_fps,

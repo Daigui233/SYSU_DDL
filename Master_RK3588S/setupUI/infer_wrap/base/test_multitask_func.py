@@ -2,7 +2,13 @@ import unittest
 
 import numpy as np
 
-from .func import CLASSES, candidate_centerlines, decode_outputs, parse_outputs
+from .func import (
+    CLASSES,
+    _row_peaks,
+    candidate_centerlines,
+    decode_outputs,
+    parse_outputs,
+)
 
 
 class MultiTaskPostprocessTest(unittest.TestCase):
@@ -61,6 +67,67 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertGreaterEqual(len(paths), 2)
         self.assertGreaterEqual(len(paths[0]), 10)
         self.assertGreaterEqual(len(paths[1]), 5)
+
+    def test_centerlines_keep_two_best_long_paths(self):
+        road = np.ones((120, 160), dtype=np.float32)
+        center = np.zeros((120, 160), dtype=np.float32)
+        for row in range(30, 118):
+            center[row, 40] = 0.70
+            center[row, 80] = 0.95
+            center[row, 120] = 0.85
+        # This produces seven sampled points: strong, but still too short.
+        center[98:119, 20] = 1.0
+
+        paths, _ = candidate_centerlines(road, center)
+
+        self.assertEqual(len(paths), 2)
+        average_confidences = [
+            sum(point[2] for point in path) / len(path) for path in paths
+        ]
+        self.assertGreater(average_confidences[0], average_confidences[1])
+        self.assertAlmostEqual(average_confidences[0], 0.95, places=5)
+        self.assertAlmostEqual(average_confidences[1], 0.85, places=5)
+
+    def test_single_centerline_is_not_duplicated(self):
+        road = np.ones((120, 160), dtype=np.float32)
+        center = np.zeros((120, 160), dtype=np.float32)
+        center[30:118, 80] = 0.90
+
+        paths, _ = candidate_centerlines(road, center)
+
+        self.assertEqual(len(paths), 1)
+
+    def test_peak_position_uses_weighted_neighborhood(self):
+        values = np.zeros(20, dtype=np.float32)
+        values[9:13] = [0.50, 1.00, 0.80, 0.40]
+
+        peaks = _row_peaks(values, threshold=0.25, max_peaks=1)
+
+        self.assertEqual(len(peaks), 1)
+        self.assertGreater(peaks[0][0], 10.0)
+        self.assertLess(peaks[0][0], 11.0)
+
+    def test_blank_rows_do_not_join_two_short_segments(self):
+        road = np.ones((120, 160), dtype=np.float32)
+        center = np.zeros((120, 160), dtype=np.float32)
+        for row in [118, 115, 112, 109, 106, 88, 85, 82, 79, 76]:
+            center[row, 80] = 0.95
+
+        paths, _ = candidate_centerlines(road, center)
+
+        self.assertEqual(paths, [])
+
+    def test_curve_fit_reduces_single_frame_zigzag(self):
+        road = np.ones((120, 160), dtype=np.float32)
+        center = np.zeros((120, 160), dtype=np.float32)
+        for index, row in enumerate(range(118, 29, -3)):
+            center[row, 79 if index % 2 == 0 else 81] = 0.90
+
+        paths, _ = candidate_centerlines(road, center)
+
+        self.assertEqual(len(paths), 1)
+        x_values = [point[0] for point in paths[0]]
+        self.assertLess(max(x_values) - min(x_values), 8)
 
 
 if __name__ == "__main__":

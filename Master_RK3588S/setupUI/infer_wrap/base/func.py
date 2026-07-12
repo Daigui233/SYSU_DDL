@@ -24,13 +24,31 @@ def _env_float(name, default):
         return float(default)
 
 
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.25)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.60)
 ROAD_THRESHOLD = _env_float("MULTITASK_ROAD_THRESHOLD", 0.50)
 ROAD_OVERLAY_ALPHA = _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28)
 CENTERLINE_THRESHOLD = _env_float("MULTITASK_CENTERLINE_THRESHOLD", 0.25)
+CENTERLINE_MIN_POINTS = max(
+    3, _env_int("MULTITASK_CENTERLINE_MIN_POINTS", 8))
+CENTERLINE_MAX_PEAKS_PER_ROW = max(
+    1, _env_int("MULTITASK_CENTERLINE_MAX_PEAKS_PER_ROW", 3))
+CENTERLINE_MAX_JUMP = max(
+    1.0, _env_float("MULTITASK_CENTERLINE_MAX_JUMP", 8.0))
+CENTERLINE_ROAD_FLOOR = float(np.clip(
+    _env_float("MULTITASK_CENTERLINE_ROAD_FLOOR", 0.10), 0.0, 1.0))
+CENTERLINE_FIT_BLEND = float(np.clip(
+    _env_float("MULTITASK_CENTERLINE_FIT_BLEND", 0.45), 0.0, 1.0))
 TOPOLOGY_THRESHOLD = _env_float("MULTITASK_TOPOLOGY_THRESHOLD", 0.45)
 MAX_DETECTIONS = 100
+MAX_CENTERLINE_PATHS = 2
 
 
 def _load_classes():
@@ -174,7 +192,8 @@ def build_detections(image_shape, nms_results):
     return detections
 
 
-def _row_peaks(values, threshold, max_peaks=None, min_distance=3):
+def _row_peaks(values, threshold, max_peaks=None, min_distance=3,
+               refine_radius=2):
     if len(values) < 3:
         return []
     mask = ((values[1:-1] >= values[:-2]) &
@@ -183,23 +202,41 @@ def _row_peaks(values, threshold, max_peaks=None, min_distance=3):
     indices = np.flatnonzero(mask) + 1
     indices = sorted(indices, key=lambda x: values[x], reverse=True)
     selected = []
+    selected_indices = []
     for index in indices:
         if all(abs(int(index) - previous) >= min_distance
-               for previous, _ in selected):
-            selected.append((int(index), float(values[index])))
+               for previous in selected_indices):
+            left = max(0, int(index) - refine_radius)
+            right = min(len(values), int(index) + refine_radius + 1)
+            positions = np.arange(left, right, dtype=np.float32)
+            weights = np.maximum(
+                np.asarray(values[left:right], dtype=np.float32) - threshold,
+                0.0,
+            )
+            weight_sum = float(weights.sum())
+            refined_x = (
+                float(np.dot(positions, weights) / weight_sum)
+                if weight_sum > 1e-9 else float(index)
+            )
+            selected_indices.append(int(index))
+            selected.append((refined_x, float(values[index])))
             if max_peaks is not None and len(selected) >= max_peaks:
                 break
     return selected
 
 
-def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
-                     min_points=3):
+def _trace_all_paths(rows, candidates, max_jump=CENTERLINE_MAX_JUMP,
+                     max_missing_rows=2,
+                     min_points=CENTERLINE_MIN_POINTS):
     """Connect every row peak into a path without selecting a driving route."""
     tracks = []
-    for row_index, (row, peaks) in enumerate(zip(rows, candidates)):
+    row_spacing = (
+        max(1, abs(int(rows[1]) - int(rows[0]))) if len(rows) > 1 else 1)
+    max_row_gap = row_spacing * (max_missing_rows + 1)
+    for row, peaks in zip(rows, candidates):
         active = [
             index for index, track in enumerate(tracks)
-            if row_index - track["last_row_index"] <= max_missing_rows + 1
+            if abs(int(row) - track["last_row"]) <= max_row_gap
         ]
         pairs = []
         for track_index in active:
@@ -216,7 +253,7 @@ def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
                 continue
             x, confidence = peaks[peak_index]
             tracks[track_index]["points"].append((x, row, confidence))
-            tracks[track_index]["last_row_index"] = row_index
+            tracks[track_index]["last_row"] = int(row)
             used_tracks.add(track_index)
             used_peaks.add(peak_index)
 
@@ -225,21 +262,68 @@ def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
             if peak_index not in used_peaks:
                 tracks.append({
                     "points": [(x, row, confidence)],
-                    "last_row_index": row_index,
+                    "last_row": int(row),
                 })
 
     paths = [track["points"] for track in tracks
              if len(track["points"]) >= min_points]
-    paths.sort(
-        key=lambda path: (len(path), sum(point[2] for point in path)),
-        reverse=True)
     return paths
+
+
+def _smooth_path(path, fit_blend=CENTERLINE_FIT_BLEND):
+    """Blend a confidence-weighted curve fit with the decoded peak points."""
+    if len(path) < 3 or fit_blend <= 0.0:
+        return path
+    x_values = np.asarray([point[0] for point in path], dtype=np.float32)
+    y_values = np.asarray([point[1] for point in path], dtype=np.float32)
+    confidences = np.asarray([point[2] for point in path], dtype=np.float32)
+    y_center = float(y_values.mean())
+    y_scale = max(float(np.ptp(y_values)), 1.0)
+    normalized_y = (y_values - y_center) / y_scale
+    degree = 2 if len(path) >= 5 else 1
+    design = (
+        np.column_stack((normalized_y * normalized_y,
+                         normalized_y,
+                         np.ones_like(normalized_y)))
+        if degree == 2
+        else np.column_stack((normalized_y, np.ones_like(normalized_y)))
+    )
+    weights = np.sqrt(np.maximum(confidences, 1e-3))
+    weighted_design = design * weights[:, None]
+    weighted_x = x_values * weights
+    try:
+        normal_matrix = weighted_design.T @ weighted_design
+        normal_matrix += np.eye(
+            normal_matrix.shape[0], dtype=np.float32) * 1e-6
+        coefficients = np.linalg.solve(
+            normal_matrix,
+            weighted_design.T @ weighted_x,
+        )
+        fitted_x = design @ coefficients
+    except (FloatingPointError, TypeError, ValueError, np.linalg.LinAlgError):
+        return path
+    blend = float(np.clip(fit_blend, 0.0, 1.0))
+    smoothed_x = np.clip(
+        x_values * (1.0 - blend) + fitted_x * blend,
+        0.0,
+        (MODEL_WIDTH // PIXEL_STRIDE) - 1.0,
+    )
+    return [
+        (float(x), int(y), float(confidence))
+        for x, (_, y, confidence) in zip(smoothed_x, path)
+    ]
 
 
 def candidate_centerlines(road_probability, center_probability,
                           peak_threshold=CENTERLINE_THRESHOLD,
-                          max_peaks_per_row=None, row_step=3, road_floor=0.25):
-    """Extract all visible centerline paths without choosing a route."""
+                          max_peaks_per_row=CENTERLINE_MAX_PEAKS_PER_ROW,
+                          row_step=3,
+                          road_floor=CENTERLINE_ROAD_FLOOR,
+                          min_path_points=CENTERLINE_MIN_POINTS,
+                          max_paths=MAX_CENTERLINE_PATHS,
+                          max_jump=CENTERLINE_MAX_JUMP,
+                          fit_blend=CENTERLINE_FIT_BLEND):
+    """Return at most the two most confident sufficiently long paths."""
     score = center_probability * (
         road_floor + (1.0 - road_floor) * road_probability)
     rows = list(range(score.shape[0] - 2,
@@ -248,11 +332,25 @@ def candidate_centerlines(road_probability, center_probability,
     candidates = []
     for row in rows:
         peaks = _row_peaks(score[row], peak_threshold, max_peaks_per_row)
-        if peaks:
-            sampled_rows.append(row)
-            candidates.append(peaks)
-    paths = _trace_all_paths(sampled_rows, candidates)
-    return [[(int(x * PIXEL_STRIDE), int(y * PIXEL_STRIDE), float(confidence))
+        sampled_rows.append(row)
+        candidates.append(peaks)
+    paths = _trace_all_paths(
+        sampled_rows,
+        candidates,
+        max_jump=max(1.0, float(max_jump)),
+        min_points=max(3, int(min_path_points)),
+    )
+    paths.sort(
+        key=lambda path: (
+            sum(point[2] for point in path) / len(path),
+            len(path),
+        ),
+        reverse=True,
+    )
+    paths = paths[:max(0, min(int(max_paths), MAX_CENTERLINE_PATHS))]
+    paths = [_smooth_path(path, fit_blend) for path in paths]
+    return [[(int(round(x * PIXEL_STRIDE)),
+              int(round(y * PIXEL_STRIDE)), float(confidence))
              for x, y, confidence in path] for path in paths], score
 
 
@@ -316,17 +414,16 @@ def _draw_result(image, result):
             (left, max(18, top - 6)), cv2.FONT_HERSHEY_SIMPLEX,
             0.55, (0, 0, 255), 2)
 
-    colors = ((0, 255, 255), (255, 128, 0), (255, 0, 255),
-              (0, 255, 0), (255, 255, 0), (0, 128, 255))
+    centerline_color = (0, 255, 255)
     scale_x = float(image.shape[1]) / MODEL_WIDTH
     scale_y = float(image.shape[0]) / MODEL_HEIGHT
-    for path_index, path in enumerate(result["centerline"]["paths"]):
+    for path in result["centerline"]["paths"]:
         points = np.asarray(
             [[int(x * scale_x), int(y * scale_y)] for x, y, _ in path],
             dtype=np.int32)
         if len(points) >= 2:
             cv2.polylines(image, [points], False,
-                          colors[path_index % len(colors)], 2,
+                          centerline_color, 2,
                           cv2.LINE_AA)
     topology = result["topology"]
     topology_text = "TOPO {} {:.2f}".format(
