@@ -12,8 +12,9 @@ import cv2
 import numpy as np
 
 
-DEFAULT_API_TYPE = "aistudio"
-DEFAULT_MODEL = "ernie-4.0-turbo-8k"
+DEFAULT_API_TYPE = "aistudio-v3"
+DEFAULT_API_BASE_URL = "https://aistudio.baidu.com/llm/lmapi/v3"
+DEFAULT_MODEL = "ernie-4.5-turbo-32k"
 API_CACHE_VERSION = os.environ.get("AR_TURNSIGN_API_CACHE_VERSION", "api_v3_left_right")
 
 DEFAULT_SYSTEM_PROMPT = """你是智能车路牌语义决策器。赛道在每个决策点只有左、右两条实际道路，不存在第三条可选道路。
@@ -344,7 +345,8 @@ class WenxinRouteInterpreter:
         api_key=None,
         api_url=None,
     ):
-        # api_key/api_url are kept only for old caller compatibility; the active backend is ERNIE SDK + AI Studio.
+        # api_key remains supported for old callers; both names contain the
+        # AI Studio access token used by its OpenAI-compatible endpoint.
         load_local_ocr_env()
         self.access_token = (
             access_token
@@ -368,9 +370,21 @@ class WenxinRouteInterpreter:
         self.temperature = max(0.01, min(1.0, float(temperature)))
         self.system_prompt = system_prompt or os.environ.get("AR_TURNSIGN_PROMPT") or DEFAULT_SYSTEM_PROMPT
         self.api_type = DEFAULT_API_TYPE
+        self.api_url = (
+            api_url
+            or os.environ.get("AR_TURNSIGN_API_BASE_URL")
+            or DEFAULT_API_BASE_URL
+        ).rstrip("/")
+        self.max_retries = max(0, int(os.environ.get("AR_TURNSIGN_API_MAX_RETRIES", "2")))
+        self.trust_env = os.environ.get("AR_TURNSIGN_API_TRUST_ENV", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._api_client = None
+        self._http_client = None
         self.log_func = log_func or (lambda message: None)
-        if api_url:
-            self.log_func("turnsign api_url ignored: ERNIE SDK uses api_type='aistudio'")
 
     def enabled(self):
         return self.api_enabled and bool(self.access_token)
@@ -390,17 +404,17 @@ class WenxinRouteInterpreter:
 
         user_payload = self._build_user_payload(source_text, ocr_confidence, context)
         try:
-            content = self._call_erniebot(user_payload)
+            content = self._call_openai(user_payload)
         except ImportError as exc:
-            result = fixed_unknown_result(source_text, "erniebot_import_failed")
+            result = fixed_unknown_result(source_text, "openai_import_failed")
             result["api_error"] = str(exc)
-            result["install_hint"] = "pip install erniebot"
+            result["install_hint"] = "pip install openai httpx"
             result["api_type"] = self.api_type
             result["api_model"] = self.model
             result["ocr_confidence"] = float(ocr_confidence or 0.0)
             return result
         except Exception as exc:
-            self.log_func(f"turnsign ERNIE SDK call failed: {exc}")
+            self.log_func(f"turnsign AI Studio v3 call failed: {exc}")
             result = fixed_unknown_result(source_text, "api_request_failed")
             result["api_error"] = str(exc)
             result["api_type"] = self.api_type
@@ -420,42 +434,44 @@ class WenxinRouteInterpreter:
             result["api_parse_error"] = "api_invalid_json"
         return result
 
-    def _call_erniebot(self, user_payload):
+    def _ensure_api_client(self):
+        if self._api_client is not None:
+            return self._api_client
         try:
-            import erniebot
+            import httpx
+            from openai import OpenAI
         except Exception as exc:
-            raise ImportError(f"erniebot import failed: {exc}") from exc
+            raise ImportError(f"OpenAI-compatible client import failed: {exc}") from exc
 
-        erniebot.api_type = self.api_type
-        erniebot.access_token = self.access_token
+        self._http_client = httpx.Client(
+            trust_env=self.trust_env,
+            timeout=self.timeout,
+        )
+        self._api_client = OpenAI(
+            api_key=self.access_token,
+            base_url=self.api_url,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            http_client=self._http_client,
+        )
+        return self._api_client
+
+    def _call_openai(self, user_payload):
+        client = self._ensure_api_client()
 
         content = (
             "请分析以下 OCR 数据并完成左右二选一：\n"
             f"{user_payload}\n"
             "只能输出 {\"direction\":\"left\"} 或 {\"direction\":\"right\"}。"
         )
-        kwargs = {
-            "_config_": {
-                "api_type": self.api_type,
-                "access_token": self.access_token,
-            },
-            "model": self.model,
-            "messages": [{"role": "user", "content": content}],
-            "system": self.system_prompt,
-            "request_timeout": self.timeout,
-        }
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
-
-        try:
-            response = erniebot.ChatCompletion.create(**kwargs)
-        except TypeError as exc:
-            message = str(exc)
-            if "request_timeout" not in message and "temperature" not in message:
-                raise
-            kwargs.pop("temperature", None)
-            kwargs.pop("request_timeout", None)
-            response = erniebot.ChatCompletion.create(**kwargs)
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": content},
+            ],
+            temperature=self.temperature,
+        )
         return self._extract_content(response)
 
     @staticmethod
