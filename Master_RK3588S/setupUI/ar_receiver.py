@@ -114,6 +114,16 @@ class RuntimeState:
         road_mask = road.get("mask")
         road_coverage = float(np.mean(road_mask)) if isinstance(road_mask, np.ndarray) and road_mask.size else 0.0
         paths = centerline.get("paths") or []
+        temporal = result.get("temporal") or {}
+        timings = result.get("timings_ms") or {}
+        path_scores = centerline.get("path_scores")
+        if isinstance(path_scores, np.ndarray):
+            path_scores = path_scores.tolist()
+        path_count_scores = centerline.get("path_count_scores")
+        if path_count_scores is None:
+            path_count_scores = centerline.get("path_count_probabilities")
+        if isinstance(path_count_scores, np.ndarray):
+            path_count_scores = path_count_scores.tolist()
         summary = {
             "enabled": not bool(error),
             "status": "error" if error else ("ready" if result else "not_started"),
@@ -122,11 +132,24 @@ class RuntimeState:
             "detection_labels": labels,
             "road_coverage": road_coverage,
             "path_count": int(centerline.get("path_count", len(paths))),
-            "path_point_counts": [len(path.get("points") or [])
-                                  for path in paths],
-            "path_scores": list(centerline.get("path_scores") or []),
-            "path_count_probabilities": list(
-                centerline.get("path_count_probabilities") or []),
+            "path_point_counts": [
+                len(path.get("points_xy"))
+                if path.get("points_xy") is not None else 0
+                for path in paths
+            ],
+            "path_roles": [str(path.get("role") or "") for path in paths],
+            "path_scores": list(path_scores or []),
+            "path_count_scores": list(path_count_scores or []),
+            "raw_path_count": int(temporal.get(
+                "raw_path_count", centerline.get("path_count", len(paths)))),
+            "temporal_status": str(temporal.get("status") or "disabled"),
+            "temporal_pending_count": temporal.get("pending_path_count"),
+            "timings_ms": {
+                key: float(timings.get(key, 0.0))
+                for key in (
+                    "preprocess", "inference", "fifo_wait", "postprocess",
+                    "temporal_filter", "total")
+            },
         }
         with self._lock:
             self._perception_status = summary
@@ -405,13 +428,18 @@ class FfplayPreview:
                     continue
                 if frame is None:
                     break
+                renderer = None
+                if isinstance(frame, tuple):
+                    frame, renderer = frame
+                if renderer is not None:
+                    frame = renderer(frame)
                 payload = memoryview(np.ascontiguousarray(frame)).cast("B")
                 while payload and not stop_event.is_set():
                     written = os.write(process.stdin.fileno(), payload)
                     if written <= 0:
                         raise BrokenPipeError("ffplay input closed")
                     payload = payload[written:]
-        except (BrokenPipeError, OSError, ValueError) as exc:
+        except Exception as exc:
             if not stop_event.is_set():
                 error = str(exc)
         finally:
@@ -421,7 +449,7 @@ class FfplayPreview:
                 self.state.set_preview_enabled(False)
             self.state.set_preview_runtime(False, "" if intentional else error)
 
-    def show(self, frame):
+    def show(self, frame, renderer=None):
         if frame is None or frame.size == 0:
             return
         height, width = frame.shape[:2]
@@ -440,14 +468,14 @@ class FfplayPreview:
         if frames is None:
             return
         try:
-            frames.put_nowait(frame)
+            frames.put_nowait((frame, renderer))
         except queue.Full:
             try:
                 frames.get_nowait()
             except queue.Empty:
                 pass
             try:
-                frames.put_nowait(frame)
+                frames.put_nowait((frame, renderer))
             except queue.Full:
                 pass
 
@@ -602,9 +630,14 @@ def read_frame(shm):
 def main():
     # Keep RKNN initialization under the main guard.  The OCR worker uses the
     # multiprocessing "spawn" method and must not initialize the NPU again.
+    render_perception = None
+    render_mode = "off"
     try:
         from infer_wrap import InferWrap
-        from infer_wrap.base.func import CLASSES
+        from infer_wrap.base.func import CLASSES, RENDER_MODE, render_result
+
+        render_perception = render_result
+        render_mode = RENDER_MODE
 
         if not CLASSES:
             raise RuntimeError("detector class list is empty")
@@ -612,8 +645,12 @@ def main():
         print(
             f"[PERCEPTION] enabled model={infer.model_path} "
             f"classes={len(CLASSES)}: {', '.join(CLASSES)} "
+            f"npu_mode={infer.npu_mode} "
             f"npu_workers={infer.TPEs} "
-            f"pipeline_depth={infer.pipeline_depth}"
+            f"pipeline_depth={infer.pipeline_depth} "
+            f"render_mode={render_mode} "
+            f"warmup_inference_ms="
+            f"{','.join(f'{value:.1f}' for value in infer.warmup_inference_ms) or 'disabled'}"
         )
     except Exception as exc:
         infer = None
@@ -702,12 +739,16 @@ def main():
                 display_frame = frame
                 detections = []
                 ocr_source_frame = frame
+                perception_result = None
                 if infer is not None:
                     try:
                         infer_result, ready = infer.infer(frame)
                         if ready and isinstance(infer_result, dict):
                             inference_frames += 1
-                            inferred_frame = infer_result.get("frame")
+                            perception_result = infer_result
+                            inferred_frame = infer_result.get("_source_frame")
+                            if inferred_frame is None:
+                                inferred_frame = infer_result.get("frame")
                             display_frame = inferred_frame if inferred_frame is not None else frame
                             detections = infer_result.get("detections") or []
                             state.update_perception(infer_result)
@@ -763,11 +804,19 @@ def main():
                     state.update_performance(
                         current_fps, current_inference_fps)
 
-                add_runtime_overlay(
-                    display_frame, current_fps, current_inference_fps,
-                    latest_ocr_response)
                 if state.preview_enabled():
-                    preview.show(display_frame)
+                    def render_preview(
+                            target,
+                            result=perception_result,
+                            process_fps=current_fps,
+                            inference_fps=current_inference_fps,
+                            ocr_response=latest_ocr_response):
+                        if result is not None and render_perception is not None:
+                            render_perception(target, result, mode=render_mode)
+                        return add_runtime_overlay(
+                            target, process_fps, inference_fps, ocr_response)
+
+                    preview.show(display_frame, renderer=render_preview)
     except KeyboardInterrupt:
         print("\n[AR_RECEIVER] stopped by user")
     finally:

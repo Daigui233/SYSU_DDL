@@ -1,7 +1,11 @@
 import os
+import time
 from pathlib import Path
 
-from .func import myFunc
+import numpy as np
+
+from .func import finalize_inference, inference_worker
+from .path_temporal_filter import PathTemporalFilter
 
 
 def get_current_dir():
@@ -19,9 +23,15 @@ class InferWrap:
         model_dir = get_current_dir() / model_dir
         selected_model = self.get_model_path(model_dir, model_path)
         self.model_path = str(selected_model)
-        # RK3588S exposes three NPU cores. Keep one runtime on each core and
-        # three frames in flight to maximize throughput without oversubscription.
-        self.TPEs = max(1, min(int(TPEs), 3))
+        # Parallel mode keeps one runtime per NPU core for throughput. The
+        # all-cores mode is available for final-model latency comparison.
+        self.npu_mode = os.environ.get(
+            "MULTITASK_NPU_MODE", "parallel").strip().lower()
+        if self.npu_mode not in {"parallel", "all_cores"}:
+            raise ValueError(
+                "MULTITASK_NPU_MODE must be parallel or all_cores")
+        use_all_cores = self.npu_mode == "all_cores"
+        self.TPEs = 1 if use_all_cores else max(1, min(int(TPEs), 3))
         try:
             requested_depth = int(os.environ.get(
                 "MULTITASK_PIPELINE_DEPTH", str(self.TPEs)))
@@ -31,9 +41,31 @@ class InferWrap:
         self.rknn_pool = rknnPoolExecutor(
             rknnModel=self.model_path,
             TPEs=self.TPEs,
-            func=myFunc,
+            func=inference_worker,
+            use_all_cores=use_all_cores,
         )
+        self.warmup_inference_ms = []
+        warmup_value = os.environ.get("MULTITASK_RKNN_WARMUP", "1")
+        warmup_enabled = warmup_value.strip().lower() not in {
+            "0", "false", "no", "off"}
+        if warmup_enabled:
+            try:
+                self._warmup_runtimes()
+            except Exception:
+                self.rknn_pool.release()
+                raise
+        # Results leave the FIFO in submission order. Keep all temporal state
+        # here, outside the three concurrent NPU workers.
+        self.path_filter = PathTemporalFilter()
         self.pending = 0
+
+    def _warmup_runtimes(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        for runtime in self.rknn_pool.rknnPool:
+            worker_result = inference_worker(runtime, frame)
+            decoded = finalize_inference(worker_result)
+            self.warmup_inference_ms.append(float(
+                decoded["timings_ms"]["inference"]))
 
     @staticmethod
     def get_model_path(model_dir, model_path=None):
@@ -65,9 +97,18 @@ class InferWrap:
         self.pending += 1
         if self.pending < self.pipeline_depth:
             return None, False
-        result = self.rknn_pool.get()
+        result, ready = self.rknn_pool.get()
         self.pending -= 1
-        return result
+        if ready:
+            result = finalize_inference(result)
+            filter_started = time.perf_counter()
+            result = self.path_filter.update(result)
+            temporal_ms = (time.perf_counter() - filter_started) * 1000.0
+            timings = result.get("timings_ms") or {}
+            timings["temporal_filter"] = temporal_ms
+            timings["total"] = float(timings.get("total", 0.0)) + temporal_ms
+            result["timings_ms"] = timings
+        return result, ready
 
     def __call__(self, *args, **kwargs):
         return self.infer(*args, **kwargs)
@@ -78,10 +119,12 @@ class InferWrap:
 
 if __name__ == "__main__":
     import cv2
+    from .func import render_result
 
     infer = InferWrap("model", TPEs=1)
     image = cv2.imread("./bus.jpg")
     result, ready = infer.infer(image)
     if ready and result:
-        cv2.imwrite("result.jpg", result["frame"])
+        rendered = render_result(result["frame"].copy(), result, mode="full")
+        cv2.imwrite("result.jpg", rendered)
     infer.release()
