@@ -1,7 +1,8 @@
 """Fast CPU post-processing for the six-output RKNN multi-task model.
 
-Detection boxes and B-spline paths are already decoded by the model. The CPU
-only performs class-wise NMS, coordinate scaling, and optional debug drawing.
+The diagnostic centerline is traced from each frame's path heatmaps. Model
+B-spline points remain in the result for comparison, but are not substituted
+for the raw heatmap trace.
 """
 
 import os
@@ -51,17 +52,44 @@ ROAD_THRESHOLD = float(np.clip(
 ROAD_OVERLAY_ALPHA = float(np.clip(
     _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28), 0.0, 1.0))
 PATH_HEATMAP_ALPHA = float(np.clip(
-    _env_float("MULTITASK_PATH_HEATMAP_ALPHA", 0.18), 0.0, 1.0))
+    _env_float("MULTITASK_PATH_HEATMAP_ALPHA", 0.45), 0.0, 1.0))
 PATH_HEATMAP_THRESHOLD = float(np.clip(
     _env_float("MULTITASK_PATH_HEATMAP_THRESHOLD", 0.25), 0.0, 1.0))
-RENDER_MODE = os.environ.get("MULTITASK_RENDER_MODE", "road").strip().lower()
-if RENDER_MODE not in {"off", "path", "road", "full"}:
-    RENDER_MODE = "road"
+RENDER_DET_THRESHOLD = float(np.clip(
+    _env_float("MULTITASK_RENDER_DET_THRESHOLD", 0.45), 0.0, 1.0))
+RENDER_MAX_DETECTIONS = max(
+    0, _env_int("MULTITASK_RENDER_MAX_DETECTIONS", 6))
+RENDER_MAX_PER_CLASS = max(
+    0, _env_int("MULTITASK_RENDER_MAX_PER_CLASS", 2))
+RENDER_FULL_MAX_DETECTIONS = max(
+    0, _env_int("MULTITASK_RENDER_FULL_MAX_DETECTIONS", 20))
+RENDER_PATH_MIN_SCORE = float(np.clip(
+    _env_float("MULTITASK_RENDER_PATH_MIN_SCORE", 0.35), 0.0, 1.0))
+RENDER_PATH_MIN_COUNT_CONFIDENCE = float(np.clip(
+    _env_float("MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE", 0.40),
+    0.0, 1.0))
+RENDER_MODE = os.environ.get(
+    "MULTITASK_RENDER_MODE", "heatmap").strip().lower()
+RENDER_MODE = {"path": "drive", "road": "debug"}.get(
+    RENDER_MODE, RENDER_MODE)
+if RENDER_MODE not in {"off", "heatmap", "drive", "debug", "full"}:
+    RENDER_MODE = "heatmap"
 
 PATH_COLORS = {
     "single": (0, 255, 255),
     "left": (60, 220, 80),
     "right": (255, 220, 40),
+}
+
+DETECTION_COLORS = {
+    "Door": (80, 200, 255),
+    "TurnSign": (0, 255, 120),
+    "BeginSign": (0, 220, 255),
+    "EndSign": (0, 150, 255),
+    "Coin": (0, 220, 255),
+    "Human": (60, 60, 255),
+    "Car": (255, 160, 60),
+    "SpeedSign": (255, 80, 220),
 }
 
 
@@ -315,16 +343,140 @@ def decode_curve_paths(points, path_scores, path_count_scores, image_shape):
     return paths, path_count, count_confidence
 
 
+def _row_peaks(values, threshold, max_peaks=None, min_distance=3):
+    """Return local maxima from one heatmap row, strongest first."""
+    if len(values) < 3:
+        return []
+    mask = ((values[1:-1] >= values[:-2]) &
+            (values[1:-1] >= values[2:]) &
+            (values[1:-1] >= threshold))
+    indices = np.flatnonzero(mask) + 1
+    indices = sorted(indices, key=lambda index: values[index], reverse=True)
+    selected = []
+    for index in indices:
+        if all(abs(int(index) - previous) >= min_distance
+               for previous, _ in selected):
+            selected.append((int(index), float(values[index])))
+            if max_peaks is not None and len(selected) >= max_peaks:
+                break
+    return selected
+
+
+def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
+                     min_points=3):
+    """Connect row peaks within one frame; this contains no temporal state."""
+    tracks = []
+    for row_index, (row, peaks) in enumerate(zip(rows, candidates)):
+        active = [
+            index for index, track in enumerate(tracks)
+            if row_index - track["last_row_index"] <= max_missing_rows + 1
+        ]
+        pairs = []
+        for track_index in active:
+            previous_x = tracks[track_index]["points"][-1][0]
+            for peak_index, (x, confidence) in enumerate(peaks):
+                distance = abs(x - previous_x)
+                if distance <= max_jump:
+                    pairs.append((distance, track_index, peak_index))
+
+        used_tracks = set()
+        used_peaks = set()
+        for _, track_index, peak_index in sorted(pairs):
+            if track_index in used_tracks or peak_index in used_peaks:
+                continue
+            x, confidence = peaks[peak_index]
+            tracks[track_index]["points"].append((x, row, confidence))
+            tracks[track_index]["last_row_index"] = row_index
+            used_tracks.add(track_index)
+            used_peaks.add(peak_index)
+
+        for peak_index, (x, confidence) in enumerate(peaks):
+            if peak_index not in used_peaks:
+                tracks.append({
+                    "points": [(x, row, confidence)],
+                    "last_row_index": row_index,
+                })
+
+    paths = [track["points"] for track in tracks
+             if len(track["points"]) >= min_points]
+    paths.sort(
+        key=lambda path: (len(path), sum(point[2] for point in path)),
+        reverse=True)
+    return paths
+
+
+def candidate_centerlines(road_probability, center_probability,
+                          peak_threshold=PATH_HEATMAP_THRESHOLD,
+                          max_peaks_per_row=None, row_step=3,
+                          road_floor=0.25):
+    """Trace the previous model's row peaks on one raw path heatmap."""
+    score = center_probability * (
+        road_floor + (1.0 - road_floor) * road_probability)
+    rows = list(range(score.shape[0] - 2,
+                      max(score.shape[0] // 5, 1), -row_step))
+    sampled_rows = []
+    candidates = []
+    for row in rows:
+        peaks = _row_peaks(
+            score[row], peak_threshold, max_peaks_per_row)
+        if peaks:
+            sampled_rows.append(row)
+            candidates.append(peaks)
+    return _trace_all_paths(sampled_rows, candidates), score
+
+
+def decode_heatmap_paths(road_probability, path_heatmaps, path_scores,
+                         path_count_scores, image_shape):
+    """Trace both heatmap slots without path-count gating or frame history."""
+    height, width = image_shape[:2]
+    path_count = int(np.argmax(path_count_scores))
+    count_confidence = float(path_count_scores[path_count])
+    roles = (("left", "right") if path_count == 2
+             else ("single", "right"))
+    paths = []
+    score_maps = []
+    for slot, role in enumerate(roles):
+        candidates, score_map = candidate_centerlines(
+            road_probability, path_heatmaps[slot])
+        score_maps.append(score_map)
+        if not candidates:
+            continue
+        points = np.asarray(candidates[0], dtype=np.float32)
+        points_xy = np.empty((len(points), 2), dtype=np.float32)
+        points_xy[:, 0] = (
+            points[:, 0] * PIXEL_STRIDE * float(max(width - 1, 0)) /
+            float(max(MODEL_WIDTH - 1, 1)))
+        points_xy[:, 1] = (
+            points[:, 1] * PIXEL_STRIDE * float(max(height - 1, 0)) /
+            float(max(MODEL_HEIGHT - 1, 1)))
+        paths.append({
+            "slot": int(slot),
+            "role": role,
+            "source": "heatmap",
+            "score": float(path_scores[slot]),
+            "heatmap_score": float(np.mean(points[:, 2])),
+            "count_confidence": count_confidence,
+            "point_confidences": points[:, 2].copy(),
+            "points_xy": points_xy,
+        })
+    return paths, path_count, count_confidence, score_maps
+
+
 def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
     """Decode all model tasks without performing route selection."""
     boxes, scores, pixel_logits, path_points, path_scores, path_count_scores = (
         parse_outputs(outputs))
-    paths, path_count, count_confidence = decode_curve_paths(
+    curve_paths, _, _ = decode_curve_paths(
         path_points, path_scores, path_count_scores, image_shape)
 
     road_probability = sigmoid(pixel_logits[0])
     road_mask = (pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
-    path_heatmaps = sigmoid(pixel_logits[1:]) if include_path_heatmaps else None
+    raw_path_heatmaps = sigmoid(pixel_logits[1:])
+    paths, path_count, count_confidence, path_score_maps = (
+        decode_heatmap_paths(
+            road_probability, raw_path_heatmaps, path_scores,
+            path_count_scores, image_shape))
+    path_heatmaps = raw_path_heatmaps if include_path_heatmaps else None
 
     path_scores_list = path_scores.tolist()
     path_count_scores_list = path_count_scores.tolist()
@@ -339,6 +491,9 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
     centerline = {
         "heatmaps": path_heatmaps,
         "paths": paths,
+        "curve_paths": curve_paths,
+        "score_maps": path_score_maps,
+        "source": "heatmap",
         "path_scores": path_scores_list,
         "path_count": path_count,
         "path_count_scores": path_count_scores_list,
@@ -354,6 +509,7 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
         "path_count": path_count,
         "path_count_scores": path_count_scores_list,
         "paths": paths,
+        "curve_paths": curve_paths,
         "road": road,
         "centerline": centerline,
         # Kept as a view so path heatmaps can be materialized only when the
@@ -380,39 +536,101 @@ def _overlay_path_heatmaps(image, heatmaps, colors, alpha, threshold):
     if alpha <= 0.0 or heatmaps is None or not heatmaps.size:
         return
     denominator = max(1.0 - threshold, 1e-6)
-    weights = []
-    for probability in heatmaps:
-        resized = cv2.resize(
-            probability, (image.shape[1], image.shape[0]),
-            interpolation=cv2.INTER_LINEAR)
-        weights.append(
-            np.clip((resized - threshold) / denominator, 0.0, 1.0) * alpha)
-    left_weight, right_weight = weights
-    total_weight = np.clip(left_weight + right_weight, 0.0, 1.0)
-    overlay = image.astype(np.float32)
-    overlay *= 1.0 - total_weight[..., None]
-    overlay += left_weight[..., None] * np.asarray(
-        colors[0], dtype=np.float32)
-    overlay += right_weight[..., None] * np.asarray(
-        colors[1], dtype=np.float32)
-    np.clip(overlay, 0.0, 255.0, out=overlay)
-    image[:] = overlay.astype(np.uint8)
+    weights = np.clip(
+        (np.asarray(heatmaps, dtype=np.float32) - threshold) / denominator,
+        0.0, 1.0)
+    # Color at native 160x120 resolution, then let OpenCV perform the only
+    # full-frame operation. Pixel brightness remains proportional to the raw
+    # sigmoid probability in heatmap mode.
+    colored = (
+        weights[0, ..., None] * np.asarray(colors[0], dtype=np.float32) +
+        weights[1, ..., None] * np.asarray(colors[1], dtype=np.float32))
+    colored = np.clip(colored, 0.0, 255.0).astype(np.uint8)
+    colored = cv2.resize(
+        colored, (image.shape[1], image.shape[0]),
+        interpolation=cv2.INTER_LINEAR)
+    cv2.addWeighted(image, 1.0, colored, alpha, 0.0, dst=image)
+
+
+def _select_detections_for_render(detections, mode):
+    threshold = (DET_SCORE_THRESHOLD if mode in {"heatmap", "full"}
+                 else RENDER_DET_THRESHOLD)
+    if mode == "heatmap":
+        total_limit = MAX_DETECTIONS
+    else:
+        total_limit = (RENDER_FULL_MAX_DETECTIONS if mode == "full"
+                       else RENDER_MAX_DETECTIONS)
+    if total_limit <= 0:
+        return []
+    per_class_limit = (total_limit if mode in {"heatmap", "full"}
+                       else RENDER_MAX_PER_CLASS)
+    counts = {}
+    selected = []
+    for detection in sorted(
+            detections or [], key=lambda item: item.get("score", 0.0),
+            reverse=True):
+        if float(detection.get("score", 0.0)) < threshold:
+            continue
+        label = str(detection.get("label") or "")
+        if counts.get(label, 0) >= per_class_limit:
+            continue
+        selected.append(detection)
+        counts[label] = counts.get(label, 0) + 1
+        if len(selected) >= total_limit:
+            break
+    return selected
+
+
+def _draw_corner_box(image, bbox, color, thickness=1):
+    left, top, right, bottom = [int(round(value)) for value in bbox]
+    left = max(0, min(left, image.shape[1] - 1))
+    right = max(0, min(right, image.shape[1] - 1))
+    top = max(0, min(top, image.shape[0] - 1))
+    bottom = max(0, min(bottom, image.shape[0] - 1))
+    length = max(4, min(12, (right - left) // 4, (bottom - top) // 4))
+    segments = (
+        ((left, top), (left + length, top)),
+        ((left, top), (left, top + length)),
+        ((right, top), (right - length, top)),
+        ((right, top), (right, top + length)),
+        ((left, bottom), (left + length, bottom)),
+        ((left, bottom), (left, bottom - length)),
+        ((right, bottom), (right - length, bottom)),
+        ((right, bottom), (right, bottom - length)),
+    )
+    for start, end in segments:
+        cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
+
+
+def _draw_path_curve(image, points, color, dashed=False):
+    if len(points) < 2:
+        return
+    if not dashed:
+        cv2.polylines(image, [points], False, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.polylines(image, [points], False, color, 2, cv2.LINE_AA)
+        return
+    for index in range(0, len(points) - 1, 2):
+        start = tuple(points[index])
+        end = tuple(points[index + 1])
+        cv2.line(image, start, end, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.line(image, start, end, color, 2, cv2.LINE_AA)
 
 
 def render_result(image, result, mode=None):
-    """Draw a result in place; intended for the drop-frame preview thread."""
+    """Draw boxes and a per-frame heatmap centerline for model diagnosis."""
     mode = str(mode or RENDER_MODE).strip().lower()
+    mode = {"path": "drive", "road": "debug"}.get(mode, mode)
     if mode == "off":
         return image
-    if mode not in {"path", "road", "full"}:
-        mode = "road"
+    if mode not in {"heatmap", "drive", "debug", "full"}:
+        mode = "heatmap"
 
-    if mode in {"road", "full"}:
+    if mode in {"debug", "full"}:
         _overlay_binary_mask(
             image, result.get("road_mask"), (70, 70, 210),
             ROAD_OVERLAY_ALPHA)
 
-    if mode == "full":
+    if mode in {"heatmap", "full"}:
         heatmaps = result.get("path_heatmaps")
         if heatmaps is None:
             logits = result.get("_pixel_logits")
@@ -423,23 +641,50 @@ def render_result(image, result, mode=None):
                 image, heatmaps,
                 (PATH_COLORS[first_role], PATH_COLORS["right"]),
                 PATH_HEATMAP_ALPHA,
-                PATH_HEATMAP_THRESHOLD)
+                0.0 if mode == "heatmap" else PATH_HEATMAP_THRESHOLD)
 
-    for detection in result.get("detections") or []:
-        left, top, right, bottom = [int(value) for value in detection["bbox"]]
-        cv2.rectangle(image, (left, top), (right, bottom), (0, 220, 0), 2)
-        cv2.putText(
-            image, "{} {:.2f}".format(
-                detection["label"], detection["score"]),
-            (left, max(18, top - 6)), cv2.FONT_HERSHEY_SIMPLEX,
-            0.55, (0, 0, 255), 2)
+    drawn_detections = _select_detections_for_render(
+        result.get("detections"), mode)
+    for detection in drawn_detections:
+        bbox = detection["bbox"]
+        label = detection["label"]
+        color = DETECTION_COLORS.get(label, (0, 220, 0))
+        if mode in {"heatmap", "full"}:
+            left, top, right, bottom = [
+                int(round(value)) for value in bbox]
+            cv2.rectangle(
+                image, (left, top), (right, bottom), color, 2, cv2.LINE_AA)
+        elif label == "Coin":
+            left, top, right, bottom = bbox
+            center = (int(round((left + right) * 0.5)),
+                      int(round((top + bottom) * 0.5)))
+            cv2.circle(image, center, 4, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.circle(image, center, 3, color, -1, cv2.LINE_AA)
+        else:
+            _draw_corner_box(
+                image, bbox, color, thickness=1)
+        if mode in {"heatmap", "full"}:
+            left, top = int(bbox[0]), int(bbox[1])
+            cv2.putText(
+                image, "{} {:.2f}".format(label, detection["score"]),
+                (left, max(18, top - 5)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.48, color, 1, cv2.LINE_AA)
 
     for path_info in result.get("paths") or []:
+        if (mode != "heatmap" and
+                float(path_info.get("score", 0.0)) < RENDER_PATH_MIN_SCORE):
+            continue
+        if (mode != "heatmap" and
+                float(path_info.get("count_confidence", 0.0)) <
+                RENDER_PATH_MIN_COUNT_CONFIDENCE):
+            continue
         points = np.rint(path_info["points_xy"]).astype(np.int32)
         if len(points) < 2:
             continue
+        points[:, 0] = np.clip(points[:, 0], 0, image.shape[1] - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, image.shape[0] - 1)
         color = PATH_COLORS[path_info["role"]]
-        cv2.polylines(image, [points], False, color, 3, cv2.LINE_AA)
+        _draw_path_curve(image, points, color, dashed=False)
         if mode == "full":
             for point in points:
                 cv2.circle(image, tuple(point), 2, color, -1, cv2.LINE_AA)
@@ -506,7 +751,7 @@ def finalize_inference(worker_result):
     source_frame = worker_result["source_frame"]
     result = decode_outputs(
         worker_result["outputs"], worker_result["image_shape"],
-        include_path_heatmaps=False)
+        include_path_heatmaps=True)
     postprocess_ms = (time.perf_counter() - started) * 1000.0
     worker_timings = worker_result.get("timings_ms") or {}
     preprocess_ms = float(worker_timings.get("preprocess", 0.0))

@@ -1,5 +1,6 @@
 import json
 import os
+import fcntl
 import queue
 import shutil
 import struct
@@ -7,6 +8,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import resource_tracker, shared_memory
 from urllib.parse import urlparse
@@ -18,6 +21,48 @@ import numpy as np
 SHM_NAME = "shm_ar_video"
 SHM_HEADER_SIZE = 16
 PREVIEW_TITLE = "AR Preview"
+INSTANCE_LOCK_PATH = "/tmp/sysu_ddl_ar_receiver.lock"
+
+
+def acquire_instance_lock():
+    lock_path = os.environ.get("AR_RECEIVER_LOCK_PATH", INSTANCE_LOCK_PATH)
+    lock_file = open(lock_path, "a+", encoding="ascii")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        print("[AR_RECEIVER] another instance is already running pid={}".format(
+            owner))
+        return None
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
+def activate_existing_preview():
+    host = os.environ.get("AR_PREVIEW_CONTROL_HOST", "127.0.0.1")
+    if host in {"", "0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    port = int(env_float("AR_PREVIEW_CONTROL_PORT", 9105))
+    request = urllib.request.Request(
+        f"http://{host}:{port}/api/preview",
+        data=json.dumps({"enabled": True}).encode("ascii"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1.0) as response:
+            activated = 200 <= int(response.status) < 300
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        print(f"[AR_RECEIVER] existing instance could not be activated: {exc}")
+        return False
+    if activated:
+        print("[AR_RECEIVER] existing instance preview activated")
+    return activated
 
 
 def env_flag(name, default):
@@ -628,6 +673,10 @@ def read_frame(shm):
 
 
 def main():
+    instance_lock = acquire_instance_lock()
+    if instance_lock is None:
+        activate_existing_preview()
+        return
     # Keep RKNN initialization under the main guard.  The OCR worker uses the
     # multiprocessing "spawn" method and must not initialize the NPU again.
     render_perception = None

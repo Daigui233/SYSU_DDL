@@ -152,7 +152,7 @@ class PathTemporalFilterTest(unittest.TestCase):
             float(result["paths"][0]["points_normalized"][0, 0]),
             0.70, places=6)
 
-    def test_infer_wrap_filters_fifo_result_after_worker_returns(self):
+    def test_infer_wrap_returns_fifo_result_without_temporal_filter(self):
         outputs = make_model_outputs()
 
         class FakeRKNN:
@@ -173,16 +173,15 @@ class PathTemporalFilterTest(unittest.TestCase):
         infer.rknn_pool = FakePool()
         infer.pipeline_depth = 1
         infer.pending = 0
-        infer.path_filter = PathTemporalFilter(max_jump_ratio=1.0)
 
         result, ready = infer.infer(frame)
 
         self.assertTrue(ready)
-        self.assertEqual(result["temporal"]["status"], "tracking")
+        self.assertNotIn("temporal", result)
         self.assertEqual(result["path_count"], 1)
         self.assertIn("inference", result["timings_ms"])
         self.assertIn("fifo_wait", result["timings_ms"])
-        self.assertGreaterEqual(result["timings_ms"]["temporal_filter"], 0.0)
+        self.assertEqual(result["timings_ms"]["temporal_filter"], 0.0)
 
     def test_startup_warmup_validates_every_runtime(self):
         outputs = make_model_outputs()

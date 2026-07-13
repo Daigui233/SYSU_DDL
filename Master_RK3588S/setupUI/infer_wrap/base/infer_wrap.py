@@ -1,11 +1,9 @@
 import os
-import time
 from pathlib import Path
 
 import numpy as np
 
 from .func import finalize_inference, inference_worker
-from .path_temporal_filter import PathTemporalFilter
 
 
 def get_current_dir():
@@ -54,9 +52,6 @@ class InferWrap:
             except Exception:
                 self.rknn_pool.release()
                 raise
-        # Results leave the FIFO in submission order. Keep all temporal state
-        # here, outside the three concurrent NPU workers.
-        self.path_filter = PathTemporalFilter()
         self.pending = 0
 
     def _warmup_runtimes(self):
@@ -101,13 +96,6 @@ class InferWrap:
         self.pending -= 1
         if ready:
             result = finalize_inference(result)
-            filter_started = time.perf_counter()
-            result = self.path_filter.update(result)
-            temporal_ms = (time.perf_counter() - filter_started) * 1000.0
-            timings = result.get("timings_ms") or {}
-            timings["temporal_filter"] = temporal_ms
-            timings["total"] = float(timings.get("total", 0.0)) + temporal_ms
-            result["timings_ms"] = timings
         return result, ready
 
     def __call__(self, *args, **kwargs):

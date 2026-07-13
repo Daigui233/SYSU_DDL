@@ -51,6 +51,11 @@ export MULTITASK_PRE_NMS_TOP_K=1000
 export MULTITASK_MAX_DETECTIONS=100
 export MULTITASK_COIN_MIN_SHORT_SIDE=10
 export MULTITASK_ROAD_THRESHOLD=0.50
+export MULTITASK_RENDER_DET_THRESHOLD=0.45
+export MULTITASK_RENDER_MAX_DETECTIONS=6
+export MULTITASK_RENDER_MAX_PER_CLASS=2
+export MULTITASK_RENDER_PATH_MIN_SCORE=0.35
+export MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE=0.40
 export MULTITASK_PATH_TEMPORAL_FILTER=1
 export MULTITASK_PATH_EMA_ALPHA=0.45
 export MULTITASK_PATH_COUNT_CONFIRM_FRAMES=2
@@ -93,27 +98,37 @@ curl -s http://127.0.0.1:9105/api/preview | \
   python3 -m json.tool
 ```
 
-The `perception.timings_ms` object separates NPU inference, FIFO wait, CPU
-postprocess, and temporal filtering.
+The `perception.timings_ms` object separates NPU inference, FIFO wait, and CPU
+postprocess. Temporal filtering is disabled.
 
 Debug rendering is performed by the drop-frame preview thread, not by an NPU
 worker. Select it with:
 
 ```bash
-export MULTITASK_RENDER_MODE=road  # off, path, road, or full
+export MULTITASK_RENDER_MODE=heatmap  # off, heatmap, drive, debug, or full
 export MULTITASK_ROAD_OVERLAY_ALPHA=0.28
-export MULTITASK_PATH_HEATMAP_ALPHA=0.18
+export MULTITASK_PATH_HEATMAP_ALPHA=0.45
 export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 ```
 
 - `off`: no perception drawing.
-- `path`: detections and direct path curves only.
-- `road`: path mode plus the binary road overlay; this is the default.
-- `full`: road, path heatmaps, all 32 curve points, roles, and scores.
+- `heatmap`: diagnostic default. Draw every post-NMS detection as a full box,
+  overlay both raw sigmoid path heatmaps, and draw the centerline traced from
+  the current frame only.
+- `drive`: low-clutter mode. No road fill or labels; paths are thin, Coin uses
+  a dot, and other detections use corner marks.
+- `debug`: drive mode plus the binary road overlay.
+- `full`: road, heatmaps, up to 20 detections, all 32 path points, roles, and
+  confidence text.
 
-Set `AR_LOCAL_PREVIEW=0` for maximum production throughput. In that mode no
-full-frame overlay or heatmap sigmoid is executed. Three RKNN runtimes remain
-in flight by default, one on each RK3588S NPU core.
+Drive rendering is separate from perception output. OCR and control still
+receive every post-NMS detection even though preview drawing defaults to at
+most six detections, two per class. Legacy `path` and `road` mode names map to
+`drive` and `debug`.
+
+Set `AR_LOCAL_PREVIEW=0` to skip full-frame rendering. Heatmap decoding still
+runs because `paths` now comes from the per-frame heatmaps. Three RKNN runtimes
+remain in flight by default, one on each RK3588S NPU core.
 
 ## Python result
 
@@ -123,14 +138,21 @@ The result exposes both the unified top-level fields and the existing nested
 - `detections`: class id/name, score, and original-image `box_xyxy`.
 - `road_probability`: `[120,160]` float32.
 - `road_mask`: `[120,160]` uint8.
-- `path_heatmaps`: `[2,120,160]` when requested.
+- `path_heatmaps`: raw sigmoid probabilities with shape `[2,120,160]`.
 - `path_count` and `path_count_scores`.
-- `paths`: role, score, count confidence, and `[32,2] points_xy`.
-- `timings_ms`: preprocess, RKNN inference, FIFO wait, postprocess, temporal
-  filter, and total latency visible to the perception consumer.
+- `paths`: current-frame row-peak traces decoded from the heatmaps.
+- `curve_paths`: the model's direct `[32,2]` B-spline outputs for comparison.
+- `timings_ms`: preprocess, RKNN inference, FIFO wait, postprocess, and total
+  latency visible to the perception consumer.
 
-The RKNN worker always produces road probability and its mask. It skips the
-two diagnostic path heatmaps; the preview computes those only in `full` mode.
+The centerline uses the previous model's row-local-peak and adjacent-row
+connection method independently on each active heatmap slot. There is no EMA,
+hold, hysteresis, cross-frame jump rejection, or any other temporal state.
 
 The old `rknn_lt.rknn` and old four-output models are incompatible and fail
 fast instead of producing incorrect paths.
+
+`ar_receiver.py` holds `/tmp/sysu_ddl_ar_receiver.lock`. A repeated launch asks
+the existing process to open its preview and then exits. Failure to bind the
+optional preview-control port only disables that HTTP endpoint; inference and
+the local preview continue to run.
