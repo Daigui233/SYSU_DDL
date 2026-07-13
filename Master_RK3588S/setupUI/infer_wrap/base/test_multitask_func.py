@@ -140,6 +140,24 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual([item[0] for item in results], [0, 1])
 
+    def test_tiny_coin_filter_matches_training_policy(self):
+        boxes = np.asarray([
+            [10, 10, 18, 30],
+            [30, 10, 42, 30],
+            [50, 10, 58, 30],
+        ], dtype=np.float32)
+        scores = np.zeros((3, 8), dtype=np.float32)
+        scores[0, 4] = 0.99  # 8 px Coin: ignored by the training dataset.
+        scores[1, 4] = 0.90  # 12 px Coin: retained.
+        scores[2, 6] = 0.80  # Small non-Coin detections are unaffected.
+
+        results = detection_nms(
+            boxes, scores, score_threshold=0.25,
+            coin_min_short_side=10.0, max_detections=10)
+
+        self.assertEqual([(item[0], round(item[1], 2)) for item in results],
+                         [(4, 0.90), (6, 0.80)])
+
     def test_render_uses_decoded_paths_without_rebuilding_heatmaps(self):
         result = decode_outputs(self.make_outputs(), (240, 320, 3),
                                 include_path_heatmaps=False)

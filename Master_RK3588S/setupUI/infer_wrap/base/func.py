@@ -44,6 +44,8 @@ DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.25)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.60)
 DET_PRE_NMS_TOP_K = max(1, _env_int("MULTITASK_PRE_NMS_TOP_K", 1000))
 MAX_DETECTIONS = max(1, _env_int("MULTITASK_MAX_DETECTIONS", 100))
+COIN_MIN_SHORT_SIDE = max(
+    0.0, _env_float("MULTITASK_COIN_MIN_SHORT_SIDE", 10.0))
 ROAD_THRESHOLD = float(np.clip(
     _env_float("MULTITASK_ROAD_THRESHOLD", 0.50), 0.0, 1.0))
 ROAD_OVERLAY_ALPHA = float(np.clip(
@@ -202,17 +204,27 @@ def _numpy_nms_indices(boxes, scores, iou_threshold):
 def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
                   iou_threshold=DET_NMS_THRESHOLD,
                   pre_nms_top_k=DET_PRE_NMS_TOP_K,
-                  max_detections=MAX_DETECTIONS):
-    """Run class-wise NMS, then apply the global detection limit."""
+                  max_detections=MAX_DETECTIONS,
+                  coin_min_short_side=COIN_MIN_SHORT_SIDE):
+    """Filter invalid/tiny candidates, run class-wise NMS, then cap output."""
     results = []
     pre_nms_top_k = max(1, int(pre_nms_top_k))
-    valid_boxes = ((boxes[:, 2] > boxes[:, 0]) &
-                   (boxes[:, 3] > boxes[:, 1]))
+    box_widths = boxes[:, 2] - boxes[:, 0]
+    box_heights = boxes[:, 3] - boxes[:, 1]
+    valid_boxes = (box_widths > 0.0) & (box_heights > 0.0)
+    short_sides = np.minimum(box_widths, box_heights)
+    coin_min_short_side = max(0.0, float(coin_min_short_side))
 
     for class_id in range(scores.shape[1]):
         class_scores = scores[:, class_id]
+        class_valid = valid_boxes
+        if CLASSES[class_id] == "Coin" and coin_min_short_side > 0.0:
+            # Training ignores Coin boxes whose short side is below 10 px in
+            # the fixed 640x480 input. Apply the same rule before NMS so tiny
+            # quantization noise cannot reintroduce those false positives.
+            class_valid = class_valid & (short_sides >= coin_min_short_side)
         indices = np.flatnonzero(
-            valid_boxes & (class_scores >= score_threshold))
+            class_valid & (class_scores >= score_threshold))
         if not indices.size:
             continue
         if indices.size > pre_nms_top_k:

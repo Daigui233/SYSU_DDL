@@ -49,6 +49,7 @@ export MULTITASK_DET_THRESHOLD=0.25
 export MULTITASK_NMS_THRESHOLD=0.60
 export MULTITASK_PRE_NMS_TOP_K=1000
 export MULTITASK_MAX_DETECTIONS=100
+export MULTITASK_COIN_MIN_SHORT_SIDE=10
 export MULTITASK_ROAD_THRESHOLD=0.50
 export MULTITASK_PATH_TEMPORAL_FILTER=1
 export MULTITASK_PATH_EMA_ALPHA=0.45
@@ -65,6 +66,10 @@ for three frames. Large one-frame jumps are held briefly, while a persistent
 new path is accepted and reinitialized. `raw_paths` and `raw_path_count` remain
 available for model comparison and threshold tuning. A camera or inference gap
 longer than 0.5 seconds resets stale path history.
+
+`MULTITASK_COIN_MIN_SHORT_SIDE=10` mirrors the training dataset rule: Coin
+detections whose short side is below 10 pixels in the fixed 640x480 model input
+are discarded before NMS. Set it to `0` only for a deliberate tiny-Coin test.
 
 NPU workers only run preprocessing and `rknn_lite.inference()`. CPU NMS and
 path decoding run after the FIFO returns the oldest result, overlapping with
