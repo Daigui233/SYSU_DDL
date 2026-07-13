@@ -102,10 +102,10 @@ Windows 定位 EXE 已根据当前源码重新打包，包含发送端 X/Z 映�
 
 ## 后续开发
 
-新模型与运行架构见 [MULTITASK_RKNN_MIGRATION_PLAN.md](MULTITASK_RKNN_MIGRATION_PLAN.md)。下一阶段顺序：
+当前训练模型以 [新的模型架构/README.md](../新的模型架构/README.md) 和 [AI Studio训练指南](../新的模型架构/AI_STUDIO_上传训练指南.md) 为准。[MULTITASK_RKNN_MIGRATION_PLAN.md](MULTITASK_RKNN_MIGRATION_PLAN.md) 仅保留为早期历史设计记录。下一阶段顺序：
 
-1. 固定检测框、road mask 和 centerline heatmap 的训练数据契约。
+1. 固定检测框、road mask、双候选热力图和有序曲线路径的训练数据契约。
 2. 完成 Paddle 共享骨干多任务模型并验证 Paddle/ONNX/RKNN 数值一致性。
 3. 接入 latest-only `采图 -> 单 RKNN 推理 -> 控制` 流水线。
-4. 基于新模型输出重新实现轻量中线、风险决策和局部规划。
+4. 直接读取模型输出的 `path_points/path_count_scores`，重新实现风险决策和局部规划，不再扫描热力图连接中线。
 5. 最后恢复必要的 HUD、Web 调试和 OCR/API。

@@ -1,7 +1,8 @@
-"""RK3588S CPU post-processing for the single-RKNN perception model.
+"""CPU post-processing for the six-output RKNN multi-task perception model.
 
-The RKNN graph deliberately exports raw detection, pixel and topology outputs.
-NMS and path selection stay here so they can be tuned without rebuilding RKNN.
+The model exports decoded B-spline candidate paths.  CPU post-processing only
+scales and displays those paths; it never reconnects heatmap peaks into a
+different path.  Road and per-slot heatmaps remain available for diagnostics.
 """
 
 import os
@@ -14,7 +15,9 @@ import numpy as np
 MODEL_WIDTH = 640
 MODEL_HEIGHT = 480
 PIXEL_STRIDE = 4
-TOPOLOGY_CLASSES = ("normal", "fork", "merge", "unknown")
+MAX_PATHS = 2
+PATH_POINTS = 32
+PATH_COLORS = ((0, 255, 255), (255, 80, 255))  # BGR: left/single, right
 
 
 def _env_float(name, default):
@@ -24,46 +27,28 @@ def _env_float(name, default):
         return float(default)
 
 
-def _env_int(name, default):
-    try:
-        return int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return int(default)
-
-
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.25)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.60)
 ROAD_THRESHOLD = _env_float("MULTITASK_ROAD_THRESHOLD", 0.50)
 ROAD_OVERLAY_ALPHA = _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28)
-CENTERLINE_THRESHOLD = _env_float("MULTITASK_CENTERLINE_THRESHOLD", 0.25)
-CENTERLINE_MIN_POINTS = max(
-    3, _env_int("MULTITASK_CENTERLINE_MIN_POINTS", 8))
-CENTERLINE_MAX_PEAKS_PER_ROW = max(
-    1, _env_int("MULTITASK_CENTERLINE_MAX_PEAKS_PER_ROW", 3))
-CENTERLINE_MAX_JUMP = max(
-    1.0, _env_float("MULTITASK_CENTERLINE_MAX_JUMP", 8.0))
-CENTERLINE_ROAD_FLOOR = float(np.clip(
-    _env_float("MULTITASK_CENTERLINE_ROAD_FLOOR", 0.10), 0.0, 1.0))
-CENTERLINE_FIT_BLEND = float(np.clip(
-    _env_float("MULTITASK_CENTERLINE_FIT_BLEND", 0.45), 0.0, 1.0))
-TOPOLOGY_THRESHOLD = _env_float("MULTITASK_TOPOLOGY_THRESHOLD", 0.45)
+# Only used if path-count predicts zero.  A predicted one/two-path frame keeps
+# every corresponding slot so the board does not choose or hide a candidate.
+PATH_SCORE_FALLBACK_THRESHOLD = _env_float(
+    "MULTITASK_PATH_SCORE_FALLBACK_THRESHOLD", 0.20)
 MAX_DETECTIONS = 100
-MAX_CENTERLINE_PATHS = 2
 
 
 def _load_classes():
     names_path = Path(__file__).resolve().parent / "model" / "coco.names"
     try:
         classes = tuple(
-            line.strip()
-            for line in names_path.read_text(encoding="utf-8").splitlines()
-            if line.strip())
+            line.strip() for line in names_path.read_text(
+                encoding="utf-8").splitlines() if line.strip())
     except OSError as exc:
         raise RuntimeError("failed to read labels: {}".format(names_path)) from exc
     if len(classes) != 8:
-        raise RuntimeError(
-            "multitask RKNN requires 8 labels, got {} in {}".format(
-                len(classes), names_path))
+        raise RuntimeError("multitask RKNN requires 8 labels, got {} in {}".format(
+            len(classes), names_path))
     return classes
 
 
@@ -79,8 +64,7 @@ def softmax(values, axis=-1):
     values = np.asarray(values, dtype=np.float32)
     values = values - np.max(values, axis=axis, keepdims=True)
     exp_values = np.exp(values)
-    return exp_values / np.maximum(
-        exp_values.sum(axis=axis, keepdims=True), 1e-9)
+    return exp_values / np.maximum(exp_values.sum(axis=axis, keepdims=True), 1e-9)
 
 
 def _squeeze_batch(value, name):
@@ -93,44 +77,61 @@ def _squeeze_batch(value, name):
 
 
 def parse_outputs(outputs):
-    """Validate and normalize RKNN outputs to their documented layouts."""
-    if not isinstance(outputs, (list, tuple)) or len(outputs) != 4:
-        raise ValueError(
-            "multitask RKNN must return 4 outputs: boxes, scores, pixel, topology; "
-            "got {}".format(len(outputs) if isinstance(outputs, (list, tuple)) else type(outputs)))
+    """Validate the fixed six-output deployment contract."""
+    if not isinstance(outputs, (list, tuple)) or len(outputs) != 6:
+        count = len(outputs) if isinstance(outputs, (list, tuple)) else type(outputs)
+        raise ValueError("multitask RKNN must return 6 outputs "
+                         "[boxes, scores, pixel, path_points, path_scores, "
+                         "path_count_scores]; got {}".format(count))
 
     boxes = _squeeze_batch(outputs[0], "det_boxes")
     scores = _squeeze_batch(outputs[1], "det_scores")
     pixel = _squeeze_batch(outputs[2], "pixel_logits")
-    topology = _squeeze_batch(outputs[3], "topology_logits").reshape(-1)
+    path_points = _squeeze_batch(outputs[3], "path_points")
+    path_scores = _squeeze_batch(outputs[4], "path_scores").reshape(-1)
+    path_count_scores = _squeeze_batch(
+        outputs[5], "path_count_scores").reshape(-1)
 
     if boxes.ndim != 2:
-        raise ValueError("det_boxes must be rank 2 after batch squeeze, got {}".format(boxes.shape))
+        raise ValueError("det_boxes must be [N,4], got {}".format(boxes.shape))
     if boxes.shape[-1] != 4 and boxes.shape[0] == 4:
         boxes = boxes.T
     if boxes.shape[-1] != 4:
         raise ValueError("det_boxes expected [N,4], got {}".format(boxes.shape))
 
     if scores.ndim != 2:
-        raise ValueError("det_scores must be rank 2 after batch squeeze, got {}".format(scores.shape))
+        raise ValueError("det_scores must be [N,8], got {}".format(scores.shape))
     if scores.shape[-1] != len(CLASSES) and scores.shape[0] == len(CLASSES):
         scores = scores.T
     if scores.shape != (boxes.shape[0], len(CLASSES)):
-        raise ValueError(
-            "det_scores expected [{},{}], got {}".format(
-                boxes.shape[0], len(CLASSES), scores.shape))
+        raise ValueError("det_scores expected [{},{}], got {}".format(
+            boxes.shape[0], len(CLASSES), scores.shape))
 
     if pixel.ndim != 3:
-        raise ValueError("pixel_logits expected rank 3 after batch squeeze, got {}".format(pixel.shape))
-    if pixel.shape[0] != 2 and pixel.shape[-1] == 2:
+        raise ValueError("pixel_logits must be [3,120,160], got {}".format(
+            pixel.shape))
+    if pixel.shape[0] != 3 and pixel.shape[-1] == 3:
         pixel = pixel.transpose(2, 0, 1)
-    expected_pixel_shape = (2, MODEL_HEIGHT // PIXEL_STRIDE,
-                            MODEL_WIDTH // PIXEL_STRIDE)
-    if pixel.shape != expected_pixel_shape:
-        raise ValueError("pixel_logits expected {}, got {}".format(expected_pixel_shape, pixel.shape))
-    if topology.shape != (len(TOPOLOGY_CLASSES),):
-        raise ValueError("topology_logits expected [4], got {}".format(topology.shape))
-    return boxes, scores, pixel, topology
+    expected_pixel = (3, MODEL_HEIGHT // PIXEL_STRIDE,
+                      MODEL_WIDTH // PIXEL_STRIDE)
+    if pixel.shape != expected_pixel:
+        raise ValueError("pixel_logits expected {}, got {}".format(
+            expected_pixel, pixel.shape))
+
+    if path_points.shape == (MAX_PATHS, 2, PATH_POINTS):
+        path_points = path_points.transpose(0, 2, 1)
+    if path_points.shape != (MAX_PATHS, PATH_POINTS, 2):
+        raise ValueError("path_points expected [2,32,2], got {}".format(
+            path_points.shape))
+    if np.any(path_points < -0.05) or np.any(path_points > 1.05):
+        raise ValueError("path_points must be normalized coordinates in [0,1]")
+    path_points = np.clip(path_points, 0.0, 1.0)
+    if path_scores.shape != (MAX_PATHS,):
+        raise ValueError("path_scores expected [2], got {}".format(path_scores.shape))
+    if path_count_scores.shape != (MAX_PATHS + 1,):
+        raise ValueError("path_count_scores expected [3], got {}".format(
+            path_count_scores.shape))
+    return boxes, scores, pixel, path_points, path_scores, path_count_scores
 
 
 def _box_iou_one_to_many(box, boxes):
@@ -140,15 +141,14 @@ def _box_iou_one_to_many(box, boxes):
     y2 = np.minimum(box[3], boxes[:, 3])
     intersection = np.maximum(x2 - x1, 0.0) * np.maximum(y2 - y1, 0.0)
     area_a = np.maximum((box[2] - box[0]) * (box[3] - box[1]), 0.0)
-    area_b = np.maximum(boxes[:, 2] - boxes[:, 0], 0.0) * np.maximum(
-        boxes[:, 3] - boxes[:, 1], 0.0)
+    area_b = np.maximum((boxes[:, 2] - boxes[:, 0]) *
+                        (boxes[:, 3] - boxes[:, 1]), 0.0)
     return intersection / np.maximum(area_a + area_b - intersection, 1e-9)
 
 
 def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
                   iou_threshold=DET_NMS_THRESHOLD,
                   max_detections=MAX_DETECTIONS):
-    """Run class-wise NMS on already decoded PP-YOLOE xyxy boxes."""
     results = []
     for class_id in range(scores.shape[1]):
         class_scores = scores[:, class_id]
@@ -171,8 +171,7 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
 
 def build_detections(image_shape, nms_results):
     height, width = image_shape[:2]
-    scale_x = float(width) / MODEL_WIDTH
-    scale_y = float(height) / MODEL_HEIGHT
+    scale_x, scale_y = float(width) / MODEL_WIDTH, float(height) / MODEL_HEIGHT
     image_area = max(1.0, float(width * height))
     detections = []
     for class_id, score, model_box in nms_results:
@@ -182,258 +181,82 @@ def build_detections(image_shape, nms_results):
         bottom = float(np.clip(model_box[3] * scale_y, top + 1, height))
         label = CLASSES[class_id]
         detections.append({
-            "class_id": int(class_id),
-            "label": label,
-            "category": label,
-            "score": float(score),
-            "bbox": [left, top, right, bottom],
+            "class_id": int(class_id), "label": label, "category": label,
+            "score": float(score), "bbox": [left, top, right, bottom],
             "area_ratio": ((right - left) * (bottom - top)) / image_area,
         })
     return detections
 
 
-def _row_peaks(values, threshold, max_peaks=None, min_distance=3,
-               refine_radius=2):
-    if len(values) < 3:
-        return []
-    mask = ((values[1:-1] >= values[:-2]) &
-            (values[1:-1] >= values[2:]) &
-            (values[1:-1] >= threshold))
-    indices = np.flatnonzero(mask) + 1
-    indices = sorted(indices, key=lambda x: values[x], reverse=True)
-    selected = []
-    selected_indices = []
-    for index in indices:
-        if all(abs(int(index) - previous) >= min_distance
-               for previous in selected_indices):
-            left = max(0, int(index) - refine_radius)
-            right = min(len(values), int(index) + refine_radius + 1)
-            positions = np.arange(left, right, dtype=np.float32)
-            weights = np.maximum(
-                np.asarray(values[left:right], dtype=np.float32) - threshold,
-                0.0,
-            )
-            weight_sum = float(weights.sum())
-            refined_x = (
-                float(np.dot(positions, weights) / weight_sum)
-                if weight_sum > 1e-9 else float(index)
-            )
-            selected_indices.append(int(index))
-            selected.append((refined_x, float(values[index])))
-            if max_peaks is not None and len(selected) >= max_peaks:
-                break
-    return selected
-
-
-def _trace_all_paths(rows, candidates, max_jump=CENTERLINE_MAX_JUMP,
-                     max_missing_rows=2,
-                     min_points=CENTERLINE_MIN_POINTS):
-    """Connect every row peak into a path without selecting a driving route."""
-    tracks = []
-    row_spacing = (
-        max(1, abs(int(rows[1]) - int(rows[0]))) if len(rows) > 1 else 1)
-    max_row_gap = row_spacing * (max_missing_rows + 1)
-    for row, peaks in zip(rows, candidates):
-        active = [
-            index for index, track in enumerate(tracks)
-            if abs(int(row) - track["last_row"]) <= max_row_gap
-        ]
-        pairs = []
-        for track_index in active:
-            previous_x = tracks[track_index]["points"][-1][0]
-            for peak_index, (x, confidence) in enumerate(peaks):
-                distance = abs(x - previous_x)
-                if distance <= max_jump:
-                    pairs.append((distance, track_index, peak_index))
-
-        used_tracks = set()
-        used_peaks = set()
-        for _, track_index, peak_index in sorted(pairs):
-            if track_index in used_tracks or peak_index in used_peaks:
-                continue
-            x, confidence = peaks[peak_index]
-            tracks[track_index]["points"].append((x, row, confidence))
-            tracks[track_index]["last_row"] = int(row)
-            used_tracks.add(track_index)
-            used_peaks.add(peak_index)
-
-        # A newly visible branch becomes another path at the row where it splits.
-        for peak_index, (x, confidence) in enumerate(peaks):
-            if peak_index not in used_peaks:
-                tracks.append({
-                    "points": [(x, row, confidence)],
-                    "last_row": int(row),
-                })
-
-    paths = [track["points"] for track in tracks
-             if len(track["points"]) >= min_points]
-    return paths
-
-
-def _smooth_path(path, fit_blend=CENTERLINE_FIT_BLEND):
-    """Blend a confidence-weighted curve fit with the decoded peak points."""
-    if len(path) < 3 or fit_blend <= 0.0:
-        return path
-    x_values = np.asarray([point[0] for point in path], dtype=np.float32)
-    y_values = np.asarray([point[1] for point in path], dtype=np.float32)
-    confidences = np.asarray([point[2] for point in path], dtype=np.float32)
-    y_center = float(y_values.mean())
-    y_scale = max(float(np.ptp(y_values)), 1.0)
-    normalized_y = (y_values - y_center) / y_scale
-    degree = 2 if len(path) >= 5 else 1
-    design = (
-        np.column_stack((normalized_y * normalized_y,
-                         normalized_y,
-                         np.ones_like(normalized_y)))
-        if degree == 2
-        else np.column_stack((normalized_y, np.ones_like(normalized_y)))
-    )
-    weights = np.sqrt(np.maximum(confidences, 1e-3))
-    weighted_design = design * weights[:, None]
-    weighted_x = x_values * weights
-    try:
-        normal_matrix = weighted_design.T @ weighted_design
-        normal_matrix += np.eye(
-            normal_matrix.shape[0], dtype=np.float32) * 1e-6
-        coefficients = np.linalg.solve(
-            normal_matrix,
-            weighted_design.T @ weighted_x,
-        )
-        fitted_x = design @ coefficients
-    except (FloatingPointError, TypeError, ValueError, np.linalg.LinAlgError):
-        return path
-    blend = float(np.clip(fit_blend, 0.0, 1.0))
-    smoothed_x = np.clip(
-        x_values * (1.0 - blend) + fitted_x * blend,
-        0.0,
-        (MODEL_WIDTH // PIXEL_STRIDE) - 1.0,
-    )
-    return [
-        (float(x), int(y), float(confidence))
-        for x, (_, y, confidence) in zip(smoothed_x, path)
-    ]
-
-
-def candidate_centerlines(road_probability, center_probability,
-                          peak_threshold=CENTERLINE_THRESHOLD,
-                          max_peaks_per_row=CENTERLINE_MAX_PEAKS_PER_ROW,
-                          row_step=3,
-                          road_floor=CENTERLINE_ROAD_FLOOR,
-                          min_path_points=CENTERLINE_MIN_POINTS,
-                          max_paths=MAX_CENTERLINE_PATHS,
-                          max_jump=CENTERLINE_MAX_JUMP,
-                          fit_blend=CENTERLINE_FIT_BLEND):
-    """Return at most the two most confident sufficiently long paths."""
-    score = center_probability * (
-        road_floor + (1.0 - road_floor) * road_probability)
-    rows = list(range(score.shape[0] - 2,
-                      max(score.shape[0] // 5, 1), -row_step))
-    sampled_rows = []
-    candidates = []
-    for row in rows:
-        peaks = _row_peaks(score[row], peak_threshold, max_peaks_per_row)
-        sampled_rows.append(row)
-        candidates.append(peaks)
-    paths = _trace_all_paths(
-        sampled_rows,
-        candidates,
-        max_jump=max(1.0, float(max_jump)),
-        min_points=max(3, int(min_path_points)),
-    )
-    paths.sort(
-        key=lambda path: (
-            sum(point[2] for point in path) / len(path),
-            len(path),
-        ),
-        reverse=True,
-    )
-    paths = paths[:max(0, min(int(max_paths), MAX_CENTERLINE_PATHS))]
-    paths = [_smooth_path(path, fit_blend) for path in paths]
-    return [[(int(round(x * PIXEL_STRIDE)),
-              int(round(y * PIXEL_STRIDE)), float(confidence))
-             for x, y, confidence in path] for path in paths], score
-
-
-def decode_topology(logits):
-    probabilities = softmax(logits).reshape(-1)
-    class_id = int(np.argmax(probabilities))
-    confidence = float(probabilities[class_id])
-    return {
-        "class_id": class_id,
-        "label": TOPOLOGY_CLASSES[class_id],
-        "confidence": confidence,
-        "reliable": confidence >= TOPOLOGY_THRESHOLD,
-        "probabilities": probabilities.tolist(),
-    }
+def decode_curve_paths(points, score_logits, count_logits):
+    """Decode every model-predicted candidate path without route selection."""
+    path_probabilities = sigmoid(score_logits)
+    count_probabilities = softmax(count_logits)
+    predicted_count = int(np.argmax(count_probabilities))
+    if predicted_count > 0:
+        active_slots = range(predicted_count)
+    else:
+        active_slots = [index for index, score in enumerate(path_probabilities)
+                        if score >= PATH_SCORE_FALLBACK_THRESHOLD]
+    paths = []
+    for slot in active_slots:
+        # Training canonicalizes slot 0 as single/left and slot 1 as right.
+        path = [(float(x * (MODEL_WIDTH - 1)), float(y * (MODEL_HEIGHT - 1)),
+                 float(path_probabilities[slot]))
+                for x, y in points[slot]]
+        paths.append({"slot": int(slot), "score": float(path_probabilities[slot]),
+                      "points": path})
+    return paths, path_probabilities, predicted_count, count_probabilities
 
 
 def decode_outputs(outputs, image_shape):
-    boxes, scores, pixel_logits, topology_logits = parse_outputs(outputs)
-    nms_results = detection_nms(boxes, scores)
+    boxes, scores, pixel_logits, path_points, path_score_logits, count_logits = (
+        parse_outputs(outputs))
     road_probability = sigmoid(pixel_logits[0])
-    center_probability = sigmoid(pixel_logits[1])
-    paths, path_score = candidate_centerlines(
-        road_probability, center_probability)
+    path_heatmaps = sigmoid(pixel_logits[1:])
+    paths, path_scores, path_count, count_probabilities = decode_curve_paths(
+        path_points, path_score_logits, count_logits)
     return {
-        "detections": build_detections(image_shape, nms_results),
-        "road": {
-            "probability": road_probability,
-            "mask": (road_probability >= ROAD_THRESHOLD).astype(np.uint8),
-            "threshold": ROAD_THRESHOLD,
-            "stride": PIXEL_STRIDE,
-        },
+        "detections": build_detections(image_shape, detection_nms(boxes, scores)),
+        "road": {"probability": road_probability,
+                 "mask": (road_probability >= ROAD_THRESHOLD).astype(np.uint8),
+                 "threshold": ROAD_THRESHOLD, "stride": PIXEL_STRIDE},
         "centerline": {
-            "probability": center_probability,
-            "score": path_score,
+            "heatmaps": path_heatmaps,
             "paths": paths,
+            "path_scores": path_scores.tolist(),
+            "path_count": path_count,
+            "path_count_probabilities": count_probabilities.tolist(),
             "stride": PIXEL_STRIDE,
         },
-        "topology": decode_topology(topology_logits),
     }
 
 
 def _draw_result(image, result):
     road_mask = result["road"]["mask"]
     if ROAD_OVERLAY_ALPHA > 0.0 and road_mask.size:
-        resized_mask = cv2.resize(
-            road_mask, (image.shape[1], image.shape[0]),
-            interpolation=cv2.INTER_NEAREST).astype(bool)
+        resized_mask = cv2.resize(road_mask, (image.shape[1], image.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST).astype(bool)
         if np.any(resized_mask):
             overlay_color = np.asarray((70, 70, 210), dtype=np.float32)
-            pixels = image[resized_mask].astype(np.float32)
             image[resized_mask] = np.clip(
-                pixels * (1.0 - ROAD_OVERLAY_ALPHA) +
-                overlay_color * ROAD_OVERLAY_ALPHA,
-                0, 255).astype(np.uint8)
+                image[resized_mask].astype(np.float32) * (1.0 - ROAD_OVERLAY_ALPHA) +
+                overlay_color * ROAD_OVERLAY_ALPHA, 0, 255).astype(np.uint8)
 
     for detection in result["detections"]:
         left, top, right, bottom = [int(value) for value in detection["bbox"]]
         cv2.rectangle(image, (left, top), (right, bottom), (0, 220, 0), 2)
-        cv2.putText(
-            image, "{} {:.2f}".format(detection["label"], detection["score"]),
-            (left, max(18, top - 6)), cv2.FONT_HERSHEY_SIMPLEX,
-            0.55, (0, 0, 255), 2)
+        cv2.putText(image, "{} {:.2f}".format(detection["label"], detection["score"]),
+                    (left, max(18, top - 6)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 0, 255), 2)
 
-    centerline_color = (0, 255, 255)
-    scale_x = float(image.shape[1]) / MODEL_WIDTH
-    scale_y = float(image.shape[0]) / MODEL_HEIGHT
-    for path in result["centerline"]["paths"]:
-        points = np.asarray(
-            [[int(x * scale_x), int(y * scale_y)] for x, y, _ in path],
-            dtype=np.int32)
+    scale_x, scale_y = float(image.shape[1]) / MODEL_WIDTH, float(image.shape[0]) / MODEL_HEIGHT
+    for path_info in result["centerline"]["paths"]:
+        points = np.asarray([[int(x * scale_x), int(y * scale_y)]
+                             for x, y, _ in path_info["points"]], dtype=np.int32)
         if len(points) >= 2:
-            cv2.polylines(image, [points], False,
-                          centerline_color, 2,
-                          cv2.LINE_AA)
-    topology = result["topology"]
-    topology_text = "TOPO {} {:.2f}".format(
-        topology["label"], topology["confidence"])
-    text_size, _ = cv2.getTextSize(
-        topology_text, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
-    topology_x = max(10, image.shape[1] - text_size[0] - 10)
-    cv2.putText(
-        image, topology_text, (topology_x, 24),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (30, 230, 255), 2)
+            color = PATH_COLORS[path_info["slot"] % len(PATH_COLORS)]
+            cv2.polylines(image, [points], False, color, 2, cv2.LINE_AA)
 
 
 def myFunc(rknn_lite, img_orin):
@@ -441,16 +264,12 @@ def myFunc(rknn_lite, img_orin):
         raise ValueError("input frame must be a BGR HxWx3 image")
     source_frame = img_orin.copy()
     rgb = cv2.cvtColor(source_frame, cv2.COLOR_BGR2RGB)
-    rgb = cv2.resize(rgb, (MODEL_WIDTH, MODEL_HEIGHT),
-                     interpolation=cv2.INTER_LINEAR)
-    # RKNN conversion owns ImageNet mean/std normalization. Keep this uint8.
+    rgb = cv2.resize(rgb, (MODEL_WIDTH, MODEL_HEIGHT), interpolation=cv2.INTER_LINEAR)
     model_input = np.expand_dims(np.ascontiguousarray(rgb), 0)
     outputs = rknn_lite.inference(inputs=[model_input])
     result = decode_outputs(outputs, source_frame.shape)
-    result["ocr_frame"] = (
-        source_frame.copy()
-        if any(item["label"] == "TurnSign" for item in result["detections"])
-        else None)
+    result["ocr_frame"] = (source_frame.copy() if any(
+        item["label"] == "TurnSign" for item in result["detections"]) else None)
     _draw_result(source_frame, result)
     result["frame"] = source_frame
     return result

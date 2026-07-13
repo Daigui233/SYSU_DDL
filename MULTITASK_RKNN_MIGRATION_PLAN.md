@@ -1,4 +1,37 @@
-# Paddle 三头多任务感知与 RKNN 异步流水线迁移计划
+# Paddle 多任务感知与 RKNN 异步流水线迁移计划（历史设计记录）
+
+> **状态说明（2026-07-13）**：本文后续章节记录的是早期“单中线热力图 + Topology Head + CPU轻量连线”方案，已经不再作为训练和部署执行标准。当前有效实现以 `../新的模型架构/README.md`、`../新的模型架构/AI_STUDIO_上传训练指南.md` 和代码配置为准。
+
+## 当前有效架构摘要
+
+```text
+PP-YOLOE Backbone + Neck
+├─ Detection Head：8类，输出NMS前boxes/scores
+└─ P3/P4/P5 Perception Fusion
+   ├─ Pixel Head：road + single/left + right，stride=4
+   └─ Curve Head：固定三次B样条，两条候选路径，每条32个有序点
+      ├─ path_scores
+      └─ path_count_scores：0/1/2条路径
+```
+
+当前版本已经删除 Topology Head。单路径定义为中性 `slot0=single`；双路径定义为 `slot0=left、slot1=right`，左右只根据明显分离区排序。热力图保留为辅助监督和可视化，板端直接使用 `path_points`，不再扫描热力图、做连通域、骨架化或重新连接中线。
+
+固定部署输出为：
+
+```text
+det_boxes           [1, 6300, 4]
+det_scores          [1, 6300, 8]
+pixel_logits        [1, 3, 120, 160]
+path_points         [1, 2, 32, 2]
+path_scores         [1, 2]
+path_count_scores   [1, 3]
+```
+
+数据集当前包含五个物理目录，但仍按 `has_det/has_road/has_path` 组成三种监督任务。`旧数据复用_添加中线和修改json标签`属于补充数据，`问题文件修改`属于独立修正数据。旧 `topology_*` 和 `has_topology` 字段即使保留，也不参与当前模型训练、划分、指标或导出。
+
+---
+
+## 以下内容为历史方案，不再执行
 
 ## 1. 文档目标
 

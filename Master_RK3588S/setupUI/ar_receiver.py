@@ -107,7 +107,6 @@ class RuntimeState:
         detections = result.get("detections") or []
         road = result.get("road") or {}
         centerline = result.get("centerline") or {}
-        topology = result.get("topology") or {}
         labels = {}
         for detection in detections:
             label = str(detection.get("label") or "unknown")
@@ -122,11 +121,12 @@ class RuntimeState:
             "detection_count": len(detections),
             "detection_labels": labels,
             "road_coverage": road_coverage,
-            "path_count": len(paths),
-            "path_point_counts": [len(path) for path in paths],
-            "topology": str(topology.get("label") or ""),
-            "topology_confidence": float(topology.get("confidence") or 0.0),
-            "topology_reliable": bool(topology.get("reliable", False)),
+            "path_count": int(centerline.get("path_count", len(paths))),
+            "path_point_counts": [len(path.get("points") or [])
+                                  for path in paths],
+            "path_scores": list(centerline.get("path_scores") or []),
+            "path_count_probabilities": list(
+                centerline.get("path_count_probabilities") or []),
         }
         with self._lock:
             self._perception_status = summary
