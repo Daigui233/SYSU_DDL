@@ -621,6 +621,25 @@ def create_control_runtime(state):
         return None
 
 
+def create_vision_control_planner():
+    if not (
+        env_flag("AR_VISION_CONTROL_DEBUG", True)
+        or env_flag("AR_VISION_CONTROL_SEND", False)
+    ):
+        print("[VISION CONTROL] disabled by AR_VISION_CONTROL_DEBUG=0 and AR_VISION_CONTROL_SEND=0")
+        return None, None
+    try:
+        from vision_control import VisionControlPlanner, render_vision_control_debug
+
+        planner = VisionControlPlanner(log_func=lambda message: print(f"[VISION CONTROL] {message}"))
+        mode = "send" if env_flag("AR_VISION_CONTROL_SEND", False) else "debug-only"
+        print(f"[VISION CONTROL] enabled ({mode})")
+        return planner, render_vision_control_debug
+    except Exception as exc:
+        print(f"[VISION CONTROL] unavailable: {exc}")
+        return None, None
+
+
 def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     cv2.putText(
         frame,
@@ -715,6 +734,8 @@ def main():
     web.start()
     ocr_processor = create_ocr_processor()
     control_runtime = create_control_runtime(state)
+    vision_control_planner, render_vision_control = create_vision_control_planner()
+    vision_control_send = env_flag("AR_VISION_CONTROL_SEND", False)
 
     print("[AR_RECEIVER] ready; waiting for camera shared memory...")
     print(f"[AR_RECEIVER] DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}")
@@ -842,6 +863,26 @@ def main():
                     except Exception as exc:
                         print(f"[OCR] process error: {exc}")
 
+                if vision_control_planner is not None and perception_result is not None:
+                    try:
+                        command, _vision_debug = vision_control_planner.update(
+                            perception_result,
+                            latest_ocr_response,
+                            now=time.monotonic(),
+                        )
+                        state.update_perception(perception_result)
+                        if vision_control_send and control_runtime is not None and command:
+                            control_runtime.update_vision_command(
+                                command["track_error"],
+                                command["target_speed"],
+                                state_cmd=command["state_cmd"],
+                                flags=command["flags"],
+                            )
+                    except Exception as exc:
+                        print(f"[VISION CONTROL] process error: {exc}")
+                        if vision_control_send and control_runtime is not None:
+                            control_runtime.clear_vision_command()
+
                 fps_frames += 1
                 now = time.time()
                 if now - fps_started >= 1.0:
@@ -862,6 +903,8 @@ def main():
                             ocr_response=latest_ocr_response):
                         if result is not None and render_perception is not None:
                             render_perception(target, result, mode=render_mode)
+                        if result is not None and render_vision_control is not None:
+                            render_vision_control(target, result)
                         return add_runtime_overlay(
                             target, process_fps, inference_fps, ocr_response)
 
