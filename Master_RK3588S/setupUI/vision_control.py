@@ -43,6 +43,14 @@ def _env_flag(name, default):
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _path_source_from_env():
+    value = os.environ.get(
+        "VISION_CONTROL_PATH_SOURCE",
+        os.environ.get("MULTITASK_PATH_SOURCE", "curve"),
+    ).strip().lower()
+    return value if value in {"curve", "heatmap"} else "curve"
+
+
 def _finite_float(value, default=None):
     try:
         result = float(value)
@@ -110,6 +118,7 @@ class VisionControlConfig:
     min_human_score: float = 0.35
     min_car_score: float = 0.35
     min_coin_score: float = 0.35
+    path_source: str = "curve"
 
     @classmethod
     def from_env(cls):
@@ -152,6 +161,7 @@ class VisionControlConfig:
             min_human_score=_clamp(_env_float("VISION_CONTROL_HUMAN_MIN_SCORE", 0.35), 0.0, 1.0),
             min_car_score=_clamp(_env_float("VISION_CONTROL_CAR_MIN_SCORE", 0.35), 0.0, 1.0),
             min_coin_score=_clamp(_env_float("VISION_CONTROL_COIN_MIN_SCORE", 0.35), 0.0, 1.0),
+            path_source=_path_source_from_env(),
         )
 
 
@@ -382,6 +392,24 @@ class VisionControlPlanner:
     def _extract_candidates(self, result, image_shape):
         started = time.perf_counter()
         centerline = result.get("centerline") or {}
+        if self.config.path_source == "curve":
+            paths = (centerline.get("curve_paths") or
+                     result.get("curve_paths") or [])
+            candidates = []
+            for path in paths:
+                points = np.asarray(path.get("points_xy"), dtype=np.float32)
+                if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+                    continue
+                candidate = dict(path)
+                candidate["points_xy"] = points
+                candidate["source"] = "direct_curve"
+                candidate["coverage"] = 1.0
+                candidate["road_support"] = None
+                candidates.append(candidate)
+            candidates.sort(key=lambda item: int(item.get("slot", 99)))
+            elapsed = (time.perf_counter() - started) * 1000.0
+            return candidates, elapsed
+
         heatmaps = centerline.get("heatmaps")
         if heatmaps is None:
             heatmaps = result.get("path_heatmaps")
@@ -696,13 +724,15 @@ class VisionControlPlanner:
     @staticmethod
     def _summarize_candidate(candidate, image_shape):
         points = np.asarray(candidate.get("points_xy"), dtype=np.float32)
+        road_support = _finite_float(candidate.get("road_support"))
         return {
             "slot": int(candidate.get("slot", -1)),
             "role": str(candidate.get("role") or ""),
+            "source": str(candidate.get("source") or "unknown"),
             "points": int(len(points)),
             "score": float(candidate.get("score", 0.0)),
             "coverage": float(candidate.get("coverage", 0.0)),
-            "road_support": float(candidate.get("road_support", 0.0)),
+            "road_support": road_support,
             "near_x": None if len(points) == 0 else float(points[np.argmax(points[:, 1]), 0]),
             "lookahead_x": _interp_path_x(points, image_shape[0] * 0.62),
         }

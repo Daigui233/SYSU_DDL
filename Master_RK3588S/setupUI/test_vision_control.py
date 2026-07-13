@@ -27,6 +27,7 @@ def _config(**overrides):
         "max_link_jump_px": 12.0,
         "max_error_step_640": 1000.0,
         "default_outer_after_s": 15.0,
+        "path_source": "heatmap",
     }
     values.update(overrides)
     return VisionControlConfig(**values)
@@ -68,6 +69,20 @@ def _result(heatmaps, detections=None):
     }
 
 
+def _curve_result(detections=None):
+    ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+    left = np.stack((np.full_like(ys, 240.0), ys), axis=1)
+    right = np.stack((np.full_like(ys, 400.0), ys), axis=1)
+    return {
+        "centerline": {"curve_paths": [
+            {"slot": 0, "role": "left", "score": 0.9, "points_xy": left},
+            {"slot": 1, "role": "right", "score": 0.9, "points_xy": right},
+        ]},
+        "image_shape": (480, 640, 3),
+        "detections": list(detections or []),
+    }
+
+
 class VisionControlPlannerTest(unittest.TestCase):
     def test_overlapping_heatmaps_can_still_be_multi_fork(self):
         planner = VisionControlPlanner(config=_config())
@@ -84,6 +99,14 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertGreater(right["track_error"], 0.0)
         self.assertLess(left["track_error"], 0.0)
         self.assertEqual(STATE_TRACK, right["state_cmd"])
+
+    def test_direct_curve_source_uses_curve_points_without_heatmap(self):
+        planner = VisionControlPlanner(config=_config(path_source="curve"))
+        command, debug = planner.update(_curve_result(), now=1.0)
+
+        self.assertIsNotNone(command)
+        self.assertEqual(2, debug["candidate_count"])
+        self.assertEqual("direct_curve", debug["candidates"][0]["source"])
 
     def test_current_ocr_locks_right_branch(self):
         planner = VisionControlPlanner(config=_config())

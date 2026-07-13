@@ -1,8 +1,8 @@
 """Fast CPU post-processing for the six-output RKNN multi-task model.
 
-The diagnostic centerline is traced from each frame's path heatmaps. Model
-B-spline points remain in the result for comparison, but are not substituted
-for the raw heatmap trace.
+The default active path is the model's ordered B-spline curve.  Raw heatmaps
+are always retained for the preview, while the former per-frame heatmap-ridge
+tracer remains available through an explicit runtime switch.
 """
 
 import os
@@ -41,6 +41,11 @@ def _env_int(name, default):
         return int(default)
 
 
+def _env_choice(name, default, allowed):
+    value = os.environ.get(name, default).strip().lower()
+    return value if value in allowed else default
+
+
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.25)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.60)
 DET_PRE_NMS_TOP_K = max(1, _env_int("MULTITASK_PRE_NMS_TOP_K", 1000))
@@ -74,6 +79,8 @@ RENDER_PATH_MIN_SCORE = float(np.clip(
 RENDER_PATH_MIN_COUNT_CONFIDENCE = float(np.clip(
     _env_float("MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE", 0.40),
     0.0, 1.0))
+PATH_SOURCE = _env_choice(
+    "MULTITASK_PATH_SOURCE", "curve", {"curve", "heatmap"})
 RENDER_MODE = os.environ.get(
     "MULTITASK_RENDER_MODE", "heatmap").strip().lower()
 RENDER_MODE = {"path": "drive", "road": "debug"}.get(
@@ -341,6 +348,7 @@ def decode_curve_paths(points, path_scores, path_count_scores, image_shape):
         paths.append({
             "slot": int(slot),
             "role": role,
+            "source": "direct_curve",
             "score": float(path_scores[slot]),
             "count_confidence": count_confidence,
             "points_normalized": points[slot].copy(),
@@ -453,8 +461,17 @@ def decode_heatmap_paths(path_heatmaps, path_scores, path_count_scores,
     return paths
 
 
-def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
-    """Decode all model tasks without performing route selection."""
+def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
+                   path_source=None):
+    """Decode all model tasks without performing route selection.
+
+    ``curve`` is the default active path source.  ``heatmap`` restores the
+    prior ridge-tracing implementation for comparison.  This switch changes
+    active paths only; the raw heatmap tensor remains available for rendering.
+    """
+    path_source = str(path_source or PATH_SOURCE).strip().lower()
+    if path_source not in {"curve", "heatmap"}:
+        raise ValueError("path_source must be curve or heatmap")
     boxes, scores, pixel_logits, path_points, path_scores, path_count_scores = (
         parse_outputs(outputs))
     curve_paths, path_count, count_confidence = decode_curve_paths(
@@ -463,8 +480,11 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
     road_probability = sigmoid(pixel_logits[0])
     road_mask = (pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
     raw_path_heatmaps = sigmoid(pixel_logits[1:])
-    paths = decode_heatmap_paths(
-        raw_path_heatmaps, path_scores, path_count_scores, image_shape)
+    heatmap_ridge_paths = []
+    if path_source == "heatmap":
+        heatmap_ridge_paths = decode_heatmap_paths(
+            raw_path_heatmaps, path_scores, path_count_scores, image_shape)
+    paths = curve_paths if path_source == "curve" else heatmap_ridge_paths
     path_heatmaps = raw_path_heatmaps if include_path_heatmaps else None
 
     path_scores_list = path_scores.tolist()
@@ -481,8 +501,9 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
         "heatmaps": path_heatmaps,
         "paths": paths,
         "curve_paths": curve_paths,
-        "path_source": "heatmap_ridge",
-        "display_source": "heatmap_ridge",
+        "heatmap_ridge_paths": heatmap_ridge_paths,
+        "path_source": "direct_curve" if path_source == "curve" else "heatmap_ridge",
+        "display_source": "direct_curve" if path_source == "curve" else "heatmap_ridge",
         "path_scores": path_scores_list,
         "path_count": path_count,
         "path_count_scores": path_count_scores_list,
@@ -499,6 +520,8 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
         "path_count_scores": path_count_scores_list,
         "paths": paths,
         "curve_paths": curve_paths,
+        "heatmap_ridge_paths": heatmap_ridge_paths,
+        "path_source": path_source,
         "road": road,
         "centerline": centerline,
         # Kept as a view so path heatmaps can be materialized only when the
@@ -621,7 +644,7 @@ def _draw_path_curve(image, points, color, dashed=False):
 
 
 def render_result(image, result, mode=None):
-    """Draw boxes and a per-frame heatmap centerline for model diagnosis."""
+    """Draw boxes, raw heatmaps, and the configured active path source."""
     mode = str(mode or RENDER_MODE).strip().lower()
     mode = {"path": "drive", "road": "debug"}.get(mode, mode)
     if mode == "off":

@@ -33,8 +33,9 @@ Path slots have conditional roles:
 - count 1: slot 0 is `single`.
 - count 2: slot 0 is `left`, slot 1 is `right`.
 
-The board preserves `path_points` as `curve_paths`. For diagnosis it also
-extracts one representative single-frame ridge from each path heatmap.
+The default active path is `path_points`: the ordered model curve is exposed
+as `paths` and `curve_paths`. The raw heatmaps remain available for preview.
+The old heatmap-ridge extraction is retained as an optional comparison mode.
 
 ## Runtime tuning
 
@@ -59,6 +60,8 @@ export MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO=0.70
 export MULTITASK_RENDER_MAX_BOX_AREA_RATIO=0.30
 export MULTITASK_RENDER_PATH_MIN_SCORE=0.35
 export MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE=0.40
+export MULTITASK_PATH_SOURCE=curve
+export VISION_CONTROL_PATH_SOURCE=curve
 ```
 
 Temporal filtering is not used. Every displayed ridge is decoded independently
@@ -105,9 +108,10 @@ export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 
 - `off`: no perception drawing.
 - `heatmap`: diagnostic default. Draw every post-NMS detection as a full box,
-  overlay both raw sigmoid path heatmaps, and draw exactly one representative
-  ridge per heatmap channel. Frame-spanning boxes are hidden from rendering
-  only and remain available to OCR/control.
+  overlay both raw sigmoid path heatmaps, and draw the active path source.
+  With the default `curve` source, these are the model's direct B-spline
+  curves rather than lines reconstructed from heatmap peaks. Frame-spanning
+  boxes are hidden from rendering only and remain available to OCR/control.
 - `drive`: low-clutter mode. No road fill or labels; paths are thin, Coin uses
   a dot, and other detections use corner marks.
 - `debug`: drive mode plus the binary road overlay.
@@ -119,9 +123,15 @@ receive every post-NMS detection even though preview drawing defaults to at
 most six detections, two per class. Legacy `path` and `road` mode names map to
 `drive` and `debug`.
 
-Set `AR_LOCAL_PREVIEW=0` to skip full-frame rendering. Heatmap ridge extraction
-still runs so diagnostics remain available in the result. Three
-RKNN runtimes remain in flight by default, one on each RK3588S NPU core.
+`MULTITASK_PATH_SOURCE=curve` is the default. It uses `path_points` for both
+the preview path and visual-control candidates. Raw heatmaps are still
+overlaid in `heatmap`/`full` preview modes, but no heatmap-derived line is
+drawn. Set `MULTITASK_PATH_SOURCE=heatmap` to restore the former heatmap ridge
+tracing. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
+overridden independently for comparison.
+
+Set `AR_LOCAL_PREVIEW=0` to skip full-frame rendering. Three RKNN runtimes
+remain in flight by default, one on each RK3588S NPU core.
 
 ## Python result
 
@@ -133,16 +143,16 @@ The result exposes both the unified top-level fields and the existing nested
 - `road_mask`: `[120,160]` uint8.
 - `path_heatmaps`: raw sigmoid probabilities with shape `[2,120,160]`.
 - `path_count` and `path_count_scores`.
-- `paths`: at most one current-frame heatmap ridge per channel.
+- `paths`: the active source, direct `[32,2]` model curves by default.
 - `curve_paths`: the model's ordered `[32,2]` B-spline outputs.
+- `heatmap_ridge_paths`: only populated when `MULTITASK_PATH_SOURCE=heatmap`.
 - `timings_ms`: preprocess, RKNN inference, FIFO wait, postprocess, and total
   latency visible to the perception consumer.
 
-The centerline scans each raw path heatmap from bottom to top, links spatially
-near row peaks across small gaps, and keeps only the track with the greatest
-row coverage and accumulated confidence. It does not multiply path probability
-by road probability. There is no EMA, hold, hysteresis, cross-frame jump
-rejection, or any other temporal state.
+In `heatmap` mode the old centerline scanner works unchanged: it scans each raw
+path heatmap from bottom to top, links spatially near row peaks across small
+gaps, and keeps only the track with the greatest row coverage and accumulated
+confidence. It does not multiply path probability by road probability.
 
 The old `rknn_lt.rknn` and old four-output models are incompatible and fail
 fast instead of producing incorrect paths.
