@@ -5,6 +5,7 @@ import numpy as np
 from .func import (
     CLASSES,
     RENDER_MODE,
+    _is_oversized_render_box,
     _select_detections_for_render,
     decode_outputs,
     detection_nms,
@@ -70,19 +71,46 @@ class MultiTaskPostprocessTest(unittest.TestCase):
             float(result["curve_paths"][0]["points_xy"][0, 1]),
             0.95 * 239, places=4)
 
-    def test_traces_each_active_heatmap_without_temporal_state(self):
+    def test_extracts_one_ridge_per_heatmap_without_temporal_state(self):
         result = decode_outputs(self.make_outputs(), (480, 640, 3))
 
-        self.assertEqual(result["centerline"]["source"], "heatmap")
+        self.assertEqual(
+            result["centerline"]["display_source"], "heatmap_ridge")
+        self.assertEqual(
+            result["centerline"]["path_source"], "heatmap_ridge")
         self.assertEqual([item["role"] for item in result["paths"]],
                          ["left", "right"])
-        self.assertTrue(all(item["source"] == "heatmap"
+        self.assertTrue(all(item["source"] == "heatmap_ridge"
                             for item in result["paths"]))
-        self.assertGreater(len(result["paths"][0]["points_xy"]), 20)
+        self.assertGreater(len(result["paths"][0]["points_xy"]), 30)
         self.assertAlmostEqual(
             float(np.mean(result["paths"][0]["points_xy"][:, 0])),
             66 * 4, delta=2.0)
         self.assertNotIn("temporal", result)
+
+    def test_keeps_only_longest_ridge_in_each_heatmap(self):
+        outputs = list(self.make_outputs())
+        outputs[2][0, 2, 24:72, 132] = 8.0
+
+        result = decode_outputs(outputs, (480, 640, 3))
+
+        right_paths = [item for item in result["paths"]
+                       if item["slot"] == 1]
+        self.assertEqual(len(right_paths), 1)
+        self.assertAlmostEqual(
+            float(np.mean(right_paths[0]["points_xy"][:, 0])),
+            108 * 4, delta=2.0)
+
+    def test_ridge_bridges_single_missing_heatmap_row(self):
+        outputs = list(self.make_outputs())
+        outputs[2][0, 2, 60, 108] = -8.0
+
+        result = decode_outputs(outputs, (480, 640, 3))
+        right_paths = [item for item in result["paths"]
+                       if item["slot"] == 1]
+
+        self.assertEqual(len(right_paths), 1)
+        self.assertGreater(len(right_paths[0]["points_xy"]), 30)
 
     def test_probability_outputs_are_not_transformed_again(self):
         result = decode_outputs(self.make_outputs(), (480, 640, 3))
@@ -219,6 +247,13 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         selected = _select_detections_for_render(detections, "heatmap")
 
         self.assertEqual(len(selected), 8)
+
+    def test_frame_spanning_detection_box_is_hidden_from_preview(self):
+        large = {"bbox": [5, 40, 635, 180]}
+        normal = {"bbox": [100, 100, 220, 240]}
+
+        self.assertTrue(_is_oversized_render_box(large, (480, 640, 3)))
+        self.assertFalse(_is_oversized_render_box(normal, (480, 640, 3)))
 
     def test_default_render_mode_is_raw_heatmap(self):
         self.assertEqual(RENDER_MODE, "heatmap")

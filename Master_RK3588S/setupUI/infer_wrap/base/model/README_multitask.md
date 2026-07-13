@@ -33,8 +33,8 @@ Path slots have conditional roles:
 - count 1: slot 0 is `single`.
 - count 2: slot 0 is `left`, slot 1 is `right`.
 
-The board maps `path_points` directly to the camera frame. It does not scan,
-skeletonize, reconnect, or fit the path heatmaps.
+The board preserves `path_points` as `curve_paths`. For diagnosis it also
+extracts one representative single-frame ridge from each path heatmap.
 
 ## Runtime tuning
 
@@ -54,23 +54,15 @@ export MULTITASK_ROAD_THRESHOLD=0.50
 export MULTITASK_RENDER_DET_THRESHOLD=0.45
 export MULTITASK_RENDER_MAX_DETECTIONS=6
 export MULTITASK_RENDER_MAX_PER_CLASS=2
+export MULTITASK_RENDER_MAX_BOX_WIDTH_RATIO=0.70
+export MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO=0.70
+export MULTITASK_RENDER_MAX_BOX_AREA_RATIO=0.30
 export MULTITASK_RENDER_PATH_MIN_SCORE=0.35
 export MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE=0.40
-export MULTITASK_PATH_TEMPORAL_FILTER=1
-export MULTITASK_PATH_EMA_ALPHA=0.45
-export MULTITASK_PATH_COUNT_CONFIRM_FRAMES=2
-export MULTITASK_PATH_LOST_HOLD_FRAMES=3
-export MULTITASK_PATH_MAX_JUMP_RATIO=0.15
-export MULTITASK_PATH_RESET_GAP_SECONDS=0.50
 ```
 
-Temporal filtering runs after the FIFO returns results in frame order. It is
-causal, processes at most 64 points, and does not wait for future frames. A
-path-count change must persist for two frames; a zero-path result must persist
-for three frames. Large one-frame jumps are held briefly, while a persistent
-new path is accepted and reinitialized. `raw_paths` and `raw_path_count` remain
-available for model comparison and threshold tuning. A camera or inference gap
-longer than 0.5 seconds resets stale path history.
+Temporal filtering is not used. Every displayed ridge is decoded independently
+from the current frame.
 
 `MULTITASK_COIN_MIN_SHORT_SIDE=10` mirrors the training dataset rule: Coin
 detections whose short side is below 10 pixels in the fixed 640x480 model input
@@ -113,8 +105,9 @@ export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 
 - `off`: no perception drawing.
 - `heatmap`: diagnostic default. Draw every post-NMS detection as a full box,
-  overlay both raw sigmoid path heatmaps, and draw the centerline traced from
-  the current frame only.
+  overlay both raw sigmoid path heatmaps, and draw exactly one representative
+  ridge per heatmap channel. Frame-spanning boxes are hidden from rendering
+  only and remain available to OCR/control.
 - `drive`: low-clutter mode. No road fill or labels; paths are thin, Coin uses
   a dot, and other detections use corner marks.
 - `debug`: drive mode plus the binary road overlay.
@@ -126,9 +119,9 @@ receive every post-NMS detection even though preview drawing defaults to at
 most six detections, two per class. Legacy `path` and `road` mode names map to
 `drive` and `debug`.
 
-Set `AR_LOCAL_PREVIEW=0` to skip full-frame rendering. Heatmap decoding still
-runs because `paths` now comes from the per-frame heatmaps. Three RKNN runtimes
-remain in flight by default, one on each RK3588S NPU core.
+Set `AR_LOCAL_PREVIEW=0` to skip full-frame rendering. Heatmap ridge extraction
+still runs so diagnostics remain available in the result. Three
+RKNN runtimes remain in flight by default, one on each RK3588S NPU core.
 
 ## Python result
 
@@ -140,14 +133,16 @@ The result exposes both the unified top-level fields and the existing nested
 - `road_mask`: `[120,160]` uint8.
 - `path_heatmaps`: raw sigmoid probabilities with shape `[2,120,160]`.
 - `path_count` and `path_count_scores`.
-- `paths`: current-frame row-peak traces decoded from the heatmaps.
-- `curve_paths`: the model's direct `[32,2]` B-spline outputs for comparison.
+- `paths`: at most one current-frame heatmap ridge per channel.
+- `curve_paths`: the model's ordered `[32,2]` B-spline outputs.
 - `timings_ms`: preprocess, RKNN inference, FIFO wait, postprocess, and total
   latency visible to the perception consumer.
 
-The centerline uses the previous model's row-local-peak and adjacent-row
-connection method independently on each active heatmap slot. There is no EMA,
-hold, hysteresis, cross-frame jump rejection, or any other temporal state.
+The centerline scans each raw path heatmap from bottom to top, links spatially
+near row peaks across small gaps, and keeps only the track with the greatest
+row coverage and accumulated confidence. It does not multiply path probability
+by road probability. There is no EMA, hold, hysteresis, cross-frame jump
+rejection, or any other temporal state.
 
 The old `rknn_lt.rknn` and old four-output models are incompatible and fail
 fast instead of producing incorrect paths.

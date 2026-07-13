@@ -63,6 +63,12 @@ RENDER_MAX_PER_CLASS = max(
     0, _env_int("MULTITASK_RENDER_MAX_PER_CLASS", 2))
 RENDER_FULL_MAX_DETECTIONS = max(
     0, _env_int("MULTITASK_RENDER_FULL_MAX_DETECTIONS", 20))
+RENDER_MAX_BOX_WIDTH_RATIO = float(np.clip(
+    _env_float("MULTITASK_RENDER_MAX_BOX_WIDTH_RATIO", 0.70), 0.0, 1.0))
+RENDER_MAX_BOX_HEIGHT_RATIO = float(np.clip(
+    _env_float("MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO", 0.70), 0.0, 1.0))
+RENDER_MAX_BOX_AREA_RATIO = float(np.clip(
+    _env_float("MULTITASK_RENDER_MAX_BOX_AREA_RATIO", 0.30), 0.0, 1.0))
 RENDER_PATH_MIN_SCORE = float(np.clip(
     _env_float("MULTITASK_RENDER_PATH_MIN_SCORE", 0.35), 0.0, 1.0))
 RENDER_PATH_MIN_COUNT_CONFIDENCE = float(np.clip(
@@ -343,8 +349,8 @@ def decode_curve_paths(points, path_scores, path_count_scores, image_shape):
     return paths, path_count, count_confidence
 
 
-def _row_peaks(values, threshold, max_peaks=None, min_distance=3):
-    """Return local maxima from one heatmap row, strongest first."""
+def _row_peaks(values, threshold, min_distance=3):
+    """Return separated local maxima from one heatmap row."""
     if len(values) < 3:
         return []
     mask = ((values[1:-1] >= values[:-2]) &
@@ -357,19 +363,25 @@ def _row_peaks(values, threshold, max_peaks=None, min_distance=3):
         if all(abs(int(index) - previous) >= min_distance
                for previous, _ in selected):
             selected.append((int(index), float(values[index])))
-            if max_peaks is not None and len(selected) >= max_peaks:
-                break
     return selected
 
 
-def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
-                     min_points=3):
-    """Connect row peaks within one frame; this contains no temporal state."""
+def _trace_heatmap_ridges(probability, threshold=PATH_HEATMAP_THRESHOLD,
+                          row_step=2, max_jump=16,
+                          max_missing_rows=6, min_points=4):
+    """Trace spatially continuous ridges within one frame."""
+    rows = range(probability.shape[0] - 2,
+                 max(probability.shape[0] // 5, 1), -row_step)
     tracks = []
-    for row_index, (row, peaks) in enumerate(zip(rows, candidates)):
+    sampled_index = 0
+    for row in rows:
+        peaks = _row_peaks(probability[row], threshold)
+        if not peaks:
+            sampled_index += 1
+            continue
         active = [
             index for index, track in enumerate(tracks)
-            if row_index - track["last_row_index"] <= max_missing_rows + 1
+            if sampled_index - track["last_index"] <= max_missing_rows + 1
         ]
         pairs = []
         for track_index in active:
@@ -386,7 +398,7 @@ def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
                 continue
             x, confidence = peaks[peak_index]
             tracks[track_index]["points"].append((x, row, confidence))
-            tracks[track_index]["last_row_index"] = row_index
+            tracks[track_index]["last_index"] = sampled_index
             used_tracks.add(track_index)
             used_peaks.add(peak_index)
 
@@ -394,51 +406,30 @@ def _trace_all_paths(rows, candidates, max_jump=20, max_missing_rows=2,
             if peak_index not in used_peaks:
                 tracks.append({
                     "points": [(x, row, confidence)],
-                    "last_row_index": row_index,
+                    "last_index": sampled_index,
                 })
+        sampled_index += 1
 
-    paths = [track["points"] for track in tracks
-             if len(track["points"]) >= min_points]
-    paths.sort(
-        key=lambda path: (len(path), sum(point[2] for point in path)),
+    candidates = [track["points"] for track in tracks
+                  if len(track["points"]) >= min_points]
+    candidates.sort(
+        key=lambda points: (
+            len(points), sum(point[2] for point in points)),
         reverse=True)
-    return paths
+    return candidates
 
 
-def candidate_centerlines(road_probability, center_probability,
-                          peak_threshold=PATH_HEATMAP_THRESHOLD,
-                          max_peaks_per_row=None, row_step=3,
-                          road_floor=0.25):
-    """Trace the previous model's row peaks on one raw path heatmap."""
-    score = center_probability * (
-        road_floor + (1.0 - road_floor) * road_probability)
-    rows = list(range(score.shape[0] - 2,
-                      max(score.shape[0] // 5, 1), -row_step))
-    sampled_rows = []
-    candidates = []
-    for row in rows:
-        peaks = _row_peaks(
-            score[row], peak_threshold, max_peaks_per_row)
-        if peaks:
-            sampled_rows.append(row)
-            candidates.append(peaks)
-    return _trace_all_paths(sampled_rows, candidates), score
-
-
-def decode_heatmap_paths(road_probability, path_heatmaps, path_scores,
-                         path_count_scores, image_shape):
-    """Trace both heatmap slots without path-count gating or frame history."""
+def decode_heatmap_paths(path_heatmaps, path_scores, path_count_scores,
+                         image_shape):
+    """Return exactly one representative ridge for each heatmap channel."""
     height, width = image_shape[:2]
     path_count = int(np.argmax(path_count_scores))
     count_confidence = float(path_count_scores[path_count])
     roles = (("left", "right") if path_count == 2
              else ("single", "right"))
     paths = []
-    score_maps = []
     for slot, role in enumerate(roles):
-        candidates, score_map = candidate_centerlines(
-            road_probability, path_heatmaps[slot])
-        score_maps.append(score_map)
+        candidates = _trace_heatmap_ridges(path_heatmaps[slot])
         if not candidates:
             continue
         points = np.asarray(candidates[0], dtype=np.float32)
@@ -452,30 +443,28 @@ def decode_heatmap_paths(road_probability, path_heatmaps, path_scores,
         paths.append({
             "slot": int(slot),
             "role": role,
-            "source": "heatmap",
+            "source": "heatmap_ridge",
             "score": float(path_scores[slot]),
             "heatmap_score": float(np.mean(points[:, 2])),
             "count_confidence": count_confidence,
             "point_confidences": points[:, 2].copy(),
             "points_xy": points_xy,
         })
-    return paths, path_count, count_confidence, score_maps
+    return paths
 
 
 def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
     """Decode all model tasks without performing route selection."""
     boxes, scores, pixel_logits, path_points, path_scores, path_count_scores = (
         parse_outputs(outputs))
-    curve_paths, _, _ = decode_curve_paths(
+    curve_paths, path_count, count_confidence = decode_curve_paths(
         path_points, path_scores, path_count_scores, image_shape)
 
     road_probability = sigmoid(pixel_logits[0])
     road_mask = (pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
     raw_path_heatmaps = sigmoid(pixel_logits[1:])
-    paths, path_count, count_confidence, path_score_maps = (
-        decode_heatmap_paths(
-            road_probability, raw_path_heatmaps, path_scores,
-            path_count_scores, image_shape))
+    paths = decode_heatmap_paths(
+        raw_path_heatmaps, path_scores, path_count_scores, image_shape)
     path_heatmaps = raw_path_heatmaps if include_path_heatmaps else None
 
     path_scores_list = path_scores.tolist()
@@ -492,8 +481,8 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True):
         "heatmaps": path_heatmaps,
         "paths": paths,
         "curve_paths": curve_paths,
-        "score_maps": path_score_maps,
-        "source": "heatmap",
+        "path_source": "heatmap_ridge",
+        "display_source": "heatmap_ridge",
         "path_scores": path_scores_list,
         "path_count": path_count,
         "path_count_scores": path_count_scores_list,
@@ -581,6 +570,21 @@ def _select_detections_for_render(detections, mode):
     return selected
 
 
+def _is_oversized_render_box(detection, image_shape):
+    """Hide frame-spanning preview boxes without changing perception data."""
+    height, width = image_shape[:2]
+    if width <= 0 or height <= 0:
+        return False
+    left, top, right, bottom = detection.get("bbox", (0, 0, 0, 0))
+    width_ratio = max(0.0, float(right) - float(left)) / float(width)
+    height_ratio = max(0.0, float(bottom) - float(top)) / float(height)
+    area_ratio = width_ratio * height_ratio
+    return (
+        width_ratio >= RENDER_MAX_BOX_WIDTH_RATIO or
+        height_ratio >= RENDER_MAX_BOX_HEIGHT_RATIO or
+        area_ratio >= RENDER_MAX_BOX_AREA_RATIO)
+
+
 def _draw_corner_box(image, bbox, color, thickness=1):
     left, top, right, bottom = [int(round(value)) for value in bbox]
     left = max(0, min(left, image.shape[1] - 1))
@@ -646,6 +650,8 @@ def render_result(image, result, mode=None):
     drawn_detections = _select_detections_for_render(
         result.get("detections"), mode)
     for detection in drawn_detections:
+        if _is_oversized_render_box(detection, image.shape):
+            continue
         bbox = detection["bbox"]
         label = detection["label"]
         color = DETECTION_COLORS.get(label, (0, 220, 0))
