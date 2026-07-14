@@ -22,6 +22,8 @@ ROUTE_MULTI_FORK = "MULTI_FORK"
 ROUTE_AMBIGUOUS = "AMBIGUOUS"
 
 _PAIR_FRACTIONS = np.arange(24, dtype=np.float32) / 23.0
+_TEMPORAL_PATH_SAMPLES = 24
+_SOLID_RED_PREVIEW = None
 
 
 def _env_float(name, default):
@@ -79,19 +81,55 @@ def _smooth_binary_mask_edges(mask, kernel_size=9):
     return (blurred >= 127).astype(np.uint8)
 
 
-def _fill_binary_mask(mask):
-    """Fill every external binary contour, including its internal holes."""
+def _fill_binary_mask(mask, max_hole_area=32):
+    """Fill only small enclosed holes without filling large fork interiors."""
     mask = (np.asarray(mask) != 0).astype(np.uint8)
-    contours, _hierarchy = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filled = np.zeros_like(mask)
-    if contours:
-        cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
+    max_hole_area = max(0, int(max_hole_area))
+    if mask.ndim != 2 or not mask.size or max_hole_area <= 0:
+        return mask
+    background = (mask == 0).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        background, connectivity=8)
+    if count <= 1:
+        return mask
+    border_labels = np.unique(np.concatenate((
+        labels[0], labels[-1], labels[:, 0], labels[:, -1],
+    )))
+    candidates = np.arange(1, count, dtype=np.int32)
+    holes = candidates[
+        (~np.isin(candidates, border_labels)) &
+        (stats[candidates, cv2.CC_STAT_AREA] <= max_hole_area)]
+    filled = mask.copy()
+    if len(holes):
+        filled[np.isin(labels, holes)] = 1
     return filled
 
 
+def _spatial_hysteresis_binary_mask(
+        heatmap, high_threshold=0.35, low_threshold=0.27):
+    """Keep weak heat only when it belongs to a current strong component."""
+    heatmap = np.asarray(heatmap, dtype=np.float32)
+    if heatmap.ndim != 2 or not heatmap.size:
+        return np.zeros(heatmap.shape, dtype=np.uint8)
+    high_threshold = _clamp(high_threshold, 0.0, 1.0)
+    low_threshold = _clamp(low_threshold, 0.0, high_threshold)
+    if high_threshold <= 0.0:
+        return (heatmap > 0.0).astype(np.uint8)
+    strong = heatmap >= high_threshold
+    if not np.any(strong):
+        return np.zeros(heatmap.shape, dtype=np.uint8)
+    weak = heatmap >= low_threshold
+    count, labels = cv2.connectedComponents(
+        weak.astype(np.uint8), connectivity=8)
+    if count <= 1:
+        return np.zeros(heatmap.shape, dtype=np.uint8)
+    seeded_labels = np.unique(labels[strong])
+    seeded_labels = seeded_labels[seeded_labels != 0]
+    return np.isin(labels, seeded_labels).astype(np.uint8)
+
+
 def _connect_binary_mask_samples(
-        mask, max_gap=8, minimum_group_area=15, bridge_thickness=3):
+        mask, max_gap=6, minimum_group_area=15, bridge_thickness=3):
     """Connect nearby mask fragments as discrete samples.
 
     Components whose dilated neighborhoods touch form one proximity group.
@@ -175,6 +213,29 @@ def _connect_binary_mask_samples(
                 second_points = boundaries.get(second_label)
                 if second_points is None or not len(second_points):
                     continue
+                first_left = int(stats[first_label, cv2.CC_STAT_LEFT])
+                first_top = int(stats[first_label, cv2.CC_STAT_TOP])
+                first_right = first_left + int(
+                    stats[first_label, cv2.CC_STAT_WIDTH]) - 1
+                first_bottom = first_top + int(
+                    stats[first_label, cv2.CC_STAT_HEIGHT]) - 1
+                second_left = int(stats[second_label, cv2.CC_STAT_LEFT])
+                second_top = int(stats[second_label, cv2.CC_STAT_TOP])
+                second_right = second_left + int(
+                    stats[second_label, cv2.CC_STAT_WIDTH]) - 1
+                second_bottom = second_top + int(
+                    stats[second_label, cv2.CC_STAT_HEIGHT]) - 1
+                gap_x = max(
+                    0, second_left - first_right,
+                    first_left - second_right)
+                gap_y = max(
+                    0, second_top - first_bottom,
+                    first_top - second_bottom)
+                if gap_x * gap_x + gap_y * gap_y > max_gap * max_gap:
+                    # Exact contour distance cannot be smaller than the
+                    # bounding-box distance.  Reject far component pairs
+                    # before the much more expensive batchDistance call.
+                    continue
                 distances, nearest = cv2.batchDistance(
                     first_points, second_points, cv2.CV_32F,
                     normType=cv2.NORM_L2, K=1)
@@ -241,6 +302,32 @@ def _interp_path_x_many(points, target_ys):
     if len(ys) == 1:
         return np.full(target_ys.shape, xs[0], dtype=np.float32)
     return np.interp(target_ys, ys, xs).astype(np.float32)
+
+
+def _resample_path_by_count(points, sample_count=48):
+    """Resample a 2-D path by arc length, including horizontal paths."""
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+        return points.copy()
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    keep = np.concatenate((
+        np.asarray([True]), segment_lengths > 1e-5))
+    points = points[keep]
+    if len(points) < 2:
+        return points.copy()
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    arc = np.concatenate((
+        np.asarray([0.0], dtype=np.float32),
+        np.cumsum(segment_lengths, dtype=np.float32)))
+    total = float(arc[-1])
+    if total <= 1e-5:
+        return points.copy()
+    sample_count = max(2, int(sample_count))
+    samples = np.linspace(0.0, total, sample_count, dtype=np.float32)
+    return np.column_stack((
+        np.interp(samples, arc, points[:, 0]),
+        np.interp(samples, arc, points[:, 1]),
+    )).astype(np.float32)
 
 
 def _heatmap_polyline_mask(points, image_shape, heatmap_shape):
@@ -389,7 +476,7 @@ class VisionControlConfig:
     road_penalty_weight: float = 0.75
     history_weight: float = 0.035
     jump_weight: float = 0.018
-    path_ema_alpha: float = 0.32
+    path_ema_alpha: float = 0.50
     path_smooth_window: int = 5
     path_max_step_px_640: float = 40.0
     path_state_hold_frames: int = 8
@@ -402,12 +489,16 @@ class VisionControlConfig:
     fragment_max_tangent_delta_deg: float = 55.0
     heatmap_component_budget: int = 2
     skeleton_threshold: float = 0.35
+    skeleton_low_threshold: float = 0.27
     skeleton_min_area: int = 15
     skeleton_min_length: int = 8
     skeleton_close_iterations: int = 1
     skeleton_edge_smooth_kernel: int = 9
-    skeleton_connect_max_gap: int = 8
+    skeleton_max_hole_area: int = 32
+    skeleton_connect_max_gap: int = 6
     skeleton_bridge_thickness: int = 3
+    skeleton_min_branch_length: int = 10
+    skeleton_max_branches: int = 2
     default_outer_after_s: float = 15.0
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
@@ -510,7 +601,7 @@ class VisionControlConfig:
             road_penalty_weight=max(0.0, _env_float("VISION_CONTROL_ROAD_WEIGHT", 0.75)),
             history_weight=max(0.0, _env_float("VISION_CONTROL_HISTORY_WEIGHT", 0.035)),
             jump_weight=max(0.0, _env_float("VISION_CONTROL_JUMP_WEIGHT", 0.018)),
-            path_ema_alpha=_clamp(_env_float("VISION_CONTROL_PATH_EMA_ALPHA", 0.32), 0.0, 1.0),
+            path_ema_alpha=_clamp(_env_float("VISION_CONTROL_PATH_EMA_ALPHA", 0.50), 0.0, 1.0),
             path_smooth_window=max(1, _env_int("VISION_CONTROL_PATH_SMOOTH_WINDOW", 5)),
             path_max_step_px_640=max(1.0, _env_float("VISION_CONTROL_PATH_MAX_STEP_640", 40.0)),
             path_state_hold_frames=max(1, _env_int("VISION_CONTROL_PATH_HOLD_FRAMES", 8)),
@@ -530,6 +621,10 @@ class VisionControlConfig:
             skeleton_threshold=_clamp(
                 _env_float("VISION_CONTROL_SKELETON_THRESHOLD", 0.35),
                 0.0, 0.99),
+            skeleton_low_threshold=_clamp(
+                _env_float(
+                    "VISION_CONTROL_SKELETON_LOW_THRESHOLD", 0.27),
+                0.0, 0.99),
             skeleton_min_area=max(
                 1, _env_int("VISION_CONTROL_SKELETON_MIN_AREA", 15)),
             skeleton_min_length=max(
@@ -538,12 +633,21 @@ class VisionControlConfig:
                 0, _env_int("VISION_CONTROL_SKELETON_CLOSE_ITERATIONS", 1)),
             skeleton_edge_smooth_kernel=max(
                 1, _env_int("VISION_CONTROL_SKELETON_EDGE_KERNEL", 9)),
+            skeleton_max_hole_area=max(
+                0, _env_int(
+                    "VISION_CONTROL_SKELETON_MAX_HOLE_AREA", 32)),
             skeleton_connect_max_gap=max(
                 0, _env_int(
-                    "VISION_CONTROL_SKELETON_MAX_CONNECT_GAP", 8)),
+                    "VISION_CONTROL_SKELETON_MAX_CONNECT_GAP", 6)),
             skeleton_bridge_thickness=max(
                 1, _env_int(
                     "VISION_CONTROL_SKELETON_BRIDGE_THICKNESS", 3)),
+            skeleton_min_branch_length=max(
+                1, _env_int(
+                    "VISION_CONTROL_SKELETON_MIN_BRANCH_LENGTH", 10)),
+            skeleton_max_branches=max(
+                1, _env_int(
+                    "VISION_CONTROL_SKELETON_MAX_BRANCHES", 2)),
             default_outer_after_s=max(0.0, _env_float("VISION_CONTROL_DEFAULT_OUTER_AFTER", 15.0)),
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
@@ -1313,6 +1417,7 @@ class VisionControlPlanner:
         self.log_func = log_func
         self.last_selected_points = None
         self.last_slot_points = {}
+        self.last_slot_branch_tails = {}
         self.last_valid_ts = 0.0
         self.last_error = 0.0
         self.route_state = ROUTE_NONE
@@ -1323,6 +1428,7 @@ class VisionControlPlanner:
         self.branch_lock = None
         self.branch_lock_source = None
         self.selected_slot_lock = None
+        self.selected_branch_signature = None
         self.selected_slot_missing_frames = 0
         self.path_missing_frames = {}
         self.fork_seen_since = None
@@ -1358,9 +1464,12 @@ class VisionControlPlanner:
         if ocr_current:
             self.last_valid_ocr_ts = now
             self.last_ocr_direction = ocr_direction
-            self.branch_lock = ocr_direction
+            wanted_slot = 1 if ocr_direction == "right" else 0
+            if self.selected_slot_lock != wanted_slot:
+                self.selected_branch_signature = None
+            self.branch_lock = "right" if ocr_direction == "right" else "left"
             self.branch_lock_source = "ocr"
-            self.selected_slot_lock = 0 if ocr_direction == "left" else 1
+            self.selected_slot_lock = wanted_slot
             self.selected_slot_missing_frames = 0
         else:
             ocr_lock_expired = self._expire_ocr_lock(now)
@@ -1381,6 +1490,8 @@ class VisionControlPlanner:
             "branch_lock": self.branch_lock,
             "branch_lock_source": self.branch_lock_source,
             "selected_slot_lock": self.selected_slot_lock,
+            "selected_branch_temporal_lock": bool(
+                self.selected_branch_signature is not None),
             "raw_ocr_direction": raw_ocr_direction if raw_ocr_current else None,
             "raw_ocr_current": bool(raw_ocr_current),
             "ocr_pending_direction": self.ocr_pending_direction,
@@ -1523,12 +1634,21 @@ class VisionControlPlanner:
                     "method": "semantic_skeleton",
                     "binary_threshold": float(
                         self.config.skeleton_threshold),
+                    "spatial_low_threshold": float(min(
+                        self.config.skeleton_threshold,
+                        self.config.skeleton_low_threshold)),
                     "min_component_area": int(
                         self.config.skeleton_min_area),
                     "min_skeleton_length": int(
                         self.config.skeleton_min_length),
                     "max_connect_gap": int(
                         self.config.skeleton_connect_max_gap),
+                    "max_hole_area": int(
+                        self.config.skeleton_max_hole_area),
+                    "min_branch_length": int(
+                        self.config.skeleton_min_branch_length),
+                    "max_branches": int(
+                        self.config.skeleton_max_branches),
                     "detected_path_count": int(len(candidates)),
                     "valid_path_count": int(len(candidates)),
                     "invalid_slots": sorted(int(slot) for slot in invalid_slots),
@@ -1624,6 +1744,9 @@ class VisionControlPlanner:
         distribution_masks = []
         component_groups = []
         binary_threshold = float(self.config.skeleton_threshold)
+        low_threshold = min(
+            binary_threshold,
+            float(self.config.skeleton_low_threshold))
         close_iterations = max(
             0, int(self.config.skeleton_close_iterations))
         edge_smooth_kernel = max(
@@ -1638,6 +1761,10 @@ class VisionControlPlanner:
             1, int(round(
                 float(self.config.skeleton_bridge_thickness) *
                 heatmap_scale)))
+        max_hole_area = max(
+            0, int(round(
+                float(self.config.skeleton_max_hole_area) *
+                heatmap_scale ** 2)))
         close_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (3, 3))
         minimum_area = max(
@@ -1648,10 +1775,8 @@ class VisionControlPlanner:
         )
         for slot in range(min(2, heatmaps.shape[0])):
             heatmap = np.clip(effective_maps[slot], 0.0, 1.0)
-            mask = (
-                (heatmap >= binary_threshold)
-                if binary_threshold > 0.0 else (heatmap > 0.0)
-            ).astype(np.uint8)
+            mask = _spatial_hysteresis_binary_mask(
+                heatmap, binary_threshold, low_threshold)
             if has_road:
                 mask &= (road >= road_threshold).astype(np.uint8)
             mask = _connect_binary_mask_samples(
@@ -1669,7 +1794,8 @@ class VisionControlPlanner:
             mask = _smooth_binary_mask_edges(mask, edge_smooth_kernel)
             if has_road:
                 mask &= (road >= road_threshold).astype(np.uint8)
-            mask = _fill_binary_mask(mask)
+            mask = _fill_binary_mask(
+                mask, max_hole_area=max_hole_area)
             if has_road:
                 mask &= (road >= road_threshold).astype(np.uint8)
             components, labels, stats, _centroids = cv2.connectedComponentsWithStats(
@@ -1677,9 +1803,8 @@ class VisionControlPlanner:
             valid_labels = np.flatnonzero(
                 stats[1:, cv2.CC_STAT_AREA] >= minimum_area) + 1
             cleaned_mask = np.isin(labels, valid_labels).astype(np.uint8) * 255
-            # Publish the exact cleaned mask used for thinning and curve
-            # fitting, so the AR red overlay and blue/green lines share one
-            # geometric source of truth.
+            # Publish the exact cleaned mask used for thinning so AR Preview
+            # and the blue/green paths share one geometric source of truth.
             distribution_masks.append(
                 (cleaned_mask != 0).astype(np.uint8))
             ximgproc = getattr(cv2, "ximgproc", None)
@@ -1726,7 +1851,7 @@ class VisionControlPlanner:
             component_groups.append([
                 (float(priorities[index]), int(slot),
                  int(valid_labels[index]), heatmap, labels, stats,
-                 label_heat_sums)
+                 label_heat_sums, skeleton_mask)
                 for index in order
             ])
 
@@ -1738,30 +1863,57 @@ class VisionControlPlanner:
         selected_components.sort(key=lambda item: item[0], reverse=True)
 
         for (_priority, slot, label, heatmap, labels, stats,
-             label_heat_sums) in selected_components:
-            points = self._component_centerline_points(
+             label_heat_sums, skeleton_mask) in selected_components:
+            component_paths = self._component_centerline_paths(
                 labels, label, heatmap, image_shape,
-                component_stats=stats[label])
-            if len(points) < int(self.config.skeleton_min_length):
-                continue
-            item = {
-                "slot": int(slot),
-                "source_slot": int(slot),
-                "source_slots": {int(slot)},
-                "points_xy": points,
-                "score": float(label_heat_sums[label]) /
-                float(max(1, stats[label, cv2.CC_STAT_AREA])),
-                "heat_mass": float(label_heat_sums[label]),
-                "component_count": 1,
-                "component_rows": int(stats[label, cv2.CC_STAT_HEIGHT]),
-                "component_area": int(stats[label, cv2.CC_STAT_AREA]),
-                "source": "semantic_skeleton",
-                "spatial_prefiltered": True,
-            }
-            self._refresh_fragment_geometry(item)
-            self._annotate_heat_support(
-                item, image_shape, support_maps)
-            lines.append(item)
+                component_stats=stats[label],
+                history_points=self.last_slot_points,
+                skeleton_mask=skeleton_mask,
+                max_paths=self.config.skeleton_max_branches,
+                min_branch_length=(
+                    self.config.skeleton_min_branch_length))
+            branch_tail_start = 0
+            if len(component_paths) >= 2:
+                first_path = np.asarray(component_paths[0], dtype=np.float32)
+                second_path = np.asarray(component_paths[1], dtype=np.float32)
+                common_limit = min(len(first_path), len(second_path))
+                same_prefix = np.all(np.isclose(
+                    first_path[:common_limit], second_path[:common_limit],
+                    rtol=0.0, atol=0.05), axis=1)
+                differences = np.flatnonzero(~same_prefix)
+                common_length = (
+                    int(differences[0]) if len(differences)
+                    else common_limit)
+                branch_tail_start = max(0, common_length - 1)
+            for branch_index, points in enumerate(component_paths):
+                if len(points) < int(self.config.skeleton_min_length):
+                    continue
+                item = {
+                    "slot": int(slot),
+                    "source_slot": int(slot),
+                    "source_slots": {int(slot)},
+                    "points_xy": points,
+                    "score": float(label_heat_sums[label]) /
+                    float(max(1, stats[label, cv2.CC_STAT_AREA])),
+                    "heat_mass": float(label_heat_sums[label]),
+                    "component_count": 1,
+                    "component_rows": int(stats[label, cv2.CC_STAT_HEIGHT]),
+                    "component_area": int(stats[label, cv2.CC_STAT_AREA]),
+                    "hysteresis_low_threshold": float(low_threshold),
+                    "source": "semantic_skeleton_root_branch",
+                    "skeleton_component_key": (int(slot), int(label)),
+                    "branch_index": int(branch_index),
+                    "branch_count": int(len(component_paths)),
+                    "spatial_prefiltered": True,
+                }
+                if len(component_paths) >= 2:
+                    item["branch_tail_points_xy"] = np.asarray(
+                        points[branch_tail_start:],
+                        dtype=np.float32).copy()
+                self._refresh_fragment_geometry(item)
+                self._annotate_heat_support(
+                    item, image_shape, support_maps)
+                lines.append(item)
         joined = self._join_heatmap_fragments(
             lines, image_shape, support_maps=support_maps)
         joined = self._select_heatmap_lines(joined, image_shape)
@@ -2261,6 +2413,18 @@ class VisionControlPlanner:
         )
 
     def _same_overall_path(self, first, second, image_shape):
+        first_component = first.get("skeleton_component_key")
+        second_component = second.get("skeleton_component_key")
+        if (first_component is not None and
+                first_component == second_component and
+                int(first.get("branch_index", -1)) !=
+                int(second.get("branch_index", -1)) and
+                min(int(first.get("branch_count", 1)),
+                    int(second.get("branch_count", 1))) >= 2):
+            # Both paths were already pruned by their distinct root-to-leaf
+            # tail length. Keep their shared root trunk instead of treating
+            # the overlap as a duplicate line.
+            return False
         first_points = np.asarray(first.get("points_xy"), dtype=np.float32)
         second_points = np.asarray(second.get("points_xy"), dtype=np.float32)
         if len(first_points) < 2 or len(second_points) < 2:
@@ -2353,14 +2517,14 @@ class VisionControlPlanner:
         low = max(float(np.min(first[:, 1])), float(np.min(second[:, 1])))
         high = min(float(np.max(first[:, 1])), float(np.max(second[:, 1])))
         if low <= high:
-            distances = []
-            for y in low + (high - low) * _PAIR_FRACTIONS:
-                first_x = _interp_path_x(first, y)
-                second_x = _interp_path_x(second, y)
-                if first_x is not None and second_x is not None:
-                    distances.append(abs(first_x - second_x))
-            if distances:
-                return float(np.mean(distances)) * 640.0 / float(max(1, image_shape[1]))
+            rows = low + (high - low) * _PAIR_FRACTIONS
+            first_x = _interp_path_x_many(first, rows)
+            second_x = _interp_path_x_many(second, rows)
+            valid = np.isfinite(first_x) & np.isfinite(second_x)
+            if np.any(valid):
+                return (
+                    float(np.mean(np.abs(first_x[valid] - second_x[valid]))) *
+                    640.0 / float(max(1, image_shape[1])))
 
         endpoint_distance = min(
             abs(float(first_point[0]) - float(second_point[0]))
@@ -2369,6 +2533,44 @@ class VisionControlPlanner:
         )
         return endpoint_distance * 640.0 / float(max(1, image_shape[1]))
 
+    @staticmethod
+    def _path_shape_distance_640(
+            first_points, second_points, image_shape, sample_count=16):
+        """Compare branch geometry in 2-D with one vectorized resampling."""
+        first = _resample_path_by_count(first_points, sample_count)
+        second = _resample_path_by_count(second_points, sample_count)
+        return VisionControlPlanner._sampled_shape_distance_640(
+            first, second, image_shape, sample_count)
+
+    @staticmethod
+    def _sampled_shape_distance_640(
+            first, second, image_shape, sample_count=16):
+        first = np.asarray(first, dtype=np.float32)
+        second = np.asarray(second, dtype=np.float32)
+        if len(first) != sample_count or len(second) != sample_count:
+            return 1e9
+        direct = (
+            np.linalg.norm(first[0] - second[0]) +
+            np.linalg.norm(first[-1] - second[-1]))
+        reverse = (
+            np.linalg.norm(first[0] - second[-1]) +
+            np.linalg.norm(first[-1] - second[0]))
+        if reverse < direct:
+            second = second[::-1]
+        distance = np.linalg.norm(first - second, axis=1)
+        return (
+            float(np.mean(distance)) * 640.0 /
+            float(max(1, image_shape[1])))
+
+    @staticmethod
+    def _identity_path_points(line):
+        tail = line.get("branch_tail_points_xy")
+        if tail is not None:
+            tail = np.asarray(tail, dtype=np.float32)
+            if tail.ndim == 2 and tail.shape[1] == 2 and len(tail) >= 2:
+                return tail
+        return np.asarray(line.get("points_xy"), dtype=np.float32)
+
     def _assign_heatmap_slots(self, lines, image_shape):
         if not lines:
             return []
@@ -2376,37 +2578,86 @@ class VisionControlPlanner:
         identity_source = "row_scan"
         if len(lines) == 1:
             item = dict(lines[0])
-            scan_x = self._row_scan_path_position(
-                item.get("points_xy"), image_shape)
-            center_x = (
-                float(image_shape[1]) * self.config.visual_center_x)
-            item["slot"] = (
-                0 if scan_x is None or scan_x <= center_x else 1)
+            item_samples = _resample_path_by_count(
+                item.get("points_xy"), 16)
+            history_distances = {
+                int(slot): self._sampled_shape_distance_640(
+                    item_samples, _resample_path_by_count(previous, 16),
+                    image_shape, 16)
+                for slot, previous in self.last_slot_points.items()
+            }
+            history_gate = max(
+                self.config.branch_separation_px_640 * 2.0,
+                self.config.path_max_step_px_640 * 3.0)
+            if (history_distances and
+                    min(history_distances.values()) <= history_gate):
+                item["slot"] = min(
+                    history_distances, key=history_distances.get)
+                identity_source = "temporal_match"
+            else:
+                scan_x = self._row_scan_path_position(
+                    item.get("points_xy"), image_shape)
+                center_x = (
+                    float(image_shape[1]) * self.config.visual_center_x)
+                item["slot"] = (
+                    0 if scan_x is None or scan_x <= center_x else 1)
             assigned.append(item)
         else:
             first = dict(lines[0])
             second = dict(lines[1])
+            first_identity = self._identity_path_points(first)
+            second_identity = self._identity_path_points(second)
             first_x = self._row_scan_path_position(
-                first.get("points_xy"), image_shape)
+                first_identity, image_shape)
             second_x = self._row_scan_path_position(
-                second.get("points_xy"), image_shape)
-            if first_x is not None and second_x is not None and abs(
+                second_identity, image_shape)
+            if 0 in self.last_slot_points and 1 in self.last_slot_points:
+                first_history = self.last_slot_branch_tails.get(
+                    0, self.last_slot_points[0])
+                second_history = self.last_slot_branch_tails.get(
+                    1, self.last_slot_points[1])
+                first_samples = _resample_path_by_count(first_identity, 16)
+                second_samples = _resample_path_by_count(second_identity, 16)
+                first_history_samples = _resample_path_by_count(
+                    first_history, 16)
+                second_history_samples = _resample_path_by_count(
+                    second_history, 16)
+                direct = (
+                    self._sampled_shape_distance_640(
+                        first_samples, first_history_samples,
+                        image_shape, 16) +
+                    self._sampled_shape_distance_640(
+                        second_samples, second_history_samples,
+                        image_shape, 16)
+                )
+                swapped = (
+                    self._sampled_shape_distance_640(
+                        first_samples, second_history_samples,
+                        image_shape, 16) +
+                    self._sampled_shape_distance_640(
+                        second_samples, first_history_samples,
+                        image_shape, 16)
+                )
+                history_gate = 2.0 * max(
+                    self.config.branch_separation_px_640 * 2.0,
+                    self.config.path_max_step_px_640 * 3.0)
+                if min(direct, swapped) <= history_gate:
+                    ordered = (
+                        [first, second]
+                        if direct <= swapped else [second, first])
+                    identity_source = "temporal_match"
+                elif first_x is not None and second_x is not None:
+                    ordered = (
+                        [first, second] if first_x <= second_x
+                        else [second, first])
+                else:
+                    ordered = [first, second]
+            elif first_x is not None and second_x is not None and abs(
                     first_x - second_x) >= max(
                         4.0, image_shape[1] * 0.008):
                 ordered = (
                     [first, second] if first_x <= second_x
                     else [second, first])
-            elif 0 in self.last_slot_points and 1 in self.last_slot_points:
-                direct = (
-                    self._path_distance_640(first.get("points_xy"), self.last_slot_points[0], image_shape) +
-                    self._path_distance_640(second.get("points_xy"), self.last_slot_points[1], image_shape)
-                )
-                swapped = (
-                    self._path_distance_640(first.get("points_xy"), self.last_slot_points[1], image_shape) +
-                    self._path_distance_640(second.get("points_xy"), self.last_slot_points[0], image_shape)
-                )
-                ordered = [first, second] if direct <= swapped else [second, first]
-                identity_source = "temporal_match"
             else:
                 ordered = sorted(
                     (first, second),
@@ -2441,13 +2692,29 @@ class VisionControlPlanner:
 
     @staticmethod
     def _component_centerline_points(
-            labels, label, heatmap, image_shape, component_stats=None):
-        """Thin one component and keep its longest ego-rooted graph path."""
+            labels, label, heatmap, image_shape, component_stats=None,
+            history_points=None, skeleton_mask=None):
+        paths = VisionControlPlanner._component_centerline_paths(
+            labels, label, heatmap, image_shape,
+            component_stats=component_stats,
+            history_points=history_points,
+            skeleton_mask=skeleton_mask,
+            max_paths=1, min_branch_length=1)
+        if not paths:
+            return np.empty((0, 2), dtype=np.float32)
+        return paths[0]
+
+    @staticmethod
+    def _component_centerline_paths(
+            labels, label, heatmap, image_shape, component_stats=None,
+            history_points=None, skeleton_mask=None,
+            max_paths=2, min_branch_length=10):
+        """Return root-to-leaf paths that share the same ego-side trunk."""
         labels = np.asarray(labels)
         heatmap = np.asarray(heatmap, dtype=np.float32)
         if (labels.ndim != 2 or heatmap.shape != labels.shape or
                 labels.size == 0):
-            return np.empty((0, 2), dtype=np.float32)
+            return []
 
         if component_stats is None:
             top = 0
@@ -2463,39 +2730,49 @@ class VisionControlPlanner:
         component_mask = np.where(
             region == label, 255, 0).astype(np.uint8)
         if not np.any(component_mask):
-            return np.empty((0, 2), dtype=np.float32)
+            return []
 
-        ximgproc = getattr(cv2, "ximgproc", None)
-        thinning = getattr(ximgproc, "thinning", None)
-        if not callable(thinning):
-            return VisionControlPlanner._weighted_component_centerline_points(
-                labels, label, heatmap, image_shape,
-                component_stats=component_stats)
-
-        padding = 1
-        padded = cv2.copyMakeBorder(
-            component_mask, padding, padding, padding, padding,
-            cv2.BORDER_CONSTANT, value=0)
-        skeleton = thinning(
-            padded,
-            thinningType=getattr(
-                ximgproc, "THINNING_ZHANGSUEN", 0))
+        published_skeleton = np.asarray(skeleton_mask)
+        if (published_skeleton.ndim == 2 and
+                published_skeleton.shape == labels.shape):
+            skeleton = published_skeleton[
+                top:top + region.shape[0],
+                left:left + region.shape[1]].astype(np.uint8)
+            skeleton &= (region == label).astype(np.uint8)
+            coordinate_left = left
+            coordinate_top = top
+        else:
+            ximgproc = getattr(cv2, "ximgproc", None)
+            thinning = getattr(ximgproc, "thinning", None)
+            if not callable(thinning):
+                fallback = VisionControlPlanner._weighted_component_centerline_points(
+                    labels, label, heatmap, image_shape,
+                    component_stats=component_stats)
+                return [] if not len(fallback) else [fallback]
+            padding = 1
+            padded = cv2.copyMakeBorder(
+                component_mask, padding, padding, padding, padding,
+                cv2.BORDER_CONSTANT, value=0)
+            skeleton = thinning(
+                padded,
+                thinningType=getattr(
+                    ximgproc, "THINNING_ZHANGSUEN", 0))
+            coordinate_left = left - padding
+            coordinate_top = top - padding
         nonzero = cv2.findNonZero(skeleton)
         if nonzero is None:
-            return np.empty((0, 2), dtype=np.float32)
+            return []
 
-        coordinates = nonzero.reshape((-1, 2)).astype(np.float32)
-        coordinates[:, 0] += float(left - padding)
-        coordinates[:, 1] += float(top - padding)
+        local_coordinates = nonzero.reshape((-1, 2)).astype(np.int32)
+        coordinates = local_coordinates.astype(np.float32)
+        coordinates[:, 0] += float(coordinate_left)
+        coordinates[:, 1] += float(coordinate_top)
         if not len(coordinates):
-            return np.empty((0, 2), dtype=np.float32)
+            return []
 
         # Build an 8-neighbor graph with vectorized coordinate lookups. Short
         # skeleton spurs then remain side branches instead of redirecting a
         # greedy nearest-neighbor trace from frame to frame.
-        local_coordinates = np.rint(coordinates).astype(np.int32)
-        local_coordinates[:, 0] -= left - padding
-        local_coordinates[:, 1] -= top - padding
         index_map = np.full(skeleton.shape, -1, dtype=np.int32)
         index_map[
             local_coordinates[:, 1], local_coordinates[:, 0]
@@ -2553,33 +2830,126 @@ class VisionControlPlanner:
         targets = endpoints[
             (endpoints != root) & (distance[endpoints] >= 0)]
         if not len(targets):
-            targets = np.flatnonzero(distance > 0)
+            reachable = np.flatnonzero(distance > 0)
+            if len(reachable):
+                targets = np.asarray([
+                    reachable[int(np.argmax(distance[reachable]))]
+                ], dtype=np.int32)
         if not len(targets):
-            return np.empty((0, 2), dtype=np.float32)
-        target_order = np.lexsort((
-            np.abs(coordinates[targets, 0] - center_x),
-            -distance[targets],
-        ))
-        current = int(targets[int(target_order[0])])
-        reverse_path = []
-        while current >= 0:
-            reverse_path.append(current)
-            if current == root:
-                break
-            current = int(parent[current])
-        if not reverse_path or reverse_path[-1] != root:
-            return np.empty((0, 2), dtype=np.float32)
-        heat_points = coordinates[
-            np.asarray(reverse_path[::-1], dtype=np.int32)]
+            return []
         img_h, img_w = image_shape[:2]
-        points = np.empty_like(heat_points, dtype=np.float32)
-        points[:, 0] = (
-            heat_points[:, 0] * float(max(img_w - 1, 1)) /
-            float(max(labels.shape[1] - 1, 1)))
-        points[:, 1] = (
-            heat_points[:, 1] * float(max(img_h - 1, 1)) /
-            float(max(labels.shape[0] - 1, 1)))
-        return points
+        ridge = cv2.distanceTransform(
+            (component_mask != 0).astype(np.uint8),
+            cv2.DIST_L2, 3)
+        maximum_distance = max(1, int(np.max(distance[targets])))
+        maximum_ridge = max(1e-6, float(np.max(ridge)))
+        if isinstance(history_points, dict):
+            raw_history_paths = list(history_points.values())
+        elif isinstance(history_points, np.ndarray):
+            raw_history_paths = [history_points]
+        elif history_points is None:
+            raw_history_paths = []
+        else:
+            raw_history_paths = list(history_points)
+        history_paths = []
+        for history_value in raw_history_paths:
+            history = np.asarray(history_value, dtype=np.float32)
+            if (history.ndim == 2 and history.shape[1] == 2 and
+                    len(history) >= 2):
+                history_paths.append(history)
+
+        path_candidates = []
+        for target_value in targets:
+            current = int(target_value)
+            reverse_path = []
+            while current >= 0:
+                reverse_path.append(current)
+                if current == root:
+                    break
+                current = int(parent[current])
+            if not reverse_path or reverse_path[-1] != root:
+                continue
+            path_indices = np.asarray(
+                reverse_path[::-1], dtype=np.int32)
+            heat_points = coordinates[path_indices]
+            heat_x = np.clip(
+                np.rint(heat_points[:, 0]).astype(np.int32),
+                0, labels.shape[1] - 1)
+            heat_y = np.clip(
+                np.rint(heat_points[:, 1]).astype(np.int32),
+                0, labels.shape[0] - 1)
+            ridge_x = np.clip(heat_x - left, 0, ridge.shape[1] - 1)
+            ridge_y = np.clip(heat_y - top, 0, ridge.shape[0] - 1)
+            length_score = (
+                float(distance[int(target_value)]) /
+                float(maximum_distance))
+            heat_score = float(np.mean(heatmap[heat_y, heat_x]))
+            ridge_score = (
+                float(np.mean(ridge[ridge_y, ridge_x])) /
+                maximum_ridge)
+            image_points = np.empty_like(
+                heat_points, dtype=np.float32)
+            image_points[:, 0] = (
+                heat_points[:, 0] * float(max(img_w - 1, 1)) /
+                float(max(labels.shape[1] - 1, 1)))
+            image_points[:, 1] = (
+                heat_points[:, 1] * float(max(img_h - 1, 1)) /
+                float(max(labels.shape[0] - 1, 1)))
+            history_score = 0.0
+            if history_paths:
+                history_distance = min(
+                    VisionControlPlanner._path_distance_640(
+                        image_points, history, image_shape)
+                    for history in history_paths)
+                history_score = max(
+                    0.0, 1.0 - history_distance / 120.0)
+            score = (
+                0.50 * length_score +
+                0.25 * heat_score +
+                0.10 * ridge_score +
+                0.15 * history_score)
+            path_candidates.append({
+                "score": float(score),
+                "indices": path_indices,
+                "points": image_points,
+                "endpoint_x": float(heat_points[-1, 0]),
+            })
+
+        path_candidates.sort(
+            key=lambda item: (
+                item["score"], len(item["indices"]),
+                -item["endpoint_x"]),
+            reverse=True)
+        selected = []
+        minimum_tail = max(1, int(min_branch_length))
+        for candidate in path_candidates:
+            distinct = True
+            for kept in selected:
+                first_indices = candidate["indices"]
+                second_indices = kept["indices"]
+                common_limit = min(
+                    len(first_indices), len(second_indices))
+                differences = np.flatnonzero(
+                    first_indices[:common_limit] !=
+                    second_indices[:common_limit])
+                common_length = (
+                    int(differences[0]) if len(differences)
+                    else common_limit)
+                distinct_tail = min(
+                    len(first_indices) - common_length,
+                    len(second_indices) - common_length)
+                if distinct_tail < minimum_tail:
+                    distinct = False
+                    break
+            if not distinct:
+                continue
+            selected.append(candidate)
+            if len(selected) >= max(1, int(max_paths)):
+                break
+        return [
+            np.asarray(item["points"], dtype=np.float32)
+            for item in selected
+        ]
 
     @staticmethod
     def _weighted_component_centerline_points(
@@ -2651,8 +3021,10 @@ class VisionControlPlanner:
             filtered["spatial_smoothed"] = self.config.path_smooth_window > 1
             filtered["temporal_smoothed"] = previous is not None
             filtered["smoothing_rejected_low_heat"] = False
-            smoothing_changed = not np.allclose(
-                filtered_points, points, rtol=0.0, atol=0.05)
+            smoothing_changed = (
+                filtered_points.shape != points.shape or
+                not np.allclose(
+                    filtered_points, points, rtol=0.0, atol=0.05))
             if (support_maps is not None and smoothing_changed and
                     not self._annotate_heat_support(
                         filtered, image_shape, support_maps)):
@@ -2673,6 +3045,12 @@ class VisionControlPlanner:
             self.last_slot_points[slot] = filtered_points.copy()
             if filtered["smoothing_rejected_low_heat"]:
                 self.last_slot_points[slot] = filtered["points_xy"].copy()
+            branch_tail = filtered.get("branch_tail_points_xy")
+            if branch_tail is not None:
+                branch_tail = np.asarray(branch_tail, dtype=np.float32)
+                if (branch_tail.ndim == 2 and branch_tail.shape[1] == 2 and
+                        len(branch_tail) >= 2):
+                    self.last_slot_branch_tails[slot] = branch_tail.copy()
             self.path_missing_frames[slot] = 0
             smoothed_candidates.append(filtered)
 
@@ -2683,6 +3061,7 @@ class VisionControlPlanner:
             self.path_missing_frames[slot] = missing
             if missing > self.config.path_state_hold_frames:
                 self.last_slot_points.pop(slot, None)
+                self.last_slot_branch_tails.pop(slot, None)
                 self.path_missing_frames.pop(slot, None)
         return smoothed_candidates
 
@@ -2706,29 +3085,44 @@ class VisionControlPlanner:
         if previous is None or len(previous) < 2 or not len(points):
             return points
         previous = np.asarray(previous, dtype=np.float32)
-        order = np.argsort(previous[:, 1])
-        previous_y = previous[order, 1]
-        previous_x = previous[order, 0]
-        previous_y, unique_indices = np.unique(previous_y, return_index=True)
-        previous_x = previous_x[unique_indices]
-        if len(previous_y) < 2:
+        if previous.ndim != 2 or previous.shape[1] != 2:
             return points
-        overlap = (
-            (points[:, 1] >= previous_y[0]) &
-            (points[:, 1] <= previous_y[-1]))
-        if not np.any(overlap):
+        current_samples = _resample_path_by_count(
+            points, _TEMPORAL_PATH_SAMPLES)
+        previous_samples = _resample_path_by_count(
+            previous, _TEMPORAL_PATH_SAMPLES)
+        if (len(current_samples) != _TEMPORAL_PATH_SAMPLES or
+                len(previous_samples) != _TEMPORAL_PATH_SAMPLES):
             return points
-        projected_x = np.interp(
-            points[overlap, 1], previous_y, previous_x).astype(np.float32)
+        direct_endpoint_cost = float(
+            np.linalg.norm(current_samples[0] - previous_samples[0]) +
+            np.linalg.norm(current_samples[-1] - previous_samples[-1]))
+        reversed_endpoint_cost = float(
+            np.linalg.norm(current_samples[0] - previous_samples[-1]) +
+            np.linalg.norm(current_samples[-1] - previous_samples[0]))
+        if reversed_endpoint_cost < direct_endpoint_cost:
+            previous_samples = previous_samples[::-1].copy()
         max_step = (
             self.config.path_max_step_px_640 *
             float(max(1, image_width)) / 640.0)
-        bounded_x = projected_x + np.clip(
-            points[overlap, 0] - projected_x, -max_step, max_step)
+        displacement = current_samples - previous_samples
+        displacement_length = np.linalg.norm(displacement, axis=1)
+        step_scale = np.minimum(
+            1.0,
+            max_step / np.maximum(displacement_length, 1e-6))
+        bounded = (
+            previous_samples +
+            displacement * step_scale[:, np.newaxis])
         alpha = float(self.config.path_ema_alpha)
-        points[overlap, 0] = (
-            bounded_x * alpha + projected_x * (1.0 - alpha))
-        return points
+        blended = (
+            bounded * alpha +
+            previous_samples * (1.0 - alpha))
+        # Preserve current topology endpoints; only the path interior is
+        # temporally filtered. Support validation in _smooth_candidates keeps
+        # every accepted point on the current low-threshold heat region.
+        blended[0] = current_samples[0]
+        blended[-1] = current_samples[-1]
+        return blended.astype(np.float32)
 
     def _publish_filtered_paths(self, result, candidates):
         raw_paths = list(result.get("paths") or [])
@@ -2807,9 +3201,11 @@ class VisionControlPlanner:
             if (
                 not ocr_current
                 and self.branch_lock is None
-                and now - self.fork_seen_since >= self.config.default_outer_after_s
             ):
-                self.branch_lock = "left" if self.config.outer_slot == 0 else "right"
+                # Straight-through behavior is the physical left branch in
+                # this course. Only a current, confirmed OCR "right" result
+                # is allowed to override this default.
+                self.branch_lock = "left"
                 self.branch_lock_source = "default"
             return
         if route_state == ROUTE_SINGLE:
@@ -2826,21 +3222,38 @@ class VisionControlPlanner:
         if not candidates:
             if self.selected_slot_lock is not None:
                 self.selected_slot_missing_frames += 1
-                if (self.branch_lock is None and
+                if (self.branch_lock_source != "ocr" and
                         self.selected_slot_missing_frames >
                         self.config.path_state_hold_frames):
-                    self.selected_slot_lock = None
-                    self.selected_slot_missing_frames = 0
-                    self.last_selected_points = None
+                    self._clear_branch_lock()
             return None
         if self.branch_lock in {"left", "right"}:
             wanted_slot = 0 if self.branch_lock == "left" else 1
+            if self.selected_slot_lock != wanted_slot:
+                self.selected_branch_signature = None
             for candidate in candidates:
                 if int(candidate.get("slot", -1)) == wanted_slot:
                     return self._remember_selection(candidate)
             self.selected_slot_lock = wanted_slot
             self.selected_slot_missing_frames += 1
             return None
+        if (route_state == ROUTE_MULTI_FORK and
+                self.selected_branch_signature is not None):
+            matched = []
+            for candidate in candidates:
+                identity_points = self._identity_path_points(candidate)
+                samples = _resample_path_by_count(identity_points, 16)
+                distance = self._sampled_shape_distance_640(
+                    samples, self.selected_branch_signature,
+                    image_shape, 16)
+                matched.append((distance, candidate))
+            if matched:
+                distance, candidate = min(matched, key=lambda item: item[0])
+                lock_gate = max(
+                    self.config.branch_separation_px_640 * 1.5,
+                    self.config.path_max_step_px_640 * 3.0)
+                if distance <= lock_gate:
+                    return self._remember_selection(candidate)
         if self.selected_slot_lock is not None:
             for candidate in candidates:
                 if int(candidate.get("slot", -1)) == self.selected_slot_lock:
@@ -2851,6 +3264,7 @@ class VisionControlPlanner:
                 return None
             self.selected_slot_lock = None
             self.selected_slot_missing_frames = 0
+            self.selected_branch_signature = None
         if self.last_selected_points is not None:
             previous_x = _interp_path_x(self.last_selected_points, image_shape[0] * self.config.lookahead_y_ratio)
             if previous_x is not None:
@@ -2874,6 +3288,28 @@ class VisionControlPlanner:
     def _remember_selection(self, candidate):
         self.selected_slot_lock = int(candidate.get("slot", -1))
         self.selected_slot_missing_frames = 0
+        branch_tail = candidate.get("branch_tail_points_xy")
+        if branch_tail is not None:
+            signature = _resample_path_by_count(branch_tail, 16)
+            if len(signature) == 16:
+                previous = self.selected_branch_signature
+                if previous is None or len(previous) != 16:
+                    self.selected_branch_signature = signature.copy()
+                else:
+                    direct = (
+                        np.linalg.norm(signature[0] - previous[0]) +
+                        np.linalg.norm(signature[-1] - previous[-1]))
+                    reverse = (
+                        np.linalg.norm(signature[0] - previous[-1]) +
+                        np.linalg.norm(signature[-1] - previous[0]))
+                    if reverse < direct:
+                        signature = signature[::-1].copy()
+                    # Keep a slow branch-identity signature independent from
+                    # the lighter geometry EMA. One noisy heatmap frame then
+                    # cannot move the selected lookahead to the other tail.
+                    self.selected_branch_signature = (
+                        previous * 0.80 + signature * 0.20
+                    ).astype(np.float32)
         return candidate
 
     def _build_command(self, selected, route_state, route_reason, result, image_shape, now, ocr_response=None):
@@ -3301,6 +3737,7 @@ class VisionControlPlanner:
         self.branch_lock = None
         self.branch_lock_source = None
         self.selected_slot_lock = None
+        self.selected_branch_signature = None
         self.selected_slot_missing_frames = 0
         self.last_selected_points = None
 
@@ -3453,6 +3890,7 @@ def render_vision_control_debug(frame, result):
 
 
 def _draw_semantic_heat_distribution(frame, result):
+    global _SOLID_RED_PREVIEW
     published_masks = result.get("semantic_heat_distribution_masks")
     use_processed_masks = published_masks is not None
     if use_processed_masks:
@@ -3467,10 +3905,10 @@ def _draw_semantic_heat_distribution(frame, result):
         heatmaps = np.asarray(heatmaps, dtype=np.float32)
         threshold = _clamp(_env_float(
             "VISION_CONTROL_SKELETON_THRESHOLD", 0.35), 0.0, 0.99)
-        if threshold > 0.0:
-            masks = (heatmaps >= threshold).astype(np.uint8)
-        else:
-            masks = (heatmaps > 0.0).astype(np.uint8)
+        low_threshold = min(threshold, _clamp(_env_float(
+            "VISION_CONTROL_SKELETON_LOW_THRESHOLD", 0.27),
+            0.0, 0.99))
+        masks = heatmaps
     if masks.ndim == 2:
         masks = masks[np.newaxis, ...]
     if masks.ndim != 3 or not len(masks):
@@ -3481,8 +3919,10 @@ def _draw_semantic_heat_distribution(frame, result):
         "VISION_CONTROL_SKELETON_CLOSE_ITERATIONS", 1))
     edge_smooth_kernel = max(1, _env_int(
         "VISION_CONTROL_SKELETON_EDGE_KERNEL", 9))
+    max_hole_area = max(0, _env_int(
+        "VISION_CONTROL_SKELETON_MAX_HOLE_AREA", 32))
     connect_max_gap = max(0, _env_int(
-        "VISION_CONTROL_SKELETON_MAX_CONNECT_GAP", 8))
+        "VISION_CONTROL_SKELETON_MAX_CONNECT_GAP", 6))
     bridge_thickness = max(1, _env_int(
         "VISION_CONTROL_SKELETON_BRIDGE_THICKNESS", 3))
     minimum_area = max(1, _env_int(
@@ -3490,9 +3930,12 @@ def _draw_semantic_heat_distribution(frame, result):
     close_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (3, 3))
     coverage = np.zeros((height, width), dtype=np.float32)
-    for slot, mask in enumerate(masks[:2]):
-        mask = (mask != 0).astype(np.uint8)
-        if not use_processed_masks:
+    for mask in masks[:2]:
+        if use_processed_masks:
+            mask = (mask != 0).astype(np.uint8)
+        else:
+            mask = _spatial_hysteresis_binary_mask(
+                mask, threshold, low_threshold)
             heat_h, heat_w = mask.shape
             heatmap_scale = math.sqrt(
                 float(heat_h * heat_w) / float(120 * 160))
@@ -3509,7 +3952,10 @@ def _draw_semantic_heat_distribution(frame, result):
                     mask, cv2.MORPH_CLOSE, close_kernel,
                     iterations=close_iterations)
             mask = _smooth_binary_mask_edges(mask, edge_smooth_kernel)
-            mask = _fill_binary_mask(mask)
+            mask = _fill_binary_mask(
+                mask, max_hole_area=max(
+                    0, int(round(
+                        max_hole_area * heatmap_scale ** 2))))
         resized = cv2.resize(
             mask.astype(np.float32), (width, height),
             interpolation=cv2.INTER_LINEAR)
@@ -3520,11 +3966,23 @@ def _draw_semantic_heat_distribution(frame, result):
         return
     # Keep the mask interior opaque red while using only the interpolated
     # boundary coverage as alpha, eliminating 4x nearest-neighbor stair steps.
-    alpha = coverage[active, np.newaxis]
-    red = np.asarray((0.0, 0.0, 255.0), dtype=np.float32)
-    frame[active] = np.rint(
-        frame[active].astype(np.float32) * (1.0 - alpha) + red * alpha
-    ).astype(np.uint8)
+    interior = coverage >= 1.0
+    if np.any(interior):
+        if (_SOLID_RED_PREVIEW is None or
+                _SOLID_RED_PREVIEW.shape != frame.shape or
+                _SOLID_RED_PREVIEW.dtype != frame.dtype):
+            _SOLID_RED_PREVIEW = np.empty_like(frame)
+            _SOLID_RED_PREVIEW[:] = (0, 0, 255)
+        cv2.copyTo(
+            _SOLID_RED_PREVIEW,
+            interior.astype(np.uint8) * 255, frame)
+    edge = active & ~interior
+    if np.any(edge):
+        alpha = coverage[edge, np.newaxis]
+        red = np.asarray((0.0, 0.0, 255.0), dtype=np.float32)
+        frame[edge] = np.rint(
+            frame[edge].astype(np.float32) * (1.0 - alpha) + red * alpha
+        ).astype(np.uint8)
 
 
 def _identity_probability_color(slot, probability):
@@ -3538,6 +3996,14 @@ def _draw_identity_probability_path(
     probabilities = np.asarray(probabilities, dtype=np.float32)
     if len(probabilities) != len(points):
         probabilities = np.ones(len(points), dtype=np.float32)
+    if _env_flag("VISION_CONTROL_FAST_RENDER", True):
+        probability = (
+            float(np.mean(probabilities)) if len(probabilities) else 1.0)
+        cv2.polylines(
+            frame, [points], False,
+            _identity_probability_color(slot, probability),
+            int(thickness), cv2.LINE_AA)
+        return
     for index in range(len(points) - 1):
         probability = 0.5 * (
             float(probabilities[index]) +

@@ -47,6 +47,8 @@ def _env_choice(name, default, allowed):
 
 
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.50)
+TURNSIGN_DET_SCORE_THRESHOLD = float(np.clip(
+    _env_float("MULTITASK_TURNSIGN_DET_THRESHOLD", 0.20), 0.0, 1.0))
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.45)
 DET_PRE_NMS_TOP_K = max(1, _env_int("MULTITASK_PRE_NMS_TOP_K", 1000))
 MAX_DETECTIONS = max(1, _env_int("MULTITASK_MAX_DETECTIONS", 100))
@@ -71,6 +73,8 @@ PATH_HEATMAP_THRESHOLD = float(np.clip(
     _env_float("MULTITASK_PATH_HEATMAP_THRESHOLD", 0.25), 0.0, 1.0))
 RENDER_DET_THRESHOLD = float(np.clip(
     _env_float("MULTITASK_RENDER_DET_THRESHOLD", 0.45), 0.0, 1.0))
+RENDER_TURNSIGN_THRESHOLD = float(np.clip(
+    _env_float("MULTITASK_RENDER_TURNSIGN_THRESHOLD", 0.20), 0.0, 1.0))
 RENDER_MAX_DETECTIONS = max(
     0, _env_int("MULTITASK_RENDER_MAX_DETECTIONS", 6))
 RENDER_MAX_PER_CLASS = max(
@@ -333,7 +337,8 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
                   iou_threshold=DET_NMS_THRESHOLD,
                   pre_nms_top_k=DET_PRE_NMS_TOP_K,
                   max_detections=MAX_DETECTIONS,
-                  coin_min_short_side=COIN_MIN_SHORT_SIDE):
+                  coin_min_short_side=COIN_MIN_SHORT_SIDE,
+                  turnsign_score_threshold=TURNSIGN_DET_SCORE_THRESHOLD):
     """Apply main-branch argmax filtering and class-wise NMS."""
     results = []
     pre_nms_top_k = max(1, int(pre_nms_top_k))
@@ -345,7 +350,16 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
     best_classes = np.argmax(scores, axis=1).astype(np.int32, copy=False)
     best_scores = scores[
         np.arange(scores.shape[0], dtype=np.int32), best_classes]
-    eligible = valid_boxes & (best_scores >= float(score_threshold))
+    effective_thresholds = np.full(
+        len(best_scores), float(score_threshold), dtype=np.float32)
+    try:
+        turnsign_class_id = CLASSES.index("TurnSign")
+    except ValueError:
+        turnsign_class_id = -1
+    if turnsign_class_id >= 0:
+        effective_thresholds[best_classes == turnsign_class_id] = min(
+            float(score_threshold), float(turnsign_score_threshold))
+    eligible = valid_boxes & (best_scores >= effective_thresholds)
 
     for class_id in np.unique(best_classes[eligible]):
         class_valid = eligible & (best_classes == class_id)
@@ -676,9 +690,13 @@ def _select_detections_for_render(detections, mode):
     for detection in sorted(
             detections or [], key=lambda item: item.get("score", 0.0),
             reverse=True):
-        if float(detection.get("score", 0.0)) < threshold:
-            continue
         label = str(detection.get("label") or "")
+        detection_threshold = (
+            min(threshold, RENDER_TURNSIGN_THRESHOLD)
+            if label.strip().lower() in {"turnsign", "turn sign"}
+            else threshold)
+        if float(detection.get("score", 0.0)) < detection_threshold:
+            continue
         if counts.get(label, 0) >= per_class_limit:
             continue
         selected.append(detection)

@@ -246,6 +246,26 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(results[0][0], 0)
         self.assertAlmostEqual(results[0][1], 0.90, places=6)
 
+    def test_low_confidence_threshold_is_lowered_for_turnsign_only(self):
+        boxes = np.asarray([
+            [0, 0, 20, 20],
+            [30, 0, 50, 20],
+            [60, 0, 80, 20],
+        ], dtype=np.float32)
+        scores = np.zeros((3, 8), dtype=np.float32)
+        scores[0, 1] = 0.20
+        scores[1, 0] = 0.20
+        scores[2, 1] = 0.19
+
+        results = detection_nms(
+            boxes, scores, score_threshold=0.50,
+            turnsign_score_threshold=0.20,
+            coin_min_short_side=0, max_detections=10)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual(1, results[0][0])
+        self.assertAlmostEqual(0.20, results[0][1], places=6)
+
     def test_tiny_coin_filter_matches_training_policy(self):
         boxes = np.asarray([
             [10, 10, 18, 30],
@@ -290,6 +310,19 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertLessEqual(len(selected), 6)
         self.assertEqual(labels.count("Coin"), 2)
         self.assertEqual(labels.count("TurnSign"), 1)
+
+    def test_render_keeps_low_confidence_turnsign_but_not_other_class(self):
+        detections = [{
+            "label": "TurnSign", "score": 0.20,
+            "bbox": [100, 40, 180, 100],
+        }, {
+            "label": "Coin", "score": 0.20,
+            "bbox": [30, 40, 60, 70],
+        }]
+
+        selected = _select_detections_for_render(detections, "drive")
+
+        self.assertEqual(["TurnSign"], [item["label"] for item in selected])
 
     def test_heatmap_render_draws_all_post_nms_detection_boxes(self):
         detections = [{

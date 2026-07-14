@@ -87,6 +87,25 @@ def env_int(name, default):
         return int(default)
 
 
+def configure_perception_defaults():
+    """Avoid duplicate path decoding/rendering in the skeleton pipeline."""
+    vision_source = os.environ.get("VISION_CONTROL_PATH_SOURCE")
+    model_source = os.environ.get("MULTITASK_PATH_SOURCE")
+    if vision_source is None:
+        # Preserve an explicit legacy MULTITASK_PATH_SOURCE selection.  With
+        # no override, the active controller is the semantic skeleton path.
+        vision_source = model_source or "skeleton"
+        os.environ["VISION_CONTROL_PATH_SOURCE"] = vision_source
+    if str(vision_source).strip().lower() == "skeleton":
+        # Curve decoding is already part of the inexpensive base decoder.
+        # Selecting it here skips the old Python heatmap-ridge tracer while
+        # raw heatmaps remain available to the skeleton controller.
+        os.environ.setdefault("MULTITASK_PATH_SOURCE", "curve")
+        # The processed red mask and identity paths are drawn later by
+        # vision_control.  Do not first render a hidden raw heatmap overlay.
+        os.environ.setdefault("MULTITASK_RENDER_MODE", "drive")
+
+
 def instruction_direction(instruction):
     instruction = instruction if isinstance(instruction, dict) else {}
     direction = str(instruction.get("direction") or instruction.get("preferred_branch") or "").strip().lower()
@@ -744,6 +763,7 @@ def main():
     if instance_lock is None:
         activate_existing_preview()
         return
+    configure_perception_defaults()
     # Keep RKNN initialization under the main guard.  The OCR worker uses the
     # multiprocessing "spawn" method and must not initialize the NPU again.
     render_perception = None

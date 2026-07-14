@@ -51,7 +51,13 @@ python3 ar_receiver.py
 
 ## 语义 mask 骨架路径试验
 
-骨架路径源先以 `0.35` 阈值将中心线 heatmap 二值化为 Mask。相距不超过 8 个热力图像素的离散片段用 3 像素宽的最短桥接线连接，再经过 9×9 边缘平滑、小连通域过滤和 Zhang-Suen thinning。骨架像素从最大 Y 点开始按最近邻顺序追踪，遇到较大空间断点时停止。左路径显示为蓝线，右路径显示为绿线；AR Preview 同时以红色显示处理后的 Mask。
+骨架路径源使用 `0.35/0.27` 空间双阈值生成 Mask：弱热值只有和当前帧强响应连通时才保留，不使用历史 Mask。相距不超过 6 个热力图像素的离散片段用 3 像素宽的最短桥接线连接，随后经过 9×9 边缘平滑、小连通域过滤，并且只填充不超过 32 像素的小孔洞。Zhang-Suen 骨架从最大 Y 端开始建立根系拓扑图，结合路径长度、热值、距边缘距离和历史路径选择最多两个有效叶分支；分叉前的根主干由两条路线共同保留，长度不足 10 个骨架像素的短毛刺会被剪除。蓝、绿线按弧长重采样后做二维时间滤波，结果仍须通过当前 Mask 热值支撑检查。AR Preview 同时以红色显示处理后的 Mask。
+
+AR 运行时会将模型解码路径设为 `curve`，只为跳过随后会被骨架结果覆盖的旧 Python 热力图脊线追踪；原始热力图仍会完整交给骨架控制器。预览使用 `drive` 模式，不再先绘制一层会被红色 Mask 覆盖的原始热力图。处理后的红色 Mask 始终完整显示并保留浮点插值边缘，蓝绿线使用整条折线绘制。左右分支的时序身份只比较共享主干之后的独立尾部，短暂乱序时不会交换蓝、绿色身份。
+
+岔路控制固定以左支作为直行和默认路线；无 OCR、OCR 未完成或 OCR 返回 `left` 都保持左支，只有当前确认的 OCR `right` 才切换右支。右转 OCR 锁到期后立即恢复默认左支，不会自动回退到另一条可见路线。
+
+设置 `VISION_CONTROL_FAST_RENDER=0` 可恢复逐段概率渐变路径。显式设置 `MULTITASK_PATH_SOURCE=heatmap` 或 `MULTITASK_RENDER_MODE=heatmap` 仍可恢复旧调试行为。
 
 首次配置或 OpenCV 依赖变更后执行：
 
@@ -74,7 +80,7 @@ python3 ar_receiver.py
 export VISION_CONTROL_PATH_SOURCE=heatmap
 ```
 
-骨架模式的主要参数是 `VISION_CONTROL_SKELETON_THRESHOLD`、`VISION_CONTROL_SKELETON_MIN_AREA`、`VISION_CONTROL_SKELETON_MIN_LENGTH`、`VISION_CONTROL_SKELETON_CLOSE_ITERATIONS`、`VISION_CONTROL_SKELETON_EDGE_KERNEL`、`VISION_CONTROL_SKELETON_MAX_CONNECT_GAP` 和 `VISION_CONTROL_SKELETON_BRIDGE_THICKNESS`。如果运行环境缺少 `cv2.ximgproc.thinning`，代码会回退到原逐行加权中心算法。
+骨架模式的主要参数是 `VISION_CONTROL_SKELETON_THRESHOLD`、`VISION_CONTROL_SKELETON_LOW_THRESHOLD`、`VISION_CONTROL_SKELETON_MIN_AREA`、`VISION_CONTROL_SKELETON_MIN_LENGTH`、`VISION_CONTROL_SKELETON_CLOSE_ITERATIONS`、`VISION_CONTROL_SKELETON_EDGE_KERNEL`、`VISION_CONTROL_SKELETON_MAX_HOLE_AREA`、`VISION_CONTROL_SKELETON_MAX_CONNECT_GAP`、`VISION_CONTROL_SKELETON_BRIDGE_THICKNESS`、`VISION_CONTROL_SKELETON_MIN_BRANCH_LENGTH` 和 `VISION_CONTROL_SKELETON_MAX_BRANCHES`。如果运行环境缺少 `cv2.ximgproc.thinning`，代码会回退到原逐行加权中心算法。
 
 ## 不在本阶段实现
 

@@ -47,6 +47,7 @@ export MULTITASK_PIPELINE_DEPTH=3
 export MULTITASK_OPENCV_THREADS=2
 export MULTITASK_RKNN_WARMUP=1
 export MULTITASK_DET_THRESHOLD=0.50
+export MULTITASK_TURNSIGN_DET_THRESHOLD=0.20
 export MULTITASK_NMS_THRESHOLD=0.45
 export MULTITASK_PRE_NMS_TOP_K=1000
 export MULTITASK_MAX_DETECTIONS=100
@@ -59,6 +60,7 @@ export MULTITASK_ROAD_MAX_RAW_RATIO=0.86
 export MULTITASK_ROAD_MIN_COMPONENT_AREA_RATIO=0.0015
 export MULTITASK_ROAD_MAX_COMPONENTS=3
 export MULTITASK_RENDER_DET_THRESHOLD=0.45
+export MULTITASK_RENDER_TURNSIGN_THRESHOLD=0.20
 export MULTITASK_RENDER_MAX_DETECTIONS=6
 export MULTITASK_RENDER_MAX_PER_CLASS=2
 export MULTITASK_RENDER_MAX_BOX_WIDTH_RATIO=0.70
@@ -162,6 +164,11 @@ ridge from each path heatmap for the preview and visual-control candidates.
 Set `MULTITASK_PATH_SOURCE=curve` to compare the model's direct `path_points`
 output. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
 overridden independently for comparison.
+
+When `ar_receiver.py` runs the semantic-skeleton controller, it defaults the
+decoder switch to `curve` only to skip the redundant legacy ridge tracer. Raw
+heatmaps are still returned and consumed by `vision_control.py`; explicit
+environment overrides remain unchanged.
 
 The visual controller derives the one/two-path decision from horizontal peaks
 inside the middle 45%-55% image band. Peaks are checked from strongest to

@@ -3,10 +3,33 @@ import tempfile
 import unittest
 from unittest import mock
 
-from .ar_receiver import acquire_instance_lock, activate_existing_preview
+from .ar_receiver import (
+    acquire_instance_lock,
+    activate_existing_preview,
+    configure_perception_defaults,
+)
 
 
 class ArReceiverSingletonTest(unittest.TestCase):
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_skeleton_defaults_skip_duplicate_ridge_and_raw_heatmap_render(self):
+        configure_perception_defaults()
+
+        self.assertEqual("skeleton", os.environ["VISION_CONTROL_PATH_SOURCE"])
+        self.assertEqual("curve", os.environ["MULTITASK_PATH_SOURCE"])
+        self.assertEqual("drive", os.environ["MULTITASK_RENDER_MODE"])
+
+    @mock.patch.dict(os.environ, {
+        "VISION_CONTROL_PATH_SOURCE": "skeleton",
+        "MULTITASK_PATH_SOURCE": "heatmap",
+        "MULTITASK_RENDER_MODE": "heatmap",
+    }, clear=True)
+    def test_explicit_debug_render_overrides_are_preserved(self):
+        configure_perception_defaults()
+
+        self.assertEqual("heatmap", os.environ["MULTITASK_PATH_SOURCE"])
+        self.assertEqual("heatmap", os.environ["MULTITASK_RENDER_MODE"])
+
     def test_second_instance_cannot_acquire_same_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "ar_receiver.lock")

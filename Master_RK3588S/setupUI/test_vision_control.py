@@ -24,7 +24,9 @@ from vision_control import (  # noqa: E402
     _draw_semantic_heat_distribution,
     _extract_heatmap_preview_lines,
     _identity_probability_color,
+    _fill_binary_mask,
     _smooth_binary_mask_edges,
+    _spatial_hysteresis_binary_mask,
     render_vision_control_debug,
 )
 
@@ -313,12 +315,37 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
 
 
 class SemanticSkeletonPathTest(unittest.TestCase):
+    def test_spatial_hysteresis_keeps_connected_weak_heat_only(self):
+        heatmap = np.zeros((50, 70), dtype=np.float32)
+        heatmap[8:42, 33:37] = 0.30
+        heatmap[8:16, 33:37] = 0.60
+        heatmap[30:38, 6:10] = 0.30
+
+        mask = _spatial_hysteresis_binary_mask(
+            heatmap, high_threshold=0.35, low_threshold=0.27)
+
+        self.assertTrue(np.all(mask[8:42, 34] != 0))
+        self.assertEqual(0, int(np.count_nonzero(mask[30:38, 6:10])))
+
+    def test_small_holes_are_filled_without_filling_large_interior(self):
+        mask = np.ones((40, 50), dtype=np.uint8)
+        mask[10:12, 10:12] = 0
+        mask[12:28, 25:42] = 0
+
+        filled = _fill_binary_mask(mask, max_hole_area=16)
+
+        self.assertTrue(np.all(filled[10:12, 10:12] != 0))
+        self.assertTrue(np.all(filled[12:28, 25:42] == 0))
+
     def test_default_environment_uses_semantic_skeleton_path_source(self):
         with patch.dict(os.environ, {}, clear=True):
             config = VisionControlConfig.from_env()
 
         self.assertEqual("skeleton", config.path_source)
         self.assertEqual(0.35, config.skeleton_threshold)
+        self.assertEqual(0.27, config.skeleton_low_threshold)
+        self.assertEqual(10, config.skeleton_min_branch_length)
+        self.assertEqual(2, config.skeleton_max_branches)
 
     def test_discrete_mask_samples_are_connected_but_far_noise_is_removed(self):
         mask = np.zeros((60, 80), dtype=np.uint8)
@@ -365,7 +392,7 @@ class SemanticSkeletonPathTest(unittest.TestCase):
     def test_preview_renders_connected_mask_across_short_sampling_gap(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
         heatmaps[0, 35:55, 78:83] = 0.80
-        heatmaps[0, 61:82, 78:83] = 0.80
+        heatmaps[0, 60:82, 78:83] = 0.80
         result = _result(heatmaps)
         frame = np.full((480, 640, 3), 100, dtype=np.uint8)
 
@@ -424,6 +451,200 @@ class SemanticSkeletonPathTest(unittest.TestCase):
 
         self.assertGreater(float(np.ptp(points[:, 1])), 100.0)
         self.assertLess(float(np.max(points[:, 0])), 90.0)
+
+    def test_history_score_keeps_same_branch_at_near_equal_fork(self):
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        cv2.line(mask, (80, 115), (80, 65), 1, 9, cv2.LINE_8)
+        cv2.line(mask, (80, 65), (35, 10), 1, 9, cv2.LINE_8)
+        cv2.line(mask, (80, 65), (125, 10), 1, 9, cv2.LINE_8)
+        _count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(mask, connectivity=8))
+        history = np.asarray([
+            [80.0, 115.0], [80.0, 65.0], [125.0, 10.0],
+        ], dtype=np.float32)
+
+        points = VisionControlPlanner._component_centerline_points(
+            labels, 1, mask.astype(np.float32), (120, 160, 3),
+            component_stats=stats[1], history_points=history)
+
+        self.assertGreater(float(points[-1, 0]), 110.0)
+
+    def test_y_fork_returns_two_paths_with_shared_root_trunk(self):
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        cv2.line(mask, (80, 118), (80, 65), 1, 9, cv2.LINE_8)
+        cv2.line(mask, (80, 65), (28, 8), 1, 9, cv2.LINE_8)
+        cv2.line(mask, (80, 65), (132, 8), 1, 9, cv2.LINE_8)
+        _count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(mask, connectivity=8))
+
+        paths = VisionControlPlanner._component_centerline_paths(
+            labels, 1, mask.astype(np.float32), (120, 160, 3),
+            component_stats=stats[1], max_paths=2,
+            min_branch_length=10)
+
+        self.assertEqual(2, len(paths))
+        common_limit = min(len(paths[0]), len(paths[1]))
+        common = np.all(
+            np.isclose(
+                paths[0][:common_limit], paths[1][:common_limit],
+                atol=1e-5), axis=1)
+        first_difference = np.flatnonzero(~common)
+        shared_count = (
+            int(first_difference[0]) if len(first_difference)
+            else common_limit)
+        self.assertGreater(shared_count, 35)
+        self.assertGreater(
+            abs(float(paths[0][-1, 0] - paths[1][-1, 0])), 90.0)
+
+    def test_short_root_spur_is_not_promoted_to_second_branch(self):
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        cv2.line(mask, (80, 118), (80, 8), 1, 7, cv2.LINE_8)
+        cv2.line(mask, (80, 70), (86, 70), 1, 3, cv2.LINE_8)
+        _count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(mask, connectivity=8))
+
+        paths = VisionControlPlanner._component_centerline_paths(
+            labels, 1, mask.astype(np.float32), (120, 160, 3),
+            component_stats=stats[1], max_paths=2,
+            min_branch_length=10)
+
+        self.assertEqual(1, len(paths))
+
+    def test_planner_keeps_both_root_connected_fork_branches(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        cv2.line(heatmaps[0], (80, 119), (80, 65), 0.80, 9, cv2.LINE_8)
+        cv2.line(heatmaps[0], (80, 65), (30, 10), 0.80, 9, cv2.LINE_8)
+        cv2.line(heatmaps[0], (80, 65), (130, 10), 0.80, 9, cv2.LINE_8)
+        result = _result(heatmaps)
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", route_confirm_frames=1,
+            skeleton_min_branch_length=10,
+            skeleton_max_branches=2))
+
+        _command, debug = planner.update(result, now=1.0)
+
+        self.assertEqual(2, debug["candidate_count"])
+        self.assertEqual(2, len(result["paths"]))
+        self.assertTrue(all(
+            path["source"] == "semantic_skeleton_root_branch"
+            for path in result["paths"]))
+        self.assertTrue(all(
+            path["branch_count"] == 2 for path in result["paths"]))
+
+    def test_arc_length_temporal_filter_stabilizes_horizontal_path(self):
+        planner = VisionControlPlanner(config=_config(
+            path_ema_alpha=0.30, path_max_step_px_640=40.0))
+        xs = np.linspace(10.0, 150.0, 60, dtype=np.float32)
+        previous = np.column_stack((
+            xs, np.full_like(xs, 60.0))).astype(np.float32)
+        current = np.column_stack((
+            xs, np.full_like(xs, 64.0))).astype(np.float32)
+
+        filtered = planner._smooth_path_points(
+            current, previous, image_width=160, apply_spatial=False)
+
+        self.assertEqual((24, 2), filtered.shape)
+        self.assertGreater(float(np.mean(filtered[1:-1, 1])), 60.0)
+        self.assertLess(float(np.mean(filtered[1:-1, 1])), 64.0)
+
+    def test_temporal_identity_match_precedes_current_left_right_order(self):
+        planner = VisionControlPlanner(config=_config(path_source="skeleton"))
+        ys = np.linspace(470.0, 40.0, 80, dtype=np.float32)
+        planner.last_slot_points = {
+            0: np.column_stack((
+                np.full_like(ys, 410.0), ys)).astype(np.float32),
+            1: np.column_stack((
+                np.full_like(ys, 210.0), ys)).astype(np.float32),
+        }
+        current_slot_zero = np.column_stack((
+            np.full_like(ys, 420.0), ys)).astype(np.float32)
+        current_slot_one = np.column_stack((
+            np.full_like(ys, 220.0), ys)).astype(np.float32)
+
+        assigned = planner._assign_heatmap_slots([
+            {"source_slot": 0, "points_xy": current_slot_zero},
+            {"source_slot": 1, "points_xy": current_slot_one},
+        ], (480, 640, 3))
+
+        self.assertEqual([0, 1], [item["slot"] for item in assigned])
+        self.assertEqual(
+            [0, 1], [item["source_slot"] for item in assigned])
+        self.assertTrue(all(
+            item["identity_source"] == "temporal_match"
+            for item in assigned))
+
+    def test_shared_trunk_identity_lock_matches_only_branch_tails(self):
+        planner = VisionControlPlanner(config=_config(path_source="skeleton"))
+        trunk = np.asarray([
+            [320.0, 470.0], [320.0, 360.0], [320.0, 260.0],
+        ], dtype=np.float32)
+        left_tail = np.asarray([
+            [320.0, 260.0], [230.0, 150.0], [120.0, 40.0],
+        ], dtype=np.float32)
+        right_tail = np.asarray([
+            [320.0, 260.0], [410.0, 150.0], [520.0, 40.0],
+        ], dtype=np.float32)
+        previous_left = np.concatenate((trunk, left_tail[1:]), axis=0)
+        previous_right = np.concatenate((trunk, right_tail[1:]), axis=0)
+        planner.last_slot_points = {
+            0: previous_left.copy(), 1: previous_right.copy(),
+        }
+        planner.last_slot_branch_tails = {
+            0: left_tail.copy(), 1: right_tail.copy(),
+        }
+
+        # Deliberately present the right branch first.  The long shared trunk
+        # must not dominate identity and swap the blue/green branch roles.
+        assigned = planner._assign_heatmap_slots([
+            {
+                "source_slot": 0,
+                "points_xy": previous_right,
+                "branch_tail_points_xy": right_tail,
+            },
+            {
+                "source_slot": 1,
+                "points_xy": previous_left,
+                "branch_tail_points_xy": left_tail,
+            },
+        ], (480, 640, 3))
+
+        self.assertEqual([0, 1], [item["slot"] for item in assigned])
+        self.assertEqual([1, 0], [item["source_slot"] for item in assigned])
+        self.assertTrue(all(
+            item["identity_source"] == "temporal_match"
+            for item in assigned))
+
+    def test_selected_fork_tail_stays_locked_when_slots_swap(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", outer_slot=0))
+        trunk = np.asarray([
+            [320.0, 470.0], [320.0, 360.0], [320.0, 260.0],
+        ], dtype=np.float32)
+        left_tail = np.asarray([
+            [320.0, 260.0], [230.0, 150.0], [120.0, 40.0],
+        ], dtype=np.float32)
+        right_tail = np.asarray([
+            [320.0, 260.0], [410.0, 150.0], [520.0, 40.0],
+        ], dtype=np.float32)
+        left = np.concatenate((trunk, left_tail[1:]), axis=0)
+        right = np.concatenate((trunk, right_tail[1:]), axis=0)
+
+        first = planner._select_candidate([
+            {"slot": 0, "points_xy": left,
+             "branch_tail_points_xy": left_tail},
+            {"slot": 1, "points_xy": right,
+             "branch_tail_points_xy": right_tail},
+        ], ROUTE_MULTI_FORK, (480, 640, 3))
+        second = planner._select_candidate([
+            {"slot": 0, "points_xy": right,
+             "branch_tail_points_xy": right_tail},
+            {"slot": 1, "points_xy": left,
+             "branch_tail_points_xy": left_tail},
+        ], ROUTE_MULTI_FORK, (480, 640, 3))
+
+        self.assertLess(float(first["points_xy"][-1, 0]), 200.0)
+        self.assertLess(float(second["points_xy"][-1, 0]), 200.0)
+        self.assertEqual(1, planner.selected_slot_lock)
 
     def test_fragmented_lane_becomes_one_continuous_skeleton(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
@@ -771,6 +992,14 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertTrue(debug["ocr_current"])
         self.assertEqual(1, debug["ocr_pending_frames"])
 
+    def test_current_left_ocr_keeps_default_left_branch(self):
+        planner = VisionControlPlanner(config=_config())
+        _command, debug = _confirm_ocr(planner, "left", start=2.0)
+
+        self.assertEqual("left", debug["branch_lock"])
+        self.assertEqual("ocr", debug["branch_lock_source"])
+        self.assertEqual(0, debug["selected_slot"])
+
     def test_locked_branch_never_falls_back_to_opposite_slot(self):
         planner = VisionControlPlanner(config=_config())
         _confirm_ocr(planner, start=2.0)
@@ -809,8 +1038,8 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual("ocr", before_expiry["branch_lock_source"])
         self.assertEqual(1, before_expiry["selected_slot"])
         self.assertTrue(after_expiry["ocr_lock_expired"])
-        self.assertIsNone(after_expiry["branch_lock"])
-        self.assertIsNone(after_expiry["branch_lock_source"])
+        self.assertEqual("left", after_expiry["branch_lock"])
+        self.assertEqual("default", after_expiry["branch_lock_source"])
         self.assertEqual(0, after_expiry["selected_slot"])
 
     def test_repeated_current_ocr_refreshes_lock_lifetime(self):
@@ -907,12 +1136,14 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         self.assertLess(float(np.std(smoothed_x)), float(np.std(xs)))
 
-    def test_no_current_ocr_defaults_to_outer_after_timeout(self):
+    def test_no_current_ocr_defaults_to_left_immediately(self):
         planner = VisionControlPlanner(config=_config(default_outer_after_s=15.0, outer_slot=0))
-        planner.update(_result(_fork_heatmaps()), {"instruction_current": False}, now=10.0)
-        _command, debug = planner.update(_result(_fork_heatmaps()), {"instruction_current": False}, now=25.1)
+        _command, debug = planner.update(
+            _result(_fork_heatmaps()),
+            {"instruction_current": False}, now=10.0)
 
         self.assertEqual("left", debug["branch_lock"])
+        self.assertEqual("default", debug["branch_lock_source"])
         self.assertEqual(0, debug["selected_slot"])
 
     def test_car_in_path_sends_avoid_car_state_with_biased_error(self):
@@ -945,7 +1176,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(0.08, command["target_speed"])
         self.assertEqual("turnsign_slow", debug["control_target"]["task_reason"])
 
-    def test_low_confidence_turnsign_still_triggers_slowdown(self):
+    def test_low_confidence_turnsign_is_display_only_for_control(self):
         detections = [{
             "label": "TurnSign",
             "score": 0.21,
@@ -957,10 +1188,10 @@ class VisionControlPlannerTest(unittest.TestCase):
         )
 
         self.assertEqual(STATE_TRACK, command["state_cmd"])
-        self.assertAlmostEqual(0.08, command["target_speed"])
-        self.assertEqual("turnsign_slow", debug["control_target"]["task_reason"])
+        self.assertAlmostEqual(0.15, command["target_speed"])
+        self.assertEqual("track", debug["control_target"]["task_reason"])
 
-    def test_turnsign_latches_after_three_detections_until_ocr_result(self):
+    def test_low_confidence_turnsign_does_not_latch_control(self):
         planner = VisionControlPlanner(config=_config())
         sign = [{
             "label": "TurnSign",
@@ -981,9 +1212,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         )
 
         self.assertEqual(STATE_TRACK, slow_command["state_cmd"])
-        self.assertEqual("turnsign_slow", slow_debug["control_target"]["task_reason"])
-        self.assertEqual(STATE_SAFE_STOP, stop_command["state_cmd"])
-        self.assertEqual("turnsign_stop", stop_debug["control_target"]["task_reason"])
+        self.assertEqual("track", slow_debug["control_target"]["task_reason"])
+        self.assertEqual(STATE_TRACK, stop_command["state_cmd"])
+        self.assertEqual("track", stop_debug["control_target"]["task_reason"])
         self.assertEqual(STATE_TRACK, resume_command["state_cmd"])
         self.assertEqual("track", resume_debug["control_target"]["task_reason"])
 
