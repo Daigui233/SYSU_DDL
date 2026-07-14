@@ -119,6 +119,29 @@ def _curve_result_at(blue_x, green_x, slots=(0, 1)):
     }
 
 
+def _curve_merge_result(blue_short=True):
+    blue_ys = np.linspace(
+        460.0, 360.0 if blue_short else 60.0,
+        8 if blue_short else 32, dtype=np.float32)
+    green_ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+    return {
+        "centerline": {"curve_paths": [
+            {
+                "slot": 0, "role": "left", "score": 0.9,
+                "points_xy": np.stack((
+                    np.full_like(blue_ys, 300.0), blue_ys), axis=1),
+            },
+            {
+                "slot": 1, "role": "right", "score": 0.9,
+                "points_xy": np.stack((
+                    np.full_like(green_ys, 310.0), green_ys), axis=1),
+            },
+        ]},
+        "image_shape": (480, 640, 3),
+        "detections": [],
+    }
+
+
 def _ocr_response(direction="right", active=False):
     return {
         "active": active,
@@ -572,6 +595,72 @@ class VisionControlPlannerTest(unittest.TestCase):
             150.0, debug["control_target"]["target_x"], delta=1.0)
         self.assertLess(command["track_error"], 0.0)
 
+    def test_curve_merge_uses_stable_green_after_blue_support_collapses(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            curve_merge_enter_evidence=4))
+
+        _command, first = planner.update(
+            _curve_merge_result(blue_short=True), now=1.0)
+        _command, second = planner.update(
+            _curve_merge_result(blue_short=True), now=1.1)
+
+        self.assertEqual(0, first["selected_slot"])
+        self.assertFalse(first["curve_merge_override"])
+        self.assertEqual(1, second["selected_slot"])
+        self.assertTrue(second["curve_merge_override"])
+        self.assertEqual(
+            "merge_continuity_green", second["selection_reason"])
+        self.assertAlmostEqual(
+            310.0, second["control_target"]["path_target_x"], delta=1.0)
+
+    def test_curve_merge_takeover_ignores_one_frame_blue_reappearance(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            curve_merge_enter_evidence=4,
+            curve_merge_release_frames=3))
+        planner.update(_curve_merge_result(blue_short=True), now=1.0)
+        planner.update(_curve_merge_result(blue_short=True), now=1.1)
+
+        _command, debug = planner.update(
+            _curve_merge_result(blue_short=False), now=1.2)
+
+        self.assertTrue(debug["curve_merge_override"])
+        self.assertEqual(1, debug["selected_slot"])
+        self.assertEqual(1, debug["curve_merge_blue_stable_frames"])
+
+    def test_curve_merge_returns_to_blue_only_after_stable_recovery(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            curve_merge_enter_evidence=4,
+            curve_merge_release_frames=3))
+        planner.update(_curve_merge_result(blue_short=True), now=1.0)
+        planner.update(_curve_merge_result(blue_short=True), now=1.1)
+
+        debug = None
+        for index in range(3):
+            _command, debug = planner.update(
+                _curve_merge_result(blue_short=False),
+                now=1.2 + index * 0.1)
+
+        self.assertFalse(debug["curve_merge_override"])
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertEqual("blue_recovered", debug["curve_merge_reason"])
+
+    def test_curve_short_blue_does_not_fall_back_if_paths_are_not_merged(self):
+        result = _curve_merge_result(blue_short=True)
+        result["centerline"]["curve_paths"][1]["points_xy"][:, 0] = 500.0
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            curve_merge_enter_evidence=4))
+
+        for index in range(4):
+            _command, debug = planner.update(result, now=1.0 + index * 0.1)
+
+        self.assertFalse(debug["curve_merge_override"])
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertFalse(debug["curve_merge_metrics"]["shared_near"])
+
     def test_curve_pending_right_ocr_stays_blue_until_confirmed(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
@@ -664,7 +753,7 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         self.assertTrue(target["path_target_adaptive_y"])
         self.assertAlmostEqual(210.0, target["path_target_x"], delta=1.0)
-        self.assertAlmostEqual(350.0, target["path_target_y"], delta=1.0)
+        self.assertAlmostEqual(300.0, target["path_target_y"], delta=1.0)
 
     def test_curve_brief_blue_loss_holds_last_route_marker(self):
         planner = VisionControlPlanner(config=_config(
