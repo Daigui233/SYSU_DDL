@@ -17,6 +17,8 @@ from vision_control import (  # noqa: E402
     STATE_TRACK,
     VisionControlConfig,
     VisionControlPlanner,
+    _extract_heatmap_preview_lines,
+    _identity_probability_color,
 )
 
 
@@ -167,17 +169,25 @@ class VisionControlPlannerTest(unittest.TestCase):
         _draw_heat_path(heatmaps[0], lambda _y: 100.0)
         _draw_heat_path(heatmaps[1], lambda _y: 104.0)
         planner = VisionControlPlanner(config=_config())
+        result = _result(heatmaps)
 
-        _command, debug = planner.update(_result(heatmaps), now=1.0)
+        _command, debug = planner.update(result, now=1.0)
 
         self.assertLessEqual(debug["candidate_count"], 2)
         self.assertLessEqual(len(debug["candidate_paths"]), 2)
+        self.assertLessEqual(len(result["heatmap_debug_lines"]), 2)
+        self.assertLessEqual(len(result["display_paths"]), 2)
+        self.assertLessEqual(len(_extract_heatmap_preview_lines(
+            result, (480, 640, 3))), 2)
+        self.assertEqual((255, 0, 0), _identity_probability_color(0, 1.0))
+        self.assertEqual((0, 255, 0), _identity_probability_color(1, 1.0))
         self.assertTrue(all(
-            item["source"] == "heatmap_component"
-            for item in debug["candidates"]
+            path["heat_supported"] and
+            path["heat_support_low_run"] == 0
+            for path in result["paths"]
         ))
 
-    def test_heatmap_paths_require_valid_road_segmentation(self):
+    def test_heatmap_paths_fall_back_to_full_map_without_valid_road(self):
         heatmaps = _straight_heatmap(80)
         result = _result(heatmaps)
         result["road"]["mask"].fill(0.0)
@@ -185,8 +195,8 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         _command, debug = planner.update(result, now=1.0)
 
-        self.assertEqual(0, debug["candidate_count"])
-        self.assertEqual([], result["paths"])
+        self.assertEqual(1, debug["candidate_count"])
+        self.assertEqual(1, len(result["paths"]))
 
     def test_only_heatmap_components_inside_road_are_kept(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
@@ -201,64 +211,62 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(1, debug["candidate_count"])
         self.assertGreater(debug["candidates"][0]["near_x"], 400.0)
 
-    def test_long_vertical_fragments_are_joined_into_one_centerline(self):
+    def test_low_heat_gap_is_not_joined_into_one_centerline(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
         _draw_heat_path_range(heatmaps[0], lambda _y: 72.0, 20, 54)
         _draw_heat_path_range(heatmaps[0], lambda _y: 74.0, 70, 119)
         result = _result(heatmaps)
-        planner = VisionControlPlanner(config=_config())
+        planner = VisionControlPlanner(config=_config(
+            heat_threshold=0.30,
+            min_path_support_probability=0.12,
+        ))
 
         _command, debug = planner.update(result, now=1.0)
 
-        self.assertEqual(1, debug["candidate_count"])
-        self.assertEqual(2, result["paths"][0]["component_count"])
-        points = result["paths"][0]["points_xy"]
-        self.assertLess(float(np.min(points[:, 1])), 100.0)
-        self.assertGreater(float(np.max(points[:, 1])), 450.0)
+        self.assertEqual(2, debug["candidate_count"])
+        self.assertTrue(all(
+            int(path.get("component_count", 1)) == 1
+            for path in result["paths"]))
+        self.assertTrue(all(
+            path["heat_support_low_run"] == 0
+            for path in result["paths"]))
+        self.assertFalse(any(
+            float(np.min(path["points_xy"][:, 1])) < 250.0 and
+            float(np.max(path["points_xy"][:, 1])) > 300.0
+            for path in result["paths"]))
 
-    def test_overlapping_parts_are_hidden_only_on_second_display_line(self):
+    def test_overlapping_fork_keeps_two_independent_supported_paths(self):
         planner = VisionControlPlanner(config=_config(overlap_px_640=28.0))
+        result = _result(_fork_heatmaps())
 
-        _command, debug = planner.update(_result(_fork_heatmaps()), now=1.0)
+        _command, debug = planner.update(result, now=1.0)
 
         self.assertEqual(2, debug["candidate_count"])
-        self.assertEqual(2, len(debug["candidate_path_segments"]))
-        self.assertEqual(1, len(debug["candidate_path_segments"][0]))
-        self.assertTrue(debug["candidate_path_segments"][1])
-        second_visible = np.concatenate([
-            np.asarray(segment, dtype=np.float32)
-            for segment in debug["candidate_path_segments"][1]
-        ])
-        self.assertLess(float(np.max(second_visible[:, 1])), 360.0)
+        self.assertEqual(2, len(result["display_paths"]))
+        self.assertTrue(all(
+            path["heat_supported"] for path in result["paths"]))
+        branch_y = 180.0
+        self.assertGreater(abs(
+            _path_x_at(result["paths"][0]["points_xy"], branch_y) -
+            _path_x_at(result["paths"][1]["points_xy"], branch_y)), 100.0)
 
-    def test_fork_uses_explicit_dual_heatmap_intersection_node(self):
+    def test_fork_identity_is_confirmed_by_row_scan_not_channel_slot(self):
         result = _result(_fork_heatmaps())
         planner = VisionControlPlanner(config=_config())
 
         _command, debug = planner.update(result, now=1.0)
 
-        intersection = debug["heatmap_intersection"]
-        self.assertTrue(intersection["active"])
-        self.assertEqual("skimage_skeleton", intersection["method"])
         self.assertEqual(2, debug["candidate_count"])
         self.assertEqual(ROUTE_MULTI_FORK, debug["route_state"])
-        shared_y = float(np.mean(intersection["regions_y"][0]))
-        paths = result["paths"]
-        self.assertAlmostEqual(
-            _path_x_at(paths[0]["points_xy"], shared_y),
-            _path_x_at(paths[1]["points_xy"], shared_y),
-            places=4,
-        )
-        branch_y = 180.0
-        self.assertGreater(
-            abs(
-                _path_x_at(paths[0]["branch_points_xy"], branch_y) -
-                _path_x_at(paths[1]["branch_points_xy"], branch_y)
-            ),
-            100.0,
-        )
+        self.assertEqual(["left", "right"], [
+            path["identity"] for path in result["paths"]])
+        self.assertEqual(["row_scan", "row_scan"], [
+            path["identity_source"] for path in result["paths"]])
+        self.assertLess(
+            debug["candidates"][0]["lookahead_x"],
+            debug["candidates"][1]["lookahead_x"])
 
-    def test_shared_road_jitter_does_not_pull_branches_together(self):
+    def test_shared_road_jitter_keeps_supported_branches_separate(self):
         planner = VisionControlPlanner(config=_config(
             path_ema_alpha=0.32,
             path_max_step_px_640=40.0,
@@ -271,26 +279,78 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         first_paths = first_result["paths"]
         second_paths = second_result["paths"]
-        shared_y = 455.0
-        first_shared_x = _path_x_at(first_paths[0]["points_xy"], shared_y)
-        second_shared_x = _path_x_at(second_paths[0]["points_xy"], shared_y)
-        self.assertLess(abs(second_shared_x - first_shared_x), 12.0)
-        self.assertAlmostEqual(
-            _path_x_at(second_paths[0]["points_xy"], shared_y),
-            _path_x_at(second_paths[1]["points_xy"], shared_y),
-            places=4,
-        )
         branch_y = 180.0
         first_separation = abs(
-            _path_x_at(first_paths[0]["branch_points_xy"], branch_y) -
-            _path_x_at(first_paths[1]["branch_points_xy"], branch_y)
+            _path_x_at(first_paths[0]["points_xy"], branch_y) -
+            _path_x_at(first_paths[1]["points_xy"], branch_y)
         )
         second_separation = abs(
-            _path_x_at(second_paths[0]["branch_points_xy"], branch_y) -
-            _path_x_at(second_paths[1]["branch_points_xy"], branch_y)
+            _path_x_at(second_paths[0]["points_xy"], branch_y) -
+            _path_x_at(second_paths[1]["points_xy"], branch_y)
         )
         self.assertGreater(second_separation, 100.0)
         self.assertLess(abs(second_separation - first_separation), 8.0)
+        self.assertTrue(all(
+            path["heat_supported"] and
+            path["heat_support_low_run"] == 0
+            for path in second_paths))
+
+    def test_continuous_weak_path_beats_disconnected_strong_regions(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        weak = np.zeros((120, 160), dtype=np.float32)
+        _draw_heat_path(weak, lambda _y: 52.0)
+        heatmaps[0] = np.maximum(heatmaps[0], weak * 0.42)
+        _draw_heat_path_range(
+            heatmaps[0], lambda _y: 118.0, 20, 48)
+        _draw_heat_path_range(
+            heatmaps[0], lambda _y: 118.0, 78, 104)
+        result = _result(heatmaps)
+
+        VisionControlPlanner(config=_config()).update(result, now=1.0)
+
+        longest = max(
+            result["paths"],
+            key=lambda path: float(np.ptp(path["points_xy"][:, 1])))
+        self.assertGreater(float(np.ptp(longest["points_xy"][:, 1])), 350.0)
+        self.assertLess(float(np.mean(longest["points_xy"][:, 0])), 260.0)
+        self.assertTrue(longest["heat_supported"])
+        self.assertEqual(0, longest["heat_support_low_run"])
+
+    def test_low_heat_weighted_center_is_rejected_and_channel_falls_back(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        _draw_heat_path(heatmaps[0], lambda _y: 55.0)
+        _draw_heat_path(heatmaps[0], lambda _y: 75.0)
+        heatmaps[0, 108, 55:76] = 1.0
+        result = _result(heatmaps)
+
+        VisionControlPlanner(config=_config()).update(result, now=1.0)
+
+        self.assertEqual(1, len(result["paths"]))
+        path = result["paths"][0]
+        self.assertEqual("heatmap_viterbi", path["source"])
+        heat_x = float(np.mean(path["points_xy"][:, 0])) * 159.0 / 639.0
+        self.assertGreater(abs(heat_x - 65.0), 6.0)
+        self.assertTrue(path["heat_supported"])
+        self.assertEqual(0, path["heat_support_low_run"])
+
+    def test_left_right_identity_survives_heatmap_channel_swap(self):
+        planner = VisionControlPlanner(config=_config())
+        first = np.concatenate((
+            _straight_heatmap(50), _straight_heatmap(110)), axis=0)
+        swapped = np.concatenate((
+            _straight_heatmap(110), _straight_heatmap(50)), axis=0)
+
+        planner.update(_result(first), now=1.0)
+        result = _result(swapped)
+        planner.update(result, now=1.02)
+
+        self.assertEqual(["left", "right"], [
+            path["identity"] for path in result["paths"]])
+        self.assertLess(
+            float(np.mean(result["paths"][0]["points_xy"][:, 0])),
+            float(np.mean(result["paths"][1]["points_xy"][:, 0])))
+        self.assertEqual(1, result["paths"][0]["source_slot"])
+        self.assertEqual(0, result["paths"][1]["source_slot"])
 
     def test_current_ocr_locks_right_branch(self):
         planner = VisionControlPlanner(config=_config())
@@ -399,23 +459,23 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertIsNone(debug["branch_lock"])
         self.assertIsNone(debug["selected_slot_lock"])
 
-    def test_path_ema_reduces_frame_to_frame_jump(self):
+    def test_path_ema_falls_back_when_blend_leaves_heat_ridge(self):
         planner = VisionControlPlanner(config=_config(
             path_ema_alpha=0.40,
             path_smooth_window=1,
             path_max_step_px_640=1000.0,
         ))
         _command, first = planner.update(
-            _result(_straight_heatmap(70)), now=1.0)
-        second_result = _result(_straight_heatmap(100))
+            _result(_straight_heatmap(45)), now=1.0)
+        second_result = _result(_straight_heatmap(70))
         _command, second = planner.update(second_result, now=1.02)
 
-        first_x = first["candidates"][0]["lookahead_x"]
         filtered_x = second["candidates"][0]["lookahead_x"]
-        raw_x = 100.0 * 639.0 / 159.0
-        self.assertGreater(filtered_x, first_x)
-        self.assertLess(filtered_x, raw_x - 20.0)
-        self.assertTrue(second_result["paths"][0]["temporal_smoothed"])
+        raw_x = 70.0 * 639.0 / 159.0
+        self.assertAlmostEqual(filtered_x, raw_x, delta=4.1)
+        self.assertFalse(second_result["paths"][0]["temporal_smoothed"])
+        self.assertTrue(
+            second_result["paths"][0]["smoothing_rejected_low_heat"])
 
     def test_spatial_filter_reduces_direct_curve_zigzag(self):
         ys = np.linspace(460.0, 60.0, 9, dtype=np.float32)

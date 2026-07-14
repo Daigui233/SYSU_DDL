@@ -21,6 +21,8 @@ ROUTE_SINGLE = "SINGLE"
 ROUTE_MULTI_FORK = "MULTI_FORK"
 ROUTE_AMBIGUOUS = "AMBIGUOUS"
 
+_PAIR_FRACTIONS = np.arange(24, dtype=np.float32) / 23.0
+
 
 def _env_float(name, default):
     try:
@@ -93,6 +95,112 @@ def _interp_path_x_many(points, target_ys):
     return np.interp(target_ys, ys, xs).astype(np.float32)
 
 
+def _heatmap_polyline_mask(points, image_shape, heatmap_shape):
+    """Rasterize an image-space path on the original heatmap grid."""
+    points = np.asarray(points, dtype=np.float32)
+    heat_h, heat_w = heatmap_shape
+    mask = np.zeros((heat_h, heat_w), dtype=np.uint8)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+        return mask
+    img_h, img_w = image_shape[:2]
+    heat_points = np.empty_like(points)
+    heat_points[:, 0] = (
+        points[:, 0] * float(max(heat_w - 1, 1)) /
+        float(max(img_w - 1, 1)))
+    heat_points[:, 1] = (
+        points[:, 1] * float(max(heat_h - 1, 1)) /
+        float(max(img_h - 1, 1)))
+    heat_points = np.rint(heat_points).astype(np.int32)
+    heat_points[:, 0] = np.clip(heat_points[:, 0], 0, heat_w - 1)
+    heat_points[:, 1] = np.clip(heat_points[:, 1], 0, heat_h - 1)
+    cv2.polylines(
+        mask, [heat_points.reshape((-1, 1, 2))], False,
+        1, 1, cv2.LINE_8)
+    return mask
+
+
+def _path_heat_support_metrics(
+        points, image_shape, support_maps, source_slots,
+        minimum_probability, require_all_channels=False):
+    """Measure continuous heat support for every raster cell of a path."""
+    support_maps = np.asarray(support_maps, dtype=np.float32)
+    if support_maps.ndim != 3 or support_maps.shape[0] < 1:
+        return {
+            "valid": False, "support_ratio": 0.0,
+            "min_probability": 0.0, "mean_probability": 0.0,
+            "low_run_pixels": 0, "sample_count": 0,
+        }
+    slots = sorted({
+        int(slot) for slot in source_slots
+        if 0 <= int(slot) < support_maps.shape[0]
+    })
+    if not slots:
+        return {
+            "valid": False, "support_ratio": 0.0,
+            "min_probability": 0.0, "mean_probability": 0.0,
+            "low_run_pixels": 0, "sample_count": 0,
+        }
+    selected = support_maps[slots]
+    combined = (
+        np.min(selected, axis=0) if require_all_channels
+        else np.max(selected, axis=0))
+    mask = _heatmap_polyline_mask(
+        points, image_shape, combined.shape)
+    path_pixels = mask != 0
+    values = combined[path_pixels]
+    if not values.size:
+        return {
+            "valid": False, "support_ratio": 0.0,
+            "min_probability": 0.0, "mean_probability": 0.0,
+            "low_run_pixels": 0, "sample_count": 0,
+        }
+    supported = values >= float(minimum_probability)
+    low_mask = (path_pixels & (combined < float(minimum_probability))).astype(
+        np.uint8)
+    low_run = 0
+    if np.any(low_mask):
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            low_mask, connectivity=8)
+        if count > 1:
+            low_run = int(np.max(stats[1:, cv2.CC_STAT_AREA]))
+    return {
+        # A 3x3 maximum filter is already applied to support_maps. After that
+        # tolerance, even one unsupported raster cell is a real blank crossing.
+        "valid": bool(np.all(supported)),
+        "support_ratio": float(np.mean(supported)),
+        "min_probability": float(np.min(values)),
+        "mean_probability": float(np.mean(values)),
+        "low_run_pixels": low_run,
+        "sample_count": int(values.size),
+    }
+
+
+def _path_point_probabilities(points, image_shape, support_maps, source_slots):
+    points = np.asarray(points, dtype=np.float32)
+    support_maps = np.asarray(support_maps, dtype=np.float32)
+    if (points.ndim != 2 or points.shape[1] != 2 or not len(points) or
+            support_maps.ndim != 3 or support_maps.shape[0] < 1):
+        return np.empty(0, dtype=np.float32)
+    slots = sorted({
+        int(slot) for slot in source_slots
+        if 0 <= int(slot) < support_maps.shape[0]
+    })
+    if not slots:
+        return np.empty(0, dtype=np.float32)
+    combined = np.max(support_maps[slots], axis=0)
+    heat_h, heat_w = combined.shape
+    img_h, img_w = image_shape[:2]
+    xs = np.rint(
+        points[:, 0] * float(max(heat_w - 1, 1)) /
+        float(max(img_w - 1, 1))).astype(np.int32)
+    ys = np.rint(
+        points[:, 1] * float(max(heat_h - 1, 1)) /
+        float(max(img_h - 1, 1))).astype(np.int32)
+    xs = np.clip(xs, 0, heat_w - 1)
+    ys = np.clip(ys, 0, heat_h - 1)
+    return combined[ys, xs].astype(np.float32)
+
+
 @dataclass
 class VisionControlConfig:
     visual_center_x: float = 0.50
@@ -113,6 +221,7 @@ class VisionControlConfig:
     min_path_points: int = 12
     min_path_coverage: float = 0.28
     min_mean_heat: float = 0.28
+    min_path_support_probability: float = 0.12
     max_link_jump_px: float = 16.0
     road_penalty_weight: float = 0.75
     history_weight: float = 0.035
@@ -126,6 +235,9 @@ class VisionControlConfig:
     branch_separation_px_640: float = 70.0
     branch_separation_rows: int = 8
     overlap_px_640: float = 28.0
+    fragment_search_radius_px_640: float = 72.0
+    fragment_max_tangent_delta_deg: float = 55.0
+    heatmap_component_budget: int = 2
     default_outer_after_s: float = 15.0
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
@@ -179,6 +291,11 @@ class VisionControlConfig:
             min_path_points=max(3, _env_int("VISION_CONTROL_MIN_PATH_POINTS", 12)),
             min_path_coverage=_clamp(_env_float("VISION_CONTROL_MIN_PATH_COVERAGE", 0.28), 0.01, 1.0),
             min_mean_heat=_clamp(_env_float("VISION_CONTROL_MIN_MEAN_HEAT", 0.28), 0.01, 0.99),
+            min_path_support_probability=_clamp(
+                _env_float(
+                    "VISION_CONTROL_MIN_PATH_SUPPORT_PROBABILITY",
+                    _env_float("VISION_CONTROL_MIN_PATH_SUPPORT", 0.12)),
+                0.01, 0.99),
             max_link_jump_px=max(2.0, _env_float("VISION_CONTROL_MAX_LINK_JUMP", 16.0)),
             road_penalty_weight=max(0.0, _env_float("VISION_CONTROL_ROAD_WEIGHT", 0.75)),
             history_weight=max(0.0, _env_float("VISION_CONTROL_HISTORY_WEIGHT", 0.035)),
@@ -192,6 +309,14 @@ class VisionControlConfig:
             branch_separation_px_640=max(1.0, _env_float("VISION_CONTROL_BRANCH_SEP_640", 70.0)),
             branch_separation_rows=max(1, _env_int("VISION_CONTROL_BRANCH_SEP_ROWS", 8)),
             overlap_px_640=max(1.0, _env_float("VISION_CONTROL_OVERLAP_640", 28.0)),
+            fragment_search_radius_px_640=max(
+                2.0, _env_float("VISION_CONTROL_FRAGMENT_RADIUS_640", 72.0)),
+            fragment_max_tangent_delta_deg=_clamp(
+                _env_float(
+                    "VISION_CONTROL_FRAGMENT_MAX_TANGENT_DELTA_DEG", 55.0),
+                5.0, 85.0),
+            heatmap_component_budget=max(
+                2, _env_int("VISION_CONTROL_HEATMAP_COMPONENT_BUDGET", 2)),
             default_outer_after_s=max(0.0, _env_float("VISION_CONTROL_DEFAULT_OUTER_AFTER", 15.0)),
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
@@ -248,6 +373,8 @@ class HeatmapPathSearch:
                 road >= road_threshold, heatmap, 1e-4).astype(np.float32)
         else:
             road = None
+        support_map = cv2.dilate(
+            heatmap, np.ones((3, 3), dtype=np.uint8))
         rows = list(range(h - 2, max(int(h * 0.18), 1), -self.config.row_step))
         layers = []
         expected_rows = len(rows)
@@ -294,6 +421,10 @@ class HeatmapPathSearch:
                     jump = abs(float(node["x"] - previous["x"]))
                     if jump > allowed_jump:
                         continue
+                    if not self._segment_has_heat_support(
+                            previous, node, support_map,
+                            self.config.min_path_support_probability):
+                        continue
                     cost = previous["cost"] + self._node_cost(node) + jump * self.config.jump_weight
                     if best_cost is None or cost < best_cost:
                         best_cost = cost
@@ -314,16 +445,15 @@ class HeatmapPathSearch:
         ]
         if not possible_end_nodes:
             return None
-        max_length = max(int(node.get("length", 1)) for node in possible_end_nodes)
-        min_length = max(self.config.min_path_points, int(round(max_length * 0.75)))
-        possible_end_nodes = [
-            node
-            for node in possible_end_nodes
-            if int(node.get("length", 1)) >= min_length
-        ]
+        # Continuous coverage is decisive. Heat magnitude only breaks ties
+        # between equally long locally supported chains.
         end_node = min(
             possible_end_nodes,
-            key=lambda item: float(item["cost"]) / float(max(1, int(item.get("length", 1)))),
+            key=lambda item: (
+                -int(item.get("length", 1)),
+                float(item["cost"]) /
+                float(max(1, int(item.get("length", 1)))),
+            ),
         )
         chain = []
         node = end_node
@@ -342,8 +472,15 @@ class HeatmapPathSearch:
         points = np.zeros((len(chain), 2), dtype=np.float32)
         points[:, 0] = [node["x"] * float(max(img_w - 1, 1)) / float(max(w - 1, 1)) for node in chain]
         points[:, 1] = [node["y"] * float(max(img_h - 1, 1)) / float(max(h - 1, 1)) for node in chain]
+        support = _path_heat_support_metrics(
+            points, image_shape, support_map[np.newaxis, ...], (0,),
+            self.config.min_path_support_probability)
+        if not support["valid"]:
+            return None
         return {
             "slot": int(slot),
+            "source_slot": int(slot),
+            "source_slots": {int(slot)},
             "role": "left" if int(slot) == 0 else "right",
             "source": "heatmap_viterbi",
             "points_xy": points,
@@ -352,12 +489,29 @@ class HeatmapPathSearch:
             "coverage": coverage,
             "road_support": float(np.mean([node["road"] for node in chain])),
             "point_confidences": np.asarray([node["p"] for node in chain], dtype=np.float32),
+            "heat_support_ratio": support["support_ratio"],
+            "heat_support_min": support["min_probability"],
+            "heat_support_mean": support["mean_probability"],
+            "heat_support_low_run": support["low_run_pixels"],
         }
 
     def _node_cost(self, node):
         heat_cost = -math.log(max(1e-4, float(node["p"])))
         road_cost = (1.0 - float(node["road"])) * self.config.road_penalty_weight
         return heat_cost + road_cost
+
+    @staticmethod
+    def _segment_has_heat_support(
+            first, second, support_map, minimum_probability):
+        x0, y0 = int(first["x"]), int(first["y"])
+        x1, y1 = int(second["x"]), int(second["y"])
+        count = max(abs(x1 - x0), abs(y1 - y0)) + 1
+        if count <= 1:
+            return float(support_map[y0, x0]) >= float(minimum_probability)
+        xs = np.rint(np.linspace(x0, x1, count)).astype(np.int32)
+        ys = np.rint(np.linspace(y0, y1, count)).astype(np.int32)
+        return bool(np.all(
+            support_map[ys, xs] >= float(minimum_probability)))
 
     @staticmethod
     def _prepare_road(road_mask, shape):
@@ -568,6 +722,7 @@ class VisionControlPlanner:
     def _extract_candidates(self, result, image_shape):
         started = time.perf_counter()
         centerline = result.get("centerline") or {}
+        support_maps = None
         if self.config.path_source == "curve":
             paths = (centerline.get("curve_paths") or
                      result.get("curve_paths") or [])
@@ -579,9 +734,12 @@ class VisionControlPlanner:
                 candidate = dict(path)
                 candidate["points_xy"] = points
                 candidate["source"] = "direct_curve"
+                candidate["source_slot"] = int(path.get("slot", len(candidates)))
+                candidate["source_slots"] = {candidate["source_slot"]}
                 candidate["coverage"] = 1.0
                 candidate["road_support"] = None
                 candidates.append(candidate)
+            candidates = candidates[:2]
         else:
             heatmaps = centerline.get("heatmaps")
             if heatmaps is None:
@@ -594,27 +752,95 @@ class VisionControlPlanner:
             road = (result.get("road") or {}).get("mask")
             if road is None:
                 road = result.get("road_mask")
-            result["heatmap_debug_lines"] = self._extract_heatmap_debug_lines(
-                heatmaps, road, image_shape)
-            candidates = []
-            for slot in range(min(2, heatmaps.shape[0])):
+            effective_maps, support_maps, _has_road = (
+                self._prepare_heatmap_support_maps(heatmaps, road))
+            component_lines, invalid_slots = self._extract_heatmap_debug_lines(
+                effective_maps, None, image_shape,
+                support_maps=support_maps, return_invalid=True)
+            candidate_pool = list(component_lines)
+
+            # Keep channel-local continuous search as a per-channel fallback
+            # for rejected component centers or a channel with no candidate;
+            # it does not wait for every other channel to fail.
+            represented_slots = set().union(*(
+                set(line.get("source_slots") or {
+                    int(line.get("source_slot", -1))})
+                for line in component_lines
+            )) if component_lines else set()
+            fallback_slots = (
+                set(range(min(2, effective_maps.shape[0]))) -
+                represented_slots) | set(invalid_slots)
+            for source_slot in sorted(fallback_slots):
                 candidate = self.path_search.search(
-                    heatmaps[slot],
-                    road_mask=road,
+                    effective_maps[source_slot],
+                    road_mask=None,
                     image_shape=image_shape,
-                    slot=slot,
-                    history_points=self.last_slot_points.get(slot),
+                    slot=source_slot,
+                    history_points=None,
                 )
                 if candidate is not None:
-                    candidates.append(candidate)
+                    candidate["source_slot"] = int(source_slot)
+                    candidate["source_slots"] = {int(source_slot)}
+                    if self._annotate_heat_support(
+                            candidate, image_shape, support_maps):
+                        candidate_pool.append(candidate)
 
+            candidates = self._select_heatmap_lines(
+                candidate_pool, image_shape)[:2]
+            result["heatmap_debug_lines"] = list(candidates)
+
+        candidates = self._assign_heatmap_slots(candidates[:2], image_shape)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
-        candidates = self._smooth_candidates(candidates, image_shape)
+        candidates = self._smooth_candidates(
+            candidates, image_shape, support_maps=support_maps)
         self._publish_filtered_paths(result, candidates)
         elapsed = (time.perf_counter() - started) * 1000.0
         return candidates, elapsed
 
-    def _extract_heatmap_debug_lines(self, heatmaps, road_mask, image_shape):
+    def _prepare_heatmap_support_maps(self, heatmaps, road_mask):
+        heatmaps = np.clip(
+            np.asarray(heatmaps, dtype=np.float32)[:2], 0.0, 1.0)
+        heat_h, heat_w = heatmaps.shape[1:3]
+        road = HeatmapPathSearch._prepare_road(
+            road_mask, (heat_h, heat_w))
+        has_road = (
+            road is not None and
+            np.any(road >= float(self.config.road_mask_threshold)))
+        if has_road:
+            effective = np.where(
+                road[np.newaxis, ...] >=
+                float(self.config.road_mask_threshold),
+                heatmaps, 0.0).astype(np.float32)
+        else:
+            effective = heatmaps.copy()
+        support = np.empty_like(effective)
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        for slot in range(len(effective)):
+            support[slot] = cv2.dilate(effective[slot], kernel)
+        return effective, support, has_road
+
+    def _annotate_heat_support(
+            self, line, image_shape, support_maps,
+            require_all_channels=False):
+        source_slots = line.get("source_slots")
+        if not source_slots:
+            source_slots = {int(line.get(
+                "source_slot", line.get("slot", -1)))}
+        metrics = _path_heat_support_metrics(
+            line.get("points_xy"), image_shape, support_maps,
+            source_slots, self.config.min_path_support_probability,
+            require_all_channels=require_all_channels)
+        line["heat_support_ratio"] = metrics["support_ratio"]
+        line["heat_support_min"] = metrics["min_probability"]
+        line["heat_support_mean"] = metrics["mean_probability"]
+        line["heat_support_low_run"] = metrics["low_run_pixels"]
+        line["heat_support_samples"] = metrics["sample_count"]
+        line["heat_supported"] = bool(metrics["valid"])
+        return bool(metrics["valid"])
+
+    def _extract_heatmap_debug_lines(
+            self, heatmaps, road_mask, image_shape, support_maps=None,
+            return_invalid=False):
         heatmaps = np.asarray(heatmaps, dtype=np.float32)
         if heatmaps.ndim != 3:
             return []
@@ -622,27 +848,95 @@ class VisionControlPlanner:
         road = HeatmapPathSearch._prepare_road(road_mask, (h, w))
         road_threshold = float(self.config.road_mask_threshold)
         has_road = road is not None and np.any(road >= road_threshold)
+        if support_maps is None:
+            effective_maps, support_maps, _has_road = (
+                self._prepare_heatmap_support_maps(heatmaps, road_mask))
+        else:
+            effective_maps = heatmaps
         lines = []
+        invalid_slots = set()
+        component_groups = []
         for slot in range(min(2, heatmaps.shape[0])):
-            heatmap = np.clip(heatmaps[slot], 0.0, 1.0)
+            heatmap = np.clip(effective_maps[slot], 0.0, 1.0)
             mask = heatmap >= float(self.config.heat_threshold)
             if has_road:
                 mask &= road >= road_threshold
             components, labels, stats, _centroids = cv2.connectedComponentsWithStats(
                 mask.astype(np.uint8), connectivity=8)
-            for label in range(1, components):
-                if int(stats[label, cv2.CC_STAT_AREA]) < max(
-                        4, self.config.min_path_points // 2):
-                    continue
-                points = self._component_centerline_points(labels, label, heatmap, image_shape)
+            minimum = max(4, self.config.min_path_points // 2)
+            valid_labels = np.flatnonzero(
+                (stats[1:, cv2.CC_STAT_AREA] >= minimum) &
+                (stats[1:, cv2.CC_STAT_HEIGHT] >= minimum)) + 1
+            label_heat_sums = np.bincount(
+                labels.reshape(-1),
+                weights=heatmap.reshape(-1),
+                minlength=components)
+            if not len(valid_labels):
+                component_groups.append([])
+                continue
+            mean_heat = (
+                label_heat_sums[valid_labels] /
+                np.maximum(
+                    1, stats[valid_labels, cv2.CC_STAT_AREA]))
+            priorities = (
+                stats[valid_labels, cv2.CC_STAT_HEIGHT].astype(
+                    np.float32) * 4.0 +
+                np.sqrt(stats[valid_labels, cv2.CC_STAT_AREA].astype(
+                    np.float32)) + mean_heat.astype(np.float32) * 0.01)
+            order = np.argsort(priorities)[::-1]
+            component_groups.append([
+                (float(priorities[index]), int(slot),
+                 int(valid_labels[index]), heatmap, labels, stats,
+                 label_heat_sums)
+                for index in order
+            ])
+
+        selected_components = []
+        budget = max(2, int(self.config.heatmap_component_budget))
+        # First preserve one globally strong region per populated channel;
+        # then spend any remaining budget on the strongest leftover regions.
+        for group in component_groups:
+            if group and len(selected_components) < budget:
+                selected_components.append(group.pop(0))
+        while len(selected_components) < budget:
+            available = [group[0] for group in component_groups if group]
+            if not available:
+                break
+            best = max(available, key=lambda item: item[0])
+            selected_components.append(best)
+            component_groups[int(best[1])].pop(0)
+
+        for (_priority, slot, label, heatmap, labels, stats,
+             label_heat_sums) in selected_components:
+                points = self._component_centerline_points(
+                    labels, label, heatmap, image_shape,
+                    component_stats=stats[label])
                 if len(points) < max(3, self.config.min_path_points // 2):
                     continue
-                lines.append({
+                item = {
                     "slot": int(slot),
+                    "source_slot": int(slot),
+                    "source_slots": {int(slot)},
                     "points_xy": points,
-                    "score": float(np.mean(heatmap[labels == label])),
-                })
-        return lines
+                    "score": float(label_heat_sums[label]) /
+                    float(max(1, stats[label, cv2.CC_STAT_AREA])),
+                    "heat_mass": float(label_heat_sums[label]),
+                    "component_count": 1,
+                    "component_rows": int(stats[label, cv2.CC_STAT_HEIGHT]),
+                    "component_area": int(stats[label, cv2.CC_STAT_AREA]),
+                    "spatial_prefiltered": True,
+                }
+                self._refresh_fragment_geometry(item)
+                if self._annotate_heat_support(
+                        item, image_shape, support_maps):
+                    lines.append(item)
+                else:
+                    invalid_slots.add(int(slot))
+        joined = self._join_heatmap_fragments(
+            lines, image_shape, support_maps=support_maps)
+        if return_invalid:
+            return joined, invalid_slots
+        return joined
 
     def _find_heatmap_intersection(self, heatmaps, road, image_shape):
         if heatmaps.shape[0] < 2:
@@ -883,76 +1177,194 @@ class VisionControlPlanner:
             return 0.0
         return float(np.max(points[:, 1]) - np.min(points[:, 1]))
 
-    def _join_heatmap_fragments(self, lines, image_shape):
-        ordered = sorted(
-            lines,
-            key=lambda item: (
-                self._vertical_span(item.get("points_xy", [])),
-                len(item.get("points_xy", [])),
-                float(item.get("score", 0.0)),
-            ),
-            reverse=True,
-        )
+    def _join_heatmap_fragments(
+            self, lines, image_shape, support_maps=None):
+        if (support_maps is not None and
+                self.config.heat_threshold <=
+                self.config.min_path_support_probability):
+            # Separate threshold-components cannot have a connector that is
+            # simultaneously above an equal-or-higher support threshold.
+            return [dict(item) for item in lines]
+        remaining = sorted(
+            (dict(item) for item in lines),
+            key=self._heatmap_line_rank,
+            reverse=True)
         tracks = []
-        for line in ordered:
-            best_index = None
-            best_cost = None
-            for index, track in enumerate(tracks):
-                if int(track.get("source_slot", -1)) != int(line.get("source_slot", -1)):
-                    continue
-                cost = self._fragment_join_cost(track, line, image_shape)
-                if cost is not None and (best_cost is None or cost < best_cost):
-                    best_index = index
-                    best_cost = cost
-            if best_index is None:
-                item = dict(line)
-                item["points_xy"] = np.asarray(
-                    line.get("points_xy"), dtype=np.float32).copy()
-                tracks.append(item)
-            else:
-                tracks[best_index] = self._merge_heatmap_fragments(
-                    tracks[best_index], line)
+        while remaining:
+            track = remaining.pop(0)
+            track["points_xy"] = np.asarray(
+                track.get("points_xy"), dtype=np.float32).copy()
+            self._refresh_fragment_geometry(track)
+            while remaining:
+                best_index = None
+                best_connection = None
+                best_key = None
+                for index, fragment in enumerate(remaining):
+                    if not self._fragment_endpoints_maybe_close(
+                            track, fragment, image_shape):
+                        continue
+                    connection = self._fragment_join_cost(
+                        track, fragment, image_shape,
+                        support_maps=support_maps)
+                    if connection is None:
+                        continue
+                    key = (
+                        -float(connection["support_ratio"]),
+                        float(connection["distance"]),
+                        float(connection["tangent_penalty"]),
+                        -float(fragment.get("heat_mass", 0.0)),
+                    )
+                    if best_key is None or key < best_key:
+                        best_index = index
+                        best_connection = connection
+                        best_key = key
+                if best_index is None:
+                    break
+                fragment = remaining.pop(best_index)
+                track = self._merge_heatmap_fragments(
+                    track, fragment,
+                    points_xy=best_connection["points_xy"])
+            tracks.append(track)
         return tracks
 
-    def _fragment_join_cost(self, first, second, image_shape):
+    @staticmethod
+    def _refresh_fragment_geometry(line):
+        points = np.asarray(line.get("points_xy"), dtype=np.float32)
+        if len(points) < 2:
+            line["fragment_y_min"] = 0.0
+            line["fragment_y_max"] = 0.0
+            return
+        if float(points[0, 1]) < float(points[-1, 1]):
+            points = points[::-1].copy()
+            line["points_xy"] = points
+        line["fragment_y_max"] = float(points[0, 1])
+        line["fragment_y_min"] = float(points[-1, 1])
+
+    def _fragment_endpoints_maybe_close(
+            self, first, second, image_shape):
         first_points = np.asarray(first.get("points_xy"), dtype=np.float32)
         second_points = np.asarray(second.get("points_xy"), dtype=np.float32)
         if len(first_points) < 2 or len(second_points) < 2:
-            return None
-
-        first_min = float(np.min(first_points[:, 1]))
-        first_max = float(np.max(first_points[:, 1]))
-        second_min = float(np.min(second_points[:, 1]))
-        second_max = float(np.max(second_points[:, 1]))
+            return False
+        first_min = float(first.get(
+            "fragment_y_min", first_points[-1, 1]))
+        first_max = float(first.get(
+            "fragment_y_max", first_points[0, 1]))
+        second_min = float(second.get(
+            "fragment_y_min", second_points[-1, 1]))
+        second_max = float(second.get(
+            "fragment_y_max", second_points[0, 1]))
         if first_min > second_max:
-            first_end = first_points[np.argmin(first_points[:, 1])]
-            second_end = second_points[np.argmax(second_points[:, 1])]
+            first_end = first_points[-1]
+            second_end = second_points[0]
+        elif second_min > first_max:
+            first_end = first_points[0]
+            second_end = second_points[-1]
+        else:
+            return False
+        radius = (
+            self.config.fragment_search_radius_px_640 *
+            float(max(1, image_shape[1])) / 640.0)
+        delta = first_end - second_end
+        return float(np.dot(delta, delta)) <= radius * radius
+
+    def _fragment_join_cost(
+            self, first, second, image_shape, support_maps=None):
+        first_points = np.asarray(
+            first.get("points_xy"), dtype=np.float32)
+        second_points = np.asarray(
+            second.get("points_xy"), dtype=np.float32)
+        if len(first_points) < 2 or len(second_points) < 2:
+            return None
+        first_min = float(first.get(
+            "fragment_y_min", first_points[-1, 1]))
+        first_max = float(first.get(
+            "fragment_y_max", first_points[0, 1]))
+        second_min = float(second.get(
+            "fragment_y_min", second_points[-1, 1]))
+        second_max = float(second.get(
+            "fragment_y_max", second_points[0, 1]))
+        if first_min > second_max:
+            lower, upper = first_points, second_points
             gap = first_min - second_max
         elif second_min > first_max:
-            first_end = first_points[np.argmax(first_points[:, 1])]
-            second_end = second_points[np.argmin(second_points[:, 1])]
+            lower, upper = second_points, first_points
             gap = second_min - first_max
         else:
             return None
 
-        max_gap = max(12.0, float(image_shape[0]) * 0.35)
-        if gap > max_gap:
+        radius = (
+            self.config.fragment_search_radius_px_640 *
+            float(max(1, image_shape[1])) / 640.0)
+        lower_end = lower[-1]
+        upper_start = upper[0]
+        connector = upper_start - lower_end
+        distance = math.hypot(
+            float(connector[0]), float(connector[1]))
+        if distance > radius or distance <= 1e-6:
             return None
-        base_x_limit = max(
-            self.config.overlap_px_640 * float(max(1, image_shape[1])) / 320.0,
-            self.config.max_link_jump_px * float(max(1, image_shape[1])) / 160.0,
-        )
-        x_limit = base_x_limit * (1.0 + 0.5 * gap / max_gap)
-        x_gap = abs(float(first_end[0]) - float(second_end[0]))
-        if x_gap > x_limit:
+        direction = connector / distance
+        lower_tangent = self._endpoint_tangent(lower, at_end=True)
+        upper_tangent = self._endpoint_tangent(upper, at_end=False)
+        lower_alignment = float(np.dot(lower_tangent, direction))
+        upper_alignment = float(np.dot(upper_tangent, direction))
+        tangent_similarity = float(np.dot(
+            lower_tangent, upper_tangent))
+        minimum_cosine = math.cos(math.radians(
+            self.config.fragment_max_tangent_delta_deg))
+        if min(
+                lower_alignment, upper_alignment,
+                tangent_similarity) < minimum_cosine:
             return None
-        return x_gap + gap * 0.10
+        source_slots = (
+            set(first.get("source_slots") or {
+                int(first.get("source_slot", -1))}) |
+            set(second.get("source_slots") or {
+                int(second.get("source_slot", -1))}))
+        support_ratio = 1.0
+        if support_maps is not None:
+            first_slots = set(first.get("source_slots") or {
+                int(first.get("source_slot", -1))})
+            second_slots = set(second.get("source_slots") or {
+                int(second.get("source_slot", -1))})
+            support = _path_heat_support_metrics(
+                np.asarray([lower_end, upper_start], dtype=np.float32),
+                image_shape, support_maps, source_slots,
+                self.config.min_path_support_probability,
+                require_all_channels=first_slots != second_slots)
+            if not support["valid"]:
+                return None
+            support_ratio = float(support["support_ratio"])
+        return {
+            "support_ratio": support_ratio,
+            "distance": float(distance),
+            "vertical_gap": float(gap),
+            "tangent_penalty": float(
+                3.0 - lower_alignment - upper_alignment -
+                tangent_similarity),
+            "points_xy": np.concatenate((lower, upper), axis=0),
+        }
 
-    def _merge_heatmap_fragments(self, first, second):
+    @staticmethod
+    def _endpoint_tangent(points, at_end):
+        points = np.asarray(points, dtype=np.float32)
+        reach = min(4, len(points) - 1)
+        vector = (
+            points[-1] - points[-1 - reach] if at_end
+            else points[reach] - points[0])
+        norm = math.hypot(float(vector[0]), float(vector[1]))
+        if norm <= 1e-6:
+            return np.zeros(2, dtype=np.float32)
+        return vector / norm
+
+    def _merge_heatmap_fragments(
+            self, first, second, points_xy=None):
         first_points = np.asarray(first.get("points_xy"), dtype=np.float32)
         second_points = np.asarray(second.get("points_xy"), dtype=np.float32)
-        points = np.concatenate((first_points, second_points), axis=0)
-        points = points[np.argsort(points[:, 1])[::-1]]
+        points = np.asarray(
+            points_xy if points_xy is not None else
+            np.concatenate((first_points, second_points), axis=0),
+            dtype=np.float32)
         first_count = max(1, len(first_points))
         second_count = max(1, len(second_points))
         merged = dict(first)
@@ -970,49 +1382,72 @@ class VisionControlPlanner:
             int(second.get("component_count", 1))
         )
         merged["vertical_span_px"] = self._vertical_span(points)
+        merged["heat_mass"] = (
+            float(first.get("heat_mass", 0.0)) +
+            float(second.get("heat_mass", 0.0)))
+        merged["component_area"] = (
+            int(first.get("component_area", 0)) +
+            int(second.get("component_area", 0)))
+        merged["source_slots"] = (
+            set(first.get("source_slots") or {
+                int(first.get("source_slot", -1))}) |
+            set(second.get("source_slots") or {
+                int(second.get("source_slot", -1))}))
+        self._refresh_fragment_geometry(merged)
         return merged
 
     def _select_heatmap_lines(self, lines, image_shape):
-        if len(lines) <= 2:
-            return list(lines)
-
-        qualities = [self._heatmap_line_quality(item) for item in lines]
-        best_pair = None
-        best_score = None
-        for first_index in range(len(lines) - 1):
-            for second_index in range(first_index + 1, len(lines)):
-                first = lines[first_index]
-                second = lines[second_index]
-                distance = self._path_distance_640(
-                    first.get("points_xy"), second.get("points_xy"), image_shape)
-                diversity = min(
-                    distance,
-                    self.config.branch_separation_px_640 * 2.0,
-                )
-                score = (
-                    qualities[first_index] + qualities[second_index] +
-                    diversity * 2.0 +
-                    self._history_match_bonus(first, qualities[first_index], image_shape) +
-                    self._history_match_bonus(second, qualities[second_index], image_shape)
-                )
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_pair = (first, second)
-        selected = list(best_pair or [])
-        selected_ids = {id(item) for item in selected}
-        for line in lines:
-            if id(line) in selected_ids or not selected:
+        ordered = sorted(
+            lines, key=self._heatmap_line_rank, reverse=True)
+        selected = []
+        for line in ordered:
+            if any(self._same_overall_path(
+                    line, kept, image_shape) for kept in selected):
                 continue
-            distances = [
-                self._path_distance_640(
-                    line.get("points_xy"), item.get("points_xy"), image_shape)
-                for item in selected
-            ]
-            nearest = int(np.argmin(distances))
-            if distances[nearest] <= self.config.overlap_px_640:
-                selected[nearest] = self._blend_heatmap_evidence(
-                    selected[nearest], line)
+            selected.append(line)
+            if len(selected) == 2:
+                break
         return selected
+
+    def _heatmap_line_rank(self, line):
+        points = np.asarray(line.get("points_xy"), dtype=np.float32)
+        span = self._vertical_span(points)
+        arc = self._path_arc_length(points)
+        return (
+            span,
+            float(line.get("heat_support_ratio", 0.0)),
+            arc,
+            float(line.get("heat_support_min", 0.0)),
+            float(line.get("score", 0.0)),
+        )
+
+    def _same_overall_path(self, first, second, image_shape):
+        first_points = np.asarray(first.get("points_xy"), dtype=np.float32)
+        second_points = np.asarray(second.get("points_xy"), dtype=np.float32)
+        if len(first_points) < 2 or len(second_points) < 2:
+            return False
+        low = max(
+            float(np.min(first_points[:, 1])),
+            float(np.min(second_points[:, 1])))
+        high = min(
+            float(np.max(first_points[:, 1])),
+            float(np.max(second_points[:, 1])))
+        if low <= high:
+            rows = low + (high - low) * _PAIR_FRACTIONS
+            distances = np.abs(
+                _interp_path_x_many(first_points, rows) -
+                _interp_path_x_many(second_points, rows))
+            distances *= 640.0 / float(max(1, image_shape[1]))
+            separated = int(np.count_nonzero(
+                distances >= self.config.branch_separation_px_640))
+            return (
+                separated < self.config.branch_separation_rows and
+                float(np.mean(distances)) <= self.config.overlap_px_640)
+
+        # Disjoint high-heat regions remain independent candidates unless a
+        # separately validated connector joined them earlier. Deduplicating
+        # them here would silently discard global evidence.
+        return False
 
     def _blend_heatmap_evidence(self, first, second):
         first_points = np.asarray(first.get("points_xy"), dtype=np.float32)
@@ -1048,6 +1483,14 @@ class VisionControlPlanner:
         span = max(1.0, self._vertical_span(line.get("points_xy", [])))
         return span * (0.5 + float(line.get("score", 0.0)))
 
+    @staticmethod
+    def _path_arc_length(points):
+        points = np.asarray(points, dtype=np.float32)
+        if len(points) < 2:
+            return 0.0
+        deltas = points[1:] - points[:-1]
+        return float(np.sum(np.hypot(deltas[:, 0], deltas[:, 1])))
+
     def _history_match_bonus(self, line, quality, image_shape):
         if not self.last_slot_points:
             return 0.0
@@ -1072,7 +1515,7 @@ class VisionControlPlanner:
         high = min(float(np.max(first[:, 1])), float(np.max(second[:, 1])))
         if low <= high:
             distances = []
-            for y in np.linspace(low, high, num=24):
+            for y in low + (high - low) * _PAIR_FRACTIONS:
                 first_x = _interp_path_x(first, y)
                 second_x = _interp_path_x(second, y)
                 if first_x is not None and second_x is not None:
@@ -1093,18 +1536,24 @@ class VisionControlPlanner:
         assigned = []
         if len(lines) == 1:
             item = dict(lines[0])
-            item["slot"] = max(0, min(1, int(item.get("source_slot", 0))))
+            scan_x = self._row_scan_path_position(
+                item.get("points_xy"), image_shape)
+            center_x = (
+                float(image_shape[1]) * self.config.visual_center_x)
+            item["slot"] = 0 if scan_x is None or scan_x <= center_x else 1
             assigned.append(item)
         else:
             first = dict(lines[0])
             second = dict(lines[1])
-            source_slots = {
-                int(first.get("source_slot", -1)),
-                int(second.get("source_slot", -1)),
-            }
-            if source_slots == {0, 1}:
-                ordered = sorted(
-                    (first, second), key=lambda item: int(item.get("source_slot", 0)))
+            first_x = self._row_scan_path_position(
+                first.get("points_xy"), image_shape)
+            second_x = self._row_scan_path_position(
+                second.get("points_xy"), image_shape)
+            if first_x is not None and second_x is not None and abs(
+                    first_x - second_x) >= max(4.0, image_shape[1] * 0.008):
+                ordered = (
+                    [first, second] if first_x <= second_x
+                    else [second, first])
             elif 0 in self.last_slot_points and 1 in self.last_slot_points:
                 direct = (
                     self._path_distance_640(first.get("points_xy"), self.last_slot_points[0], image_shape) +
@@ -1116,48 +1565,88 @@ class VisionControlPlanner:
                 )
                 ordered = [first, second] if direct <= swapped else [second, first]
             else:
-                lookahead_y = image_shape[0] * self.config.lookahead_y_ratio
                 ordered = sorted(
                     (first, second),
-                    key=lambda item: float(
-                        _interp_path_x(item.get("points_xy"), lookahead_y) or 0.0),
-                )
+                    key=lambda item: (
+                        self._row_scan_path_position(
+                            item.get("points_xy"), image_shape)
+                        if self._row_scan_path_position(
+                            item.get("points_xy"), image_shape) is not None
+                        else image_shape[1] * 0.5))
             for slot, item in enumerate(ordered):
                 item["slot"] = slot
                 assigned.append(item)
         for item in assigned:
             item["points_xy"] = np.asarray(item.get("points_xy"), dtype=np.float32)
             item["role"] = "left" if int(item["slot"]) == 0 else "right"
+            item["identity"] = item["role"]
+            item["identity_source"] = "row_scan"
         return assigned
 
     @staticmethod
-    def _component_centerline_points(labels, label, heatmap, image_shape):
-        ys, xs = np.nonzero(labels == label)
+    def _row_scan_path_position(points, image_shape):
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+            return None
+        row_mask = (
+            (points[:, 1] <= image_shape[0] * 0.88) &
+            (points[:, 1] >= image_shape[0] * 0.25))
+        scan_points = points[row_mask]
+        if not len(scan_points):
+            scan_points = points
+        return float(np.median(scan_points[:, 0]))
+
+    @staticmethod
+    def _component_centerline_points(
+            labels, label, heatmap, image_shape, component_stats=None):
+        if component_stats is None:
+            top = 0
+            left = 0
+            region = labels
+        else:
+            left = int(component_stats[cv2.CC_STAT_LEFT])
+            top = int(component_stats[cv2.CC_STAT_TOP])
+            width = int(component_stats[cv2.CC_STAT_WIDTH])
+            height = int(component_stats[cv2.CC_STAT_HEIGHT])
+            region = labels[top:top + height, left:left + width]
+        ys, local_xs = np.nonzero(region == label)
+        xs = local_xs + left
         if len(xs) == 0:
             return []
+        absolute_ys = ys + top
+        row_count = int(region.shape[0])
+        weights = heatmap[absolute_ys, xs].astype(np.float64)
+        weight_sums = np.bincount(
+            ys, weights=weights, minlength=row_count)
+        weighted_x_sums = np.bincount(
+            ys, weights=weights * xs, minlength=row_count)
+        pixel_counts = np.bincount(ys, minlength=row_count)
+        pixel_x_sums = np.bincount(
+            ys, weights=xs.astype(np.float64), minlength=row_count)
+        rows = np.flatnonzero(pixel_counts)[::-1]
+        centers = np.divide(
+            weighted_x_sums[rows], weight_sums[rows],
+            out=np.divide(
+                pixel_x_sums[rows], pixel_counts[rows],
+                dtype=np.float64),
+            where=weight_sums[rows] > 0.0)
         img_h, img_w = image_shape[:2]
-        points = []
-        for y in sorted(set(int(value) for value in ys), reverse=True):
-            row_xs = xs[ys == y]
-            weights = heatmap[y, row_xs].astype(np.float32)
-            if float(np.sum(weights)) <= 0.0:
-                center_x = float(np.mean(row_xs))
-            else:
-                center_x = float(np.average(row_xs, weights=weights))
-            points.append([
-                center_x * float(max(img_w - 1, 1)) / float(max(labels.shape[1] - 1, 1)),
-                float(y) * float(max(img_h - 1, 1)) / float(max(labels.shape[0] - 1, 1)),
-            ])
+        points = np.stack((
+            centers * float(max(img_w - 1, 1)) /
+            float(max(labels.shape[1] - 1, 1)),
+            (rows + top).astype(np.float64) *
+            float(max(img_h - 1, 1)) /
+            float(max(labels.shape[0] - 1, 1)),
+        ), axis=1).astype(np.float32)
         if len(points) >= 5:
-            arr = np.asarray(points, dtype=np.float32)
             kernel = np.asarray([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
             kernel /= float(np.sum(kernel))
-            padded = np.pad(arr[:, 0], (2, 2), mode="edge")
-            arr[:, 0] = np.convolve(padded, kernel, mode="valid")
-            points = arr.tolist()
+            padded = np.pad(points[:, 0], (2, 2), mode="edge")
+            points[:, 0] = np.convolve(padded, kernel, mode="valid")
         return points
 
-    def _smooth_candidates(self, candidates, image_shape):
+    def _smooth_candidates(
+            self, candidates, image_shape, support_maps=None):
         present_slots = set()
         smoothed_candidates = []
         for candidate in candidates:
@@ -1170,11 +1659,35 @@ class VisionControlPlanner:
             filtered["raw_points_xy"] = points.copy()
             previous = self.last_slot_points.get(slot)
             filtered_points = self._smooth_path_points(
-                points, previous, image_shape[1])
+                points, previous, image_shape[1],
+                apply_spatial=not bool(candidate.get(
+                    "spatial_prefiltered", False)))
             filtered["points_xy"] = filtered_points
             filtered["spatial_smoothed"] = self.config.path_smooth_window > 1
             filtered["temporal_smoothed"] = previous is not None
+            filtered["smoothing_rejected_low_heat"] = False
+            smoothing_changed = not np.allclose(
+                filtered_points, points, rtol=0.0, atol=0.05)
+            if (support_maps is not None and smoothing_changed and
+                    not self._annotate_heat_support(
+                        filtered, image_shape, support_maps)):
+                # The current-frame candidate was already validated. Never
+                # let spatial/temporal filtering drag it through empty heat.
+                filtered["points_xy"] = points.copy()
+                filtered["spatial_smoothed"] = False
+                filtered["temporal_smoothed"] = False
+                filtered["smoothing_rejected_low_heat"] = True
+                self._annotate_heat_support(
+                    filtered, image_shape, support_maps)
+            if support_maps is not None:
+                source_slots = filtered.get("source_slots") or {
+                    int(filtered.get("source_slot", -1))}
+                filtered["point_confidences"] = _path_point_probabilities(
+                    filtered["points_xy"], image_shape,
+                    support_maps, source_slots)
             self.last_slot_points[slot] = filtered_points.copy()
+            if filtered["smoothing_rejected_low_heat"]:
+                self.last_slot_points[slot] = filtered["points_xy"].copy()
             self.path_missing_frames[slot] = 0
             smoothed_candidates.append(filtered)
 
@@ -1188,12 +1701,13 @@ class VisionControlPlanner:
                 self.path_missing_frames.pop(slot, None)
         return smoothed_candidates
 
-    def _smooth_path_points(self, points, previous, image_width):
+    def _smooth_path_points(
+            self, points, previous, image_width, apply_spatial=True):
         points = np.asarray(points, dtype=np.float32).copy()
         window = max(1, int(self.config.path_smooth_window))
         if window % 2 == 0:
             window += 1
-        if window > 1 and len(points) >= 3:
+        if apply_spatial and window > 1 and len(points) >= 3:
             window = min(window, len(points) if len(points) % 2 else len(points) - 1)
             half = window // 2
             weights = np.concatenate((
@@ -1235,6 +1749,10 @@ class VisionControlPlanner:
         raw_paths = list(result.get("paths") or [])
         result["raw_paths"] = raw_paths
         result["paths"] = candidates
+        result["display_paths"] = list(candidates[:2])
+        # ARPreview lets the vision-control overlay draw these once with
+        # probability-segmented identity colors.
+        result["vision_control_path_overlay"] = True
         result["temporal"] = {
             "enabled": True,
             "status": "tracking" if candidates else "path_unavailable",
@@ -1245,6 +1763,7 @@ class VisionControlPlanner:
         if isinstance(centerline, dict):
             centerline["raw_paths"] = raw_paths
             centerline["paths"] = candidates
+            centerline["display_paths"] = list(candidates[:2])
             centerline["temporal"] = result["temporal"]
 
     @staticmethod
@@ -1833,23 +2352,19 @@ class VisionControlPlanner:
         second = np.asarray(second_points, dtype=np.float32)
         if len(first) == 0 or len(second) == 0:
             return {"mean_distance_640": 1e9, "separated_rows": 0}
-        ys = np.linspace(
-            max(float(np.min(first[:, 1])), float(np.min(second[:, 1]))),
-            min(float(np.max(first[:, 1])), float(np.max(second[:, 1]))),
-            num=24,
-        )
-        if ys.size == 0:
+        low = max(float(np.min(first[:, 1])), float(np.min(second[:, 1])))
+        high = min(float(np.max(first[:, 1])), float(np.max(second[:, 1])))
+        if low > high:
             return {"mean_distance_640": 1e9, "separated_rows": 0}
-        distances = []
-        for y in ys:
-            ax = _interp_path_x(first, y)
-            bx = _interp_path_x(second, y)
-            if ax is None or bx is None:
-                continue
-            distances.append(abs(ax - bx) * 640.0 / float(max(1, image_shape[1])))
-        if not distances:
+        rows = low + (high - low) * _PAIR_FRACTIONS
+        first_x = _interp_path_x_many(first, rows)
+        second_x = _interp_path_x_many(second, rows)
+        valid = np.isfinite(first_x) & np.isfinite(second_x)
+        if not np.any(valid):
             return {"mean_distance_640": 1e9, "separated_rows": 0}
-        distances = np.asarray(distances, dtype=np.float32)
+        distances = (
+            np.abs(first_x[valid] - second_x[valid]) * 640.0 /
+            float(max(1, image_shape[1])))
         return {
             "mean_distance_640": float(np.mean(distances)),
             "separated_rows": int(np.count_nonzero(distances >= self.config.branch_separation_px_640)),
@@ -1892,30 +2407,20 @@ def render_vision_control_debug(frame, result):
     if not debug:
         return frame
     h, w = frame.shape[:2]
-    colors = [(60, 230, 70), (255, 220, 40)]
     selected_slot = debug.get("selected_slot")
     center_x = int(round(w * _clamp(_env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8)))
     cv2.line(frame, (center_x, int(h * 0.45)), (center_x, h - 1), (210, 210, 210), 1, cv2.LINE_AA)
 
-    path_segments = debug.get("candidate_path_segments") or []
-    candidate_paths = debug.get("candidate_paths") or []
-    for index, pts in enumerate(candidate_paths):
-        summaries = debug.get("candidates") or []
-        slot = int(summaries[index].get("slot", index)) if index < len(summaries) else index
-        color = colors[slot % len(colors)]
-        thickness = 3 if slot == selected_slot else 1
-        segments = path_segments[index] if index < len(path_segments) else [pts]
-        for segment in segments:
-            segment = np.asarray(segment, dtype=np.int32)
-            if len(segment) < 2:
-                continue
-            cv2.polylines(
-                frame, [segment.reshape((-1, 1, 2))], False,
-                color, thickness, cv2.LINE_AA)
-
-    selected_path = np.asarray(debug.get("selected_path") or [], dtype=np.int32)
-    if not path_segments and len(selected_path) >= 2:
-        cv2.polylines(frame, [selected_path.reshape((-1, 1, 2))], False, (255, 0, 255), 2, cv2.LINE_AA)
+    for line in _extract_heatmap_preview_lines(result, frame.shape):
+        points = np.rint(line["points_xy"]).astype(np.int32)
+        if len(points) < 2:
+            continue
+        points[:, 0] = np.clip(points[:, 0], 0, w - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, h - 1)
+        _draw_identity_probability_path(
+            frame, points, line.get("probabilities"),
+            int(line.get("slot", 0)),
+            thickness=3 if int(line.get("slot", -1)) == selected_slot else 2)
 
     target = debug.get("control_target") or {}
     target_x = _finite_float(target.get("target_x"))
@@ -1937,3 +2442,51 @@ def render_vision_control_debug(frame, result):
     )
     cv2.putText(frame, text, (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
     return frame
+
+
+def _identity_probability_color(slot, probability):
+    intensity = int(round(80.0 + 175.0 * _clamp(probability, 0.0, 1.0)))
+    # OpenCV uses BGR: left is always blue, right is always green.
+    return (intensity, 0, 0) if int(slot) == 0 else (0, intensity, 0)
+
+
+def _draw_identity_probability_path(
+        frame, points, probabilities, slot, thickness=2):
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float32)
+    for index in range(len(points) - 1):
+        probability = 0.5 * (
+            float(probabilities[index]) +
+            float(probabilities[index + 1]))
+        cv2.line(
+            frame, tuple(points[index]), tuple(points[index + 1]),
+            _identity_probability_color(slot, probability),
+            int(thickness), cv2.LINE_AA)
+
+
+def _extract_heatmap_preview_lines(result, image_shape, max_lines=2):
+    if not isinstance(result, dict):
+        return []
+    paths = result.get("display_paths")
+    if paths is None:
+        paths = result.get("paths") or []
+    lines = []
+    for path in list(paths)[:max(0, min(2, int(max_lines)))]:
+        points = np.asarray(path.get("points_xy"), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+            continue
+        probabilities = np.asarray(
+            path.get("point_confidences", []), dtype=np.float32)
+        if len(probabilities) != len(points):
+            probabilities = np.full(
+                len(points), float(path.get("score", 1.0)),
+                dtype=np.float32)
+        lines.append({
+            "slot": int(path.get("slot", len(lines))),
+            "identity": str(path.get("identity") or path.get("role") or ""),
+            "points_xy": points,
+            "probabilities": probabilities,
+            "score": float(np.mean(probabilities)),
+        })
+    return lines[:2]

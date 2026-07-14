@@ -22,9 +22,9 @@ PATH_POINTS = 32
 
 try:
     cv2.setNumThreads(max(1, int(os.environ.get(
-        "MULTITASK_OPENCV_THREADS", "2"))))
+        "MULTITASK_OPENCV_THREADS", "1"))))
 except (TypeError, ValueError):
-    cv2.setNumThreads(2)
+    cv2.setNumThreads(1)
 
 
 def _env_float(name, default):
@@ -98,9 +98,9 @@ if RENDER_MODE not in {"off", "heatmap", "drive", "debug", "full"}:
     RENDER_MODE = "heatmap"
 
 PATH_COLORS = {
-    "single": (0, 255, 255),
-    "left": (60, 220, 80),
-    "right": (255, 220, 40),
+    "single": (255, 0, 0),
+    "left": (255, 0, 0),
+    "right": (0, 255, 0),
 }
 
 DETECTION_COLORS = {
@@ -797,7 +797,9 @@ def render_result(image, result, mode=None):
     display_paths = result.get("display_paths")
     if display_paths is None:
         display_paths = result.get("paths") or []
-    for path_info in display_paths:
+    if result.get("vision_control_path_overlay"):
+        display_paths = ()
+    for path_info in list(display_paths)[:MAX_PATHS]:
         if (mode != "heatmap" and
                 float(path_info.get("score", 0.0)) < RENDER_PATH_MIN_SCORE):
             continue
