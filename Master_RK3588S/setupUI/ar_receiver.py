@@ -22,6 +22,7 @@ SHM_NAME = "shm_ar_video"
 SHM_HEADER_SIZE = 16
 PREVIEW_TITLE = "AR Preview"
 INSTANCE_LOCK_PATH = "/tmp/sysu_ddl_ar_receiver.lock"
+VISION_CONTROL_SEND_DEFAULT = True
 
 
 def acquire_instance_lock():
@@ -86,6 +87,12 @@ def env_int(name, default):
         return int(default)
 
 
+def instruction_direction(instruction):
+    instruction = instruction if isinstance(instruction, dict) else {}
+    direction = str(instruction.get("direction") or instruction.get("preferred_branch") or "").strip().lower()
+    return direction if direction in {"left", "right"} else ""
+
+
 class RuntimeState:
     def __init__(self, preview_enabled=True):
         self._lock = threading.Lock()
@@ -120,10 +127,14 @@ class RuntimeState:
 
     def update_ocr(self, response):
         response = response if isinstance(response, dict) else {}
-        instruction = response.get("instruction") or response.get("latest_instruction") or {}
+        instruction = response.get("instruction") or {}
+        latest_instruction = response.get("latest_instruction") or {}
+        display_instruction = (
+            instruction if instruction_direction(instruction)
+            else latest_instruction)
         ocr = response.get("ocr") or {}
-        next_text = str(ocr.get("text") or instruction.get("source_text") or "")[:120]
-        next_choice = str(instruction.get("direction") or instruction.get("preferred_branch") or "")
+        next_text = str(ocr.get("text") or display_instruction.get("source_text") or "")[:120]
+        next_choice = instruction_direction(display_instruction)
         with self._lock:
             if response.get("clear_result"):
                 self._ocr_text = ""
@@ -134,7 +145,7 @@ class RuntimeState:
                 self._ocr_text = next_text
             if next_choice in {"left", "right"}:
                 self._api_choice = next_choice
-                self._api_reason = str(instruction.get("reason") or "")[:160]
+                self._api_reason = str(display_instruction.get("reason") or "")[:160]
             self._ocr_worker_ready = bool(response.get("worker_ready", self._ocr_worker_ready))
             self._ocr_error = str(response.get("error") or instruction.get("api_error") or "")[:240]
 
@@ -160,6 +171,8 @@ class RuntimeState:
         road_coverage = float(np.mean(road_mask)) if isinstance(road_mask, np.ndarray) and road_mask.size else 0.0
         paths = centerline.get("paths") or []
         temporal = result.get("temporal") or {}
+        vision_control = result.get("vision_control") or {}
+        vision_timings = vision_control.get("timings_ms") or {}
         timings = result.get("timings_ms") or {}
         path_scores = centerline.get("path_scores")
         if isinstance(path_scores, np.ndarray):
@@ -189,6 +202,32 @@ class RuntimeState:
                 "raw_path_count", centerline.get("path_count", len(paths)))),
             "temporal_status": str(temporal.get("status") or "disabled"),
             "temporal_pending_count": temporal.get("pending_path_count"),
+            "vision_control": {
+                "route_state": str(
+                    vision_control.get("route_state") or "NONE"),
+                "raw_route_state": str(
+                    vision_control.get("raw_route_state") or "NONE"),
+                "route_reason": str(
+                    vision_control.get("route_reason") or ""),
+                "pending_route_state": vision_control.get(
+                    "pending_route_state"),
+                "branch_lock": vision_control.get("branch_lock"),
+                "branch_lock_source": vision_control.get(
+                    "branch_lock_source"),
+                "selected_slot_lock": vision_control.get(
+                    "selected_slot_lock"),
+                "selected_slot": vision_control.get("selected_slot"),
+                "ocr_lock_expired": bool(vision_control.get(
+                    "ocr_lock_expired", False)),
+                "ocr_lock_remaining_s": vision_control.get(
+                    "ocr_lock_remaining_s"),
+                "timings_ms": {
+                    "path_search": float(
+                        vision_timings.get("path_search", 0.0)),
+                    "control_total": float(
+                        vision_timings.get("control_total", 0.0)),
+                },
+            },
             "timings_ms": {
                 key: float(timings.get(key, 0.0))
                 for key in (
@@ -579,12 +618,14 @@ def create_ocr_processor():
 
         processor = AsyncTurnSignOcrApiProcessor(
             worker_cpu_set=os.environ.get("AR_TURNSIGN_OCR_CPUSET", "0-3"),
-            min_det_score=env_float("AR_TURNSIGN_MIN_DET_SCORE", 0.35),
-            min_ocr_confidence=env_float("AR_TURNSIGN_MIN_OCR_CONFIDENCE", 0.45),
+            min_det_score=env_float("AR_TURNSIGN_MIN_DET_SCORE", 0.25),
+            min_area_ratio=env_float("AR_TURNSIGN_MIN_AREA_RATIO", 0.0004),
+            min_ocr_confidence=env_float("AR_TURNSIGN_MIN_OCR_CONFIDENCE", 0.30),
             stable_frames=max(1, int(env_float("AR_TURNSIGN_STABLE_FRAMES", 2))),
+            stable_duration_s=env_float("AR_TURNSIGN_STABLE_DURATION_S", 0.50),
             stable_bypass_confidence=env_float("AR_TURNSIGN_STABLE_BYPASS_CONFIDENCE", 0.90),
             stable_bypass_min_text_len=max(1, int(env_float("AR_TURNSIGN_STABLE_BYPASS_MIN_TEXT_LEN", 6))),
-            ocr_interval=env_float("AR_TURNSIGN_OCR_INTERVAL", 0.25),
+            ocr_interval=env_float("AR_TURNSIGN_OCR_INTERVAL", 0.10),
             api_cooldown=env_float("AR_TURNSIGN_API_COOLDOWN", 1.0),
             cache_ttl=0.0,
             async_api=True,
@@ -624,7 +665,7 @@ def create_control_runtime(state):
 def create_vision_control_planner():
     if not (
         env_flag("AR_VISION_CONTROL_DEBUG", True)
-        or env_flag("AR_VISION_CONTROL_SEND", False)
+        or env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT)
     ):
         print("[VISION CONTROL] disabled by AR_VISION_CONTROL_DEBUG=0 and AR_VISION_CONTROL_SEND=0")
         return None, None
@@ -632,7 +673,7 @@ def create_vision_control_planner():
         from vision_control import VisionControlPlanner, render_vision_control_debug
 
         planner = VisionControlPlanner(log_func=lambda message: print(f"[VISION CONTROL] {message}"))
-        mode = "send" if env_flag("AR_VISION_CONTROL_SEND", False) else "debug-only"
+        mode = "send" if env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT) else "debug-only"
         print(f"[VISION CONTROL] enabled ({mode})")
         return planner, render_vision_control_debug
     except Exception as exc:
@@ -653,11 +694,12 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     if not isinstance(ocr_response, dict):
         return frame
     status = str(ocr_response.get("status") or "-")
-    instruction = ocr_response.get("instruction") or ocr_response.get("latest_instruction") or {}
-    choice = str(instruction.get("preferred_branch") or "-")
+    instruction = ocr_response.get("instruction") or {}
+    latest_instruction = ocr_response.get("latest_instruction") or {}
+    choice = instruction_direction(instruction) or instruction_direction(latest_instruction) or "-"
     cv2.putText(
         frame,
-        f"OCR: {status}  API: {choice}",
+        f"OCR: {status}  LOCK: {choice}",
         (10, 58),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -735,7 +777,7 @@ def main():
     ocr_processor = create_ocr_processor()
     control_runtime = create_control_runtime(state)
     vision_control_planner, render_vision_control = create_vision_control_planner()
-    vision_control_send = env_flag("AR_VISION_CONTROL_SEND", False)
+    vision_control_send = env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT)
 
     print("[AR_RECEIVER] ready; waiting for camera shared memory...")
     print(f"[AR_RECEIVER] DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}")
@@ -821,7 +863,6 @@ def main():
                                 inferred_frame = infer_result.get("frame")
                             display_frame = inferred_frame if inferred_frame is not None else frame
                             detections = infer_result.get("detections") or []
-                            state.update_perception(infer_result)
                             ocr_source_frame = infer_result.get("ocr_frame")
                             if ocr_source_frame is None:
                                 ocr_source_frame = display_frame
@@ -882,6 +923,8 @@ def main():
                         print(f"[VISION CONTROL] process error: {exc}")
                         if vision_control_send and control_runtime is not None:
                             control_runtime.clear_vision_command()
+                if perception_result is not None:
+                    state.update_perception(perception_result)
 
                 fps_frames += 1
                 now = time.time()

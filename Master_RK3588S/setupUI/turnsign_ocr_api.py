@@ -528,8 +528,9 @@ class TurnSignOcrApiProcessor:
         self,
         min_det_score=0.35,
         min_area_ratio=0.001,
-        min_ocr_confidence=0.45,
+        min_ocr_confidence=0.30,
         stable_frames=2,
+        stable_duration_s=0.50,
         stable_bypass_confidence=0.90,
         stable_bypass_min_text_len=6,
         text_similarity=0.86,
@@ -545,6 +546,10 @@ class TurnSignOcrApiProcessor:
         self.min_area_ratio = float(min_area_ratio)
         self.min_ocr_confidence = float(min_ocr_confidence)
         self.stable_frames = int(stable_frames)
+        self.stable_duration_s = max(
+            0.0,
+            float(os.environ.get("AR_TURNSIGN_STABLE_DURATION_S", stable_duration_s)),
+        )
         self.stable_bypass_confidence = float(
             os.environ.get("AR_TURNSIGN_STABLE_BYPASS_CONFIDENCE", stable_bypass_confidence)
         )
@@ -568,6 +573,7 @@ class TurnSignOcrApiProcessor:
         self.last_ocr_ts = 0.0
         self.last_api_ts = 0.0
         self.last_text = ""
+        self.stable_since_ts = 0.0
         self.stable_count = 0
         self.history = deque(maxlen=8)
         self.cache = {}
@@ -799,12 +805,17 @@ class TurnSignOcrApiProcessor:
         if not text:
             self.stable_count = 0
             self.last_text = ""
+            self.stable_since_ts = 0.0
             return False
         if (
+            self.stable_duration_s <= 0.0
+            and
             confidence >= self.stable_bypass_confidence
             and len(text) >= self.stable_bypass_min_text_len
         ):
             self.stable_count = max(self.stable_count, self.stable_frames)
+            if not self.stable_since_ts:
+                self.stable_since_ts = float(ts)
             self.last_text = text
             return True
         if self.last_text and SequenceMatcher(None, self.last_text, text).ratio() >= self.text_similarity:
@@ -812,7 +823,10 @@ class TurnSignOcrApiProcessor:
         else:
             self.stable_count = 1
             self.last_text = text
-        return self.stable_count >= self.stable_frames
+            self.stable_since_ts = float(ts)
+        if self.stable_count < self.stable_frames:
+            return False
+        return float(ts) - float(self.stable_since_ts) >= self.stable_duration_s
 
     def _get_cache(self, key, ts):
         if self.cache_ttl <= 0.0:

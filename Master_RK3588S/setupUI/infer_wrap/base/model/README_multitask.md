@@ -46,12 +46,18 @@ export MULTITASK_RKNN_TPES=3
 export MULTITASK_PIPELINE_DEPTH=3
 export MULTITASK_OPENCV_THREADS=2
 export MULTITASK_RKNN_WARMUP=1
-export MULTITASK_DET_THRESHOLD=0.25
-export MULTITASK_NMS_THRESHOLD=0.60
+export MULTITASK_DET_THRESHOLD=0.50
+export MULTITASK_NMS_THRESHOLD=0.45
 export MULTITASK_PRE_NMS_TOP_K=1000
 export MULTITASK_MAX_DETECTIONS=100
 export MULTITASK_COIN_MIN_SHORT_SIDE=10
 export MULTITASK_ROAD_THRESHOLD=0.50
+export MULTITASK_ROAD_TOP_CROP_RATIO=0.34
+export MULTITASK_ROAD_MIN_RATIO=0.001
+export MULTITASK_ROAD_MAX_RATIO=0.60
+export MULTITASK_ROAD_MAX_RAW_RATIO=0.86
+export MULTITASK_ROAD_MIN_COMPONENT_AREA_RATIO=0.0015
+export MULTITASK_ROAD_MAX_COMPONENTS=3
 export MULTITASK_RENDER_DET_THRESHOLD=0.45
 export MULTITASK_RENDER_MAX_DETECTIONS=6
 export MULTITASK_RENDER_MAX_PER_CLASS=2
@@ -60,16 +66,31 @@ export MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO=0.70
 export MULTITASK_RENDER_MAX_BOX_AREA_RATIO=0.30
 export MULTITASK_RENDER_PATH_MIN_SCORE=0.35
 export MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE=0.40
-export MULTITASK_PATH_SOURCE=curve
-export VISION_CONTROL_PATH_SOURCE=curve
+export MULTITASK_PATH_SOURCE=heatmap
+export VISION_CONTROL_PATH_SOURCE=heatmap
+export VISION_CONTROL_PATH_EMA_ALPHA=0.40
+export VISION_CONTROL_PATH_SMOOTH_WINDOW=5
+export VISION_CONTROL_PATH_MAX_STEP_640=48
+export VISION_CONTROL_PATH_HOLD_FRAMES=8
+export VISION_CONTROL_ROUTE_CONFIRM_FRAMES=6
+export VISION_CONTROL_BRANCH_RELEASE_FRAMES=20
 ```
 
-Temporal filtering is not used. Every displayed ridge is decoded independently
-from the current frame.
+Path filtering is causal and adds no buffered-frame latency. Each path is
+spatially smoothed, aligned to the previous path from the same model slot, and
+then filtered with an EMA. Raw heatmaps remain unchanged.
 
 `MULTITASK_COIN_MIN_SHORT_SIDE=10` mirrors the training dataset rule: Coin
 detections whose short side is below 10 pixels in the fixed 640x480 model input
 are discarded before NMS. Set it to `0` only for a deliberate tiny-Coin test.
+Detection follows the `main` branch policy: each box is assigned only to its
+highest-scoring class, candidates below 0.50 are removed, and same-class boxes
+are suppressed at IoU 0.45.
+
+Road-mask cleanup also follows the reusable part of `main`: close 5x5, open
+3x3, rank connected components by area, bottom contact, center proximity, and
+height, then retain at most three road bodies. Implausibly full, tiny, or large
+masks are rejected. `road_mask_raw` keeps the unmodified threshold result.
 
 NPU workers only run preprocessing and `rknn_lite.inference()`. CPU NMS and
 path decoding run after the FIFO returns the oldest result, overlapping with
@@ -94,7 +115,7 @@ curl -s http://127.0.0.1:9105/api/preview | \
 ```
 
 The `perception.timings_ms` object separates NPU inference, FIFO wait, and CPU
-postprocess. Temporal filtering is disabled.
+postprocess. Visual-control timing includes path search and causal filtering.
 
 Debug rendering is performed by the drop-frame preview thread, not by an NPU
 worker. Select it with:
@@ -109,9 +130,9 @@ export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 - `off`: no perception drawing.
 - `heatmap`: diagnostic default. Draw every post-NMS detection as a full box,
   overlay both raw sigmoid path heatmaps, and draw the active path source.
-  With the default `curve` source, these are the model's direct B-spline
-  curves rather than lines reconstructed from heatmap peaks. Frame-spanning
-  boxes are hidden from rendering only and remain available to OCR/control.
+  With the default `heatmap` source, these are filtered heatmap ridges used by
+  visual control. Frame-spanning boxes are hidden from rendering only and
+  remain available to OCR/control.
 - `drive`: low-clutter mode. No road fill or labels; paths are thin, Coin uses
   a dot, and other detections use corner marks.
 - `debug`: drive mode plus the binary road overlay.
@@ -123,12 +144,16 @@ receive every post-NMS detection even though preview drawing defaults to at
 most six detections, two per class. Legacy `path` and `road` mode names map to
 `drive` and `debug`.
 
-`MULTITASK_PATH_SOURCE=curve` is the default. It uses `path_points` for both
-the preview path and visual-control candidates. Raw heatmaps are still
-overlaid in `heatmap`/`full` preview modes, but no heatmap-derived line is
-drawn. Set `MULTITASK_PATH_SOURCE=heatmap` to restore the former heatmap ridge
-tracing. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
+`MULTITASK_PATH_SOURCE=heatmap` is the default. It traces one representative
+ridge from each path heatmap for the preview and visual-control candidates.
+Set `MULTITASK_PATH_SOURCE=curve` to compare the model's direct `path_points`
+output. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
 overridden independently for comparison.
+
+Route classification changes only after six consecutive confirming frames.
+The selected path slot is held across eight missing frames, and an OCR-locked
+branch never falls back to the opposite slot. Branch context is released only
+after 20 stable single-route frames.
 
 Set `AR_LOCAL_PREVIEW=0` to skip full-frame rendering. Three RKNN runtimes
 remain in flight by default, one on each RK3588S NPU core.
@@ -143,7 +168,7 @@ The result exposes both the unified top-level fields and the existing nested
 - `road_mask`: `[120,160]` uint8.
 - `path_heatmaps`: raw sigmoid probabilities with shape `[2,120,160]`.
 - `path_count` and `path_count_scores`.
-- `paths`: the active source, direct `[32,2]` model curves by default.
+- `paths`: the active source, heatmap ridges by default.
 - `curve_paths`: the model's ordered `[32,2]` B-spline outputs.
 - `heatmap_ridge_paths`: only populated when `MULTITASK_PATH_SOURCE=heatmap`.
 - `timings_ms`: preprocess, RKNN inference, FIFO wait, postprocess, and total

@@ -45,7 +45,7 @@ python3 ar_receiver.py
 - 手柄输入：`0.0.0.0:9010`
 - TC264D：`/dev/ttyUSB0`, `460800` baud
 
-`ar_receiver.py` 会自动启动 `ControlRuntime`。手柄有效时使用 `GAMEPAD` 命令；手柄无效时自动选择最新的 `VISION` 命令。当前尚未产生视觉控制命令，因此未勾选手柄时保持 `IDLE`；手柄从有效状态退出或超时后发送一次 `STATE_SAFE_STOP`。TC264D 自身的输入超时和硬保护继续有效。
+`ar_receiver.py` 会自动启动 `ControlRuntime`。手柄有效时使用 `GAMEPAD` 命令；手柄无效时自动选择最新的 `VISION` 命令。视觉控制默认下发到 TC264D；若只需要调试画面，可设置 `AR_VISION_CONTROL_SEND=0`。手柄从有效状态退出、视觉命令超时或视觉清空后会发送 `STATE_SAFE_STOP`。TC264D 自身的输入超时和硬保护继续有效。
 
 `standalone_control_bridge.py` 只在不运行 `ar_receiver.py` 时使用，二者不能同时启动。后续多任务视觉控制通过 `ControlRuntime.update_vision_command()` 接入，不再创建第二条串口链路。
 

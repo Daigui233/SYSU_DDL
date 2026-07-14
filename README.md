@@ -74,7 +74,7 @@ cd ~/Desktop/setupUI
 python3 ar_receiver.py
 ```
 
-`ar_receiver.py` 会自动启动定位、手柄和 TC264D 控制运行时。勾选 Windows `Gamepad Mode` 后手柄优先控车；未勾选时运行时选择视觉命令。当前 1.07 基线尚未产生视觉控制命令，因此未勾选手柄时不主动控车；手柄退出或超时会安全停车。
+`ar_receiver.py` 会自动启动定位、手柄、视觉控制和 TC264D 控制运行时。勾选 Windows `Gamepad Mode` 后手柄优先控车；未勾选时运行时选择最新视觉命令。若只想看视觉调试、不向下位机发送视觉命令，可启动前设置 `AR_VISION_CONTROL_SEND=0`；手柄退出或视觉命令超时会安全停车。
 
 只需要定位和手柄、不运行视觉入口时，才单独运行 `python3 standalone_control_bridge.py`。它与 `ar_receiver.py` 不能同时运行，否则会争用 `9005/9010` 和 TC264D 串口。
 

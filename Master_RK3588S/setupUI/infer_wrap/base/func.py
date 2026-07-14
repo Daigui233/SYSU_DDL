@@ -46,14 +46,23 @@ def _env_choice(name, default, allowed):
     return value if value in allowed else default
 
 
-DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.25)
-DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.60)
+DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.50)
+DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.45)
 DET_PRE_NMS_TOP_K = max(1, _env_int("MULTITASK_PRE_NMS_TOP_K", 1000))
 MAX_DETECTIONS = max(1, _env_int("MULTITASK_MAX_DETECTIONS", 100))
 COIN_MIN_SHORT_SIDE = max(
     0.0, _env_float("MULTITASK_COIN_MIN_SHORT_SIDE", 10.0))
 ROAD_THRESHOLD = float(np.clip(
     _env_float("MULTITASK_ROAD_THRESHOLD", 0.50), 0.0, 1.0))
+ROAD_TOP_CROP_RATIO = float(np.clip(
+    _env_float("MULTITASK_ROAD_TOP_CROP_RATIO", 0.34), 0.0, 0.8))
+ROAD_MIN_RATIO = max(0.0, _env_float("MULTITASK_ROAD_MIN_RATIO", 0.001))
+ROAD_MAX_RATIO = min(1.0, _env_float("MULTITASK_ROAD_MAX_RATIO", 0.60))
+ROAD_MAX_RAW_RATIO = min(
+    1.0, _env_float("MULTITASK_ROAD_MAX_RAW_RATIO", 0.86))
+ROAD_MIN_COMPONENT_AREA_RATIO = max(
+    0.0, _env_float("MULTITASK_ROAD_MIN_COMPONENT_AREA_RATIO", 0.0015))
+ROAD_MAX_COMPONENTS = max(1, _env_int("MULTITASK_ROAD_MAX_COMPONENTS", 3))
 ROAD_OVERLAY_ALPHA = float(np.clip(
     _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28), 0.0, 1.0))
 PATH_HEATMAP_ALPHA = float(np.clip(
@@ -80,7 +89,7 @@ RENDER_PATH_MIN_COUNT_CONFIDENCE = float(np.clip(
     _env_float("MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE", 0.40),
     0.0, 1.0))
 PATH_SOURCE = _env_choice(
-    "MULTITASK_PATH_SOURCE", "curve", {"curve", "heatmap"})
+    "MULTITASK_PATH_SOURCE", "heatmap", {"curve", "heatmap"})
 RENDER_MODE = os.environ.get(
     "MULTITASK_RENDER_MODE", "heatmap").strip().lower()
 RENDER_MODE = {"path": "drive", "road": "debug"}.get(
@@ -137,6 +146,84 @@ def _probability_to_logit(probability):
 
 
 ROAD_LOGIT_THRESHOLD = _probability_to_logit(ROAD_THRESHOLD)
+
+
+def _road_component_score(labels, stats, label, height, width):
+    left, top, component_width, component_height, area = stats[label]
+    bottom_y = int(height * 0.72)
+    bottom_roi = labels[
+        bottom_y:, left:left + component_width] == label
+    bottom_contact = float(bottom_roi.sum()) / float(max(
+        1, component_width * max(1, height - bottom_y)))
+    xs = np.flatnonzero(bottom_roi.sum(axis=0))
+    if xs.size:
+        bottom_center = left + (xs[0] + xs[-1]) * 0.5
+        center_score = 1.0 - min(
+            1.0,
+            abs(bottom_center - width * 0.5) / max(1.0, width * 0.5),
+        )
+    else:
+        center_score = 0.0
+    area_score = float(area) / float(max(1, height * width))
+    height_score = float(component_height) / float(max(1, height))
+    return (
+        area_score * 3.0 + bottom_contact * 1.8 +
+        center_score * 0.6 + height_score * 0.35)
+
+
+def clean_road_mask(raw_mask, top_crop_ratio=ROAD_TOP_CROP_RATIO,
+                    return_info=False):
+    """Adapt the main-branch road-mask cleanup to the 120x160 output."""
+    raw = (np.asarray(raw_mask) != 0).astype(np.uint8)
+    raw_ratio = float(np.mean(raw)) if raw.size else 0.0
+    mask = raw.copy()
+    height, width = mask.shape
+    mask[:int(height * float(top_crop_ratio)), :] = 0
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask, connectivity=8)
+    min_area = max(
+        6, int(round(height * width * ROAD_MIN_COMPONENT_AREA_RATIO)))
+    components = []
+    for label in range(1, component_count):
+        left, top, component_width, component_height, area = stats[label]
+        if area < min_area or component_width < 2 or component_height < 2:
+            continue
+        score = _road_component_score(
+            labels, stats, label, height, width)
+        components.append((score, label))
+    components.sort(reverse=True)
+    selected = np.zeros_like(mask)
+    for _score, label in components[:ROAD_MAX_COMPONENTS]:
+        selected[labels == label] = 1
+    if np.any(selected):
+        selected = cv2.morphologyEx(
+            selected, cv2.MORPH_CLOSE,
+            np.ones((3, 3), dtype=np.uint8))
+
+    ratio = float(np.mean(selected)) if selected.size else 0.0
+    if raw_ratio > ROAD_MAX_RAW_RATIO:
+        valid, reason = False, "raw-full"
+    elif ratio < ROAD_MIN_RATIO:
+        valid, reason = False, "small"
+    elif ratio > ROAD_MAX_RATIO:
+        valid, reason = False, "large"
+    else:
+        valid, reason = True, "ok"
+    if not valid:
+        selected.fill(0)
+    info = {
+        "valid": valid,
+        "reason": reason,
+        "ratio": ratio if valid else 0.0,
+        "raw_ratio": raw_ratio,
+        "component_count": min(len(components), ROAD_MAX_COMPONENTS),
+    }
+    return (selected, info) if return_info else selected
 
 
 def _squeeze_batch(value, name):
@@ -247,7 +334,7 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
                   pre_nms_top_k=DET_PRE_NMS_TOP_K,
                   max_detections=MAX_DETECTIONS,
                   coin_min_short_side=COIN_MIN_SHORT_SIDE):
-    """Filter invalid/tiny candidates, run class-wise NMS, then cap output."""
+    """Apply main-branch argmax filtering and class-wise NMS."""
     results = []
     pre_nms_top_k = max(1, int(pre_nms_top_k))
     box_widths = boxes[:, 2] - boxes[:, 0]
@@ -255,26 +342,28 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
     valid_boxes = (box_widths > 0.0) & (box_heights > 0.0)
     short_sides = np.minimum(box_widths, box_heights)
     coin_min_short_side = max(0.0, float(coin_min_short_side))
+    best_classes = np.argmax(scores, axis=1).astype(np.int32, copy=False)
+    best_scores = scores[
+        np.arange(scores.shape[0], dtype=np.int32), best_classes]
+    eligible = valid_boxes & (best_scores >= float(score_threshold))
 
-    for class_id in range(scores.shape[1]):
-        class_scores = scores[:, class_id]
-        class_valid = valid_boxes
+    for class_id in np.unique(best_classes[eligible]):
+        class_valid = eligible & (best_classes == class_id)
         if CLASSES[class_id] == "Coin" and coin_min_short_side > 0.0:
             # Training ignores Coin boxes whose short side is below 10 px in
             # the fixed 640x480 input. Apply the same rule before NMS so tiny
             # quantization noise cannot reintroduce those false positives.
             class_valid = class_valid & (short_sides >= coin_min_short_side)
-        indices = np.flatnonzero(
-            class_valid & (class_scores >= score_threshold))
+        indices = np.flatnonzero(class_valid)
         if not indices.size:
             continue
         if indices.size > pre_nms_top_k:
-            candidate_scores = class_scores[indices]
+            candidate_scores = best_scores[indices]
             top_positions = np.argpartition(
                 candidate_scores, -pre_nms_top_k)[-pre_nms_top_k:]
             indices = indices[top_positions]
         candidate_boxes = boxes[indices]
-        candidate_scores = class_scores[indices]
+        candidate_scores = best_scores[indices]
         xywh = candidate_boxes.copy()
         xywh[:, 2:] -= xywh[:, :2]
         try:
@@ -292,7 +381,7 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
         for position in kept_positions:
             source_index = int(indices[int(position)])
             results.append((
-                class_id, float(class_scores[source_index]),
+                int(class_id), float(best_scores[source_index]),
                 boxes[source_index]))
 
     results.sort(key=lambda item: item[1], reverse=True)
@@ -478,7 +567,10 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         path_points, path_scores, path_count_scores, image_shape)
 
     road_probability = sigmoid(pixel_logits[0])
-    road_mask = (pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
+    road_mask_raw = (
+        pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
+    road_mask, road_quality = clean_road_mask(
+        road_mask_raw, return_info=True)
     raw_path_heatmaps = sigmoid(pixel_logits[1:])
     heatmap_ridge_paths = []
     if path_source == "heatmap":
@@ -494,8 +586,10 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
     road = {
         "probability": road_probability,
         "mask": road_mask,
+        "raw_mask": road_mask_raw,
         "threshold": ROAD_THRESHOLD,
         "stride": PIXEL_STRIDE,
+        **road_quality,
     }
     centerline = {
         "heatmaps": path_heatmaps,
@@ -515,6 +609,7 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "detections": detections,
         "road_probability": road_probability,
         "road_mask": road_mask,
+        "road_mask_raw": road_mask_raw,
         "path_heatmaps": path_heatmaps,
         "path_count": path_count,
         "path_count_scores": path_count_scores_list,
@@ -699,7 +794,10 @@ def render_result(image, result, mode=None):
                 (left, max(18, top - 5)), cv2.FONT_HERSHEY_SIMPLEX,
                 0.48, color, 1, cv2.LINE_AA)
 
-    for path_info in result.get("paths") or []:
+    display_paths = result.get("display_paths")
+    if display_paths is None:
+        display_paths = result.get("paths") or []
+    for path_info in display_paths:
         if (mode != "heatmap" and
                 float(path_info.get("score", 0.0)) < RENDER_PATH_MIN_SCORE):
             continue
@@ -707,17 +805,24 @@ def render_result(image, result, mode=None):
                 float(path_info.get("count_confidence", 0.0)) <
                 RENDER_PATH_MIN_COUNT_CONFIDENCE):
             continue
-        points = np.rint(path_info["points_xy"]).astype(np.int32)
-        if len(points) < 2:
-            continue
-        points[:, 0] = np.clip(points[:, 0], 0, image.shape[1] - 1)
-        points[:, 1] = np.clip(points[:, 1], 0, image.shape[0] - 1)
         color = PATH_COLORS[path_info["role"]]
-        _draw_path_curve(image, points, color, dashed=False)
-        if mode == "full":
-            for point in points:
-                cv2.circle(image, tuple(point), 2, color, -1, cv2.LINE_AA)
-            label_point = tuple(points[0])
+        segments = path_info.get("display_segments_xy")
+        if segments is None:
+            segments = [path_info["points_xy"]]
+        drawn_points = []
+        for segment in segments:
+            points = np.rint(segment).astype(np.int32)
+            if len(points) < 2:
+                continue
+            points[:, 0] = np.clip(points[:, 0], 0, image.shape[1] - 1)
+            points[:, 1] = np.clip(points[:, 1], 0, image.shape[0] - 1)
+            _draw_path_curve(image, points, color, dashed=False)
+            drawn_points.append(points)
+            if mode == "full":
+                for point in points:
+                    cv2.circle(image, tuple(point), 2, color, -1, cv2.LINE_AA)
+        if mode == "full" and drawn_points:
+            label_point = tuple(drawn_points[0][0])
             cv2.putText(
                 image, "{} {:.2f}".format(
                     path_info["role"], path_info["score"]),

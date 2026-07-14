@@ -8,6 +8,7 @@ from .func import (
     RENDER_MODE,
     _is_oversized_render_box,
     _select_detections_for_render,
+    clean_road_mask,
     decode_outputs,
     detection_nms,
     myFunc,
@@ -72,22 +73,22 @@ class MultiTaskPostprocessTest(unittest.TestCase):
             float(result["curve_paths"][0]["points_xy"][0, 1]),
             0.95 * 239, places=4)
 
-    def test_default_paths_use_direct_curve_without_heatmap_tracing(self):
+    def test_default_paths_use_heatmap_ridges(self):
         result = decode_outputs(self.make_outputs(), (480, 640, 3))
 
         self.assertEqual(
-            result["centerline"]["display_source"], "direct_curve")
+            result["centerline"]["display_source"], "heatmap_ridge")
         self.assertEqual(
-            result["centerline"]["path_source"], "direct_curve")
+            result["centerline"]["path_source"], "heatmap_ridge")
         self.assertEqual([item["role"] for item in result["paths"]],
                           ["left", "right"])
-        self.assertTrue(all(item["source"] == "direct_curve"
+        self.assertTrue(all(item["source"] == "heatmap_ridge"
                              for item in result["paths"]))
-        self.assertEqual(len(result["paths"][0]["points_xy"]), 32)
+        self.assertGreater(len(result["paths"][0]["points_xy"]), 32)
         self.assertAlmostEqual(
             float(np.mean(result["paths"][0]["points_xy"][:, 0])),
-            0.42 * 639, delta=2.0)
-        self.assertEqual(result["heatmap_ridge_paths"], [])
+            66 * 4, delta=2.0)
+        self.assertEqual(result["paths"], result["heatmap_ridge_paths"])
         self.assertNotIn("temporal", result)
 
     def test_heatmap_switch_restores_one_ridge_per_channel(self):
@@ -130,10 +131,11 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertAlmostEqual(result["centerline"]["count_confidence"],
                                0.90, places=6)
 
-    def test_one_path_uses_single_role_and_slot_zero(self):
+    def test_direct_curve_one_path_uses_single_role_and_slot_zero(self):
         outputs = list(self.make_outputs())
         outputs[5] = np.asarray([[0.03, 0.94, 0.03]], dtype=np.float32)
-        result = decode_outputs(outputs, (480, 640, 3))
+        result = decode_outputs(
+            outputs, (480, 640, 3), path_source="curve")
         self.assertEqual(result["path_count"], 1)
         self.assertEqual(len(result["curve_paths"]), 1)
         self.assertEqual(result["curve_paths"][0]["slot"], 0)
@@ -142,11 +144,12 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(result["paths"][0]["slot"], 0)
         self.assertEqual(result["paths"][0]["role"], "single")
 
-    def test_zero_path_count_disables_both_slots(self):
+    def test_direct_curve_zero_path_count_disables_both_slots(self):
         outputs = list(self.make_outputs())
         outputs[4] = np.asarray([[0.99, 0.99]], dtype=np.float32)
         outputs[5] = np.asarray([[0.96, 0.03, 0.01]], dtype=np.float32)
-        result = decode_outputs(outputs, (480, 640, 3))
+        result = decode_outputs(
+            outputs, (480, 640, 3), path_source="curve")
         self.assertEqual(result["path_count"], 0)
         self.assertEqual(result["paths"], [])
         self.assertEqual(result["curve_paths"], [])
@@ -166,7 +169,34 @@ class MultiTaskPostprocessTest(unittest.TestCase):
                                0.5, places=6)
         self.assertAlmostEqual(float(result["path_heatmaps"][0, 0, 0]),
                                0.5, places=6)
-        self.assertEqual(int(result["road_mask"][0, 0]), 1)
+        self.assertEqual(int(result["road_mask_raw"][0, 0]), 1)
+        self.assertEqual(int(result["road_mask"][0, 0]), 0)
+        self.assertFalse(result["road"]["valid"])
+        self.assertEqual(result["road"]["reason"], "raw-full")
+
+    def test_road_cleanup_fills_cracks_and_removes_small_islands(self):
+        raw = np.zeros((40, 40), dtype=np.uint8)
+        raw[10:40, 8:32] = 1
+        raw[24:26, 18:20] = 0
+        raw[5:7, 5:7] = 1
+
+        cleaned, info = clean_road_mask(
+            raw, top_crop_ratio=0.0, return_info=True)
+
+        self.assertTrue(info["valid"])
+        self.assertEqual(int(cleaned[24, 18]), 1)
+        self.assertEqual(int(cleaned[5, 5]), 0)
+        self.assertEqual(info["component_count"], 1)
+
+    def test_road_cleanup_rejects_full_frame_false_positive(self):
+        raw = np.ones((120, 160), dtype=np.uint8)
+
+        cleaned, info = clean_road_mask(
+            raw, top_crop_ratio=0.0, return_info=True)
+
+        self.assertFalse(info["valid"])
+        self.assertEqual(info["reason"], "raw-full")
+        self.assertEqual(int(cleaned.sum()), 0)
 
     def test_classwise_nms_applies_global_limit_after_all_classes(self):
         boxes = np.asarray([
@@ -201,6 +231,20 @@ class MultiTaskPostprocessTest(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
         self.assertEqual([item[0] for item in results], [0, 1])
+
+    def test_each_candidate_is_assigned_only_to_its_highest_class(self):
+        boxes = np.asarray([[0, 0, 100, 100]], dtype=np.float32)
+        scores = np.zeros((1, 8), dtype=np.float32)
+        scores[0, 0] = 0.90
+        scores[0, 1] = 0.80
+
+        results = detection_nms(
+            boxes, scores, score_threshold=0.50,
+            coin_min_short_side=0, max_detections=10)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], 0)
+        self.assertAlmostEqual(results[0][1], 0.90, places=6)
 
     def test_tiny_coin_filter_matches_training_policy(self):
         boxes = np.asarray([
@@ -249,7 +293,7 @@ class MultiTaskPostprocessTest(unittest.TestCase):
 
     def test_heatmap_render_draws_all_post_nms_detection_boxes(self):
         detections = [{
-            "label": "Coin", "score": 0.30,
+            "label": "Coin", "score": 0.60,
             "bbox": [index * 10, 10, index * 10 + 8, 20],
         } for index in range(8)]
 
@@ -264,8 +308,8 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertTrue(_is_oversized_render_box(large, (480, 640, 3)))
         self.assertFalse(_is_oversized_render_box(normal, (480, 640, 3)))
 
-    def test_default_path_source_is_direct_curve(self):
-        self.assertEqual(PATH_SOURCE, "curve")
+    def test_default_path_source_is_heatmap(self):
+        self.assertEqual(PATH_SOURCE, "heatmap")
 
     def test_default_render_mode_is_raw_heatmap(self):
         self.assertEqual(RENDER_MODE, "heatmap")
