@@ -50,12 +50,13 @@ def make_result(path_count, xs=()):
 def make_model_outputs(x=0.40):
     boxes = np.zeros((1, 6300, 4), dtype=np.float32)
     scores = np.zeros((1, 6300, 8), dtype=np.float32)
-    pixel = np.zeros((1, 3, 120, 160), dtype=np.float32)
-    points = np.zeros((1, 2, 32, 2), dtype=np.float32)
-    points[0, 0, :, 0] = x
-    points[0, :, :, 1] = np.linspace(0.95, 0.10, 32)
+    pixel = np.full((1, 3, 120, 160), -8.0, dtype=np.float32)
+    pixel[0, 0, 40:, 20:140] = 8.0
+    row_logits = np.full((1, 2, 32, 161), -8.0, dtype=np.float32)
+    row_logits[0, 0, :, int(round(x * 159))] = 8.0
+    row_logits[0, 1, :, 160] = 8.0
     return (
-        boxes, scores, pixel, points,
+        boxes, scores, pixel, row_logits,
         np.asarray([[0.90, 0.10]], dtype=np.float32),
         np.asarray([[0.03, 0.94, 0.03]], dtype=np.float32),
     )

@@ -105,6 +105,9 @@ ROW_NO_PATH_THRESHOLD = float(np.clip(
     _env_float("MULTITASK_ROW_NO_PATH_THRESHOLD", 0.50), 0.0, 1.0))
 ROW_MAX_MISSING_ANCHORS = max(
     0, _env_int("MULTITASK_ROW_MAX_MISSING_ANCHORS", 2))
+ROW_MAX_LATERAL_JUMP_RATIO = float(np.clip(
+    _env_float("MULTITASK_ROW_MAX_LATERAL_JUMP_RATIO", 0.18),
+    0.02, 1.0))
 PATH_CONSTRAIN_TO_ROAD = _env_bool("MULTITASK_PATH_CONSTRAIN_TO_ROAD", True)
 PATH_ROAD_SNAP_RADIUS = max(
     0.0, _env_float("MULTITASK_PATH_ROAD_SNAP_RADIUS", 10.0))
@@ -471,16 +474,35 @@ def _split_anchor_segments(points_xy, row_indices):
     return segments
 
 
+def _near_continuous_prefix(points, row_indices):
+    """Discard a far tail after the row head jumps to another branch."""
+    points = np.asarray(points, dtype=np.float32)
+    row_indices = np.asarray(row_indices, dtype=np.int32)
+    if len(points) < 2:
+        return points, row_indices
+    end = len(points)
+    for index in range(1, len(points)):
+        row_gap = int(row_indices[index] - row_indices[index - 1])
+        if row_gap <= 0 or row_gap > ROW_MAX_MISSING_ANCHORS + 1:
+            end = index
+            break
+        maximum_jump = ROW_MAX_LATERAL_JUMP_RATIO * float(row_gap)
+        if abs(float(points[index, 0] - points[index - 1, 0])) > \
+                maximum_jump:
+            end = index
+            break
+    return points[:end], row_indices[:end]
+
+
 def _project_normalized_points_to_road(points, road_mask):
-    """Keep each decoded point inside the cleaned road mask when available."""
+    """Snap x within the same row so ordered row anchors never fold back."""
     normalized = np.asarray(points, dtype=np.float32).copy()
     keep = np.ones((len(normalized), ), dtype=bool)
     if (not PATH_CONSTRAIN_TO_ROAD or road_mask is None or
             not np.asarray(road_mask).size):
         return normalized, keep, None
     road = np.asarray(road_mask, dtype=np.uint8) != 0
-    road_y, road_x = np.nonzero(road)
-    if not len(road_x):
+    if not np.any(road):
         return normalized, np.zeros((len(normalized), ), dtype=bool), 0.0
 
     height, width = road.shape
@@ -492,15 +514,18 @@ def _project_normalized_points_to_road(points, road_mask):
         if road[y, x]:
             overlap.append(1.0)
             continue
-        distances = (road_x.astype(np.float32) - float(x)) ** 2 + \
-            (road_y.astype(np.float32) - float(y)) ** 2
-        nearest = int(np.argmin(distances))
-        if distances[nearest] > max_distance_sq:
+        row_x = np.flatnonzero(road[y])
+        if not len(row_x):
             keep[index] = False
             overlap.append(0.0)
             continue
-        normalized[index, 0] = float(road_x[nearest]) / max(width - 1, 1)
-        normalized[index, 1] = float(road_y[nearest]) / max(height - 1, 1)
+        distances_sq = (row_x.astype(np.float32) - float(x)) ** 2
+        nearest = int(np.argmin(distances_sq))
+        if distances_sq[nearest] > max_distance_sq:
+            keep[index] = False
+            overlap.append(0.0)
+            continue
+        normalized[index, 0] = float(row_x[nearest]) / max(width - 1, 1)
         overlap.append(0.0)
     return normalized, keep, float(np.mean(overlap)) if overlap else None
 
@@ -558,10 +583,14 @@ def decode_curve_paths(row_path_logits, path_scores, path_count_scores,
             continue
         normalized = np.stack((x_normalized[slot, visible_indices],
                                y_normalized[visible_indices]), axis=1)
+        normalized, visible_indices = _near_continuous_prefix(
+            normalized, visible_indices)
         normalized, keep, road_overlap = _project_normalized_points_to_road(
             normalized, road_mask)
         visible_indices = visible_indices[keep]
         normalized = normalized[keep]
+        normalized, visible_indices = _near_continuous_prefix(
+            normalized, visible_indices)
         if len(normalized) < 3:
             continue
         points_xy = normalized * np.asarray(

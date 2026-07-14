@@ -257,6 +257,10 @@ class VisionControlConfig:
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
     outer_slot: int = 0
+    curve_merge_support_ratio: float = 0.70
+    curve_merge_near_px_640: float = 36.0
+    curve_merge_enter_evidence: int = 4
+    curve_merge_release_frames: int = 30
     no_path_stop_s: float = 0.8
     recover_hold_s: float = 0.5
     hazard_bottom_ratio: float = 0.58
@@ -378,6 +382,18 @@ class VisionControlConfig:
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
             ocr_confirm_frames=max(1, _env_int("VISION_CONTROL_OCR_CONFIRM_FRAMES", 1)),
             outer_slot=max(0, min(1, _env_int("VISION_CONTROL_OUTER_SLOT", 0))),
+            curve_merge_support_ratio=_clamp(
+                _env_float("VISION_CONTROL_CURVE_MERGE_SUPPORT_RATIO", 0.70),
+                0.25, 1.0),
+            curve_merge_near_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CURVE_MERGE_NEAR_640", 36.0)),
+            curve_merge_enter_evidence=max(
+                2, _env_int(
+                    "VISION_CONTROL_CURVE_MERGE_ENTER_EVIDENCE", 4)),
+            curve_merge_release_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CURVE_MERGE_RELEASE_FRAMES", 30)),
             no_path_stop_s=max(0.1, _env_float("VISION_CONTROL_NO_PATH_STOP_S", 0.8)),
             recover_hold_s=max(0.0, _env_float("VISION_CONTROL_RECOVER_HOLD_S", 0.5)),
             hazard_bottom_ratio=_clamp(_env_float("VISION_CONTROL_HAZARD_BOTTOM_RATIO", 0.58), 0.0, 1.0),
@@ -1142,6 +1158,10 @@ class VisionControlPlanner:
         self.peak_path_detector = HeatmapPeakPathDetector(self.config)
         self.log_func = log_func
         self.last_selected_points = None
+        self.last_path_target_x = None
+        self.last_path_target_y = None
+        self.last_path_target_slot = None
+        self.last_path_target_ts = 0.0
         self.last_slot_points = {}
         self.last_valid_ts = 0.0
         self.last_error = 0.0
@@ -1150,10 +1170,17 @@ class VisionControlPlanner:
         self.route_initialized = False
         self.pending_route_state = None
         self.pending_route_frames = 0
-        self.branch_lock = None
-        self.branch_lock_source = None
-        self.selected_slot_lock = None
+        curve_defaults_blue = self.config.path_source == "curve"
+        self.branch_lock = "left" if curve_defaults_blue else None
+        self.branch_lock_source = "default" if curve_defaults_blue else None
+        self.selected_slot_lock = 0 if curve_defaults_blue else None
         self.selected_slot_missing_frames = 0
+        self.curve_merge_override = False
+        self.curve_merge_bad_evidence = 0
+        self.curve_merge_blue_stable_frames = 0
+        self.curve_merge_reason = "inactive"
+        self.curve_merge_metrics = {}
+        self.selection_reason = "initial"
         self.path_missing_frames = {}
         self.fork_seen_since = None
         self.single_seen_frames = 0
@@ -1197,6 +1224,7 @@ class VisionControlPlanner:
         else:
             ocr_lock_expired = self._expire_ocr_lock(now)
         self._update_default_outer(route_state, now, ocr_current)
+        self._update_curve_merge_continuity(candidates, image_shape)
         selected = self._select_candidate(candidates, route_state, image_shape)
         command, control_target = self._build_command(
             selected, route_state, route_reason, perception_result,
@@ -1213,6 +1241,13 @@ class VisionControlPlanner:
             "branch_lock": self.branch_lock,
             "branch_lock_source": self.branch_lock_source,
             "selected_slot_lock": self.selected_slot_lock,
+            "selection_reason": self.selection_reason,
+            "curve_merge_override": bool(self.curve_merge_override),
+            "curve_merge_reason": self.curve_merge_reason,
+            "curve_merge_bad_evidence": self.curve_merge_bad_evidence,
+            "curve_merge_blue_stable_frames": (
+                self.curve_merge_blue_stable_frames),
+            "curve_merge_metrics": dict(self.curve_merge_metrics),
             "raw_ocr_direction": raw_ocr_direction if raw_ocr_current else None,
             "raw_ocr_current": bool(raw_ocr_current),
             "ocr_pending_direction": self.ocr_pending_direction,
@@ -2438,6 +2473,22 @@ class VisionControlPlanner:
         return ROUTE_AMBIGUOUS, "weak_separation"
 
     def _update_default_outer(self, route_state, now, ocr_current):
+        if self.config.path_source == "curve":
+            # Row-head slot identity is fixed: slot 0 is the blue/default
+            # route and slot 1 is the green/right route. Never let proximity
+            # to the vehicle or merge geometry override this policy.
+            if self.branch_lock_source != "ocr":
+                self._set_default_curve_branch()
+            if route_state == ROUTE_MULTI_FORK:
+                self.single_seen_frames = 0
+                if self.fork_seen_since is None:
+                    self.fork_seen_since = now
+            elif route_state == ROUTE_SINGLE:
+                self.fork_seen_since = None
+                self.single_seen_frames += 1
+            else:
+                self.single_seen_frames = 0
+            return
         if route_state == ROUTE_MULTI_FORK:
             self.single_seen_frames = 0
             if self.fork_seen_since is None:
@@ -2460,8 +2511,137 @@ class VisionControlPlanner:
             self.single_seen_frames = 0
             return
 
+    def _update_curve_merge_continuity(self, candidates, image_shape):
+        """Temporarily follow stable slot 1 when slot 0 collapses at a merge.
+
+        Curve-head slot identity is normally authoritative.  In real merge
+        frames, however, slot 0 alternates between a full route and a short
+        piece of the shared trunk while slot 1 remains continuous.  Requiring
+        both paths to meet near the vehicle keeps this exception out of
+        unrelated missing-line and ordinary two-lane cases.
+        """
+        self.curve_merge_metrics = {}
+        if self.config.path_source != "curve":
+            return
+        if self.branch_lock != "left":
+            self.curve_merge_override = False
+            self.curve_merge_bad_evidence = 0
+            self.curve_merge_blue_stable_frames = 0
+            self.curve_merge_reason = (
+                "ocr_right" if self.branch_lock == "right" else "inactive")
+            return
+
+        by_slot = {
+            int(candidate.get("slot", -1)): candidate
+            for candidate in candidates
+        }
+        blue = by_slot.get(0)
+        green = by_slot.get(1)
+        if blue is None or green is None:
+            # Do not turn an ordinary missing-blue frame into an implicit
+            # green fallback.  An already-active merge takeover stays latched
+            # until blue has genuinely recovered for several frames.
+            if not self.curve_merge_override:
+                self.curve_merge_bad_evidence = max(
+                    0, self.curve_merge_bad_evidence - 1)
+            self.curve_merge_blue_stable_frames = 0
+            self.curve_merge_reason = "waiting_for_both_paths"
+            if self.curve_merge_override:
+                self.selected_slot_lock = 1
+            return
+
+        blue_points = np.asarray(blue.get("points_xy"), dtype=np.float32)
+        green_points = np.asarray(green.get("points_xy"), dtype=np.float32)
+        if not len(blue_points) or not len(green_points):
+            return
+        height, width = image_shape[:2]
+        lookahead_y = float(height) * self.config.lookahead_y_ratio
+        near_y = float(height) * 0.875
+        blue_span = float(np.ptp(blue_points[:, 1]))
+        green_span = float(np.ptp(green_points[:, 1]))
+        blue_covers_lookahead = self._path_covers_y(
+            blue_points, lookahead_y)
+        green_covers_lookahead = self._path_covers_y(
+            green_points, lookahead_y)
+        blue_covers_near = self._path_covers_y(blue_points, near_y)
+        green_covers_near = self._path_covers_y(green_points, near_y)
+        blue_near_x = _interp_path_x(blue_points, near_y)
+        green_near_x = _interp_path_x(green_points, near_y)
+        near_distance_640 = 1e9
+        if blue_near_x is not None and green_near_x is not None:
+            near_distance_640 = (
+                abs(float(blue_near_x) - float(green_near_x)) * 640.0 /
+                float(max(1, width)))
+        shared_near = (
+            blue_covers_near and green_covers_near and
+            near_distance_640 <= self.config.curve_merge_near_px_640)
+        green_good = green_covers_lookahead and green_span > 0.0
+        blue_bad = (
+            not blue_covers_lookahead or
+            blue_span < (
+                green_span * self.config.curve_merge_support_ratio))
+        bad_merge_frame = shared_near and green_good and blue_bad
+        blue_recovered = (
+            blue_covers_lookahead and
+            blue_span >= green_span * max(
+                0.85, self.config.curve_merge_support_ratio))
+        self.curve_merge_metrics = {
+            "shared_near": bool(shared_near),
+            "near_distance_640": float(near_distance_640),
+            "blue_span": blue_span,
+            "green_span": green_span,
+            "blue_covers_lookahead": bool(blue_covers_lookahead),
+            "green_covers_lookahead": bool(green_covers_lookahead),
+            "blue_bad": bool(blue_bad),
+        }
+
+        if self.curve_merge_override:
+            if blue_recovered:
+                self.curve_merge_blue_stable_frames += 1
+            else:
+                self.curve_merge_blue_stable_frames = 0
+            if (self.curve_merge_blue_stable_frames >=
+                    self.config.curve_merge_release_frames):
+                self.curve_merge_override = False
+                self.curve_merge_bad_evidence = 0
+                self.curve_merge_blue_stable_frames = 0
+                self.curve_merge_reason = "blue_recovered"
+                self.selected_slot_lock = 0
+            else:
+                self.curve_merge_reason = "stable_green_takeover"
+                self.selected_slot_lock = 1
+            return
+
+        if bad_merge_frame:
+            # Bad frames add evidence faster than good frames remove it.  The
+            # observed failure alternates full and truncated blue paths, so a
+            # consecutive-frame counter would never latch reliably.
+            self.curve_merge_bad_evidence += 2
+            self.curve_merge_reason = "blue_support_unstable"
+        else:
+            self.curve_merge_bad_evidence = max(
+                0, self.curve_merge_bad_evidence - 1)
+            self.curve_merge_reason = "default_blue"
+        if (self.curve_merge_bad_evidence >=
+                self.config.curve_merge_enter_evidence):
+            self.curve_merge_override = True
+            self.curve_merge_blue_stable_frames = 0
+            self.curve_merge_reason = "enter_green_takeover"
+            self.selected_slot_lock = 1
+        else:
+            self.selected_slot_lock = 0
+
+    @staticmethod
+    def _path_covers_y(points, target_y):
+        points = np.asarray(points, dtype=np.float32)
+        return bool(
+            points.ndim == 2 and points.shape[1] == 2 and len(points) and
+            float(np.min(points[:, 1])) <= float(target_y) <=
+            float(np.max(points[:, 1])))
+
     def _select_candidate(self, candidates, route_state, image_shape):
         if not candidates:
+            self.selection_reason = "no_candidate"
             if self.selected_slot_lock is not None:
                 self.selected_slot_missing_frames += 1
                 if (self.branch_lock is None and
@@ -2472,7 +2652,14 @@ class VisionControlPlanner:
                     self.last_selected_points = None
             return None
         if self.branch_lock in {"left", "right"}:
-            wanted_slot = 0 if self.branch_lock == "left" else 1
+            wanted_slot = (
+                1 if (self.branch_lock == "right" or
+                      (self.branch_lock == "left" and
+                       self.curve_merge_override)) else 0)
+            self.selection_reason = (
+                "merge_continuity_green" if
+                self.branch_lock == "left" and self.curve_merge_override
+                else "locked_{}".format(self.branch_lock))
             for candidate in candidates:
                 if int(candidate.get("slot", -1)) == wanted_slot:
                     return self._remember_selection(candidate)
@@ -2480,6 +2667,7 @@ class VisionControlPlanner:
             self.selected_slot_missing_frames += 1
             return None
         if self.selected_slot_lock is not None:
+            self.selection_reason = "held_slot"
             for candidate in candidates:
                 if int(candidate.get("slot", -1)) == self.selected_slot_lock:
                     return self._remember_selection(candidate)
@@ -2492,6 +2680,7 @@ class VisionControlPlanner:
         if self.last_selected_points is not None:
             previous_x = _interp_path_x(self.last_selected_points, image_shape[0] * self.config.lookahead_y_ratio)
             if previous_x is not None:
+                self.selection_reason = "path_continuity"
                 return self._remember_selection(min(
                     candidates,
                     key=lambda item: abs(
@@ -2502,8 +2691,10 @@ class VisionControlPlanner:
         if route_state == ROUTE_MULTI_FORK:
             for candidate in candidates:
                 if int(candidate.get("slot", -1)) == self.config.outer_slot:
+                    self.selection_reason = "configured_outer"
                     return self._remember_selection(candidate)
         center_x = image_shape[1] * self.config.visual_center_x
+        self.selection_reason = "nearest_visual_center"
         return self._remember_selection(min(
             candidates,
             key=lambda item: abs((_interp_path_x(item["points_xy"], image_shape[0] * self.config.lookahead_y_ratio) or center_x) - center_x),
@@ -2520,10 +2711,14 @@ class VisionControlPlanner:
             result, selected, image_shape, lookahead_y, route_state, now, ocr_response=ocr_response)
         if selected is None:
             age = now - self.last_valid_ts if self.last_valid_ts else 1e9
+            held_target = self._held_path_target(now)
             if self.last_valid_ts and age <= self.config.recover_hold_s:
                 error = self.last_error
                 return self._command(error, self.config.recover_speed_mps, STATE_RECOVER_LINE), {
-                    "target_x": None,
+                    "target_x": None if held_target is None else held_target[0],
+                    "path_target_x": None if held_target is None else held_target[0],
+                    "path_target_y": None if held_target is None else held_target[1],
+                    "path_target_held": held_target is not None,
                     "track_error_640": error,
                     "reason": "recover_hold",
                     "task_reason": task_reason,
@@ -2535,7 +2730,10 @@ class VisionControlPlanner:
                 "reason": route_reason,
                 "task_reason": task_reason,
             }
-        if route_state == ROUTE_AMBIGUOUS:
+        curve_slot_is_locked = (
+            self.config.path_source == "curve" and
+            self.branch_lock in {"left", "right"})
+        if route_state == ROUTE_AMBIGUOUS and not curve_slot_is_locked:
             return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
                 "target_x": None,
                 "track_error_640": 0.0,
@@ -2543,30 +2741,74 @@ class VisionControlPlanner:
                 "task_reason": "ambiguous_stop",
             }
 
-        target_x = target_override_x
-        if target_x is None:
-            target_x = _interp_path_x(selected["points_xy"], lookahead_y)
-        if target_x is None:
+        path_target = self._path_target_on_selected(selected, lookahead_y)
+        if path_target is None:
             return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
                 "target_x": None,
+                "path_target_x": None,
+                "path_target_y": None,
                 "track_error_640": 0.0,
                 "reason": "missing_target_x",
                 "task_reason": task_reason,
             }
+        path_target_x, path_target_y, path_target_adaptive = path_target
+        target_x = (float(target_override_x) if target_override_x is not None
+                    else float(path_target_x))
         raw_error = (float(target_x) / float(max(1, image_shape[1])) - self.config.visual_center_x) * 640.0
         error = self._limit_error(raw_error)
         self.last_error = error
         self.last_valid_ts = now
         self.last_selected_points = np.asarray(selected["points_xy"], dtype=np.float32).copy()
         self.last_slot_points[int(selected["slot"])] = self.last_selected_points
+        self.last_path_target_x = float(path_target_x)
+        self.last_path_target_y = float(path_target_y)
+        self.last_path_target_slot = int(selected["slot"])
+        self.last_path_target_ts = float(now)
         return self._command(error, speed, task_state), {
             "target_x": float(target_x),
-            "lookahead_y": float(lookahead_y),
+            "path_target_x": float(path_target_x),
+            "path_target_y": float(path_target_y),
+            "path_target_held": False,
+            "path_target_adaptive_y": bool(path_target_adaptive),
+            "lookahead_y": float(path_target_y),
             "track_error_640": float(error),
             "raw_track_error_640": float(raw_error),
             "reason": route_reason,
             "task_reason": task_reason,
         }
+
+    @staticmethod
+    def _path_target_on_selected(selected, preferred_y):
+        points = np.asarray(
+            (selected or {}).get("points_xy", ()), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or not len(points):
+            return None
+        finite = np.all(np.isfinite(points), axis=1)
+        points = points[finite]
+        if not len(points):
+            return None
+        minimum_y = float(np.min(points[:, 1]))
+        maximum_y = float(np.max(points[:, 1]))
+        target_x = _interp_path_x(points, preferred_y)
+        if (target_x is not None and
+                minimum_y <= float(preferred_y) <= maximum_y):
+            return float(target_x), float(preferred_y), False
+        nearest = int(np.argmin(np.abs(points[:, 1] - float(preferred_y))))
+        # Keep the displayed/control lookahead row fixed. Only borrow the x
+        # coordinate from the nearest supported endpoint when the curve is
+        # temporarily too short to cross that row.
+        return float(points[nearest, 0]), float(preferred_y), True
+
+    def _held_path_target(self, now):
+        if (self.last_path_target_x is None or
+                self.last_path_target_y is None or
+                self.last_path_target_slot is None or
+                self.selected_slot_lock != self.last_path_target_slot or
+                float(now) - self.last_path_target_ts >
+                self.config.recover_hold_s):
+            return None
+        return (float(self.last_path_target_x),
+                float(self.last_path_target_y))
 
     def _task_from_detections(self, result, selected, image_shape, lookahead_y, route_state, now, ocr_response=None):
         detections = result.get("detections") or []
@@ -2620,7 +2862,7 @@ class VisionControlPlanner:
                 STATE_TRACK,
                 min(self.config.normal_speed_mps, self.config.turnsign_slow_speed_mps),
                 "turnsign_slow",
-                sign_target_x,
+                None,
             )
         return STATE_TRACK, self.config.normal_speed_mps, "track", None
 
@@ -2953,8 +3195,17 @@ class VisionControlPlanner:
             return False
         if now - self.last_valid_ocr_ts < self.config.ocr_lock_lifetime_s:
             return False
-        self._clear_branch_lock()
+        if self.config.path_source == "curve":
+            self._set_default_curve_branch()
+        else:
+            self._clear_branch_lock()
         return True
+
+    def _set_default_curve_branch(self):
+        self.branch_lock = "left"
+        self.branch_lock_source = "default"
+        self.selected_slot_lock = 0
+        self.selected_slot_missing_frames = 0
 
     def _clear_branch_lock(self):
         self.branch_lock = None
@@ -3082,8 +3333,12 @@ def render_vision_control_debug(frame, result):
             thickness=3 if int(line.get("slot", -1)) == selected_slot else 2)
 
     target = debug.get("control_target") or {}
-    target_x = _finite_float(target.get("target_x"))
-    lookahead_y = _finite_float(target.get("lookahead_y"), h * 0.62)
+    target_x = _finite_float(
+        target.get("path_target_x"),
+        _finite_float(target.get("target_x")))
+    lookahead_y = _finite_float(
+        target.get("path_target_y"),
+        _finite_float(target.get("lookahead_y"), h * 0.62))
     if target_x is not None:
         x = int(round(_clamp(target_x, 0, w - 1)))
         y = int(round(_clamp(lookahead_y, 0, h - 1)))
@@ -3091,12 +3346,14 @@ def render_vision_control_debug(frame, result):
         cv2.line(frame, (0, y), (w - 1, y), (255, 0, 255), 1, cv2.LINE_AA)
 
     command = debug.get("command") or {}
-    text = "{} raw={} lock={}/{} slot={} err={:.1f}".format(
+    merge_tag = " MERGE->G" if debug.get("curve_merge_override") else ""
+    text = "{} raw={} lock={}/{} slot={}{} err={:.1f}".format(
         debug.get("route_state", "-"),
         debug.get("raw_route_state", "-"),
         debug.get("branch_lock") or "-",
         "-" if debug.get("selected_slot_lock") is None else debug.get("selected_slot_lock"),
         "-" if selected_slot is None else selected_slot,
+        merge_tag,
         float(command.get("track_error", 0.0)),
     )
     cv2.putText(frame, text, (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
