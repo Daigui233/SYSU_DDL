@@ -282,7 +282,11 @@ class VisionControlConfig:
     human_cross_release_px_640: float = 45.0
     human_pass_offset_px_640: float = 38.0
     human_speed_hold_s: float = 0.5
+    human_absence_confirm_s: float = 1.5
     car_avoid_offset_px_640: float = 55.0
+    car_avoid_hold_s: float = 2.0
+    car_human_pass_speed_mps: float = 0.25
+    car_human_pass_hold_s: float = 2.0
     human_avoid_offset_px_640: float = 75.0
     avoid_box_width_gain: float = 0.35
     gold_bias_gain: float = 0.45
@@ -415,7 +419,11 @@ class VisionControlConfig:
             human_cross_release_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_CROSS_RELEASE_640", 45.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
+            human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
             car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 55.0)),
+            car_avoid_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_HOLD_S", 2.0)),
+            car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.25)),
+            car_human_pass_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S", 2.0)),
             human_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_AVOID_OFFSET_640", 75.0)),
             avoid_box_width_gain=max(0.0, _env_float("VISION_CONTROL_AVOID_BOX_WIDTH_GAIN", 0.35)),
             gold_bias_gain=max(0.0, _env_float("VISION_CONTROL_GOLD_BIAS_GAIN", 0.45)),
@@ -1197,6 +1205,16 @@ class VisionControlPlanner:
         self.human_pass_side = None
         self.human_pass_offset_x = 0.0
         self.human_speed_hold_until = 0.0
+        self.human_detected_latched = False
+        self.human_last_seen_ts = 0.0
+        self.car_avoid_side = 0
+        self.car_avoid_offset_px_640 = 0.0
+        self.car_avoid_hold_until = 0.0
+        self.car_human_active = False
+        self.car_human_waiting_cross = False
+        self.car_human_seen_avoid_side = False
+        self.car_human_last_seen_ts = 0.0
+        self.car_human_pass_until = 0.0
         self.sign_ocr_active_since = None
         self.sign_ocr_pulse_until = 0.0
         self.sign_ocr_pulse_sent = False
@@ -2784,6 +2802,8 @@ class VisionControlPlanner:
             "path_target_held": False,
             "path_target_adaptive_y": bool(path_target_adaptive),
             "lookahead_y": float(path_target_y),
+            "human_stop_line_y": self._human_stop_line_y(
+                image_shape, path_target_y),
             "task_offset_x": float(task_offset_x),
             "task_target_applied": target_override_x is not None,
             "track_error_640": float(error),
@@ -2851,8 +2871,13 @@ class VisionControlPlanner:
         if target_path_x is None:
             target_path_x = image_shape[1] * self.config.visual_center_x
         lookahead_path_x = float(target_path_x)
+        car_action = self._car_avoidance_action(
+            detections, image_shape, lookahead_y, lookahead_path_x, now)
+        if car_action is not None:
+            return car_action
         human_action = self._human_action(
-            detections, selected, image_shape, lookahead_y, lookahead_path_x)
+            detections, selected, image_shape, lookahead_y,
+            lookahead_path_x, now)
         if human_action is not None:
             if int(human_action[0]) == STATE_AVOID_HUMAN:
                 self.human_speed_hold_until = float(now) + self.config.human_speed_hold_s
@@ -2870,21 +2895,6 @@ class VisionControlPlanner:
                 held_target_x,
             )
         self.human_pass_offset_x = 0.0
-        hazard_limit = image_shape[1] * self.config.hazard_lateral_ratio
-        for det in detections:
-            label = self._normalized_label(det)
-            if label != "car":
-                continue
-            score = _finite_float(det.get("score"), 0.0)
-            if score < self.config.min_car_score:
-                continue
-            geom = self._detection_geom(det, image_shape)
-            if geom is None or geom["bottom_ratio"] < self.config.hazard_bottom_ratio:
-                continue
-            if abs(geom["cx"] - target_path_x) > max(hazard_limit, geom["box_w"] * 0.75):
-                continue
-            avoid_target_x = self._avoid_target_x(label, geom, target_path_x, image_shape)
-            return STATE_AVOID_CAR, self.config.obstacle_speed_mps, "car_in_path_bias", avoid_target_x
         coin = self._best_coin(detections, image_shape, target_path_x)
         if coin is not None:
             return STATE_COLLECT_GOLD, self.config.collect_speed_mps, "coin_bias", self._coin_target_x(coin, target_path_x, image_shape)
@@ -2966,7 +2976,235 @@ class VisionControlPlanner:
         self.sign_seen_frames = 0
         self.sign_latched_since = None
 
-    def _human_action(self, detections, selected, image_shape, lookahead_y, lookahead_path_x):
+    def _car_avoidance_action(
+            self, detections, image_shape, lookahead_y, path_x, now):
+        """Keep one continuous avoidance side across car and human phases."""
+        if (
+            self.car_human_pass_until > 0.0
+            and float(now) >= self.car_human_pass_until
+        ):
+            self._clear_car_avoidance_state()
+        car = self._best_car(detections, image_shape, path_x)
+        pass_holding = float(now) < self.car_human_pass_until
+        car_holding = float(now) < self.car_avoid_hold_until
+
+        if car is not None:
+            desired_target_x = self._avoid_target_x(
+                "car", car, path_x, image_shape)
+            desired_offset = float(desired_target_x) - float(path_x)
+            desired_side = self._sign(desired_offset)
+            new_sequence = (
+                self.car_avoid_side == 0
+                or (not car_holding
+                    and not self.car_human_active
+                    and not pass_holding)
+            )
+            if new_sequence:
+                self._clear_car_avoidance_state()
+                self.car_avoid_side = desired_side or 1
+                self._clear_human_state()
+                self.human_pass_offset_x = 0.0
+                self.human_speed_hold_until = 0.0
+
+            # Never cross the baseline while one avoidance sequence is active.
+            # The magnitude may grow as the car box grows, but its sign remains
+            # the originally selected side away from the car.
+            scale = 640.0 / float(max(1, image_shape[1]))
+            desired_magnitude_640 = abs(desired_offset) * scale
+            self.car_avoid_offset_px_640 = max(
+                self.car_avoid_offset_px_640,
+                self.config.car_avoid_offset_px_640,
+                desired_magnitude_640,
+            )
+            self.car_avoid_hold_until = (
+                float(now) + self.config.car_avoid_hold_s)
+            car_holding = True
+
+        context_active = bool(
+            car is not None
+            or car_holding
+            or self.car_human_active
+            or pass_holding)
+        if not context_active or self.car_avoid_side == 0:
+            self._clear_car_avoidance_state()
+            return None
+
+        avoid_target_x = self._latched_car_target_x(path_x, image_shape)
+        human = self._best_car_context_human(
+            detections, image_shape, avoid_target_x)
+
+        if pass_holding:
+            return (
+                STATE_AVOID_HUMAN,
+                self.config.car_human_pass_speed_mps,
+                "car_human_same_side_pass_hold",
+                avoid_target_x,
+            )
+
+        if human is not None:
+            if not self.car_human_active:
+                self.car_human_active = True
+                self._clear_human_state()
+                self.human_pass_offset_x = 0.0
+                self.human_speed_hold_until = 0.0
+            self.car_human_last_seen_ts = float(now)
+
+            human_side = self._sign(
+                float(human["geom"]["cx"]) - float(avoid_target_x))
+            if human_side == self.car_avoid_side:
+                self.car_human_seen_avoid_side = True
+
+            crossed_to_other_side = (
+                self.car_human_waiting_cross
+                and self.car_human_seen_avoid_side
+                and human_side != 0
+                and human_side == -self.car_avoid_side
+            )
+            if crossed_to_other_side:
+                self.car_human_pass_until = (
+                    float(now) + self.config.car_human_pass_hold_s)
+                self.car_human_waiting_cross = False
+                return (
+                    STATE_AVOID_HUMAN,
+                    self.config.car_human_pass_speed_mps,
+                    "car_human_same_side_pass",
+                    avoid_target_x,
+                )
+
+            geom = human["geom"]
+            if self._human_on_stop_line(geom, image_shape, lookahead_y):
+                self.car_human_waiting_cross = True
+            if self.car_human_waiting_cross:
+                return (
+                    STATE_SAFE_STOP,
+                    0.0,
+                    "car_human_same_side_wait",
+                    avoid_target_x,
+                )
+            return (
+                STATE_AVOID_HUMAN,
+                self.config.obstacle_speed_mps,
+                "car_human_same_side_approach",
+                avoid_target_x,
+            )
+
+        if self.car_human_active:
+            absence_age = max(
+                0.0, float(now) - self.car_human_last_seen_ts)
+            if absence_age < self.config.human_absence_confirm_s:
+                return (
+                    STATE_SAFE_STOP,
+                    0.0,
+                    "car_human_absence_check",
+                    avoid_target_x,
+                )
+
+            # No Human has been detected for the complete confirmation window.
+            # Release only the pedestrian part of the state; a remaining car
+            # hold still owns the same avoidance side until its own 2 s expires.
+            self.car_human_active = False
+            self.car_human_waiting_cross = False
+            self.car_human_seen_avoid_side = False
+            self.car_human_last_seen_ts = 0.0
+            if car is None and not car_holding:
+                self._clear_car_avoidance_state()
+                return None
+
+        reason = "car_in_path_bias" if car is not None else "car_avoid_hold"
+        return (
+            STATE_AVOID_CAR,
+            self.config.obstacle_speed_mps,
+            reason,
+            avoid_target_x,
+        )
+
+    def _best_car(self, detections, image_shape, path_x):
+        hazard_limit = (
+            float(image_shape[1]) * self.config.hazard_lateral_ratio)
+        best = None
+        best_rank = -1.0
+        for det in detections:
+            if self._normalized_label(det) != "car":
+                continue
+            score = _finite_float(det.get("score"), 0.0)
+            if score < self.config.min_car_score:
+                continue
+            geom = self._detection_geom(det, image_shape)
+            if (
+                geom is None
+                or geom["bottom_ratio"] < self.config.hazard_bottom_ratio
+                or abs(float(geom["cx"]) - float(path_x))
+                > max(hazard_limit, float(geom["box_w"]) * 0.75)
+            ):
+                continue
+            rank = (
+                float(score)
+                + float(geom["bottom_ratio"])
+                - abs(float(geom["cx"]) - float(path_x))
+                / float(max(1, image_shape[1]))
+            )
+            if rank > best_rank:
+                best = geom
+                best_rank = rank
+        return best
+
+    def _best_car_context_human(
+            self, detections, image_shape, avoid_target_x):
+        lateral_limit = (
+            float(image_shape[1]) * self.config.hazard_lateral_ratio)
+        best = None
+        best_rank = -1.0
+        for det in detections:
+            if self._normalized_label(det) != "human":
+                continue
+            score = _finite_float(det.get("score"), 0.0)
+            if score < self.config.min_human_score:
+                continue
+            geom = self._detection_geom(det, image_shape)
+            if geom is None:
+                continue
+            lateral = abs(float(geom["cx"]) - float(avoid_target_x))
+            if (
+                not self.car_human_active
+                and lateral
+                > max(lateral_limit, float(geom["box_w"]) * 0.75)
+            ):
+                continue
+            rank = (
+                float(score)
+                + float(geom["bottom_ratio"])
+                - lateral / float(max(1, image_shape[1]))
+            )
+            if rank > best_rank:
+                best = {"geom": geom, "score": score}
+                best_rank = rank
+        return best
+
+    def _latched_car_target_x(self, path_x, image_shape):
+        scale = float(max(1, image_shape[1])) / 640.0
+        offset = (
+            float(self.car_avoid_side)
+            * float(self.car_avoid_offset_px_640)
+            * scale)
+        return _clamp(
+            float(path_x) + offset,
+            0.0,
+            float(max(0, image_shape[1] - 1)),
+        )
+
+    def _clear_car_avoidance_state(self):
+        self.car_avoid_side = 0
+        self.car_avoid_offset_px_640 = 0.0
+        self.car_avoid_hold_until = 0.0
+        self.car_human_active = False
+        self.car_human_waiting_cross = False
+        self.car_human_seen_avoid_side = False
+        self.car_human_last_seen_ts = 0.0
+        self.car_human_pass_until = 0.0
+
+    def _human_action(
+            self, detections, selected, image_shape, lookahead_y,
+            lookahead_path_x, now):
         humans = []
         for det in detections:
             if self._normalized_label(det) != "human":
@@ -2994,7 +3232,26 @@ class VisionControlPlanner:
                 "side": side,
                 "on_path": abs(distance) <= path_margin,
             })
+        if humans and not self.human_pass_active:
+            self.human_detected_latched = True
+            self.human_last_seen_ts = float(now)
         if not humans:
+            if self.human_pass_active:
+                self._clear_human_state()
+                return None
+            if self.human_detected_latched:
+                absence_age = max(
+                    0.0, float(now) - self.human_last_seen_ts)
+                if absence_age < self.config.human_absence_confirm_s:
+                    # A person leaving the image is ambiguous. Require one
+                    # continuous 1.5 s interval with no Human detections before
+                    # treating the scene as clear.
+                    return (
+                        STATE_SAFE_STOP,
+                        0.0,
+                        "human_absence_check",
+                        None,
+                    )
             self._clear_human_state()
             return None
 
@@ -3022,27 +3279,28 @@ class VisionControlPlanner:
             and self.human_last_side is not None
             and human["side"] != self.human_last_side
         )
-        release_distance = (
-            self.config.human_cross_release_px_640 *
-            float(max(1, image_shape[1])) / 640.0)
-        released_to_side = (
-            self.human_waiting_cross
-            and not human["on_path"]
-            and abs(float(human["distance"])) >= release_distance
-        )
-        if crossed or released_to_side:
+        if crossed:
+            self.human_waiting_cross = False
             self.human_pass_active = True
             self.human_pass_side = side
+            self.human_detected_latched = False
+            self.human_last_seen_ts = 0.0
             return self._human_pass_command(lookahead_path_x, image_shape, side)
 
-        if human["on_path"] and self._human_on_stop_line(geom, image_shape, lookahead_y):
+        if (
+            human["on_path"]
+            and self._human_on_stop_line(geom, image_shape, lookahead_y)
+        ):
             self.human_waiting_cross = True
             if human["side"] != 0:
                 self.human_last_side = human["side"]
             return STATE_SAFE_STOP, 0.0, "human_half_lookahead_stop", None
 
+        if self.human_waiting_cross:
+            return STATE_SAFE_STOP, 0.0, "human_wait_cross", None
+
         if not human["on_path"] and not self.human_waiting_cross:
-            self._clear_human_state()
+            self._clear_human_state(clear_detection=False)
         return None
 
     def _human_pass_command(self, path_x, image_shape, human_side):
@@ -3057,20 +3315,26 @@ class VisionControlPlanner:
         return STATE_AVOID_HUMAN, self.config.human_pass_speed_mps, "human_cross_pass", target_x
 
     def _human_on_stop_line(self, geom, image_shape, lookahead_y):
-        stop_y = float(image_shape[0]) - (
-            float(image_shape[0]) - float(lookahead_y)
-        ) * self.config.human_stop_progress_ratio
+        stop_y = self._human_stop_line_y(image_shape, lookahead_y)
         line_margin = float(image_shape[0]) * self.config.human_stop_line_margin_ratio
         return (
             float(geom["top"]) - line_margin <= stop_y <= float(geom["bottom"]) + line_margin
             or abs(float(geom["cy"]) - stop_y) <= line_margin
         )
 
-    def _clear_human_state(self):
+    def _human_stop_line_y(self, image_shape, lookahead_y):
+        return float(image_shape[0]) - (
+            float(image_shape[0]) - float(lookahead_y)
+        ) * self.config.human_stop_progress_ratio
+
+    def _clear_human_state(self, clear_detection=True):
         self.human_waiting_cross = False
         self.human_last_side = None
         self.human_pass_active = False
         self.human_pass_side = None
+        if clear_detection:
+            self.human_detected_latched = False
+            self.human_last_seen_ts = 0.0
 
     def _sign_should_stop(self, geom, image_shape, lookahead_y):
         area_ratio = geom.get("area_ratio")
@@ -3370,6 +3634,16 @@ def render_vision_control_debug(frame, result):
     lookahead_y = _finite_float(
         target.get("path_target_y"),
         _finite_float(target.get("lookahead_y"), h * 0.62))
+    human_stop_line_y = _finite_float(target.get("human_stop_line_y"))
+    if human_stop_line_y is not None:
+        stop_y = int(round(_clamp(human_stop_line_y, 0, h - 1)))
+        cv2.line(
+            frame, (0, stop_y), (w - 1, stop_y),
+            (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            frame, "HUMAN STOP", (max(4, w - 145), max(14, stop_y - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1,
+            cv2.LINE_AA)
     if target_x is not None:
         x = int(round(_clamp(target_x, 0, w - 1)))
         y = int(round(_clamp(lookahead_y, 0, h - 1)))
