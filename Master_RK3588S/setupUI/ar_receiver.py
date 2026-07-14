@@ -189,7 +189,13 @@ class RuntimeState:
             "detection_count": len(detections),
             "detection_labels": labels,
             "road_coverage": road_coverage,
-            "path_count": int(centerline.get("path_count", len(paths))),
+            "path_count": int(centerline.get(
+                "detected_path_count",
+                result.get(
+                    "detected_path_count",
+                    centerline.get("path_count", len(paths))))),
+            "valid_path_count": int(centerline.get(
+                "valid_path_count", len(paths))),
             "path_point_counts": [
                 len(path.get("points_xy"))
                 if path.get("points_xy") is not None else 0

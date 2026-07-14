@@ -68,6 +68,19 @@ export MULTITASK_RENDER_PATH_MIN_SCORE=0.35
 export MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE=0.40
 export MULTITASK_PATH_SOURCE=heatmap
 export VISION_CONTROL_PATH_SOURCE=heatmap
+export VISION_CONTROL_BLANK_PROBABILITY=0.05
+export VISION_CONTROL_PEAK_SCAN_TOP_RATIO=0.45
+export VISION_CONTROL_PEAK_SCAN_BOTTOM_RATIO=0.55
+export VISION_CONTROL_MIN_PEAK_COMPONENT_AREA=20
+export VISION_CONTROL_BOTTOM_REACH_RATIO=0.90
+export VISION_CONTROL_SIDE_EXIT_MIN_Y_RATIO=0.667
+export VISION_CONTROL_SIDE_EXIT_MARGIN_RATIO=0.05
+export VISION_CONTROL_RECOVERY_MAX_GAP_ROWS=12
+export VISION_CONTROL_RECOVERY_MAX_RADIUS=24
+export VISION_CONTROL_RECOVERY_MIN_PROBABILITY=0.35
+export VISION_CONTROL_RECOVERY_MIN_CONTINUATION_ROWS=8
+export VISION_CONTROL_RECOVERY_AMBIGUITY_MARGIN=0.08
+export VISION_CONTROL_CURVE_FIT_BLEND=0.25
 export VISION_CONTROL_PATH_EMA_ALPHA=0.40
 export VISION_CONTROL_PATH_SMOOTH_WINDOW=5
 export VISION_CONTROL_PATH_MAX_STEP_640=48
@@ -149,6 +162,18 @@ ridge from each path heatmap for the preview and visual-control candidates.
 Set `MULTITASK_PATH_SOURCE=curve` to compare the model's direct `path_points`
 output. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
 overridden independently for comparison.
+
+The visual controller derives the one/two-path decision from horizontal peaks
+inside the middle 45%-55% image band. Peaks are checked from strongest to
+weakest; low-confidence peaks and components smaller than 20 heatmap pixels
+are skipped. Accepted peaks seed a greedy hysteresis trace. Values below 0.05
+are blank. A trace is valid if it reaches the bottom 10% of the image, or a
+left/right edge margin inside the lower third. One short interruption can be
+bridged using a robust quadratic prediction, but only when the lower segment
+is strong, continuous, reaches a valid exit, and is unambiguous. Observed
+points receive only a small fitted correction; blank bridge points use the
+fitted curve. `AR Preview` outlines the scan band and displays the resulting
+path count.
 
 Route classification changes only after six consecutive confirming frames.
 The selected path slot is held across eight missing frames, and an OCR-locked

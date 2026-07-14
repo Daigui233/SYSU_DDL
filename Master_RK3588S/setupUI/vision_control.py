@@ -215,6 +215,21 @@ class VisionControlConfig:
     collect_speed_mps: float = 0.15
     turnsign_slow_speed_mps: float = 0.08
     heat_threshold: float = 0.22
+    blank_probability: float = 0.05
+    peak_scan_top_ratio: float = 0.45
+    peak_scan_bottom_ratio: float = 0.55
+    min_peak_component_area: int = 20
+    peak_min_distance_px: int = 8
+    greedy_search_radius_px: int = 8
+    bottom_reach_ratio: float = 0.90
+    side_exit_min_y_ratio: float = 2.0 / 3.0
+    side_exit_margin_ratio: float = 0.05
+    recovery_max_gap_rows: int = 12
+    recovery_max_radius_px: int = 24
+    recovery_min_probability: float = 0.35
+    recovery_min_continuation_rows: int = 8
+    recovery_ambiguity_margin: float = 0.08
+    curve_fit_blend: float = 0.25
     road_mask_threshold: float = 0.20
     heat_peak_top_k: int = 6
     row_step: int = 2
@@ -285,6 +300,46 @@ class VisionControlConfig:
             collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.15)),
             turnsign_slow_speed_mps=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_SLOW_SPEED", 0.08)),
             heat_threshold=_clamp(_env_float("VISION_CONTROL_HEAT_THRESHOLD", 0.22), 0.01, 0.99),
+            blank_probability=_clamp(
+                _env_float("VISION_CONTROL_BLANK_PROBABILITY", 0.05),
+                0.0, 0.99),
+            peak_scan_top_ratio=_clamp(
+                _env_float("VISION_CONTROL_PEAK_SCAN_TOP_RATIO", 0.45),
+                0.05, 0.90),
+            peak_scan_bottom_ratio=_clamp(
+                _env_float("VISION_CONTROL_PEAK_SCAN_BOTTOM_RATIO", 0.55),
+                0.10, 0.95),
+            min_peak_component_area=max(
+                1, _env_int("VISION_CONTROL_MIN_PEAK_COMPONENT_AREA", 20)),
+            peak_min_distance_px=max(
+                1, _env_int("VISION_CONTROL_PEAK_MIN_DISTANCE", 8)),
+            greedy_search_radius_px=max(
+                1, _env_int("VISION_CONTROL_GREEDY_SEARCH_RADIUS", 8)),
+            bottom_reach_ratio=_clamp(
+                _env_float("VISION_CONTROL_BOTTOM_REACH_RATIO", 0.90),
+                0.60, 1.0),
+            side_exit_min_y_ratio=_clamp(
+                _env_float("VISION_CONTROL_SIDE_EXIT_MIN_Y_RATIO", 2.0 / 3.0),
+                0.40, 0.95),
+            side_exit_margin_ratio=_clamp(
+                _env_float("VISION_CONTROL_SIDE_EXIT_MARGIN_RATIO", 0.05),
+                0.01, 0.25),
+            recovery_max_gap_rows=max(
+                0, _env_int("VISION_CONTROL_RECOVERY_MAX_GAP_ROWS", 12)),
+            recovery_max_radius_px=max(
+                1, _env_int("VISION_CONTROL_RECOVERY_MAX_RADIUS", 24)),
+            recovery_min_probability=_clamp(
+                _env_float("VISION_CONTROL_RECOVERY_MIN_PROBABILITY", 0.35),
+                0.05, 0.99),
+            recovery_min_continuation_rows=max(
+                2, _env_int(
+                    "VISION_CONTROL_RECOVERY_MIN_CONTINUATION_ROWS", 8)),
+            recovery_ambiguity_margin=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_RECOVERY_AMBIGUITY_MARGIN", 0.08)),
+            curve_fit_blend=_clamp(
+                _env_float("VISION_CONTROL_CURVE_FIT_BLEND", 0.25),
+                0.0, 0.75),
             road_mask_threshold=_clamp(_env_float("VISION_CONTROL_ROAD_MASK_THRESHOLD", 0.20), 0.0, 1.0),
             heat_peak_top_k=max(1, _env_int("VISION_CONTROL_HEAT_TOP_K", 6)),
             row_step=max(1, _env_int("VISION_CONTROL_ROW_STEP", 2)),
@@ -556,12 +611,533 @@ class HeatmapPathSearch:
         return float(bottom[0]) * float(max(heatmap_width - 1, 1)) / img_w
 
 
+class HeatmapPeakPathDetector:
+    """Seed paths in a middle band and trace them to a safe screen exit."""
+
+    def __init__(self, config=None):
+        self.config = config or VisionControlConfig.from_env()
+
+    def extract(self, heatmaps, image_shape=(480, 640, 3)):
+        heatmaps = np.clip(np.asarray(heatmaps, dtype=np.float32), 0.0, 1.0)
+        if heatmaps.ndim != 3 or heatmaps.shape[0] < 1:
+            return [], self._empty_debug()
+        heatmaps = heatmaps[:2]
+        _channels, height, width = heatmaps.shape
+        if height < 2 or width < 3:
+            return [], self._empty_debug()
+
+        top, bottom = self._scan_rows(height)
+        channel_profiles = np.mean(
+            heatmaps[:, top:bottom + 1, :], axis=1)
+        for slot in range(len(channel_profiles)):
+            channel_profiles[slot] = cv2.GaussianBlur(
+                channel_profiles[slot].reshape((1, -1)),
+                (5, 1), 0.0).reshape((-1,))
+        profile = np.max(channel_profiles, axis=0)
+        peaks = self._profile_peaks(profile)
+        component_data = [
+            self._components(channel) for channel in heatmaps
+        ]
+
+        accepted = []
+        examined = []
+        for peak_x in peaks:
+            peak_probability = float(profile[peak_x])
+            record = {
+                "x": int(peak_x),
+                "probability": peak_probability,
+                "accepted": False,
+            }
+            if peak_probability < float(self.config.heat_threshold):
+                record["reason"] = "peak_probability_too_low"
+                examined.append(record)
+                continue
+
+            candidate = None
+            slot_order = np.argsort(channel_profiles[:, peak_x])[::-1]
+            slot_rejections = []
+            for slot_value in slot_order:
+                slot = int(slot_value)
+                slot_probability = float(channel_profiles[slot, peak_x])
+                if slot_probability < float(self.config.heat_threshold):
+                    slot_rejections.append("slot_probability_too_low")
+                    continue
+                labels, stats = component_data[slot]
+                seed = self._seed_in_band(
+                    heatmaps[slot], labels, peak_x, top, bottom)
+                if seed is None:
+                    slot_rejections.append("blank_seed")
+                    continue
+                seed_x, seed_y, label = seed
+                component_area = int(stats[label, cv2.CC_STAT_AREA])
+                if component_area < int(self.config.min_peak_component_area):
+                    slot_rejections.append("component_too_small")
+                    continue
+                trace_result = self._trace_component_to_exit(
+                    heatmaps[slot], labels, stats,
+                    label, seed_x, seed_y)
+                if trace_result is None:
+                    slot_rejections.append("does_not_reach_allowed_exit")
+                    continue
+                traced, trace_meta = trace_result
+                points, probabilities = self._to_image_points(
+                    traced, image_shape, (height, width))
+                supported_probabilities = probabilities[
+                    probabilities >= float(self.config.blank_probability)]
+                mean_probability = float(np.mean(supported_probabilities))
+                support_ratio = float(
+                    len(supported_probabilities)) / float(len(probabilities))
+                candidate = {
+                    "source": "heatmap_hysteresis_greedy",
+                    "source_slot": slot,
+                    "source_slots": {slot},
+                    "slot": slot,
+                    "points_xy": points,
+                    "point_confidences": probabilities,
+                    "score": mean_probability,
+                    "heatmap_score": mean_probability,
+                    "peak_probability": peak_probability,
+                    "peak_x": int(peak_x),
+                    "peak_y": int(seed_y),
+                    "component_area": component_area,
+                    "component_count": 1 + int(trace_meta["bridge_count"]),
+                    "coverage": float(len(traced)) / float(height),
+                    "road_support": 1.0,
+                    "valid_exit": True,
+                    "exit_type": str(trace_meta["exit_type"]),
+                    "reaches_bottom_region": (
+                        trace_meta["exit_type"] == "bottom"),
+                    "bottom_reach_ratio": float(
+                        self.config.bottom_reach_ratio),
+                    "side_exit_min_y_ratio": float(
+                        self.config.side_exit_min_y_ratio),
+                    "occlusion_bridge_count": int(
+                        trace_meta["bridge_count"]),
+                    "occlusion_bridge_rows": int(
+                        trace_meta["bridge_rows"]),
+                    "curve_fit_degree": int(
+                        trace_meta["curve_fit_degree"]),
+                    "curve_fit_rmse": float(
+                        trace_meta["curve_fit_rmse"]),
+                    "hysteresis_high_threshold": float(
+                        self.config.heat_threshold),
+                    "hysteresis_low_threshold": float(
+                        self.config.blank_probability),
+                    "heat_supported": True,
+                    "heat_support_ratio": support_ratio,
+                    "heat_support_min": float(np.min(probabilities)),
+                    "heat_support_mean": mean_probability,
+                    "heat_support_low_run": int(trace_meta["bridge_rows"]),
+                    "spatial_prefiltered": True,
+                }
+                record.update({
+                    "accepted": True,
+                    "source_slot": slot,
+                    "component_area": component_area,
+                    "exit_type": str(trace_meta["exit_type"]),
+                    "bridge_rows": int(trace_meta["bridge_rows"]),
+                })
+                break
+
+            if candidate is None:
+                record["reason"] = (
+                    slot_rejections[0] if slot_rejections
+                    else "no_supporting_channel")
+            else:
+                accepted.append(candidate)
+            examined.append(record)
+            if len(accepted) == 2:
+                break
+
+        debug = {
+            "scan_rows": [int(top), int(bottom)],
+            "scan_ratios": [
+                float(top) / float(max(height - 1, 1)),
+                float(bottom) / float(max(height - 1, 1)),
+            ],
+            "blank_probability": float(self.config.blank_probability),
+            "peak_probability_threshold": float(self.config.heat_threshold),
+            "min_component_area": int(self.config.min_peak_component_area),
+            "bottom_reach_ratio": float(self.config.bottom_reach_ratio),
+            "side_exit_min_y_ratio": float(
+                self.config.side_exit_min_y_ratio),
+            "side_exit_margin_ratio": float(
+                self.config.side_exit_margin_ratio),
+            "peaks_examined": examined,
+            "valid_path_count": len(accepted),
+            # The requested route decision is binary: two valid paths, or one.
+            "detected_path_count": 2 if len(accepted) >= 2 else 1,
+        }
+        return accepted, debug
+
+    def _scan_rows(self, height):
+        top_ratio = float(self.config.peak_scan_top_ratio)
+        bottom_ratio = float(self.config.peak_scan_bottom_ratio)
+        if bottom_ratio < top_ratio:
+            top_ratio, bottom_ratio = bottom_ratio, top_ratio
+        top = int(round(top_ratio * float(height - 1)))
+        bottom = int(round(bottom_ratio * float(height - 1)))
+        top = max(0, min(height - 2, top))
+        bottom = max(top + 1, min(height - 1, bottom))
+        return top, bottom
+
+    def _profile_peaks(self, profile):
+        profile = np.asarray(profile, dtype=np.float32)
+        if profile.size < 3:
+            return []
+        candidates = []
+        if profile[0] >= profile[1]:
+            candidates.append(0)
+        candidates.extend((np.flatnonzero(
+            (profile[1:-1] >= profile[:-2]) &
+            (profile[1:-1] >= profile[2:])) + 1).tolist())
+        if profile[-1] >= profile[-2]:
+            candidates.append(len(profile) - 1)
+        candidates = sorted(
+            set(candidates), key=lambda x: float(profile[x]), reverse=True)
+        selected = []
+        min_distance = max(1, int(self.config.peak_min_distance_px))
+        for x in candidates:
+            if float(profile[x]) < float(self.config.blank_probability):
+                continue
+            if all(abs(int(x) - kept) >= min_distance for kept in selected):
+                selected.append(int(x))
+        return selected
+
+    def _components(self, heatmap):
+        foreground = (
+            np.asarray(heatmap, dtype=np.float32) >=
+            float(self.config.blank_probability))
+        _count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            foreground.astype(np.uint8), connectivity=8)
+        return labels, stats
+
+    def _seed_in_band(self, heatmap, labels, peak_x, top, bottom):
+        radius = max(1, int(self.config.peak_min_distance_px) // 3)
+        left = max(0, int(peak_x) - radius)
+        right = min(heatmap.shape[1] - 1, int(peak_x) + radius)
+        region = heatmap[top:bottom + 1, left:right + 1]
+        if region.size == 0:
+            return None
+        flat_order = np.argsort(region.reshape(-1))[::-1]
+        for flat_index in flat_order:
+            local_y, local_x = np.unravel_index(int(flat_index), region.shape)
+            seed_x = left + int(local_x)
+            seed_y = top + int(local_y)
+            label = int(labels[seed_y, seed_x])
+            if (label > 0 and
+                    float(heatmap[seed_y, seed_x]) >=
+                    float(self.config.blank_probability)):
+                return seed_x, seed_y, label
+        return None
+
+    def _trace_component_to_exit(
+            self, heatmap, labels, stats, label, seed_x, seed_y):
+        downward = self._trace_direction(
+            heatmap, labels, label, seed_x, seed_y, 1, include_seed=True)
+        bridge_rows = 0
+        bridge_count = 0
+        exit_type = self._allowed_exit_type(
+            downward[-1] if downward else None, heatmap.shape)
+        if exit_type is None:
+            recovery = self._recover_below_gap(
+                heatmap, labels, stats, downward)
+            if recovery is None:
+                return None
+            bridge, continuation, exit_type = recovery
+            bridge_rows = len(bridge)
+            bridge_count = 1
+            downward.extend(bridge)
+            downward.extend(continuation)
+
+        upward = self._trace_direction(
+            heatmap, labels, label, seed_x, seed_y, -1,
+            include_seed=False)
+        traced = list(reversed(downward)) + upward
+        if len(traced) < int(self.config.min_path_points):
+            return None
+        traced, fit_meta = self._fit_and_filter_trace(
+            traced, heatmap.shape[1])
+        return traced, {
+            "exit_type": str(exit_type),
+            "bridge_count": bridge_count,
+            "bridge_rows": bridge_rows,
+            "curve_fit_degree": int(fit_meta["degree"]),
+            "curve_fit_rmse": float(fit_meta["rmse"]),
+        }
+
+    def _recover_below_gap(self, heatmap, labels, stats, downward):
+        """Conservatively reconnect one short occlusion gap below a track."""
+        if (not downward or
+                int(self.config.recovery_max_gap_rows) <= 0):
+            return None
+        last_x = float(downward[-1][0])
+        last_y = int(downward[-1][1])
+        maximum_gap = min(
+            int(self.config.recovery_max_gap_rows),
+            heatmap.shape[0] - 1 - last_y)
+        if maximum_gap <= 0:
+            return None
+
+        recent = downward[-min(18, len(downward)):]
+        minimum_probability = max(
+            float(self.config.heat_threshold),
+            float(self.config.recovery_min_probability))
+        minimum_area = max(
+            int(self.config.min_peak_component_area),
+            int(self.config.recovery_min_continuation_rows))
+        seen_labels = set()
+        candidates = []
+        for offset in range(1, maximum_gap + 1):
+            row = last_y + offset
+            predicted_x = float(self._predict_curve_x(recent, row))
+            predicted_x = _clamp(
+                predicted_x, 0.0, heatmap.shape[1] - 1.0)
+            radius = min(
+                int(self.config.recovery_max_radius_px),
+                int(self.config.greedy_search_radius_px) + offset)
+            left = max(0, int(math.floor(predicted_x - radius)))
+            right = min(
+                heatmap.shape[1] - 1,
+                int(math.ceil(predicted_x + radius)))
+            xs = np.arange(left, right + 1, dtype=np.int32)
+            eligible = (
+                (labels[row, xs] > 0) &
+                (heatmap[row, xs] >= minimum_probability))
+            xs = xs[eligible]
+            for candidate_label in np.unique(labels[row, xs]).tolist():
+                candidate_label = int(candidate_label)
+                if candidate_label <= 0 or candidate_label in seen_labels:
+                    continue
+                seen_labels.add(candidate_label)
+                if int(stats[candidate_label, cv2.CC_STAT_AREA]) < minimum_area:
+                    continue
+                label_xs = xs[labels[row, xs] == candidate_label]
+                if not len(label_xs):
+                    continue
+                values = heatmap[row, label_xs].astype(np.float32)
+                distances = np.abs(
+                    label_xs.astype(np.float32) - predicted_x)
+                local_scores = values - distances * float(
+                    self.config.jump_weight)
+                best_index = int(np.argmax(local_scores))
+                candidate_x = int(label_xs[best_index])
+                continuation = self._trace_direction(
+                    heatmap, labels, candidate_label,
+                    candidate_x, row, 1, include_seed=True)
+                exit_type = self._allowed_exit_type(
+                    continuation[-1] if continuation else None,
+                    heatmap.shape)
+                if exit_type is None:
+                    continue
+                minimum_rows = min(
+                    int(self.config.recovery_min_continuation_rows),
+                    max(2, heatmap.shape[0] - row))
+                if len(continuation) < minimum_rows:
+                    continue
+                distance_ratio = (
+                    abs(float(candidate_x) - predicted_x) /
+                    float(max(1, radius)))
+                continuation_probability = float(np.mean([
+                    point[2] for point in continuation[
+                        :min(len(continuation), 12)]
+                ]))
+                score = (
+                    float(heatmap[row, candidate_x]) +
+                    0.10 * continuation_probability -
+                    0.45 * distance_ratio -
+                    0.015 * float(offset))
+                candidates.append({
+                    "score": score,
+                    "seed_x": candidate_x,
+                    "seed_y": row,
+                    "predicted_x": predicted_x,
+                    "continuation": continuation,
+                    "exit_type": exit_type,
+                })
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: float(item["score"]), reverse=True)
+        if (len(candidates) > 1 and
+                float(candidates[0]["score"]) -
+                float(candidates[1]["score"]) <
+                float(self.config.recovery_ambiguity_margin)):
+            return None
+
+        selected = candidates[0]
+        bridge = []
+        for row in range(last_y + 1, int(selected["seed_y"])):
+            x = self._predict_curve_x(recent, row)
+            x = _clamp(x, 0.0, heatmap.shape[1] - 1.0)
+            bridge.append((float(x), float(row), 0.0))
+        return (
+            bridge,
+            list(selected["continuation"]),
+            str(selected["exit_type"]),
+        )
+
+    def _allowed_exit_type(self, point, heatmap_shape):
+        if point is None:
+            return None
+        height, width = heatmap_shape[:2]
+        x, y = float(point[0]), float(point[1])
+        bottom_start = int(math.ceil(
+            float(self.config.bottom_reach_ratio) *
+            float(height - 1)))
+        if y >= bottom_start:
+            return "bottom"
+        side_y_start = int(math.ceil(
+            float(self.config.side_exit_min_y_ratio) *
+            float(height - 1)))
+        side_margin = max(
+            1.0,
+            float(self.config.side_exit_margin_ratio) *
+            float(width - 1))
+        if y >= side_y_start and x <= side_margin:
+            return "left_side"
+        if y >= side_y_start and x >= float(width - 1) - side_margin:
+            return "right_side"
+        return None
+
+    def _fit_and_filter_trace(self, traced, heatmap_width):
+        """Robust quadratic fit with conservative correction of observed x."""
+        values = np.asarray(traced, dtype=np.float64)
+        if len(values) < 3:
+            return traced, {"degree": 0, "rmse": 0.0}
+        supported = values[:, 2] >= float(self.config.blank_probability)
+        if int(np.count_nonzero(supported)) < 3:
+            return traced, {"degree": 0, "rmse": 0.0}
+        observed = values[supported]
+        degree = 2 if len(observed) >= 7 and np.ptp(observed[:, 1]) >= 6 else 1
+        center = float(np.mean(observed[:, 1]))
+        scale = max(1.0, float(np.ptp(observed[:, 1])) * 0.5)
+        normalized_y = (observed[:, 1] - center) / scale
+        weights = np.sqrt(np.clip(
+            observed[:, 2], float(self.config.blank_probability), 1.0))
+        coefficients = np.polyfit(
+            normalized_y, observed[:, 0], degree, w=weights)
+        predicted_observed = np.polyval(coefficients, normalized_y)
+        residuals = observed[:, 0] - predicted_observed
+        median = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - median)))
+        inlier_limit = max(2.0, 3.5 * 1.4826 * mad)
+        inliers = np.abs(residuals - median) <= inlier_limit
+        if int(np.count_nonzero(inliers)) >= degree + 2:
+            coefficients = np.polyfit(
+                normalized_y[inliers], observed[inliers, 0], degree,
+                w=weights[inliers])
+            predicted_observed = np.polyval(coefficients, normalized_y)
+            residuals = observed[:, 0] - predicted_observed
+
+        predicted = np.polyval(
+            coefficients, (values[:, 1] - center) / scale)
+        blend = float(self.config.curve_fit_blend)
+        corrections = np.clip(predicted - values[:, 0], -3.0, 3.0)
+        values[supported, 0] += blend * corrections[supported]
+        values[~supported, 0] = predicted[~supported]
+        values[:, 0] = np.clip(values[:, 0], 0.0, heatmap_width - 1.0)
+        rmse = float(np.sqrt(np.mean(residuals * residuals)))
+        return [tuple(row) for row in values.tolist()], {
+            "degree": degree,
+            "rmse": rmse,
+        }
+
+    def _predict_curve_x(self, points, target_y):
+        points = np.asarray(points, dtype=np.float64)
+        if len(points) < 2:
+            return float(points[-1, 0]) if len(points) else 0.0
+        degree = 2 if len(points) >= 7 and np.ptp(points[:, 1]) >= 6 else 1
+        center = float(points[-1, 1])
+        scale = max(1.0, float(np.ptp(points[:, 1])))
+        normalized_y = (points[:, 1] - center) / scale
+        weights = np.sqrt(np.clip(
+            points[:, 2], float(self.config.blank_probability), 1.0))
+        coefficients = np.polyfit(
+            normalized_y, points[:, 0], degree, w=weights)
+        predicted = float(np.polyval(
+            coefficients, (float(target_y) - center) / scale))
+        # Keep short extrapolations close to the recent tangent so a noisy
+        # quadratic cannot jump to an unrelated lower component.
+        tail = points[-min(6, len(points)):]
+        linear = np.polyfit(tail[:, 1], tail[:, 0], 1)
+        tangent = float(np.polyval(linear, float(target_y)))
+        allowance = max(
+            2.0, 0.5 * abs(float(target_y) - center))
+        return _clamp(predicted, tangent - allowance, tangent + allowance)
+
+    def _trace_direction(
+            self, heatmap, labels, label, seed_x, seed_y, step,
+            include_seed):
+        points = []
+        current_x = int(seed_x)
+        previous_x = None
+        if include_seed:
+            points.append((
+                float(current_x), float(seed_y),
+                float(heatmap[seed_y, current_x])))
+        row = int(seed_y) + int(step)
+        radius = max(1, int(self.config.greedy_search_radius_px))
+        low = float(self.config.blank_probability)
+        while 0 <= row < heatmap.shape[0]:
+            predicted_x = current_x
+            if previous_x is not None:
+                predicted_x += current_x - previous_x
+            left = max(0, min(current_x, predicted_x) - radius)
+            right = min(
+                heatmap.shape[1] - 1,
+                max(current_x, predicted_x) + radius)
+            xs = np.arange(left, right + 1, dtype=np.int32)
+            valid = (
+                (labels[row, xs] == int(label)) &
+                (heatmap[row, xs] >= low))
+            xs = xs[valid]
+            if not len(xs):
+                break
+            values = heatmap[row, xs].astype(np.float32)
+            jump = np.abs(xs.astype(np.float32) - float(predicted_x))
+            scores = values - jump * float(self.config.jump_weight)
+            best = int(np.argmax(scores))
+            next_x = int(xs[best])
+            points.append((
+                float(next_x), float(row), float(heatmap[row, next_x])))
+            previous_x, current_x = current_x, next_x
+            row += int(step)
+        return points
+
+    @staticmethod
+    def _to_image_points(traced, image_shape, heatmap_shape):
+        traced = np.asarray(traced, dtype=np.float32)
+        heat_h, heat_w = heatmap_shape
+        img_h, img_w = image_shape[:2]
+        points = np.empty((len(traced), 2), dtype=np.float32)
+        points[:, 0] = (
+            traced[:, 0] * float(max(img_w - 1, 1)) /
+            float(max(heat_w - 1, 1)))
+        points[:, 1] = (
+            traced[:, 1] * float(max(img_h - 1, 1)) /
+            float(max(heat_h - 1, 1)))
+        return points, traced[:, 2].copy()
+
+    @staticmethod
+    def _empty_debug():
+        return {
+            "scan_rows": [],
+            "scan_ratios": [],
+            "blank_probability": 0.05,
+            "peaks_examined": [],
+            "valid_path_count": 0,
+            "detected_path_count": 1,
+        }
+
+
 class VisionControlPlanner:
     """Convert pure visual perception into one TC264D command and debug packet."""
 
     def __init__(self, config=None, log_func=None):
         self.config = config or VisionControlConfig.from_env()
         self.path_search = HeatmapPathSearch(self.config)
+        self.peak_path_detector = HeatmapPeakPathDetector(self.config)
         self.log_func = log_func
         self.last_selected_points = None
         self.last_slot_points = {}
@@ -646,6 +1222,13 @@ class VisionControlPlanner:
             "default_outer_elapsed": self._default_outer_elapsed(now),
             "selected_slot": None if selected is None else int(selected.get("slot", -1)),
             "candidate_count": len(candidates),
+            "detected_path_count": int(perception_result.get(
+                "detected_path_count", 2 if len(candidates) >= 2 else 1)),
+            "valid_path_count": int((perception_result.get(
+                "heatmap_peak_detection") or {}).get(
+                    "valid_path_count", len(candidates))),
+            "heatmap_peak_detection": dict(perception_result.get(
+                "heatmap_peak_detection") or {}),
             "candidates": [self._summarize_candidate(item, image_shape) for item in candidates],
             "heatmap_lines": [
                 self._debug_path_points(item)
@@ -754,39 +1337,15 @@ class VisionControlPlanner:
                 road = result.get("road_mask")
             effective_maps, support_maps, _has_road = (
                 self._prepare_heatmap_support_maps(heatmaps, road))
-            component_lines, invalid_slots = self._extract_heatmap_debug_lines(
-                effective_maps, None, image_shape,
-                support_maps=support_maps, return_invalid=True)
-            candidate_pool = list(component_lines)
-
-            # Keep channel-local continuous search as a per-channel fallback
-            # for rejected component centers or a channel with no candidate;
-            # it does not wait for every other channel to fail.
-            represented_slots = set().union(*(
-                set(line.get("source_slots") or {
-                    int(line.get("source_slot", -1))})
-                for line in component_lines
-            )) if component_lines else set()
-            fallback_slots = (
-                set(range(min(2, effective_maps.shape[0]))) -
-                represented_slots) | set(invalid_slots)
-            for source_slot in sorted(fallback_slots):
-                candidate = self.path_search.search(
-                    effective_maps[source_slot],
-                    road_mask=None,
-                    image_shape=image_shape,
-                    slot=source_slot,
-                    history_points=None,
-                )
-                if candidate is not None:
-                    candidate["source_slot"] = int(source_slot)
-                    candidate["source_slots"] = {int(source_slot)}
-                    if self._annotate_heat_support(
-                            candidate, image_shape, support_maps):
-                        candidate_pool.append(candidate)
-
-            candidates = self._select_heatmap_lines(
-                candidate_pool, image_shape)[:2]
+            candidates, peak_debug = self.peak_path_detector.extract(
+                effective_maps, image_shape=image_shape)
+            result["heatmap_peak_detection"] = peak_debug
+            result["detected_path_count"] = int(
+                peak_debug["detected_path_count"])
+            centerline["detected_path_count"] = int(
+                peak_debug["detected_path_count"])
+            centerline["valid_path_count"] = int(
+                peak_debug["valid_path_count"])
             result["heatmap_debug_lines"] = list(candidates)
 
         candidates = self._assign_heatmap_slots(candidates[:2], image_shape)
@@ -828,7 +1387,9 @@ class VisionControlPlanner:
                 "source_slot", line.get("slot", -1)))}
         metrics = _path_heat_support_metrics(
             line.get("points_xy"), image_shape, support_maps,
-            source_slots, self.config.min_path_support_probability,
+            source_slots, float(line.get(
+                "hysteresis_low_threshold",
+                self.config.min_path_support_probability)),
             require_all_channels=require_all_channels)
         line["heat_support_ratio"] = metrics["support_ratio"]
         line["heat_support_min"] = metrics["min_probability"]
@@ -2382,6 +2943,11 @@ class VisionControlPlanner:
             "score": float(candidate.get("score", 0.0)),
             "coverage": float(candidate.get("coverage", 0.0)),
             "road_support": road_support,
+            "exit_type": str(candidate.get("exit_type") or ""),
+            "occlusion_bridge_rows": int(candidate.get(
+                "occlusion_bridge_rows", 0)),
+            "curve_fit_rmse": float(candidate.get(
+                "curve_fit_rmse", 0.0)),
             "near_x": None if len(points) == 0 else float(points[np.argmax(points[:, 1]), 0]),
             "lookahead_x": _interp_path_x(points, image_shape[0] * 0.62),
         }
@@ -2410,6 +2976,16 @@ def render_vision_control_debug(frame, result):
     selected_slot = debug.get("selected_slot")
     center_x = int(round(w * _clamp(_env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8)))
     cv2.line(frame, (center_x, int(h * 0.45)), (center_x, h - 1), (210, 210, 210), 1, cv2.LINE_AA)
+
+    peak_detection = result.get("heatmap_peak_detection") or {}
+    scan_ratios = peak_detection.get("scan_ratios") or []
+    if len(scan_ratios) == 2:
+        scan_top = int(round(_clamp(scan_ratios[0], 0.0, 1.0) * (h - 1)))
+        scan_bottom = int(round(_clamp(scan_ratios[1], 0.0, 1.0) * (h - 1)))
+        cv2.rectangle(
+            frame, (0, min(scan_top, scan_bottom)),
+            (w - 1, max(scan_top, scan_bottom)),
+            (30, 230, 255), 1, cv2.LINE_AA)
 
     for line in _extract_heatmap_preview_lines(result, frame.shape):
         points = np.rint(line["points_xy"]).astype(np.int32)
@@ -2441,6 +3017,13 @@ def render_vision_control_debug(frame, result):
         float(command.get("track_error", 0.0)),
     )
     cv2.putText(frame, text, (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
+    detected_count = int(debug.get(
+        "detected_path_count",
+        peak_detection.get("detected_path_count", 1)))
+    cv2.putText(
+        frame, "PATH COUNT: {}".format(detected_count),
+        (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+        (30, 230, 255), 2, cv2.LINE_AA)
     return frame
 
 

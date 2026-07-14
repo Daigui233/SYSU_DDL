@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -8,6 +9,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 from vision_control import (  # noqa: E402
+    HeatmapPeakPathDetector,
     HeatmapPathSearch,
     ROUTE_MULTI_FORK,
     STATE_AVOID_CAR,
@@ -19,6 +21,7 @@ from vision_control import (  # noqa: E402
     VisionControlPlanner,
     _extract_heatmap_preview_lines,
     _identity_probability_color,
+    render_vision_control_debug,
 )
 
 
@@ -40,7 +43,7 @@ def _config(**overrides):
 
 
 def _draw_heat_path(heatmap, x_at_y):
-    _draw_heat_path_range(heatmap, x_at_y, 20, heatmap.shape[0] - 1)
+    _draw_heat_path_range(heatmap, x_at_y, 20, heatmap.shape[0])
 
 
 def _draw_heat_path_range(heatmap, x_at_y, start_y, end_y):
@@ -121,6 +124,188 @@ def _confirm_ocr(planner, direction="right", start=2.0, active=False):
         now=start,
     )
     return command, debug
+
+
+class HeatmapPeakPathDetectorTest(unittest.TestCase):
+    def test_skips_small_high_peak_and_uses_next_two_valid_peaks(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        left = _straight_heatmap(34)[0] * 0.70
+        right = _straight_heatmap(126)[0] * 0.65
+        heatmaps[0] = np.maximum(left, right)
+        heatmaps[0, 54:66, 79:82] = 1.0
+        detector = HeatmapPeakPathDetector(_config(
+            min_peak_component_area=50,
+            bottom_reach_ratio=0.90,
+        ))
+
+        paths, debug = detector.extract(heatmaps, (480, 640, 3))
+
+        self.assertEqual(2, len(paths))
+        self.assertEqual(2, debug["detected_path_count"])
+        self.assertEqual("component_too_small", debug["peaks_examined"][0]["reason"])
+        self.assertEqual([34, 126], sorted(
+            int(path["peak_x"]) for path in paths))
+
+    def test_peak_below_high_threshold_is_ignored(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0] = np.maximum(
+            _straight_heatmap(46)[0] * 0.80,
+            _straight_heatmap(112)[0] * 0.08)
+        detector = HeatmapPeakPathDetector(_config(
+            heat_threshold=0.10,
+            bottom_reach_ratio=0.90,
+        ))
+
+        paths, debug = detector.extract(heatmaps, (480, 640, 3))
+
+        self.assertEqual(1, len(paths))
+        self.assertEqual(1, debug["detected_path_count"])
+        self.assertTrue(any(
+            item.get("reason") == "peak_probability_too_low"
+            for item in debug["peaks_examined"]))
+
+    def test_path_must_reach_configured_bottom_region(self):
+        short = np.zeros((1, 120, 160), dtype=np.float32)
+        _draw_heat_path_range(short[0], lambda _y: 80.0, 20, 106)
+        long_enough = np.zeros_like(short)
+        _draw_heat_path_range(
+            long_enough[0], lambda _y: 80.0, 20, 109)
+        detector = HeatmapPeakPathDetector(_config(
+            bottom_reach_ratio=0.90,
+        ))
+
+        short_paths, short_debug = detector.extract(
+            short, (480, 640, 3))
+        long_paths, long_debug = detector.extract(
+            long_enough, (480, 640, 3))
+
+        self.assertEqual([], short_paths)
+        self.assertEqual(0, short_debug["valid_path_count"])
+        self.assertEqual(1, len(long_paths))
+        self.assertEqual(1, long_debug["valid_path_count"])
+        self.assertGreaterEqual(
+            float(np.max(long_paths[0]["points_xy"][:, 1])),
+            0.90 * 479.0)
+
+    def test_probability_below_point_zero_five_is_blank(self):
+        at_threshold = np.zeros((1, 120, 160), dtype=np.float32)
+        at_threshold[0, 20:72, 79:82] = 0.80
+        at_threshold[0, 72:109, 79:82] = 0.05
+        below_threshold = at_threshold.copy()
+        below_threshold[0, 72:109, 79:82] = 0.049
+        detector = HeatmapPeakPathDetector(_config(
+            blank_probability=0.05,
+            bottom_reach_ratio=0.90,
+            min_peak_component_area=10,
+        ))
+
+        valid_paths, _debug = detector.extract(
+            at_threshold, (480, 640, 3))
+        blank_paths, blank_debug = detector.extract(
+            below_threshold, (480, 640, 3))
+
+        self.assertEqual(1, len(valid_paths))
+        self.assertEqual([], blank_paths)
+        self.assertEqual(0.05, blank_debug["blank_probability"])
+
+    def test_ar_preview_overlay_contains_detected_path_count(self):
+        result = _result(_fork_heatmaps())
+        VisionControlPlanner(config=_config()).update(result, now=1.0)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("vision_control.cv2.putText") as put_text:
+            render_vision_control_debug(frame, result)
+
+        texts = [str(call.args[1]) for call in put_text.call_args_list]
+        self.assertTrue(any(
+            text.startswith("PATH COUNT: 2") for text in texts))
+
+    def test_short_occlusion_gap_is_reconnected_to_strong_lower_line(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        curve = lambda y: 70.0 + 0.10 * float(y)
+        _draw_heat_path_range(heatmaps[0], curve, 20, 76)
+        _draw_heat_path_range(heatmaps[0], curve, 84, 120)
+        detector = HeatmapPeakPathDetector(_config(
+            recovery_max_gap_rows=12,
+            recovery_min_probability=0.35,
+        ))
+
+        paths, debug = detector.extract(heatmaps, (480, 640, 3))
+
+        self.assertEqual(1, len(paths))
+        self.assertEqual(1, debug["valid_path_count"])
+        self.assertEqual(1, paths[0]["occlusion_bridge_count"])
+        self.assertEqual(8, paths[0]["occlusion_bridge_rows"])
+        self.assertEqual("bottom", paths[0]["exit_type"])
+
+    def test_ambiguous_lower_lines_are_not_reconnected(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        _draw_heat_path_range(
+            heatmaps[0], lambda _y: 80.0, 20, 76)
+        _draw_heat_path_range(
+            heatmaps[0], lambda _y: 73.0, 84, 120)
+        _draw_heat_path_range(
+            heatmaps[0], lambda _y: 87.0, 84, 120)
+        detector = HeatmapPeakPathDetector(_config(
+            recovery_ambiguity_margin=0.08,
+        ))
+
+        paths, debug = detector.extract(heatmaps, (480, 640, 3))
+
+        self.assertEqual([], paths)
+        self.assertEqual(0, debug["valid_path_count"])
+        self.assertEqual(
+            "does_not_reach_allowed_exit",
+            debug["peaks_examined"][0]["reason"])
+
+    def test_quadratic_fit_filters_row_to_row_jitter(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+
+        def base_curve(y):
+            return 72.0 + 0.002 * (float(y) - 70.0) ** 2
+
+        def noisy_curve(y):
+            return base_curve(y) + (2.0 if y % 2 else -2.0)
+
+        _draw_heat_path_range(heatmaps[0], noisy_curve, 20, 120)
+        detector = HeatmapPeakPathDetector(_config(curve_fit_blend=0.50))
+
+        paths, _debug = detector.extract(heatmaps, (480, 640, 3))
+
+        self.assertEqual(1, len(paths))
+        path = paths[0]
+        heat_xs = path["points_xy"][:, 0] * 159.0 / 639.0
+        heat_ys = path["points_xy"][:, 1] * 119.0 / 479.0
+        expected = np.asarray(
+            [base_curve(y) for y in heat_ys], dtype=np.float32)
+        filtered_rmse = float(np.sqrt(np.mean(
+            (heat_xs - expected) ** 2)))
+        self.assertEqual(2, path["curve_fit_degree"])
+        self.assertLess(filtered_rmse, 1.2)
+
+    def test_side_exit_is_valid_only_in_lower_third(self):
+        def side_curve(y):
+            if y <= 65:
+                return 30.0
+            return max(0.0, 30.0 - 1.5 * (float(y) - 65.0))
+
+        lower_exit = np.zeros((1, 120, 160), dtype=np.float32)
+        _draw_heat_path_range(lower_exit[0], side_curve, 20, 90)
+        upper_exit = np.zeros_like(lower_exit)
+        _draw_heat_path_range(upper_exit[0], side_curve, 20, 75)
+        detector = HeatmapPeakPathDetector(_config(
+            side_exit_min_y_ratio=2.0 / 3.0,
+            side_exit_margin_ratio=0.05,
+        ))
+
+        lower_paths, _lower_debug = detector.extract(
+            lower_exit, (480, 640, 3))
+        upper_paths, _upper_debug = detector.extract(
+            upper_exit, (480, 640, 3))
+
+        self.assertEqual(1, len(lower_paths))
+        self.assertEqual("left_side", lower_paths[0]["exit_type"])
+        self.assertEqual([], upper_paths)
 
 
 class VisionControlPlannerTest(unittest.TestCase):
@@ -211,7 +396,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(1, debug["candidate_count"])
         self.assertGreater(debug["candidates"][0]["near_x"], 400.0)
 
-    def test_low_heat_gap_is_not_joined_into_one_centerline(self):
+    def test_peak_without_middle_band_support_is_not_a_candidate(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
         _draw_heat_path_range(heatmaps[0], lambda _y: 72.0, 20, 54)
         _draw_heat_path_range(heatmaps[0], lambda _y: 74.0, 70, 119)
@@ -223,17 +408,9 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         _command, debug = planner.update(result, now=1.0)
 
-        self.assertEqual(2, debug["candidate_count"])
-        self.assertTrue(all(
-            int(path.get("component_count", 1)) == 1
-            for path in result["paths"]))
-        self.assertTrue(all(
-            path["heat_support_low_run"] == 0
-            for path in result["paths"]))
-        self.assertFalse(any(
-            float(np.min(path["points_xy"][:, 1])) < 250.0 and
-            float(np.max(path["points_xy"][:, 1])) > 300.0
-            for path in result["paths"]))
+        self.assertEqual(0, debug["candidate_count"])
+        self.assertEqual(1, debug["detected_path_count"])
+        self.assertEqual(0, debug["valid_path_count"])
 
     def test_overlapping_fork_keeps_two_independent_supported_paths(self):
         planner = VisionControlPlanner(config=_config(overlap_px_640=28.0))
@@ -316,7 +493,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertTrue(longest["heat_supported"])
         self.assertEqual(0, longest["heat_support_low_run"])
 
-    def test_low_heat_weighted_center_is_rejected_and_channel_falls_back(self):
+    def test_two_middle_band_peaks_in_one_channel_make_two_paths(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
         _draw_heat_path(heatmaps[0], lambda _y: 55.0)
         _draw_heat_path(heatmaps[0], lambda _y: 75.0)
@@ -325,13 +502,12 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         VisionControlPlanner(config=_config()).update(result, now=1.0)
 
-        self.assertEqual(1, len(result["paths"]))
-        path = result["paths"][0]
-        self.assertEqual("heatmap_viterbi", path["source"])
-        heat_x = float(np.mean(path["points_xy"][:, 0])) * 159.0 / 639.0
-        self.assertGreater(abs(heat_x - 65.0), 6.0)
-        self.assertTrue(path["heat_supported"])
-        self.assertEqual(0, path["heat_support_low_run"])
+        self.assertEqual(2, len(result["paths"]))
+        self.assertEqual(2, result["detected_path_count"])
+        self.assertTrue(all(
+            path["source"] == "heatmap_hysteresis_greedy" and
+            path["reaches_bottom_region"]
+            for path in result["paths"]))
 
     def test_left_right_identity_survives_heatmap_channel_swap(self):
         planner = VisionControlPlanner(config=_config())
