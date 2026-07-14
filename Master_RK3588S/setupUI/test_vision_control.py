@@ -284,7 +284,7 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
         self.assertIn((200, 300), centers)
         self.assertIn((255, 300), centers)
 
-    def test_ar_preview_draws_human_stop_line_at_y_345(self):
+    def test_ar_preview_draws_human_stop_line_at_y_340(self):
         result = {
             "vision_control": {
                 "selected_slot": 0,
@@ -292,7 +292,7 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
                     "path_target_x": 320.0,
                     "path_target_y": 300.0,
                     "target_x": 320.0,
-                    "human_stop_line_y": 345.0,
+                    "human_stop_line_y": 340.0,
                 },
                 "command": {"track_error": 0.0},
             },
@@ -307,7 +307,7 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
             (call.args[1], call.args[2], call.args[3])
             for call in line.call_args_list
         ]
-        self.assertIn(((0, 345), (639, 345), (0, 255, 255)), segments)
+        self.assertIn(((0, 340), (639, 340), (0, 255, 255)), segments)
 
     def test_short_occlusion_gap_is_reconnected_to_strong_lower_line(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
@@ -398,6 +398,76 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
 
 
 class VisionControlPlannerTest(unittest.TestCase):
+    def test_default_human_stop_line_is_above_old_line_but_below_lookahead(self):
+        planner = VisionControlPlanner(config=VisionControlConfig())
+
+        stop_y = planner._human_stop_line_y((480, 640, 3), 300.0)
+
+        self.assertAlmostEqual(339.6, stop_y)
+        self.assertGreaterEqual(stop_y, 300.0)
+        self.assertLess(stop_y, 345.0)
+
+    def test_human_touching_line_stops_even_far_from_planned_path(self):
+        planner = VisionControlPlanner(config=_config())
+        off_path_human_at_line = [{
+            "label": "Human",
+            "score": 0.95,
+            "bbox": [20.0, 260.0, 80.0, 350.0],
+        }]
+
+        command, debug = planner.update(
+            _result(
+                _straight_heatmap(80),
+                detections=off_path_human_at_line),
+            now=1.0,
+        )
+
+        self.assertEqual(STATE_SAFE_STOP, command["state_cmd"])
+        self.assertEqual(0.0, command["target_speed"])
+        self.assertEqual(
+            "human_half_lookahead_stop",
+            debug["control_target"]["task_reason"],
+        )
+
+    def test_near_preline_disappearance_waits_and_reappearance_drives(self):
+        planner = VisionControlPlanner(config=_config(
+            human_absence_confirm_s=1.5,
+            human_preline_missing_px_480=20.0,
+        ))
+        near_line_human = [{
+            "label": "Human",
+            "score": 0.95,
+            "bbox": [20.0, 240.0, 80.0, 325.0],
+        }]
+
+        seen, _ = planner.update(
+            _result(_straight_heatmap(80), detections=near_line_human),
+            now=1.0,
+        )
+        missing, missing_debug = planner.update(
+            _result(_straight_heatmap(80), detections=[]), now=1.1)
+        reappeared, reappeared_debug = planner.update(
+            _result(_straight_heatmap(80), detections=near_line_human),
+            now=1.2,
+        )
+        missing_again, _ = planner.update(
+            _result(_straight_heatmap(80), detections=[]), now=1.3)
+        timeout, timeout_debug = planner.update(
+            _result(_straight_heatmap(80), detections=[]), now=2.81)
+
+        self.assertEqual(STATE_TRACK, seen["state_cmd"])
+        self.assertEqual(STATE_SAFE_STOP, missing["state_cmd"])
+        self.assertEqual(
+            "human_preline_absence_check",
+            missing_debug["control_target"]["task_reason"],
+        )
+        self.assertEqual(STATE_TRACK, reappeared["state_cmd"])
+        self.assertEqual(
+            "track", reappeared_debug["control_target"]["task_reason"])
+        self.assertEqual(STATE_SAFE_STOP, missing_again["state_cmd"])
+        self.assertEqual(STATE_TRACK, timeout["state_cmd"])
+        self.assertEqual("track", timeout_debug["control_target"]["task_reason"])
+
     def test_overlapping_heatmaps_can_still_be_multi_fork(self):
         planner = VisionControlPlanner(config=_config())
         command, debug = planner.update(_result(_fork_heatmaps()), now=1.0)
@@ -982,13 +1052,16 @@ class VisionControlPlannerTest(unittest.TestCase):
             "score": 0.90,
             "bbox": [282.0, 260.0, 358.0, 420.0],
         }]
-        command, debug = VisionControlPlanner(config=_config()).update(
+        command, debug = VisionControlPlanner(config=_config(
+            normal_speed_mps=0.17,
+            obstacle_speed_mps=0.04,
+        )).update(
             _result(_straight_heatmap(80), detections=detections),
             now=1.0,
         )
 
         self.assertEqual(STATE_AVOID_CAR, command["state_cmd"])
-        self.assertGreater(command["target_speed"], 0.0)
+        self.assertAlmostEqual(0.17, command["target_speed"])
         self.assertEqual("car_in_path_bias", debug["control_target"]["task_reason"])
 
     def test_locked_curve_is_baseline_for_car_avoidance_offset(self):
@@ -1045,12 +1118,12 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(STATE_TRACK, resume_command["state_cmd"])
         self.assertEqual("track", resume_debug["control_target"]["task_reason"])
 
-    def test_human_behind_car_cannot_flip_side_then_passes_at_point_two_five(self):
+    def test_human_behind_car_cannot_flip_side_then_passes_at_point_three(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve",
             path_smooth_window=1,
             car_avoid_hold_s=2.0,
-            car_human_pass_speed_mps=0.25,
+            car_human_pass_speed_mps=0.30,
             car_human_pass_hold_s=2.0,
         ))
         car_and_human = _curve_result_at(200.0, 430.0)
@@ -1098,9 +1171,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         wait_target = wait_debug["control_target"]
         pass_target = pass_debug["control_target"]
         hold_target = hold_debug["control_target"]
-        self.assertEqual(STATE_AVOID_HUMAN, approach_command["state_cmd"])
+        self.assertEqual(STATE_AVOID_CAR, approach_command["state_cmd"])
         self.assertEqual(
-            "car_human_same_side_approach", approach_target["task_reason"])
+            "car_human_preline_approach", approach_target["task_reason"])
         self.assertGreater(approach_target["task_offset_x"], 0.0)
         self.assertEqual(STATE_SAFE_STOP, wait_command["state_cmd"])
         self.assertEqual(0.0, wait_command["target_speed"])
@@ -1113,7 +1186,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             missing_debug["control_target"]["task_reason"],
         )
         self.assertEqual(STATE_AVOID_HUMAN, pass_command["state_cmd"])
-        self.assertAlmostEqual(0.25, pass_command["target_speed"])
+        self.assertAlmostEqual(0.30, pass_command["target_speed"])
         self.assertEqual("car_human_same_side_pass", pass_target["task_reason"])
         self.assertGreater(pass_target["task_offset_x"], 0.0)
         self.assertAlmostEqual(
@@ -1122,14 +1195,14 @@ class VisionControlPlannerTest(unittest.TestCase):
             delta=0.01,
         )
         self.assertEqual(STATE_AVOID_HUMAN, hold_command["state_cmd"])
-        self.assertAlmostEqual(0.25, hold_command["target_speed"])
+        self.assertAlmostEqual(0.30, hold_command["target_speed"])
         self.assertEqual(
             "car_human_same_side_pass_hold", hold_target["task_reason"])
         self.assertGreater(hold_target["task_offset_x"], 0.0)
         self.assertEqual(STATE_TRACK, resume_command["state_cmd"])
         self.assertEqual("track", resume_debug["control_target"]["task_reason"])
 
-    def test_car_human_absence_clears_human_then_finishes_car_hold(self):
+    def test_car_human_far_preline_absence_is_ignored_during_car_hold(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve",
             path_smooth_window=1,
@@ -1158,9 +1231,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         clear_command, clear_debug = planner.update(
             _curve_result_at(200.0, 430.0), now=3.01)
 
-        self.assertEqual(STATE_SAFE_STOP, checking_command["state_cmd"])
+        self.assertEqual(STATE_AVOID_CAR, checking_command["state_cmd"])
         self.assertEqual(
-            "car_human_absence_check",
+            "car_avoid_hold",
             checking_debug["control_target"]["task_reason"],
         )
         self.assertEqual(STATE_AVOID_CAR, car_hold_command["state_cmd"])
@@ -1170,6 +1243,52 @@ class VisionControlPlannerTest(unittest.TestCase):
             car_hold_debug["control_target"]["task_offset_x"], 0.0)
         self.assertEqual(STATE_TRACK, clear_command["state_cmd"])
         self.assertEqual("track", clear_debug["control_target"]["task_reason"])
+
+    def test_car_human_near_preline_dropout_waits_then_reappears_at_car_speed(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            normal_speed_mps=0.17,
+            obstacle_speed_mps=0.04,
+            car_avoid_hold_s=2.0,
+            human_absence_confirm_s=1.5,
+            human_preline_missing_px_480=20.0,
+        ))
+        car_and_human = _curve_result_at(200.0, 430.0)
+        car_and_human["detections"] = [
+            {
+                "label": "Car",
+                "score": 0.90,
+                "bbox": [160.0, 280.0, 220.0, 420.0],
+            },
+            {
+                "label": "Human",
+                "score": 0.95,
+                "bbox": [270.0, 240.0, 330.0, 325.0],
+            },
+        ]
+        human_reappeared = _curve_result_at(200.0, 430.0)
+        human_reappeared["detections"] = [car_and_human["detections"][1]]
+
+        approach, _ = planner.update(car_and_human, now=1.0)
+        missing, missing_debug = planner.update(
+            _curve_result_at(200.0, 430.0), now=1.1)
+        reappeared, reappeared_debug = planner.update(
+            human_reappeared, now=1.2)
+
+        self.assertEqual(STATE_AVOID_CAR, approach["state_cmd"])
+        self.assertAlmostEqual(0.17, approach["target_speed"])
+        self.assertEqual(STATE_SAFE_STOP, missing["state_cmd"])
+        self.assertEqual(
+            "car_human_preline_absence_check",
+            missing_debug["control_target"]["task_reason"],
+        )
+        self.assertEqual(STATE_AVOID_CAR, reappeared["state_cmd"])
+        self.assertAlmostEqual(0.17, reappeared["target_speed"])
+        self.assertEqual(
+            "car_human_preline_approach",
+            reappeared_debug["control_target"]["task_reason"],
+        )
 
     def test_locked_curve_is_baseline_for_coin_offset(self):
         result = _curve_result_at(200.0, 430.0)
@@ -1426,7 +1545,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(
             "human_cross_pass", resume_debug["control_target"]["task_reason"])
 
-    def test_human_absence_requires_full_one_point_five_seconds(self):
+    def test_human_far_preline_absence_is_ignored(self):
         planner = VisionControlPlanner(config=_config(
             human_absence_confirm_s=1.5))
         approaching_human = [{
@@ -1449,10 +1568,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         )
 
         self.assertEqual(STATE_TRACK, seen_command["state_cmd"])
-        self.assertEqual(STATE_SAFE_STOP, checking_command["state_cmd"])
-        self.assertEqual(0.0, checking_command["target_speed"])
+        self.assertEqual(STATE_TRACK, checking_command["state_cmd"])
         self.assertEqual(
-            "human_absence_check",
+            "track",
             checking_debug["control_target"]["task_reason"],
         )
         self.assertEqual(STATE_TRACK, clear_command["state_cmd"])
@@ -1516,11 +1634,11 @@ class VisionControlPlannerTest(unittest.TestCase):
         )
 
         self.assertEqual(STATE_AVOID_HUMAN, pass_command["state_cmd"])
-        self.assertAlmostEqual(0.35, pass_command["target_speed"])
+        self.assertAlmostEqual(0.30, pass_command["target_speed"])
         self.assertLess(pass_command["track_error"], 0.0)
         self.assertEqual("human_cross_pass", pass_debug["control_target"]["task_reason"])
         self.assertEqual(STATE_AVOID_HUMAN, hold_command["state_cmd"])
-        self.assertAlmostEqual(0.35, hold_command["target_speed"])
+        self.assertAlmostEqual(0.30, hold_command["target_speed"])
         self.assertEqual("human_speed_hold", hold_debug["control_target"]["task_reason"])
         self.assertAlmostEqual(
             pass_debug["control_target"]["task_offset_x"],

@@ -205,13 +205,13 @@ def _path_point_probabilities(points, image_shape, support_maps, source_slots):
 class VisionControlConfig:
     visual_center_x: float = 0.50
     lookahead_y_ratio: float = 0.625
-    max_track_error_640: float = 210.0
-    max_error_step_640: float = 36.0
+    max_track_error_640: float = 160.0
+    max_error_step_640: float = 24.0
     normal_speed_mps: float = 0.15
     recover_speed_mps: float = 0.15
     obstacle_speed_mps: float = 0.15
     human_speed_mps: float = 0.15
-    human_pass_speed_mps: float = 0.35
+    human_pass_speed_mps: float = 0.30
     collect_speed_mps: float = 0.15
     turnsign_slow_speed_mps: float = 0.08
     heat_threshold: float = 0.22
@@ -277,15 +277,16 @@ class VisionControlConfig:
     sign_ocr_timeout_s: float = 8.0
     sign_ocr_pulse_speed_mps: float = 0.25
     sign_ocr_pulse_duration_s: float = 0.30
-    human_stop_line_margin_ratio: float = 0.08
-    human_stop_progress_ratio: float = 0.75
+    human_stop_line_margin_ratio: float = 0.0
+    human_stop_progress_ratio: float = 0.78
+    human_preline_missing_px_480: float = 20.0
     human_cross_release_px_640: float = 45.0
     human_pass_offset_px_640: float = 38.0
     human_speed_hold_s: float = 0.5
     human_absence_confirm_s: float = 1.5
     car_avoid_offset_px_640: float = 55.0
     car_avoid_hold_s: float = 2.0
-    car_human_pass_speed_mps: float = 0.25
+    car_human_pass_speed_mps: float = 0.30
     car_human_pass_hold_s: float = 2.0
     human_avoid_offset_px_640: float = 75.0
     avoid_box_width_gain: float = 0.35
@@ -301,13 +302,13 @@ class VisionControlConfig:
         return cls(
             visual_center_x=_clamp(_env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8),
             lookahead_y_ratio=_clamp(_env_float("VISION_CONTROL_LOOKAHEAD_Y_RATIO", 0.625), 0.25, 0.95),
-            max_track_error_640=max(1.0, _env_float("VISION_CONTROL_MAX_ERROR_640", 210.0)),
-            max_error_step_640=max(1.0, _env_float("VISION_CONTROL_MAX_STEP_640", 36.0)),
+            max_track_error_640=max(1.0, _env_float("VISION_CONTROL_MAX_ERROR_640", 160.0)),
+            max_error_step_640=max(1.0, _env_float("VISION_CONTROL_MAX_STEP_640", 24.0)),
             normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.15)),
             recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.15)),
             obstacle_speed_mps=max(0.0, _env_float("VISION_CONTROL_OBSTACLE_SPEED", 0.15)),
             human_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED", 0.15)),
-            human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.35)),
+            human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
             collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.15)),
             turnsign_slow_speed_mps=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_SLOW_SPEED", 0.08)),
             heat_threshold=_clamp(_env_float("VISION_CONTROL_HEAT_THRESHOLD", 0.22), 0.01, 0.99),
@@ -414,15 +415,16 @@ class VisionControlConfig:
             sign_ocr_timeout_s=max(0.1, _env_float("VISION_CONTROL_SIGN_OCR_TIMEOUT_S", 8.0)),
             sign_ocr_pulse_speed_mps=max(0.0, _env_float("VISION_CONTROL_SIGN_OCR_PULSE_SPEED", 0.25)),
             sign_ocr_pulse_duration_s=max(0.0, _env_float("VISION_CONTROL_SIGN_OCR_PULSE_DURATION_S", 0.30)),
-            human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.08), 0.0, 0.5),
-            human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 0.75), 0.0, 1.0),
+            human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
+            human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 0.78), 0.0, 1.0),
+            human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
             human_cross_release_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_CROSS_RELEASE_640", 45.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
             car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 55.0)),
             car_avoid_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_HOLD_S", 2.0)),
-            car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.25)),
+            car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.30)),
             car_human_pass_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S", 2.0)),
             human_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_AVOID_OFFSET_640", 75.0)),
             avoid_box_width_gain=max(0.0, _env_float("VISION_CONTROL_AVOID_BOX_WIDTH_GAIN", 0.35)),
@@ -1207,6 +1209,8 @@ class VisionControlPlanner:
         self.human_speed_hold_until = 0.0
         self.human_detected_latched = False
         self.human_last_seen_ts = 0.0
+        self.human_preline_last_gap_px_480 = None
+        self.human_preline_wait_until = 0.0
         self.car_avoid_side = 0
         self.car_avoid_offset_px_640 = 0.0
         self.car_avoid_hold_until = 0.0
@@ -3042,15 +3046,36 @@ class VisionControlPlanner:
             )
 
         if human is not None:
+            geom = human["geom"]
+            reached_line = self._human_on_stop_line(
+                geom, image_shape, lookahead_y)
+            if not self.car_human_active and not reached_line:
+                preline_side = self._sign(
+                    float(geom["cx"]) - float(avoid_target_x))
+                if preline_side == self.car_avoid_side:
+                    self.car_human_seen_avoid_side = True
+                # A visible person before the stop line does not take control
+                # away from the car route. Remember only the vertical gap so a
+                # near-line detector dropout can trigger the 1.5 s safety wait.
+                self._record_human_preline_gap(
+                    geom, image_shape, lookahead_y)
+                return (
+                    STATE_AVOID_CAR,
+                    self.config.normal_speed_mps,
+                    "car_human_preline_approach",
+                    avoid_target_x,
+                )
+
             if not self.car_human_active:
                 self.car_human_active = True
                 self._clear_human_state()
                 self.human_pass_offset_x = 0.0
                 self.human_speed_hold_until = 0.0
+            self._clear_human_preline_state()
             self.car_human_last_seen_ts = float(now)
 
             human_side = self._sign(
-                float(human["geom"]["cx"]) - float(avoid_target_x))
+                float(geom["cx"]) - float(avoid_target_x))
             if human_side == self.car_avoid_side:
                 self.car_human_seen_avoid_side = True
 
@@ -3071,8 +3096,7 @@ class VisionControlPlanner:
                     avoid_target_x,
                 )
 
-            geom = human["geom"]
-            if self._human_on_stop_line(geom, image_shape, lookahead_y):
+            if reached_line:
                 self.car_human_waiting_cross = True
             if self.car_human_waiting_cross:
                 return (
@@ -3081,12 +3105,6 @@ class VisionControlPlanner:
                     "car_human_same_side_wait",
                     avoid_target_x,
                 )
-            return (
-                STATE_AVOID_HUMAN,
-                self.config.obstacle_speed_mps,
-                "car_human_same_side_approach",
-                avoid_target_x,
-            )
 
         if self.car_human_active:
             absence_age = max(
@@ -3110,10 +3128,18 @@ class VisionControlPlanner:
                 self._clear_car_avoidance_state()
                 return None
 
+        elif self._human_preline_missing_waiting(now):
+            return (
+                STATE_SAFE_STOP,
+                0.0,
+                "car_human_preline_absence_check",
+                avoid_target_x,
+            )
+
         reason = "car_in_path_bias" if car is not None else "car_avoid_hold"
         return (
             STATE_AVOID_CAR,
-            self.config.obstacle_speed_mps,
+            self.config.normal_speed_mps,
             reason,
             avoid_target_x,
         )
@@ -3150,10 +3176,8 @@ class VisionControlPlanner:
 
     def _best_car_context_human(
             self, detections, image_shape, avoid_target_x):
-        lateral_limit = (
-            float(image_shape[1]) * self.config.hazard_lateral_ratio)
         best = None
-        best_rank = -1.0
+        best_rank = (-1.0, -1.0)
         for det in detections:
             if self._normalized_label(det) != "human":
                 continue
@@ -3163,18 +3187,9 @@ class VisionControlPlanner:
             geom = self._detection_geom(det, image_shape)
             if geom is None:
                 continue
-            lateral = abs(float(geom["cx"]) - float(avoid_target_x))
-            if (
-                not self.car_human_active
-                and lateral
-                > max(lateral_limit, float(geom["box_w"]) * 0.75)
-            ):
-                continue
-            rank = (
-                float(score)
-                + float(geom["bottom_ratio"])
-                - lateral / float(max(1, image_shape[1]))
-            )
+            # Vertical progress is primary: a lower-confidence person already
+            # at the line must beat a higher-confidence person farther away.
+            rank = (float(geom["bottom_ratio"]), float(score))
             if rank > best_rank:
                 best = {"geom": geom, "score": score}
                 best_rank = rank
@@ -3220,21 +3235,13 @@ class VisionControlPlanner:
                 path_x = lookahead_path_x
             distance = float(geom["cx"]) - float(path_x)
             side = self._sign(distance)
-            path_margin = max(
-                float(image_shape[1]) * self.config.hazard_lateral_ratio,
-                float(geom["box_w"]) * 0.75,
-            )
             humans.append({
                 "geom": geom,
                 "score": score,
                 "path_x": path_x,
                 "distance": distance,
                 "side": side,
-                "on_path": abs(distance) <= path_margin,
             })
-        if humans and not self.human_pass_active:
-            self.human_detected_latched = True
-            self.human_last_seen_ts = float(now)
         if not humans:
             if self.human_pass_active:
                 self._clear_human_state()
@@ -3252,22 +3259,25 @@ class VisionControlPlanner:
                         "human_absence_check",
                         None,
                     )
+            elif self._human_preline_missing_waiting(now):
+                return (
+                    STATE_SAFE_STOP,
+                    0.0,
+                    "human_preline_absence_check",
+                    None,
+                )
             self._clear_human_state()
             return None
 
         human = max(
             humans,
             key=lambda item: (
-                bool(item["on_path"]),
                 float(item["geom"]["bottom_ratio"]),
                 float(item["score"]),
             ),
         )
         geom = human["geom"]
         side = human["side"] or self.human_last_side or 1
-        if human["side"] != 0:
-            if self.human_last_side is None:
-                self.human_last_side = human["side"]
 
         if self.human_pass_active:
             self.human_pass_side = side
@@ -3287,20 +3297,20 @@ class VisionControlPlanner:
             self.human_last_seen_ts = 0.0
             return self._human_pass_command(lookahead_path_x, image_shape, side)
 
-        if (
-            human["on_path"]
-            and self._human_on_stop_line(geom, image_shape, lookahead_y)
-        ):
+        if self._human_on_stop_line(geom, image_shape, lookahead_y):
+            self._clear_human_preline_state()
+            self.human_detected_latched = True
+            self.human_last_seen_ts = float(now)
             self.human_waiting_cross = True
             if human["side"] != 0:
                 self.human_last_side = human["side"]
             return STATE_SAFE_STOP, 0.0, "human_half_lookahead_stop", None
 
         if self.human_waiting_cross:
+            self.human_last_seen_ts = float(now)
             return STATE_SAFE_STOP, 0.0, "human_wait_cross", None
 
-        if not human["on_path"] and not self.human_waiting_cross:
-            self._clear_human_state(clear_detection=False)
+        self._record_human_preline_gap(geom, image_shape, lookahead_y)
         return None
 
     def _human_pass_command(self, path_x, image_shape, human_side):
@@ -3317,15 +3327,40 @@ class VisionControlPlanner:
     def _human_on_stop_line(self, geom, image_shape, lookahead_y):
         stop_y = self._human_stop_line_y(image_shape, lookahead_y)
         line_margin = float(image_shape[0]) * self.config.human_stop_line_margin_ratio
-        return (
-            float(geom["top"]) - line_margin <= stop_y <= float(geom["bottom"]) + line_margin
-            or abs(float(geom["cy"]) - stop_y) <= line_margin
-        )
+        # People approach this horizontal line from the top of the image. Once
+        # the bottom edge reaches or passes it, the crossing must be handled
+        # even when the detector skipped the exact contact frame.
+        return float(geom["bottom"]) + line_margin >= stop_y
 
     def _human_stop_line_y(self, image_shape, lookahead_y):
         return float(image_shape[0]) - (
             float(image_shape[0]) - float(lookahead_y)
         ) * self.config.human_stop_progress_ratio
+
+    def _record_human_preline_gap(self, geom, image_shape, lookahead_y):
+        stop_y = self._human_stop_line_y(image_shape, lookahead_y)
+        gap = max(0.0, stop_y - float(geom["bottom"]))
+        self.human_preline_last_gap_px_480 = (
+            gap * 480.0 / float(max(1, image_shape[0])))
+        # Reappearance before the line immediately releases a dropout wait.
+        self.human_preline_wait_until = 0.0
+
+    def _human_preline_missing_waiting(self, now):
+        gap = self.human_preline_last_gap_px_480
+        if gap is None or gap > self.config.human_preline_missing_px_480:
+            self._clear_human_preline_state()
+            return False
+        if self.human_preline_wait_until <= 0.0:
+            self.human_preline_wait_until = (
+                float(now) + self.config.human_absence_confirm_s)
+        if float(now) < self.human_preline_wait_until:
+            return True
+        self._clear_human_preline_state()
+        return False
+
+    def _clear_human_preline_state(self):
+        self.human_preline_last_gap_px_480 = None
+        self.human_preline_wait_until = 0.0
 
     def _clear_human_state(self, clear_detection=True):
         self.human_waiting_cross = False
@@ -3335,6 +3370,7 @@ class VisionControlPlanner:
         if clear_detection:
             self.human_detected_latched = False
             self.human_last_seen_ts = 0.0
+            self._clear_human_preline_state()
 
     def _sign_should_stop(self, geom, image_shape, lookahead_y):
         area_ratio = geom.get("area_ratio")
