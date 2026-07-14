@@ -1150,9 +1150,10 @@ class VisionControlPlanner:
         self.route_initialized = False
         self.pending_route_state = None
         self.pending_route_frames = 0
-        self.branch_lock = None
-        self.branch_lock_source = None
-        self.selected_slot_lock = None
+        curve_defaults_blue = self.config.path_source == "curve"
+        self.branch_lock = "left" if curve_defaults_blue else None
+        self.branch_lock_source = "default" if curve_defaults_blue else None
+        self.selected_slot_lock = 0 if curve_defaults_blue else None
         self.selected_slot_missing_frames = 0
         self.path_missing_frames = {}
         self.fork_seen_since = None
@@ -2438,6 +2439,22 @@ class VisionControlPlanner:
         return ROUTE_AMBIGUOUS, "weak_separation"
 
     def _update_default_outer(self, route_state, now, ocr_current):
+        if self.config.path_source == "curve":
+            # Row-head slot identity is fixed: slot 0 is the blue/default
+            # route and slot 1 is the green/right route. Never let proximity
+            # to the vehicle or merge geometry override this policy.
+            if self.branch_lock_source != "ocr":
+                self._set_default_curve_branch()
+            if route_state == ROUTE_MULTI_FORK:
+                self.single_seen_frames = 0
+                if self.fork_seen_since is None:
+                    self.fork_seen_since = now
+            elif route_state == ROUTE_SINGLE:
+                self.fork_seen_since = None
+                self.single_seen_frames += 1
+            else:
+                self.single_seen_frames = 0
+            return
         if route_state == ROUTE_MULTI_FORK:
             self.single_seen_frames = 0
             if self.fork_seen_since is None:
@@ -2953,8 +2970,17 @@ class VisionControlPlanner:
             return False
         if now - self.last_valid_ocr_ts < self.config.ocr_lock_lifetime_s:
             return False
-        self._clear_branch_lock()
+        if self.config.path_source == "curve":
+            self._set_default_curve_branch()
+        else:
+            self._clear_branch_lock()
         return True
+
+    def _set_default_curve_branch(self):
+        self.branch_lock = "left"
+        self.branch_lock_source = "default"
+        self.selected_slot_lock = 0
+        self.selected_slot_missing_frames = 0
 
     def _clear_branch_lock(self):
         self.branch_lock = None
