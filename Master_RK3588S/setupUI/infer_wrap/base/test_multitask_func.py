@@ -169,6 +169,21 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         path = result["curve_paths"][0]
         self.assertTrue(path["road_constrained"])
         self.assertTrue(np.all(path["points_xy"][:, 0] >= 20 / 159 * 320))
+        expected_y = np.linspace(1.0, 0.40, 32) * 240
+        np.testing.assert_allclose(
+            path["points_xy"][:, 1], expected_y, atol=1e-4)
+
+    def test_row_path_truncates_tail_after_large_lateral_jump(self):
+        outputs = list(self.make_outputs())
+        outputs[3][0, 1, :, :] = -8.0
+        outputs[3][0, 1, :24, 108] = 8.0
+        outputs[3][0, 1, 24:, 30] = 8.0
+
+        result = decode_outputs(outputs, (480, 640, 3))
+        right = result["curve_paths"][1]
+
+        self.assertEqual(right["row_indices"].tolist(), list(range(24)))
+        self.assertEqual(len(right["points_xy"]), 24)
 
     def test_pixel_logits_receive_exactly_one_sigmoid(self):
         outputs = list(self.make_outputs())
