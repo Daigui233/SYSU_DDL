@@ -12,7 +12,21 @@ from .ar_receiver import (
 
 class ArReceiverSingletonTest(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_skeleton_defaults_skip_duplicate_ridge_and_raw_heatmap_render(self):
+    def test_road_mask_experiment_is_the_direct_receiver_default(self):
+        configure_perception_defaults()
+
+        self.assertEqual("curve", os.environ["VISION_CONTROL_PATH_SOURCE"])
+        self.assertEqual("curve", os.environ["MULTITASK_PATH_SOURCE"])
+        self.assertEqual("road_mask", os.environ["MULTITASK_RENDER_MODE"])
+        self.assertEqual("0", os.environ["AR_VISION_CONTROL_DEBUG"])
+        self.assertEqual("0", os.environ["AR_VISION_CONTROL_SEND"])
+        self.assertEqual("0", os.environ["AR_CONTROL_RUNTIME_ENABLED"])
+        self.assertNotIn("AR_TURNSIGN_OCR_ENABLED", os.environ)
+
+    @mock.patch.dict(os.environ, {
+        "AR_ROAD_MASK_EXPERIMENT": "0",
+    }, clear=True)
+    def test_disabling_experiment_restores_skeleton_defaults(self):
         configure_perception_defaults()
 
         self.assertEqual("skeleton", os.environ["VISION_CONTROL_PATH_SOURCE"])
@@ -20,6 +34,7 @@ class ArReceiverSingletonTest(unittest.TestCase):
         self.assertEqual("drive", os.environ["MULTITASK_RENDER_MODE"])
 
     @mock.patch.dict(os.environ, {
+        "AR_ROAD_MASK_EXPERIMENT": "0",
         "VISION_CONTROL_PATH_SOURCE": "skeleton",
         "MULTITASK_PATH_SOURCE": "heatmap",
         "MULTITASK_RENDER_MODE": "heatmap",

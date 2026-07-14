@@ -74,6 +74,18 @@ cd ~/Desktop/setupUI
 python3 ar_receiver.py
 ```
 
+查看仅经过阈值和一次 3x3 闭运算的初始赛道分割 Mask：
+
+```bash
+cd ~/Desktop/setupUI
+python3 ar_receiver.py
+```
+
+当前实验分支的 `ar_receiver.py` 默认直接进入 `road_mask` 模式，并关闭
+视觉控制下发和车辆运行时；TurnSign OCR 仍在后台正常运行。需要恢复实验前入口时设置
+`AR_ROAD_MASK_EXPERIMENT=0`；`vision_road_mask_env.sh` 仍可用于显式加载
+全部 Mask 参数。
+
 恢复原热力图追踪器：
 
 ```bash

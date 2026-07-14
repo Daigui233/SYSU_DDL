@@ -88,7 +88,20 @@ def env_int(name, default):
 
 
 def configure_perception_defaults():
-    """Avoid duplicate path decoding/rendering in the skeleton pipeline."""
+    """Select this branch's road-mask experiment or the legacy pipeline."""
+    if env_flag("AR_ROAD_MASK_EXPERIMENT", True):
+        # This branch starts from the model's road-segmentation channel. Make
+        # the experiment the direct ar_receiver.py default so a stale shell
+        # environment cannot silently restore the skeleton/path overlay.
+        os.environ["MULTITASK_PATH_SOURCE"] = "curve"
+        os.environ["MULTITASK_RENDER_MODE"] = "road_mask"
+        os.environ["VISION_CONTROL_PATH_SOURCE"] = "curve"
+        os.environ["AR_VISION_CONTROL_DEBUG"] = "0"
+        os.environ["AR_VISION_CONTROL_SEND"] = "0"
+        os.environ["AR_CONTROL_RUNTIME_ENABLED"] = "0"
+        return
+
+    # AR_ROAD_MASK_EXPERIMENT=0 restores the pre-experiment behavior.
     vision_source = os.environ.get("VISION_CONTROL_PATH_SOURCE")
     model_source = os.environ.get("MULTITASK_PATH_SOURCE")
     if vision_source is None:

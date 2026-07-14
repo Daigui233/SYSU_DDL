@@ -12,6 +12,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .road_mask_diagnostics import analyze_road_mask
+
 
 MODEL_WIDTH = 640
 MODEL_HEIGHT = 480
@@ -67,6 +69,36 @@ ROAD_MIN_COMPONENT_AREA_RATIO = max(
 ROAD_MAX_COMPONENTS = max(1, _env_int("MULTITASK_ROAD_MAX_COMPONENTS", 3))
 ROAD_OVERLAY_ALPHA = float(np.clip(
     _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28), 0.0, 1.0))
+ROAD_SIMPLE_CLOSE_ITERATIONS = max(
+    0, _env_int("MULTITASK_ROAD_SIMPLE_CLOSE_ITERATIONS", 1))
+ROAD_MASK_PREVIEW_ALPHA = float(np.clip(
+    _env_float("MULTITASK_ROAD_MASK_PREVIEW_ALPHA", 0.55), 0.0, 1.0))
+ROAD_BEV_TOP_Y = float(np.clip(
+    _env_float("MULTITASK_ROAD_BEV_TOP_Y", 0.32), 0.0, 0.95))
+ROAD_BEV_TOP_LEFT_X = float(np.clip(
+    _env_float("MULTITASK_ROAD_BEV_TOP_LEFT_X", 0.15), 0.0, 1.0))
+ROAD_BEV_TOP_RIGHT_X = float(np.clip(
+    _env_float("MULTITASK_ROAD_BEV_TOP_RIGHT_X", 0.85), 0.0, 1.0))
+ROAD_BEV_BOTTOM_LEFT_X = float(np.clip(
+    _env_float("MULTITASK_ROAD_BEV_BOTTOM_LEFT_X", 0.02), 0.0, 1.0))
+ROAD_BEV_BOTTOM_RIGHT_X = float(np.clip(
+    _env_float("MULTITASK_ROAD_BEV_BOTTOM_RIGHT_X", 0.98), 0.0, 1.0))
+ROAD_BEV_DEST_MARGIN = float(np.clip(
+    _env_float("MULTITASK_ROAD_BEV_DEST_MARGIN", 0.08), 0.0, 0.45))
+ROAD_BEV_EXIT_BAND = max(
+    1, _env_int("MULTITASK_ROAD_BEV_EXIT_BAND", 12))
+ROAD_BEV_EXIT_SIDE_REACH = float(np.clip(
+    _env_float("MULTITASK_ROAD_BEV_EXIT_SIDE_REACH", 0.70), 0.05, 1.0))
+ROAD_BEV_EXIT_MIN_AREA = max(
+    1, _env_int("MULTITASK_ROAD_BEV_EXIT_MIN_AREA", 6))
+ROAD_BEV_CENTER_WEIGHT = max(
+    0.0, _env_float("MULTITASK_ROAD_BEV_CENTER_WEIGHT", 6.0))
+ROAD_BEV_START_BAND = max(
+    1, _env_int("MULTITASK_ROAD_BEV_START_BAND", 6))
+ROAD_BEV_START_SEARCH_RADIUS = max(
+    1, _env_int("MULTITASK_ROAD_BEV_START_SEARCH_RADIUS", 8))
+ROAD_BEV_PLANNING_DOWNSAMPLE = max(
+    1, _env_int("MULTITASK_ROAD_BEV_PLANNING_DOWNSAMPLE", 2))
 PATH_HEATMAP_ALPHA = float(np.clip(
     _env_float("MULTITASK_PATH_HEATMAP_ALPHA", 0.45), 0.0, 1.0))
 PATH_HEATMAP_THRESHOLD = float(np.clip(
@@ -98,7 +130,8 @@ RENDER_MODE = os.environ.get(
     "MULTITASK_RENDER_MODE", "heatmap").strip().lower()
 RENDER_MODE = {"path": "drive", "road": "debug"}.get(
     RENDER_MODE, RENDER_MODE)
-if RENDER_MODE not in {"off", "heatmap", "drive", "debug", "full"}:
+if RENDER_MODE not in {
+        "off", "heatmap", "drive", "debug", "full", "road_mask"}:
     RENDER_MODE = "heatmap"
 
 PATH_COLORS = {
@@ -228,6 +261,25 @@ def clean_road_mask(raw_mask, top_crop_ratio=ROAD_TOP_CROP_RATIO,
         "component_count": min(len(components), ROAD_MAX_COMPONENTS),
     }
     return (selected, info) if return_info else selected
+
+
+def simple_road_mask(
+        raw_mask, close_iterations=ROAD_SIMPLE_CLOSE_ITERATIONS):
+    """Apply only a small closing operation to the thresholded road output.
+
+    This intentionally avoids cropping, component selection, area rejection,
+    hole filling, skeletonization, and temporal state.  It is the minimal
+    segmentation mask used by the inverse-perspective experiment.
+    """
+    mask = (np.asarray(raw_mask) != 0).astype(np.uint8)
+    if mask.ndim != 2 or not mask.size:
+        return mask
+    iterations = max(0, int(close_iterations))
+    if iterations:
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8),
+            iterations=iterations)
+    return mask
 
 
 def _squeeze_batch(value, name):
@@ -583,6 +635,25 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
     road_probability = sigmoid(pixel_logits[0])
     road_mask_raw = (
         pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
+    road_mask_simple = simple_road_mask(road_mask_raw)
+    road_diagnostics = None
+    if RENDER_MODE == "road_mask":
+        road_diagnostics = analyze_road_mask(
+            road_mask_simple,
+            top_y_ratio=ROAD_BEV_TOP_Y,
+            top_left_x_ratio=ROAD_BEV_TOP_LEFT_X,
+            top_right_x_ratio=ROAD_BEV_TOP_RIGHT_X,
+            bottom_left_x_ratio=ROAD_BEV_BOTTOM_LEFT_X,
+            bottom_right_x_ratio=ROAD_BEV_BOTTOM_RIGHT_X,
+            destination_margin_ratio=ROAD_BEV_DEST_MARGIN,
+            band_width=ROAD_BEV_EXIT_BAND,
+            side_reach_ratio=ROAD_BEV_EXIT_SIDE_REACH,
+            minimum_area=ROAD_BEV_EXIT_MIN_AREA,
+            center_weight=ROAD_BEV_CENTER_WEIGHT,
+            start_band_width=ROAD_BEV_START_BAND,
+            start_search_radius=ROAD_BEV_START_SEARCH_RADIUS,
+            planning_downsample=ROAD_BEV_PLANNING_DOWNSAMPLE,
+        )
     road_mask, road_quality = clean_road_mask(
         road_mask_raw, return_info=True)
     raw_path_heatmaps = sigmoid(pixel_logits[1:])
@@ -601,6 +672,8 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "probability": road_probability,
         "mask": road_mask,
         "raw_mask": road_mask_raw,
+        "simple_mask": road_mask_simple,
+        "diagnostics": road_diagnostics,
         "threshold": ROAD_THRESHOLD,
         "stride": PIXEL_STRIDE,
         **road_quality,
@@ -624,6 +697,8 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "road_probability": road_probability,
         "road_mask": road_mask,
         "road_mask_raw": road_mask_raw,
+        "road_mask_simple": road_mask_simple,
+        "road_mask_diagnostics": road_diagnostics,
         "path_heatmaps": path_heatmaps,
         "path_count": path_count,
         "path_count_scores": path_count_scores_list,
@@ -651,6 +726,129 @@ def _overlay_binary_mask(image, mask, color, alpha):
     tinted[:] = color
     cv2.addWeighted(image, 1.0 - alpha, tinted, alpha, 0.0, dst=tinted)
     cv2.copyTo(tinted, resized, image)
+
+
+def _render_road_mask_diagnostics(image, result):
+    """Overlay the forward mask and an inset BEV/frontier diagnostic."""
+    mask = result.get("road_mask_simple")
+    if mask is None:
+        mask = result.get("road_mask_raw")
+    _overlay_binary_mask(
+        image, mask, (0, 0, 255), ROAD_MASK_PREVIEW_ALPHA)
+
+    diagnostics = result.get("road_mask_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return
+    birds_eye = diagnostics.get("mask")
+    frontier = diagnostics.get("frontier_mask")
+    if not isinstance(birds_eye, np.ndarray) or birds_eye.ndim != 2:
+        return
+
+    source = diagnostics.get("source_points")
+    scale = np.asarray([
+        image.shape[1] / float(max(1, mask.shape[1])),
+        image.shape[0] / float(max(1, mask.shape[0])),
+    ], dtype=np.float32)
+    if isinstance(source, np.ndarray) and source.shape == (4, 2):
+        polygon = np.rint(source * scale).astype(np.int32)
+        cv2.polylines(
+            image, [polygon.reshape((-1, 1, 2))], True,
+            (0, 255, 255), 2, cv2.LINE_AA)
+
+    route_colors = ((255, 0, 0), (0, 255, 0))
+    inverse_matrix = diagnostics.get("inverse_matrix")
+    if isinstance(inverse_matrix, np.ndarray) and inverse_matrix.shape == (3, 3):
+        for index, path_info in enumerate(diagnostics.get("paths") or []):
+            points = np.asarray(path_info.get("points_xy"), dtype=np.float32)
+            if points.ndim != 2 or points.shape[0] < 2:
+                continue
+            forward_points = cv2.perspectiveTransform(
+                points.reshape((1, -1, 2)), inverse_matrix)[0]
+            forward_points = np.rint(forward_points * scale).astype(np.int32)
+            forward_points[:, 0] = np.clip(
+                forward_points[:, 0], 0, image.shape[1] - 1)
+            forward_points[:, 1] = np.clip(
+                forward_points[:, 1], 0, image.shape[0] - 1)
+            color = route_colors[index % len(route_colors)]
+            cv2.polylines(
+                image, [forward_points.reshape((-1, 1, 2))], False,
+                (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.polylines(
+                image, [forward_points.reshape((-1, 1, 2))], False,
+                color, 3, cv2.LINE_AA)
+
+    inset_width = max(256, int(round(image.shape[1] * 0.625)))
+    inset_width = min(inset_width, max(2, image.shape[1] - 16))
+    inset_height = max(96, int(round(inset_width * 3.0 / 8.0)))
+    inset_height = min(inset_height, max(1, image.shape[0] - 16))
+    raw_panel = np.zeros((*birds_eye.shape, 3), dtype=np.uint8)
+    raw_panel[mask != 0] = (235, 235, 235)
+    if isinstance(source, np.ndarray) and source.shape == (4, 2):
+        cv2.polylines(
+            raw_panel,
+            [np.rint(source).astype(np.int32).reshape((-1, 1, 2))],
+            True, (0, 255, 255), 1, cv2.LINE_AA)
+    panel = np.zeros((*birds_eye.shape, 3), dtype=np.uint8)
+    panel[birds_eye != 0] = (235, 235, 235)
+    skeleton = diagnostics.get("skeleton")
+    if isinstance(skeleton, np.ndarray) and skeleton.shape == birds_eye.shape:
+        panel[skeleton != 0] = (0, 180, 180)
+    if isinstance(frontier, np.ndarray) and frontier.shape == birds_eye.shape:
+        panel[(frontier != 0) & (birds_eye == 0)] = (90, 90, 0)
+    for index, path_info in enumerate(diagnostics.get("paths") or []):
+        points = np.asarray(path_info.get("points_xy"), dtype=np.float32)
+        if points.ndim != 2 or points.shape[0] < 2:
+            continue
+        points = np.rint(points).astype(np.int32)
+        color = route_colors[index % len(route_colors)]
+        cv2.polylines(
+            panel, [points.reshape((-1, 1, 2))], False,
+            (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.polylines(
+            panel, [points.reshape((-1, 1, 2))], False,
+            color, 2, cv2.LINE_AA)
+    start = diagnostics.get("start_xy")
+    if start is not None:
+        cv2.circle(
+            panel, (int(round(start[0])), int(round(start[1]))),
+            4, (255, 0, 255), -1, cv2.LINE_AA)
+    for index, exit_info in enumerate(diagnostics.get("exits") or []):
+        center = exit_info.get("center_xy", (0.0, 0.0))
+        point = (int(round(center[0])), int(round(center[1])))
+        cv2.circle(panel, point, 4, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            panel, str(index + 1), (point[0] + 4, point[1] + 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 0, 255), 1,
+            cv2.LINE_AA)
+    comparison = np.hstack((raw_panel, panel))
+    resized = cv2.resize(
+        comparison, (inset_width, inset_height),
+        interpolation=cv2.INTER_NEAREST)
+    x0 = image.shape[1] - inset_width - 8
+    y0 = min(58, max(8, image.shape[0] - inset_height - 8))
+    cv2.rectangle(
+        image, (x0 - 2, y0 - 2),
+        (x0 + inset_width + 1, y0 + inset_height + 1),
+        (0, 0, 0), 2)
+    image[y0:y0 + inset_height, x0:x0 + inset_width] = resized
+    cv2.putText(
+        image, "RAW", (x0 + 7, y0 + 19),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+        (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(
+        image, "BEV exits={} paths={} {}".format(
+            int(diagnostics.get("exit_count", 0)),
+            len(diagnostics.get("paths") or []),
+            "MA" if diagnostics.get("planner") == "medial_axis" else "DJ"),
+        (x0 + inset_width // 2 + 7, y0 + 19),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+        (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(
+        image, "plan {:.1f} ms".format(
+            float(diagnostics.get("planning_ms", 0.0))),
+        (x0 + inset_width // 2 + 7, y0 + 38),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+        (0, 255, 0), 1, cv2.LINE_AA)
 
 
 def _overlay_path_heatmaps(image, heatmaps, colors, alpha, threshold):
@@ -762,8 +960,13 @@ def render_result(image, result, mode=None):
     mode = {"path": "drive", "road": "debug"}.get(mode, mode)
     if mode == "off":
         return image
-    if mode not in {"heatmap", "drive", "debug", "full"}:
+    if mode not in {
+            "heatmap", "drive", "debug", "full", "road_mask"}:
         mode = "heatmap"
+
+    if mode == "road_mask":
+        _render_road_mask_diagnostics(image, result)
+        return image
 
     if mode in {"debug", "full"}:
         _overlay_binary_mask(

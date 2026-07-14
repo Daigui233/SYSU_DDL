@@ -1,6 +1,7 @@
 import unittest
 
 import numpy as np
+import cv2
 
 from .func import (
     CLASSES,
@@ -14,6 +15,14 @@ from .func import (
     myFunc,
     parse_outputs,
     render_result,
+    simple_road_mask,
+)
+from .road_mask_diagnostics import (
+    build_birds_eye_mask,
+    detect_frontier_exits,
+    plan_center_biased_paths,
+    plan_medial_axis_paths,
+    road_clearance_map,
 )
 
 
@@ -197,6 +206,143 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertFalse(info["valid"])
         self.assertEqual(info["reason"], "raw-full")
         self.assertEqual(int(cleaned.sum()), 0)
+
+    def test_simple_road_mask_only_closes_small_gaps(self):
+        raw = np.zeros((9, 9), dtype=np.uint8)
+        raw[2:7, 2:7] = 1
+        raw[4, 4] = 0
+        raw[0, 0] = 1
+
+        mask = simple_road_mask(raw, close_iterations=1)
+
+        self.assertEqual(int(mask[4, 4]), 1)
+        self.assertEqual(int(mask[0, 0]), 1)
+
+    def test_decode_exposes_simple_road_mask_without_old_rejection(self):
+        result = decode_outputs(self.make_outputs(), (480, 640, 3))
+
+        self.assertEqual(int(result["road_mask_simple"].sum()), 120 * 160)
+        self.assertIs(result["road"]["simple_mask"],
+                      result["road_mask_simple"])
+        self.assertEqual(int(result["road_mask"].sum()), 0)
+
+    def test_road_mask_render_draws_only_simple_mask(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        result = {
+            "road_mask_simple": np.pad(
+                np.ones((2, 2), dtype=np.uint8), ((1, 1), (1, 1))),
+            "detections": [{
+                "label": "Coin", "score": 0.99,
+                "bbox": [0, 0, 7, 7],
+            }],
+            "paths": [{
+                "role": "single", "score": 1.0,
+                "count_confidence": 1.0,
+                "points_xy": np.asarray([[0, 0], [7, 7]]),
+            }],
+        }
+
+        rendered = render_result(image, result, mode="road_mask")
+
+        self.assertEqual(int(rendered[0, 0].sum()), 0)
+        self.assertGreater(int(rendered[4, 4, 2]), 0)
+        self.assertEqual(int(rendered[4, 4, 0]), 0)
+        self.assertEqual(int(rendered[4, 4, 1]), 0)
+
+    def test_frontier_detects_two_persistent_y_exits(self):
+        mask = np.zeros((60, 80), dtype=np.uint8)
+        cv2.line(mask, (40, 59), (40, 34), 1, 9)
+        cv2.line(mask, (40, 36), (18, 0), 1, 9)
+        cv2.line(mask, (40, 36), (62, 0), 1, 9)
+
+        exits, frontier = detect_frontier_exits(
+            mask, band_width=4, side_reach_ratio=0.7,
+            minimum_area=6)
+
+        self.assertEqual(len(exits), 2)
+        self.assertTrue(np.all(frontier[:4]))
+        self.assertLess(exits[0]["center_xy"][0],
+                        exits[1]["center_xy"][0])
+
+    def test_frontier_treats_straight_road_as_one_exit(self):
+        mask = np.zeros((60, 80), dtype=np.uint8)
+        mask[:, 32:48] = 1
+
+        exits, _frontier = detect_frontier_exits(mask)
+
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0]["boundary"], "top")
+
+    def test_birds_eye_mask_keeps_binary_shape_and_source_quad(self):
+        mask = np.zeros((60, 80), dtype=np.uint8)
+        mask[25:, 10:70] = 1
+
+        birds_eye, matrix, source, destination = build_birds_eye_mask(mask)
+
+        self.assertEqual(birds_eye.shape, mask.shape)
+        self.assertEqual(set(np.unique(birds_eye).tolist()), {0, 1})
+        self.assertEqual(matrix.shape, (3, 3))
+        self.assertEqual(source.shape, (4, 2))
+        self.assertEqual(destination.shape, (4, 2))
+
+    def test_clearance_is_highest_away_from_road_edges(self):
+        mask = np.zeros((20, 30), dtype=np.uint8)
+        mask[:, 8:22] = 1
+
+        clearance = road_clearance_map(mask)
+
+        self.assertGreater(float(clearance[10, 15]),
+                           float(clearance[10, 8]))
+        self.assertGreater(float(clearance[10, 15]), 5.0)
+
+    def test_one_dijkstra_tree_returns_two_shared_trunk_paths(self):
+        mask = np.zeros((60, 80), dtype=np.uint8)
+        cv2.line(mask, (40, 59), (40, 34), 1, 11)
+        cv2.line(mask, (40, 36), (18, 0), 1, 11)
+        cv2.line(mask, (40, 36), (62, 0), 1, 11)
+        exits, _frontier = detect_frontier_exits(mask)
+
+        start, paths, clearance = plan_center_biased_paths(mask, exits)
+
+        self.assertIsNotNone(start)
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(clearance.shape, mask.shape)
+        first = paths[0]["points_xy"].astype(np.int32)
+        second = paths[1]["points_xy"].astype(np.int32)
+        common = 0
+        for point_a, point_b in zip(first, second):
+            if not np.array_equal(point_a, point_b):
+                break
+            common += 1
+        self.assertGreaterEqual(common, 8)
+        for path_info in paths:
+            points = path_info["points_xy"].astype(np.int32)
+            self.assertTrue(np.all(mask[points[:, 1], points[:, 0]] != 0))
+
+    def test_medial_axis_returns_two_true_shared_trunk_paths(self):
+        mask = np.zeros((60, 80), dtype=np.uint8)
+        cv2.line(mask, (40, 59), (40, 34), 1, 11)
+        cv2.line(mask, (40, 36), (18, 0), 1, 11)
+        cv2.line(mask, (40, 36), (62, 0), 1, 11)
+        exits, _frontier = detect_frontier_exits(mask)
+
+        start, paths, skeleton, _clearance = plan_medial_axis_paths(
+            mask, exits, planning_downsample=1)
+
+        self.assertIsNotNone(start)
+        self.assertEqual(len(paths), 2)
+        self.assertGreater(int(skeleton.sum()), 20)
+        first = paths[0]["points_xy"].astype(np.int32)
+        second = paths[1]["points_xy"].astype(np.int32)
+        common = 0
+        for point_a, point_b in zip(first, second):
+            if not np.array_equal(point_a, point_b):
+                break
+            common += 1
+        self.assertGreater(common, 10)
+        self.assertTrue(all(
+            path_info["source"] == "medial_axis"
+            for path_info in paths))
 
     def test_classwise_nms_applies_global_limit_after_all_classes(self):
         boxes = np.asarray([

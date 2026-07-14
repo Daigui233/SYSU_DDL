@@ -136,13 +136,19 @@ Debug rendering is performed by the drop-frame preview thread, not by an NPU
 worker. Select it with:
 
 ```bash
-export MULTITASK_RENDER_MODE=heatmap  # off, heatmap, drive, debug, or full
+export MULTITASK_RENDER_MODE=heatmap  # off, road_mask, heatmap, drive, debug, or full
 export MULTITASK_ROAD_OVERLAY_ALPHA=0.28
+export MULTITASK_ROAD_MASK_PREVIEW_ALPHA=0.55
+export MULTITASK_ROAD_SIMPLE_CLOSE_ITERATIONS=1
 export MULTITASK_PATH_HEATMAP_ALPHA=0.45
 export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 ```
 
 - `off`: no perception drawing.
+- `road_mask`: draw only the road segmentation in red. It uses the raw road
+  probability threshold followed by one configurable 3x3 closing operation;
+  it does not crop, select components, reject areas, trace paths, or draw
+  detections.
 - `heatmap`: diagnostic default. Draw every post-NMS detection as a full box,
   overlay both raw sigmoid path heatmaps, and draw the active path source.
   With the default `heatmap` source, these are filtered heatmap ridges used by
