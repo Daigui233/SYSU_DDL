@@ -48,9 +48,9 @@ def _env_flag(name, default):
 def _path_source_from_env():
     value = os.environ.get(
         "VISION_CONTROL_PATH_SOURCE",
-        os.environ.get("MULTITASK_PATH_SOURCE", "heatmap"),
+        os.environ.get("MULTITASK_PATH_SOURCE", "curve"),
     ).strip().lower()
-    return value if value in {"curve", "heatmap"} else "heatmap"
+    return value if value in {"curve", "heatmap"} else "curve"
 
 
 def _finite_float(value, default=None):
@@ -266,7 +266,8 @@ class VisionControlConfig:
     sign_stop_height_ratio: float = 0.24
     sign_stop_area_ratio: float = 0.035
     sign_stop_line_margin_ratio: float = 0.08
-    sign_slow_min_score: float = 0.35
+    sign_slow_min_score: float = 0.20
+    sign_latch_frames: int = 3
     sign_ocr_timeout_s: float = 8.0
     sign_ocr_pulse_speed_mps: float = 0.25
     sign_ocr_pulse_duration_s: float = 0.30
@@ -283,7 +284,7 @@ class VisionControlConfig:
     min_human_score: float = 0.35
     min_car_score: float = 0.35
     min_coin_score: float = 0.35
-    path_source: str = "heatmap"
+    path_source: str = "curve"
 
     @classmethod
     def from_env(cls):
@@ -386,7 +387,8 @@ class VisionControlConfig:
             sign_stop_height_ratio=_clamp(_env_float("VISION_CONTROL_SIGN_STOP_HEIGHT_RATIO", 0.24), 0.01, 1.0),
             sign_stop_area_ratio=_clamp(_env_float("VISION_CONTROL_SIGN_STOP_AREA_RATIO", 0.035), 0.001, 1.0),
             sign_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_SIGN_STOP_LINE_MARGIN_RATIO", 0.08), 0.0, 0.5),
-            sign_slow_min_score=_clamp(_env_float("VISION_CONTROL_SIGN_SLOW_MIN_SCORE", 0.35), 0.0, 1.0),
+            sign_slow_min_score=_clamp(_env_float("VISION_CONTROL_SIGN_SLOW_MIN_SCORE", 0.20), 0.0, 1.0),
+            sign_latch_frames=max(1, _env_int("VISION_CONTROL_SIGN_LATCH_FRAMES", 3)),
             sign_ocr_timeout_s=max(0.1, _env_float("VISION_CONTROL_SIGN_OCR_TIMEOUT_S", 8.0)),
             sign_ocr_pulse_speed_mps=max(0.0, _env_float("VISION_CONTROL_SIGN_OCR_PULSE_SPEED", 0.25)),
             sign_ocr_pulse_duration_s=max(0.0, _env_float("VISION_CONTROL_SIGN_OCR_PULSE_DURATION_S", 0.30)),
@@ -1168,6 +1170,8 @@ class VisionControlPlanner:
         self.sign_ocr_active_since = None
         self.sign_ocr_pulse_until = 0.0
         self.sign_ocr_pulse_sent = False
+        self.sign_seen_frames = 0
+        self.sign_latched_since = None
 
     def update(self, perception_result, ocr_response=None, now=None):
         now = float(time.monotonic() if now is None else now)
@@ -1306,6 +1310,9 @@ class VisionControlPlanner:
         started = time.perf_counter()
         centerline = result.get("centerline") or {}
         support_maps = None
+        road = (result.get("road") or {}).get("mask")
+        if road is None:
+            road = result.get("road_mask")
         if self.config.path_source == "curve":
             paths = (centerline.get("curve_paths") or
                      result.get("curve_paths") or [])
@@ -1316,11 +1323,13 @@ class VisionControlPlanner:
                     continue
                 candidate = dict(path)
                 candidate["points_xy"] = points
-                candidate["source"] = "direct_curve"
+                candidate["source"] = "row_classifier"
                 candidate["source_slot"] = int(path.get("slot", len(candidates)))
                 candidate["source_slots"] = {candidate["source_slot"]}
                 candidate["coverage"] = 1.0
-                candidate["road_support"] = None
+                candidate["road_support"] = path.get("road_overlap")
+                # This keeps only the existing small moving-average filter;
+                # no B-spline fit or unsupported-point extrapolation is used.
                 candidates.append(candidate)
             candidates = candidates[:2]
         else:
@@ -1332,9 +1341,6 @@ class VisionControlPlanner:
             heatmaps = np.asarray(heatmaps, dtype=np.float32)
             if heatmaps.ndim != 3 or heatmaps.shape[0] < 1:
                 return [], 0.0
-            road = (result.get("road") or {}).get("mask")
-            if road is None:
-                road = result.get("road_mask")
             effective_maps, support_maps, _has_road = (
                 self._prepare_heatmap_support_maps(heatmaps, road))
             candidates, peak_debug = self.peak_path_detector.extract(
@@ -1348,10 +1354,13 @@ class VisionControlPlanner:
                 peak_debug["valid_path_count"])
             result["heatmap_debug_lines"] = list(candidates)
 
-        candidates = self._assign_heatmap_slots(candidates[:2], image_shape)
+        if self.config.path_source != "curve":
+            candidates = self._assign_heatmap_slots(candidates[:2], image_shape)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
         candidates = self._smooth_candidates(
             candidates, image_shape, support_maps=support_maps)
+        candidates = self._constrain_candidates_to_road(
+            candidates, road, image_shape)
         self._publish_filtered_paths(result, candidates)
         elapsed = (time.perf_counter() - started) * 1000.0
         return candidates, elapsed
@@ -2262,6 +2271,59 @@ class VisionControlPlanner:
                 self.path_missing_frames.pop(slot, None)
         return smoothed_candidates
 
+    def _constrain_candidates_to_road(self, candidates, road_mask, image_shape):
+        """Project post-smoothed paths back into the semantic-road support."""
+        if road_mask is None:
+            return candidates
+        road = np.asarray(road_mask, dtype=np.uint8)
+        if road.ndim != 2 or not np.any(road):
+            return []
+        road_y, road_x = np.nonzero(road)
+        height, width = image_shape[:2]
+        max_distance = 10.0 * float(max(width, height)) / 160.0
+        max_distance_sq = max_distance * max_distance
+        constrained_candidates = []
+        for candidate in candidates:
+            points = np.asarray(candidate.get("points_xy"), dtype=np.float32)
+            if points.ndim != 2 or points.shape[1] != 2 or not len(points):
+                continue
+            normalized_x = np.clip(
+                np.rint(points[:, 0] * (road.shape[1] - 1) /
+                        max(width - 1, 1)), 0, road.shape[1] - 1).astype(np.int32)
+            normalized_y = np.clip(
+                np.rint(points[:, 1] * (road.shape[0] - 1) /
+                        max(height - 1, 1)), 0, road.shape[0] - 1).astype(np.int32)
+            kept = []
+            projected = []
+            for index, (x, y) in enumerate(zip(normalized_x, normalized_y)):
+                if road[y, x]:
+                    nearest_x, nearest_y = x, y
+                else:
+                    distances = ((road_x.astype(np.float32) - float(x)) ** 2 +
+                                 (road_y.astype(np.float32) - float(y)) ** 2)
+                    nearest_index = int(np.argmin(distances))
+                    if distances[nearest_index] > max_distance_sq:
+                        continue
+                    nearest_x = int(road_x[nearest_index])
+                    nearest_y = int(road_y[nearest_index])
+                kept.append(index)
+                projected.append((
+                    nearest_x * float(max(width - 1, 0)) /
+                    max(road.shape[1] - 1, 1),
+                    nearest_y * float(max(height - 1, 0)) /
+                    max(road.shape[0] - 1, 1),
+                ))
+            if len(projected) < 2:
+                continue
+            item = dict(candidate)
+            item["points_xy"] = np.asarray(projected, dtype=np.float32)
+            item["road_constrained"] = True
+            item["display_segments_xy"] = [item["points_xy"].copy()]
+            if "row_indices" in item:
+                item["row_indices"] = np.asarray(item["row_indices"])[kept]
+            constrained_candidates.append(item)
+        return constrained_candidates
+
     def _smooth_path_points(
             self, points, previous, image_width, apply_spatial=True):
         points = np.asarray(points, dtype=np.float32).copy()
@@ -2565,8 +2627,12 @@ class VisionControlPlanner:
     def _turnsign_action(self, detections, image_shape, lookahead_y, ocr_response, now):
         has_active_ocr = bool((ocr_response or {}).get("active"))
         if self._ocr_has_current_direction(ocr_response):
-            self._clear_sign_ocr_state()
+            self._clear_turnsign_state()
             return None
+        if (self.sign_latched_since is not None and
+                float(now) - float(self.sign_latched_since) >
+                self.config.sign_ocr_timeout_s):
+            self._clear_turnsign_state()
         has_sign = False
         should_stop = False
         sign_target_x = None
@@ -2584,8 +2650,20 @@ class VisionControlPlanner:
                 if rank > best_rank:
                     best_rank = rank
                     sign_target_x = float(geom["cx"])
-                if self._sign_should_stop(geom, image_shape, lookahead_y):
-                    should_stop = True
+            if self._sign_should_stop(geom, image_shape, lookahead_y):
+                should_stop = True
+        if has_sign:
+            self.sign_seen_frames += 1
+            if self.sign_seen_frames >= self.config.sign_latch_frames:
+                if self.sign_latched_since is None:
+                    self.sign_latched_since = float(now)
+        else:
+            self.sign_seen_frames = 0
+        if self.sign_latched_since is not None:
+            # The sign may leave the camera before OCR returns. Stop rather
+            # than resuming into an undecided branch; the latch has a timeout.
+            if not has_sign:
+                return "stop", None
         if has_active_ocr:
             if self.sign_ocr_active_since is None:
                 self.sign_ocr_active_since = float(now)
@@ -2603,6 +2681,11 @@ class VisionControlPlanner:
         self.sign_ocr_active_since = None
         self.sign_ocr_pulse_until = 0.0
         self.sign_ocr_pulse_sent = False
+
+    def _clear_turnsign_state(self):
+        self._clear_sign_ocr_state()
+        self.sign_seen_frames = 0
+        self.sign_latched_since = None
 
     def _human_action(self, detections, selected, image_shape, lookahead_y, lookahead_path_x):
         humans = []

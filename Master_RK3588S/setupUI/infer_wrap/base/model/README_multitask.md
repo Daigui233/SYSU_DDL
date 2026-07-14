@@ -5,8 +5,9 @@ Place the trained six-output RKNN model here as one of:
 - `multitask_ppyoloe_int8.rknn` (default)
 - `multitask_ppyoloe_fp16.rknn`
 
-Select it with `MULTITASK_RKNN_VARIANT=int8|fp16`, or set an absolute path
-with `MULTITASK_RKNN_MODEL`.
+Select it with `MULTITASK_RKNN_VARIANT=int8|fp16|curve_best|heatmap_best|multitask_best`,
+or set an absolute path with `MULTITASK_RKNN_MODEL`. The included
+`curve_best` variant is the Stage3 row-classifier curve checkpoint.
 
 ## Fixed I/O contract
 
@@ -18,7 +19,8 @@ The RKNN must return these tensors in this exact order:
 1. `det_boxes [1,6300,4]`: decoded xyxy boxes in the 640x480 input space.
 2. `det_scores [1,6300,8]`: class probabilities; do not apply sigmoid.
 3. `pixel_logits [1,3,120,160]`: road, single/left, and right logits.
-4. `path_points [1,2,32,2]`: normalized `(x,y)` B-spline points.
+4. `row_path_logits [1,2,32,161]`: two fixed path queries, 32 bottom-to-top
+   row anchors, 160 horizontal bins, and one final `no_path` class.
 5. `path_scores [1,2]`: sigmoid probabilities; do not apply sigmoid again.
 6. `path_count_scores [1,3]`: softmax probabilities for 0/1/2 paths; do
    not apply softmax again.
@@ -33,14 +35,15 @@ Path slots have conditional roles:
 - count 1: slot 0 is `single`.
 - count 2: slot 0 is `left`, slot 1 is `right`.
 
-The default active path is `path_points`: the ordered model curve is exposed
-as `paths` and `curve_paths`. The raw heatmaps remain available for preview.
-The old heatmap-ridge extraction is retained as an optional comparison mode.
+The default active path is `row_path_logits`: the ordered row-classifier curve
+is exposed as `paths` and `curve_paths`. It is decoded without B-spline fitting
+or extrapolation. Raw heatmaps remain available for preview. The old
+heatmap-ridge extraction is retained as an optional comparison mode.
 
 ## Runtime tuning
 
 ```bash
-export MULTITASK_RKNN_VARIANT=int8
+export MULTITASK_RKNN_VARIANT=curve_best
 export MULTITASK_NPU_MODE=parallel
 export MULTITASK_RKNN_TPES=3
 export MULTITASK_PIPELINE_DEPTH=3
@@ -66,8 +69,10 @@ export MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO=0.70
 export MULTITASK_RENDER_MAX_BOX_AREA_RATIO=0.30
 export MULTITASK_RENDER_PATH_MIN_SCORE=0.35
 export MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE=0.40
-export MULTITASK_PATH_SOURCE=heatmap
-export VISION_CONTROL_PATH_SOURCE=heatmap
+export MULTITASK_PATH_SOURCE=curve  # curve (default) or heatmap
+export VISION_CONTROL_PATH_SOURCE=curve
+export MULTITASK_PATH_CONSTRAIN_TO_ROAD=1
+export MULTITASK_PATH_ROAD_SNAP_RADIUS=10
 export VISION_CONTROL_BLANK_PROBABILITY=0.05
 export VISION_CONTROL_PEAK_SCAN_TOP_RATIO=0.45
 export VISION_CONTROL_PEAK_SCAN_BOTTOM_RATIO=0.55
@@ -143,8 +148,8 @@ export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 - `off`: no perception drawing.
 - `heatmap`: diagnostic default. Draw every post-NMS detection as a full box,
   overlay both raw sigmoid path heatmaps, and draw the active path source.
-  With the default `heatmap` source, these are filtered heatmap ridges used by
-  visual control. Frame-spanning boxes are hidden from rendering only and
+  The default active source is the row-classifier curve; use the heatmap source
+  switch only for comparison. Frame-spanning boxes are hidden from rendering only and
   remain available to OCR/control.
 - `drive`: low-clutter mode. No road fill or labels; paths are thin, Coin uses
   a dot, and other detections use corner marks.
@@ -157,10 +162,12 @@ receive every post-NMS detection even though preview drawing defaults to at
 most six detections, two per class. Legacy `path` and `road` mode names map to
 `drive` and `debug`.
 
-`MULTITASK_PATH_SOURCE=heatmap` is the default. It traces one representative
-ridge from each path heatmap for the preview and visual-control candidates.
-Set `MULTITASK_PATH_SOURCE=curve` to compare the model's direct `path_points`
-output. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
+`MULTITASK_PATH_SOURCE=curve` is the default. It decodes each query at the 32
+fixed row anchors, keeps only rows predicted as present, and never fits a
+B-spline through unsupported regions. All rendered heatmap pixels and curve
+points are clipped to the cleaned road segmentation mask. Set
+`MULTITASK_PATH_SOURCE=heatmap` to restore the prior heatmap-ridge comparison
+mode. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
 overridden independently for comparison.
 
 The visual controller derives the one/two-path decision from horizontal peaks
@@ -193,8 +200,9 @@ The result exposes both the unified top-level fields and the existing nested
 - `road_mask`: `[120,160]` uint8.
 - `path_heatmaps`: raw sigmoid probabilities with shape `[2,120,160]`.
 - `path_count` and `path_count_scores`.
-- `paths`: the active source, heatmap ridges by default.
-- `curve_paths`: the model's ordered `[32,2]` B-spline outputs.
+- `paths`: the active source, row-classifier paths by default.
+- `curve_paths`: paths decoded from `[2,32,161]` row logits; each contains
+  only visible row anchors and road-constrained display segments.
 - `heatmap_ridge_paths`: only populated when `MULTITASK_PATH_SOURCE=heatmap`.
 - `timings_ms`: preprocess, RKNN inference, FIFO wait, postprocess, and total
   latency visible to the perception consumer.
@@ -202,7 +210,8 @@ The result exposes both the unified top-level fields and the existing nested
 In `heatmap` mode the old centerline scanner works unchanged: it scans each raw
 path heatmap from bottom to top, links spatially near row peaks across small
 gaps, and keeps only the track with the greatest row coverage and accumulated
-confidence. It does not multiply path probability by road probability.
+confidence. Its resulting points are then projected into the cleaned road mask;
+the raw heatmap values themselves are not changed.
 
 The old `rknn_lt.rknn` and old four-output models are incompatible and fail
 fast instead of producing incorrect paths.

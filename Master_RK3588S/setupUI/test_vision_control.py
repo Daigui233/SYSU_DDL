@@ -331,7 +331,7 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         self.assertIsNotNone(command)
         self.assertEqual(2, debug["candidate_count"])
-        self.assertEqual("direct_curve", debug["candidates"][0]["source"])
+        self.assertEqual("row_classifier", debug["candidates"][0]["source"])
 
     def test_heatmap_search_ignores_points_outside_road_mask(self):
         config = _config()
@@ -372,7 +372,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             for path in result["paths"]
         ))
 
-    def test_heatmap_paths_fall_back_to_full_map_without_valid_road(self):
+    def test_heatmap_paths_are_suppressed_without_valid_road(self):
         heatmaps = _straight_heatmap(80)
         result = _result(heatmaps)
         result["road"]["mask"].fill(0.0)
@@ -380,8 +380,8 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         _command, debug = planner.update(result, now=1.0)
 
-        self.assertEqual(1, debug["candidate_count"])
-        self.assertEqual(1, len(result["paths"]))
+        self.assertEqual(0, debug["candidate_count"])
+        self.assertEqual(0, len(result["paths"]))
 
     def test_only_heatmap_components_inside_road_are_kept(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)

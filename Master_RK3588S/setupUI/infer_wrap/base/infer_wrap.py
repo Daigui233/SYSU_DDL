@@ -72,10 +72,19 @@ class InferWrap:
             return path
 
         model_dir = Path(model_dir)
-        variant = os.environ.get("MULTITASK_RKNN_VARIANT", "int8").strip().lower()
-        if variant not in {"fp16", "int8"}:
-            raise ValueError("MULTITASK_RKNN_VARIANT must be fp16 or int8")
-        preferred = model_dir / "multitask_ppyoloe_{}.rknn".format(variant)
+        variant = os.environ.get("MULTITASK_RKNN_VARIANT", "curve_best").strip().lower()
+        variant_files = {
+            "int8": "multitask_ppyoloe_int8.rknn",
+            "fp16": "multitask_ppyoloe_fp16.rknn",
+            "curve_best": "multitask_ppyoloe_curve_best_int8.rknn",
+            "heatmap_best": "multitask_ppyoloe_heatmap_best_int8.rknn",
+            "multitask_best": "multitask_ppyoloe_multitask_best_int8.rknn",
+        }
+        if variant not in variant_files:
+            raise ValueError(
+                "MULTITASK_RKNN_VARIANT must be one of: {}".format(
+                    ", ".join(sorted(variant_files))))
+        preferred = model_dir / variant_files[variant]
         if preferred.is_file():
             return preferred.resolve()
         available = sorted(model_dir.glob("multitask_ppyoloe_*.rknn"))

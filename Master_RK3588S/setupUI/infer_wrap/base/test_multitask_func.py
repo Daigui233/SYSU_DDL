@@ -22,24 +22,23 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         boxes = np.zeros((1, 6300, 4), dtype=np.float32)
         scores = np.zeros((1, 6300, 8), dtype=np.float32)
         pixel = np.full((1, 3, 120, 160), -8.0, dtype=np.float32)
-        pixel[0, 0, :, :] = 8.0
-        pixel[0, 1, 24:119, 66] = 8.0
-        pixel[0, 2, 24:119, 108] = 8.0
-        points = np.zeros((1, 2, 32, 2), dtype=np.float32)
-        points[0, :, :, 1] = np.linspace(0.95, 0.10, 32)
-        points[0, 0, :, 0] = 0.42
-        points[0, 1, :, 0] = 0.68
+        pixel[0, 0, 40:120, 20:140] = 8.0
+        pixel[0, 1, 40:119, 66] = 8.0
+        pixel[0, 2, 40:119, 108] = 8.0
+        row_logits = np.full((1, 2, 32, 161), -8.0, dtype=np.float32)
+        row_logits[0, 0, :, 66] = 8.0
+        row_logits[0, 1, :, 108] = 8.0
         path_scores = np.asarray([[0.92, 0.81]], dtype=np.float32)
         count_scores = np.asarray([[0.02, 0.08, 0.90]], dtype=np.float32)
-        return boxes, scores, pixel, points, path_scores, count_scores
+        return boxes, scores, pixel, row_logits, path_scores, count_scores
 
     def test_output_contract(self):
-        boxes, scores, pixel, points, path_scores, count_scores = (
+        boxes, scores, pixel, row_logits, path_scores, count_scores = (
             parse_outputs(self.make_outputs()))
         self.assertEqual(boxes.shape, (6300, 4))
         self.assertEqual(scores.shape, (6300, 8))
         self.assertEqual(pixel.shape, (3, 120, 160))
-        self.assertEqual(points.shape, (2, 32, 2))
+        self.assertEqual(row_logits.shape, (2, 32, 161))
         self.assertEqual(path_scores.shape, (2,))
         self.assertEqual(count_scores.shape, (3,))
         self.assertEqual(CLASSES, (
@@ -52,7 +51,13 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         parsed = parse_outputs(outputs)
         self.assertEqual(parsed[2].shape, (3, 120, 160))
 
-    def test_keeps_direct_curve_paths_for_model_comparison(self):
+    def test_accepts_nhwc_row_classifier_output(self):
+        outputs = list(self.make_outputs())
+        outputs[3] = outputs[3].transpose(0, 2, 3, 1)
+        parsed = parse_outputs(outputs)
+        self.assertEqual(parsed[3].shape, (2, 32, 161))
+
+    def test_decodes_row_classifier_paths_for_model_comparison(self):
         outputs = list(self.make_outputs())
         outputs[0][0, 0] = [64, 48, 192, 144]
         outputs[1][0, 0, 7] = 0.90
@@ -63,32 +68,32 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(result["detections"][0]["label"], "SpeedSign")
         self.assertEqual(result["path_count"], 2)
         self.assertEqual([item["role"] for item in result["curve_paths"]],
-                         ["left", "right"])
+                          ["left", "right"])
         self.assertEqual(
             result["curve_paths"][0]["points_xy"].shape, (32, 2))
         self.assertAlmostEqual(
             float(result["curve_paths"][0]["points_xy"][0, 0]),
-            0.42 * 319, places=4)
+            66 / 159 * 319, places=3)
         self.assertAlmostEqual(
             float(result["curve_paths"][0]["points_xy"][0, 1]),
-            0.95 * 239, places=4)
+            239.0, places=4)
 
-    def test_default_paths_use_heatmap_ridges(self):
+    def test_default_paths_use_row_classifier(self):
         result = decode_outputs(self.make_outputs(), (480, 640, 3))
 
         self.assertEqual(
-            result["centerline"]["display_source"], "heatmap_ridge")
+            result["centerline"]["display_source"], "row_classifier")
         self.assertEqual(
-            result["centerline"]["path_source"], "heatmap_ridge")
+            result["centerline"]["path_source"], "row_classifier")
         self.assertEqual([item["role"] for item in result["paths"]],
                           ["left", "right"])
-        self.assertTrue(all(item["source"] == "heatmap_ridge"
-                             for item in result["paths"]))
-        self.assertGreater(len(result["paths"][0]["points_xy"]), 32)
+        self.assertTrue(all(item["source"] == "row_classifier"
+                              for item in result["paths"]))
+        self.assertEqual(len(result["paths"][0]["points_xy"]), 32)
         self.assertAlmostEqual(
             float(np.mean(result["paths"][0]["points_xy"][:, 0])),
-            66 * 4, delta=2.0)
-        self.assertEqual(result["paths"], result["heatmap_ridge_paths"])
+            66 / 159 * 639, delta=2.0)
+        self.assertEqual(result["paths"], result["curve_paths"])
         self.assertNotIn("temporal", result)
 
     def test_heatmap_switch_restores_one_ridge_per_channel(self):
@@ -131,9 +136,11 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertAlmostEqual(result["centerline"]["count_confidence"],
                                0.90, places=6)
 
-    def test_direct_curve_one_path_uses_single_role_and_slot_zero(self):
+    def test_row_classifier_one_path_uses_single_role_and_slot_zero(self):
         outputs = list(self.make_outputs())
         outputs[5] = np.asarray([[0.03, 0.94, 0.03]], dtype=np.float32)
+        outputs[3][0, 1, :, :] = -8.0
+        outputs[3][0, 1, :, 160] = 8.0
         result = decode_outputs(
             outputs, (480, 640, 3), path_source="curve")
         self.assertEqual(result["path_count"], 1)
@@ -144,22 +151,24 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(result["paths"][0]["slot"], 0)
         self.assertEqual(result["paths"][0]["role"], "single")
 
-    def test_direct_curve_zero_path_count_disables_both_slots(self):
+    def test_row_support_is_not_erased_by_count_head(self):
         outputs = list(self.make_outputs())
         outputs[4] = np.asarray([[0.99, 0.99]], dtype=np.float32)
         outputs[5] = np.asarray([[0.96, 0.03, 0.01]], dtype=np.float32)
         result = decode_outputs(
             outputs, (480, 640, 3), path_source="curve")
-        self.assertEqual(result["path_count"], 0)
-        self.assertEqual(result["paths"], [])
-        self.assertEqual(result["curve_paths"], [])
+        self.assertEqual(result["model_path_count"], 0)
+        self.assertEqual(result["path_count"], 2)
+        self.assertEqual(len(result["curve_paths"]), 2)
 
-    def test_path_points_are_clipped_before_mapping(self):
+    def test_row_path_is_projected_inside_road_mask(self):
         outputs = list(self.make_outputs())
-        outputs[3][0, 0, 0] = [-0.20, 1.20]
+        outputs[3][0, 0, :, :] = -8.0
+        outputs[3][0, 0, :, 10] = 8.0
         result = decode_outputs(outputs, (241, 321, 3))
-        point = result["curve_paths"][0]["points_xy"][0]
-        np.testing.assert_allclose(point, [0.0, 240.0])
+        path = result["curve_paths"][0]
+        self.assertTrue(path["road_constrained"])
+        self.assertTrue(np.all(path["points_xy"][:, 0] >= 20 / 159 * 320))
 
     def test_pixel_logits_receive_exactly_one_sigmoid(self):
         outputs = list(self.make_outputs())
@@ -264,12 +273,22 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual([(item[0], round(item[1], 2)) for item in results],
                          [(4, 0.90), (6, 0.80)])
 
-    def test_render_uses_direct_curve_when_heatmap_array_is_not_retained(self):
+    def test_render_uses_row_curve_when_heatmap_array_is_not_retained(self):
         result = decode_outputs(self.make_outputs(), (240, 320, 3),
                                 include_path_heatmaps=False)
         image = np.zeros((240, 320, 3), dtype=np.uint8)
         rendered = render_result(image, result, mode="path")
         self.assertGreater(int(rendered.sum()), 0)
+
+    def test_render_clips_heatmap_pixels_to_road_mask(self):
+        outputs = list(self.make_outputs())
+        outputs[2][0, 1, 80, 10] = 8.0
+        result = decode_outputs(outputs, (480, 640, 3))
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        rendered = render_result(image, result, mode="heatmap")
+
+        self.assertEqual(int(rendered[320, 40].sum()), 0)
+        self.assertGreater(int(rendered[320, 264].sum()), 0)
 
     def test_drive_render_limits_detection_clutter_per_class(self):
         detections = []
@@ -308,8 +327,8 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertTrue(_is_oversized_render_box(large, (480, 640, 3)))
         self.assertFalse(_is_oversized_render_box(normal, (480, 640, 3)))
 
-    def test_default_path_source_is_heatmap(self):
-        self.assertEqual(PATH_SOURCE, "heatmap")
+    def test_default_path_source_is_curve(self):
+        self.assertEqual(PATH_SOURCE, "curve")
 
     def test_default_render_mode_is_raw_heatmap(self):
         self.assertEqual(RENDER_MODE, "heatmap")

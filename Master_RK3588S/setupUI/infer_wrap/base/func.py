@@ -1,8 +1,8 @@
 """Fast CPU post-processing for the six-output RKNN multi-task model.
 
-The default active path is the model's ordered B-spline curve.  Raw heatmaps
-are always retained for the preview, while the former per-frame heatmap-ridge
-tracer remains available through an explicit runtime switch.
+The active curve is decoded from the model's ordered row-classification head.
+Raw heatmaps remain available for preview, and the legacy heatmap ridge tracer
+is kept behind an explicit runtime switch for comparison only.
 """
 
 import os
@@ -18,7 +18,9 @@ MODEL_HEIGHT = 480
 PIXEL_STRIDE = 4
 DET_CANDIDATES = 6300
 MAX_PATHS = 2
-PATH_POINTS = 32
+ROW_ANCHORS = 32
+ROW_BINS = 160
+ROW_ANCHOR_TOP = 0.40
 
 try:
     cv2.setNumThreads(max(1, int(os.environ.get(
@@ -44,6 +46,15 @@ def _env_int(name, default):
 def _env_choice(name, default, allowed):
     value = os.environ.get(name, default).strip().lower()
     return value if value in allowed else default
+
+
+def _env_bool(name, default):
+    value = os.environ.get(name, str(int(bool(default)))).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
 
 
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.50)
@@ -88,8 +99,17 @@ RENDER_PATH_MIN_SCORE = float(np.clip(
 RENDER_PATH_MIN_COUNT_CONFIDENCE = float(np.clip(
     _env_float("MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE", 0.40),
     0.0, 1.0))
+ROW_PATH_MIN_SCORE = float(np.clip(
+    _env_float("MULTITASK_ROW_PATH_MIN_SCORE", 0.25), 0.0, 1.0))
+ROW_NO_PATH_THRESHOLD = float(np.clip(
+    _env_float("MULTITASK_ROW_NO_PATH_THRESHOLD", 0.50), 0.0, 1.0))
+ROW_MAX_MISSING_ANCHORS = max(
+    0, _env_int("MULTITASK_ROW_MAX_MISSING_ANCHORS", 2))
+PATH_CONSTRAIN_TO_ROAD = _env_bool("MULTITASK_PATH_CONSTRAIN_TO_ROAD", True)
+PATH_ROAD_SNAP_RADIUS = max(
+    0.0, _env_float("MULTITASK_PATH_ROAD_SNAP_RADIUS", 10.0))
 PATH_SOURCE = _env_choice(
-    "MULTITASK_PATH_SOURCE", "heatmap", {"curve", "heatmap"})
+    "MULTITASK_PATH_SOURCE", "curve", {"curve", "heatmap"})
 RENDER_MODE = os.environ.get(
     "MULTITASK_RENDER_MODE", "heatmap").strip().lower()
 RENDER_MODE = {"path": "drive", "road": "debug"}.get(
@@ -247,13 +267,13 @@ def parse_outputs(outputs):
         count = len(outputs) if isinstance(outputs, (list, tuple)) else type(outputs)
         raise ValueError(
             "multitask RKNN must return 6 outputs "
-            "[boxes, scores, pixel, path_points, path_scores, "
+            "[boxes, scores, pixel, row_path_logits, path_scores, "
             "path_count_scores]; got {}".format(count))
 
     boxes = _squeeze_batch(outputs[0], "det_boxes")
     scores = _squeeze_batch(outputs[1], "det_scores")
     pixel = _squeeze_batch(outputs[2], "pixel_logits")
-    path_points = _squeeze_batch(outputs[3], "path_points")
+    row_path_logits = _squeeze_batch(outputs[3], "row_path_logits")
     path_scores = _squeeze_batch(outputs[4], "path_scores").reshape(-1)
     path_count_scores = _squeeze_batch(
         outputs[5], "path_count_scores").reshape(-1)
@@ -285,12 +305,16 @@ def parse_outputs(outputs):
         raise ValueError("pixel_logits expected {}, got {}".format(
             expected_pixel, pixel.shape))
 
-    if path_points.shape == (MAX_PATHS, 2, PATH_POINTS):
-        path_points = path_points.transpose(0, 2, 1)
-    if path_points.shape != (MAX_PATHS, PATH_POINTS, 2):
-        raise ValueError("path_points expected [2,32,2], got {}".format(
-            path_points.shape))
-    path_points = np.clip(path_points, 0.0, 1.0)
+    if row_path_logits.shape == (ROW_ANCHORS, MAX_PATHS, ROW_BINS + 1):
+        row_path_logits = row_path_logits.transpose(1, 0, 2)
+    if row_path_logits.shape == (ROW_ANCHORS, ROW_BINS + 1, MAX_PATHS):
+        row_path_logits = row_path_logits.transpose(2, 0, 1)
+    expected_row_logits = (MAX_PATHS, ROW_ANCHORS, ROW_BINS + 1)
+    if row_path_logits.shape != expected_row_logits:
+        raise ValueError(
+            "row_path_logits expected {}, got {}. This board package no "
+            "longer supports the old B-spline [2,32,2] output.".format(
+                expected_row_logits, row_path_logits.shape))
 
     if path_scores.shape != (MAX_PATHS,):
         raise ValueError("path_scores expected [2], got {}".format(
@@ -301,7 +325,8 @@ def parse_outputs(outputs):
     path_scores = _clip_probability(path_scores, "path_scores")
     path_count_scores = _clip_probability(
         path_count_scores, "path_count_scores")
-    return boxes, scores, pixel, path_points, path_scores, path_count_scores
+    return (boxes, scores, pixel, row_path_logits, path_scores,
+            path_count_scores)
 
 
 def _box_iou_one_to_many(box, boxes):
@@ -418,32 +443,152 @@ def build_detections(image_shape, nms_results):
     return detections
 
 
-def decode_curve_paths(points, path_scores, path_count_scores, image_shape):
-    """Map the active model slots directly into original-image coordinates."""
+def softmax(values, axis=-1):
+    values = np.asarray(values, dtype=np.float32)
+    values = values - np.max(values, axis=axis, keepdims=True)
+    values = np.exp(np.clip(values, -60.0, 30.0))
+    return values / np.maximum(values.sum(axis=axis, keepdims=True), 1e-12)
+
+
+def _row_anchor_y_normalized(count):
+    """Return the exact bottom-to-top anchors used by MultitaskResize."""
+    return np.linspace(1.0, ROW_ANCHOR_TOP, count, dtype=np.float32)
+
+
+def _split_anchor_segments(points_xy, row_indices):
+    if len(points_xy) < 2:
+        return []
+    segments = []
+    start = 0
+    for index in range(1, len(points_xy)):
+        if int(row_indices[index] - row_indices[index - 1]) > \
+                ROW_MAX_MISSING_ANCHORS + 1:
+            if index - start >= 2:
+                segments.append(points_xy[start:index].copy())
+            start = index
+    if len(points_xy) - start >= 2:
+        segments.append(points_xy[start:].copy())
+    return segments
+
+
+def _project_normalized_points_to_road(points, road_mask):
+    """Keep each decoded point inside the cleaned road mask when available."""
+    normalized = np.asarray(points, dtype=np.float32).copy()
+    keep = np.ones((len(normalized), ), dtype=bool)
+    if (not PATH_CONSTRAIN_TO_ROAD or road_mask is None or
+            not np.asarray(road_mask).size):
+        return normalized, keep, None
+    road = np.asarray(road_mask, dtype=np.uint8) != 0
+    road_y, road_x = np.nonzero(road)
+    if not len(road_x):
+        return normalized, np.zeros((len(normalized), ), dtype=bool), 0.0
+
+    height, width = road.shape
+    overlap = []
+    max_distance_sq = float(PATH_ROAD_SNAP_RADIUS) ** 2
+    for index, point in enumerate(normalized):
+        x = int(np.clip(np.rint(point[0] * (width - 1)), 0, width - 1))
+        y = int(np.clip(np.rint(point[1] * (height - 1)), 0, height - 1))
+        if road[y, x]:
+            overlap.append(1.0)
+            continue
+        distances = (road_x.astype(np.float32) - float(x)) ** 2 + \
+            (road_y.astype(np.float32) - float(y)) ** 2
+        nearest = int(np.argmin(distances))
+        if distances[nearest] > max_distance_sq:
+            keep[index] = False
+            overlap.append(0.0)
+            continue
+        normalized[index, 0] = float(road_x[nearest]) / max(width - 1, 1)
+        normalized[index, 1] = float(road_y[nearest]) / max(height - 1, 1)
+        overlap.append(0.0)
+    return normalized, keep, float(np.mean(overlap)) if overlap else None
+
+
+def _constrain_path_to_road(path, road_mask, image_shape):
+    """Apply the same road projection to row and legacy-heatmap paths."""
+    points_xy = np.asarray(path.get("points_xy", ()), dtype=np.float32)
+    if not len(points_xy):
+        return None
     height, width = image_shape[:2]
-    path_count = int(np.argmax(path_count_scores))
-    count_confidence = float(path_count_scores[path_count])
-    if path_count == 0:
-        roles = ()
-    elif path_count == 1:
-        roles = ("single",)
+    normalized = points_xy / np.asarray(
+        [max(width - 1, 1), max(height - 1, 1)], dtype=np.float32)
+    normalized, keep, road_overlap = _project_normalized_points_to_road(
+        normalized, road_mask)
+    if not np.any(keep):
+        return None
+    constrained = dict(path)
+    constrained["points_normalized"] = normalized[keep]
+    constrained["points_xy"] = normalized[keep] * np.asarray(
+        [max(width - 1, 0), max(height - 1, 0)], dtype=np.float32)
+    constrained["road_overlap"] = road_overlap
+    constrained["road_constrained"] = bool(PATH_CONSTRAIN_TO_ROAD)
+    if "row_indices" in constrained:
+        constrained["row_indices"] = np.asarray(
+            constrained["row_indices"])[keep]
+        constrained["display_segments_xy"] = _split_anchor_segments(
+            constrained["points_xy"], constrained["row_indices"])
     else:
-        roles = ("left", "right")
+        constrained["display_segments_xy"] = [constrained["points_xy"]]
+    return constrained
+
+
+def decode_curve_paths(row_path_logits, path_scores, path_count_scores,
+                       image_shape, road_mask=None):
+    """Decode the UFLD-style row head; no B-spline fitting or extrapolation."""
+    height, width = image_shape[:2]
+    probabilities = softmax(row_path_logits, axis=-1)
+    coordinate_probabilities = probabilities[..., :ROW_BINS]
+    coordinate_mass = coordinate_probabilities.sum(axis=-1)
+    conditional = coordinate_probabilities / np.maximum(
+        coordinate_mass[..., None], 1e-12)
+    x_values = np.arange(ROW_BINS, dtype=np.float32)
+    x_normalized = (conditional * x_values).sum(axis=-1) / float(ROW_BINS - 1)
+    row_visible = (
+        probabilities[..., -1] <= ROW_NO_PATH_THRESHOLD) & \
+        (coordinate_mass >= 1.0 - ROW_NO_PATH_THRESHOLD)
+    y_normalized = _row_anchor_y_normalized(ROW_ANCHORS)
+    model_path_count = int(np.argmax(path_count_scores))
+    count_confidence = float(path_count_scores[model_path_count])
     paths = []
-    for slot, role in enumerate(roles):
-        points_xy = points[slot].copy()
-        points_xy[:, 0] *= max(width - 1, 0)
-        points_xy[:, 1] *= max(height - 1, 0)
+    for slot in range(MAX_PATHS):
+        visible_indices = np.flatnonzero(row_visible[slot])
+        if (float(path_scores[slot]) < ROW_PATH_MIN_SCORE or
+                len(visible_indices) < 3):
+            continue
+        normalized = np.stack((x_normalized[slot, visible_indices],
+                               y_normalized[visible_indices]), axis=1)
+        normalized, keep, road_overlap = _project_normalized_points_to_road(
+            normalized, road_mask)
+        visible_indices = visible_indices[keep]
+        normalized = normalized[keep]
+        if len(normalized) < 3:
+            continue
+        points_xy = normalized * np.asarray(
+            [max(width - 1, 0), max(height - 1, 0)], dtype=np.float32)
+        row_confidences = coordinate_mass[slot, visible_indices]
         paths.append({
             "slot": int(slot),
-            "role": role,
-            "source": "direct_curve",
+            "role": "candidate",
+            "source": "row_classifier",
             "score": float(path_scores[slot]),
             "count_confidence": count_confidence,
-            "points_normalized": points[slot].copy(),
-            "points_xy": points_xy,
+            "row_support": int(len(normalized)),
+            "row_indices": visible_indices.astype(np.int32),
+            "row_confidences": row_confidences.astype(np.float32),
+            "points_normalized": normalized.astype(np.float32),
+            "points_xy": points_xy.astype(np.float32),
+            "road_overlap": road_overlap,
+            "road_constrained": bool(PATH_CONSTRAIN_TO_ROAD),
+            "display_segments_xy": _split_anchor_segments(
+                points_xy, visible_indices),
         })
-    return paths, path_count, count_confidence
+    if len(paths) == 1:
+        paths[0]["role"] = "single"
+    elif len(paths) >= 2:
+        for path in paths:
+            path["role"] = "left" if path["slot"] == 0 else "right"
+    return paths, model_path_count, count_confidence
 
 
 def _row_peaks(values, threshold, min_distance=3):
@@ -561,22 +706,29 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
     path_source = str(path_source or PATH_SOURCE).strip().lower()
     if path_source not in {"curve", "heatmap"}:
         raise ValueError("path_source must be curve or heatmap")
-    boxes, scores, pixel_logits, path_points, path_scores, path_count_scores = (
+    boxes, scores, pixel_logits, row_path_logits, path_scores, path_count_scores = (
         parse_outputs(outputs))
-    curve_paths, path_count, count_confidence = decode_curve_paths(
-        path_points, path_scores, path_count_scores, image_shape)
 
     road_probability = sigmoid(pixel_logits[0])
     road_mask_raw = (
         pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
     road_mask, road_quality = clean_road_mask(
         road_mask_raw, return_info=True)
+    curve_paths, model_path_count, count_confidence = decode_curve_paths(
+        row_path_logits, path_scores, path_count_scores, image_shape,
+        road_mask=road_mask)
     raw_path_heatmaps = sigmoid(pixel_logits[1:])
     heatmap_ridge_paths = []
     if path_source == "heatmap":
-        heatmap_ridge_paths = decode_heatmap_paths(
+        legacy_paths = decode_heatmap_paths(
             raw_path_heatmaps, path_scores, path_count_scores, image_shape)
+        heatmap_ridge_paths = [
+            constrained for constrained in (
+                _constrain_path_to_road(
+                    path, road_mask, image_shape)
+                for path in legacy_paths) if constrained is not None]
     paths = curve_paths if path_source == "curve" else heatmap_ridge_paths
+    path_count = len(paths)
     path_heatmaps = raw_path_heatmaps if include_path_heatmaps else None
 
     path_scores_list = path_scores.tolist()
@@ -596,12 +748,13 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "paths": paths,
         "curve_paths": curve_paths,
         "heatmap_ridge_paths": heatmap_ridge_paths,
-        "path_source": "direct_curve" if path_source == "curve" else "heatmap_ridge",
-        "display_source": "direct_curve" if path_source == "curve" else "heatmap_ridge",
+        "path_source": "row_classifier" if path_source == "curve" else "heatmap_ridge",
+        "display_source": "row_classifier" if path_source == "curve" else "heatmap_ridge",
         "path_scores": path_scores_list,
         "path_count": path_count,
         "path_count_scores": path_count_scores_list,
         "path_count_probabilities": path_count_scores_list,
+        "model_path_count": model_path_count,
         "count_confidence": count_confidence,
         "stride": PIXEL_STRIDE,
     }
@@ -612,6 +765,7 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "road_mask_raw": road_mask_raw,
         "path_heatmaps": path_heatmaps,
         "path_count": path_count,
+        "model_path_count": model_path_count,
         "path_count_scores": path_count_scores_list,
         "paths": paths,
         "curve_paths": curve_paths,
@@ -639,13 +793,24 @@ def _overlay_binary_mask(image, mask, color, alpha):
     cv2.copyTo(tinted, resized, image)
 
 
-def _overlay_path_heatmaps(image, heatmaps, colors, alpha, threshold):
+def _overlay_path_heatmaps(image, heatmaps, colors, alpha, threshold,
+                           road_mask=None):
     if alpha <= 0.0 or heatmaps is None or not heatmaps.size:
         return
     denominator = max(1.0 - threshold, 1e-6)
     weights = np.clip(
         (np.asarray(heatmaps, dtype=np.float32) - threshold) / denominator,
         0.0, 1.0)
+    if PATH_CONSTRAIN_TO_ROAD:
+        if road_mask is None or not np.asarray(road_mask).size:
+            weights.fill(0.0)
+        else:
+            road = np.asarray(road_mask, dtype=np.uint8)
+            if road.shape != weights.shape[1:]:
+                road = cv2.resize(
+                    road, (weights.shape[2], weights.shape[1]),
+                    interpolation=cv2.INTER_NEAREST)
+            weights *= (road != 0)[None, ...]
     # Color at native 160x120 resolution, then let OpenCV perform the only
     # full-frame operation. Pixel brightness remains proportional to the raw
     # sigmoid probability in heatmap mode.
@@ -763,7 +928,8 @@ def render_result(image, result, mode=None):
                 image, heatmaps,
                 (PATH_COLORS[first_role], PATH_COLORS["right"]),
                 PATH_HEATMAP_ALPHA,
-                0.0 if mode == "heatmap" else PATH_HEATMAP_THRESHOLD)
+                0.0 if mode == "heatmap" else PATH_HEATMAP_THRESHOLD,
+                result.get("road_mask"))
 
     drawn_detections = _select_detections_for_render(
         result.get("detections"), mode)
