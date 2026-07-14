@@ -527,7 +527,7 @@ class TurnSignOcrApiProcessor:
     def __init__(
         self,
         min_det_score=0.35,
-        min_area_ratio=0.001,
+        min_area_ratio=0.031,
         min_ocr_confidence=0.30,
         stable_frames=2,
         stable_duration_s=0.50,
@@ -986,6 +986,7 @@ def _ocr_worker_main(request_queue, result_queue, stop_event, processor_kwargs, 
                         "type": "result",
                         "timestamp": now_seconds(),
                         "request_id": payload.get("request_id"),
+                        "session_id": payload.get("session_id"),
                         "response": {
                             "active": True,
                             "status": "ocr_unavailable",
@@ -1019,6 +1020,7 @@ def _ocr_worker_main(request_queue, result_queue, stop_event, processor_kwargs, 
                 "type": "result",
                 "timestamp": now_seconds(),
                 "request_id": payload.get("request_id"),
+                "session_id": payload.get("session_id"),
                 "response": response,
             },
         )
@@ -1037,6 +1039,9 @@ class AsyncTurnSignOcrApiProcessor:
         worker_cpu_set="0-3",
         mp_start_method=None,
         log_func=None,
+        confirm_frames=3,
+        confirm_iou=0.30,
+        confirm_max_misses=2,
         **processor_kwargs,
     ):
         self.log_func = log_func or (lambda _message: None)
@@ -1046,12 +1051,21 @@ class AsyncTurnSignOcrApiProcessor:
         self.processor_kwargs.pop("log_func", None)
 
         self.min_det_score = float(self.processor_kwargs.get("min_det_score", 0.35))
-        self.min_area_ratio = float(self.processor_kwargs.get("min_area_ratio", 0.001))
+        self.min_area_ratio = float(self.processor_kwargs.get("min_area_ratio", 0.031))
         self.ocr_interval = float(self.processor_kwargs.get("ocr_interval", 0.25))
+        self.confirm_frames = max(1, int(confirm_frames))
+        self.confirm_iou = clamp(confirm_iou, 0.0, 1.0)
+        self.confirm_max_misses = max(0, int(confirm_max_misses))
+        self.confirm_count = 0
+        self.confirm_misses = 0
+        self.confirm_bbox = None
+        self.session_active = False
+        self.session_resolved = False
+        self.session_id = 0
         self.latest_result = fixed_unknown_result("", "not_started")
         self.latest_response = {
             "active": False,
-            "status": "worker_starting",
+            "status": "idle",
             "instruction": self.latest_result,
         }
         self.latest_response_ts = 0.0
@@ -1068,6 +1082,9 @@ class AsyncTurnSignOcrApiProcessor:
         self.last_valid_response_ts = 0.0
         self.last_turnsign_seen_ts = 0.0
         self.last_turnsign_bbox = None
+        self.turnsign_snapshot_crop = None
+        self.turnsign_snapshot_detection = None
+        self.turnsign_snapshot_ts = 0.0
         self.detection_iou_reset = float(
             os.environ.get("AR_TURNSIGN_DET_IOU_RESET", "0.05")
         )
@@ -1099,9 +1116,17 @@ class AsyncTurnSignOcrApiProcessor:
 
         start_method = mp_start_method or os.environ.get("AR_TURNSIGN_OCR_MP_START", "spawn")
         self.ctx = mp.get_context(start_method)
-        self._start_worker()
+        # Do not create the process or load PaddleOCR at application startup.
+        # The third tracked TurnSign observation starts this worker as a prewarm
+        # step; the image is submitted only after the sign reaches stop size.
+        self.request_queue = None
+        self.result_queue = None
+        self.stop_event = None
+        self.process_handle = None
 
     def _start_worker(self):
+        if self._worker_alive():
+            return True
         self.request_queue = self.ctx.Queue(maxsize=1)
         self.result_queue = self.ctx.Queue(maxsize=3)
         self.stop_event = self.ctx.Event()
@@ -1172,6 +1197,7 @@ class AsyncTurnSignOcrApiProcessor:
         return TurnSignOcrApiProcessor.is_turnsign_detection(det)
 
     def select_turnsign(self, detections):
+        """Select a detection for tracking without applying the stop-size gate."""
         candidates = []
         for det in detections or []:
             if not self.is_turnsign_detection(det):
@@ -1181,7 +1207,7 @@ class AsyncTurnSignOcrApiProcessor:
                 area = float(det.get("area_ratio", 0.0))
             except Exception:
                 continue
-            if score < self.min_det_score or area < self.min_area_ratio:
+            if score < self.min_det_score:
                 continue
             candidates.append((score + area * 4.0, det))
         if not candidates:
@@ -1198,6 +1224,60 @@ class AsyncTurnSignOcrApiProcessor:
             if self._bbox_iou(self.last_turnsign_bbox, tracked[1].get("bbox")) >= self.detection_iou_reset:
                 return tracked[1]
         return candidates[0][1]
+
+    def _detection_area_ratio(self, det, frame=None):
+        try:
+            area = float((det or {}).get("area_ratio", 0.0))
+        except (TypeError, ValueError):
+            area = 0.0
+        if area > 0.0:
+            return area
+        try:
+            left, top, right, bottom = [float(value) for value in det.get("bbox")]
+            frame_h, frame_w = frame.shape[:2]
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+        box_area = max(0.0, right - left) * max(0.0, bottom - top)
+        return box_area / float(max(1, int(frame_h) * int(frame_w)))
+
+    def _snapshot_size_reached(self, det, frame=None):
+        return self._detection_area_ratio(det, frame) >= self.min_area_ratio
+
+    def _reset_confirmation(self):
+        self.confirm_count = 0
+        self.confirm_misses = 0
+        self.confirm_bbox = None
+
+    def _observe_for_confirmation(self, det):
+        """Count repeated observations of one sign and start a new session."""
+        bbox = (det or {}).get("bbox")
+        if self.confirm_count <= 0:
+            self.confirm_count = 1
+        elif (
+            self.confirm_bbox is not None
+            and bbox is not None
+            and self._bbox_iou(self.confirm_bbox, bbox) >= self.confirm_iou
+        ):
+            self.confirm_count = min(self.confirm_frames, self.confirm_count + 1)
+        else:
+            self.confirm_count = 1
+        self.confirm_misses = 0
+        self.confirm_bbox = list(bbox) if bbox is not None else None
+
+        if self.session_active or self.confirm_count < self.confirm_frames:
+            return False
+        self.session_active = True
+        self.session_resolved = False
+        self.session_id += 1
+        self._start_worker()
+        return True
+
+    def _observe_confirmation_miss(self):
+        if self.session_active or self.confirm_count <= 0:
+            return
+        self.confirm_misses += 1
+        if self.confirm_misses > self.confirm_max_misses:
+            self._reset_confirmation()
 
     @staticmethod
     def _response_direction(response):
@@ -1249,6 +1329,8 @@ class AsyncTurnSignOcrApiProcessor:
         held["refresh_pending"] = bool(refresh_pending)
         held["instruction_current"] = False
         held["display_result_valid"] = True
+        held["turnsign_resolved"] = bool(self.session_resolved)
+        held["session_id"] = self.session_id
         held["result_age"] = max(0.0, float(age))
         if refresh_status:
             held["refresh_status"] = str(refresh_status)
@@ -1272,8 +1354,25 @@ class AsyncTurnSignOcrApiProcessor:
         self.pending = False
         self.pending_since_ts = 0.0
         self.pending_request_id = 0
+        self.session_active = False
+        self.session_resolved = False
+        self._reset_confirmation()
         self.bbox_mismatch_candidate = None
         self.bbox_mismatch_count = 0
+        self.turnsign_snapshot_crop = None
+        self.turnsign_snapshot_detection = None
+        self.turnsign_snapshot_ts = 0.0
+
+    def _capture_turnsign_snapshot(self, frame, det, timestamp):
+        """Freeze the first stop-size crop and reuse it for this sign."""
+        if self.turnsign_snapshot_crop is None:
+            crop = crop_bbox(frame, (det or {}).get("bbox"))
+            if crop is None or crop.size == 0:
+                return None
+            self.turnsign_snapshot_crop = np.ascontiguousarray(crop).copy()
+            self.turnsign_snapshot_detection = dict(det or {})
+            self.turnsign_snapshot_ts = float(timestamp)
+        return self.turnsign_snapshot_crop
 
     def close(self):
         self._stop_worker(terminate=True, graceful_timeout=10.0)
@@ -1316,7 +1415,15 @@ class AsyncTurnSignOcrApiProcessor:
                     item_request_id = int(item.get("request_id") or 0)
                 except (TypeError, ValueError):
                     item_request_id = 0
-                if not item_request_id or item_request_id != self.pending_request_id:
+                try:
+                    item_session_id = int(item.get("session_id") or 0)
+                except (TypeError, ValueError):
+                    item_session_id = 0
+                if (
+                    not item_request_id
+                    or item_request_id != self.pending_request_id
+                    or item_session_id != self.session_id
+                ):
                     continue
                 response = dict(item.get("response") or {})
                 instruction = response.get("instruction")
@@ -1325,6 +1432,7 @@ class AsyncTurnSignOcrApiProcessor:
                     if self._response_direction(response) in {"left", "right"}:
                         self.last_valid_response = dict(response)
                         self.last_valid_response_ts = now_seconds()
+                        self.session_resolved = True
                 else:
                     response.setdefault("latest_instruction", self.latest_result)
                 self.latest_response = response
@@ -1340,34 +1448,19 @@ class AsyncTurnSignOcrApiProcessor:
         clear_result = bool(self.clear_result_pending)
         self.clear_result_pending = False
         result_received = self._drain_results()
-
-        if not self._worker_alive():
-            self.pending = False
-            self.pending_since_ts = 0.0
-            error = self._worker_exit_error()
-            self.worker_ready = False
-            self.worker_error = error
-            restarted = False
-            if ts - self.last_worker_restart_ts >= self.worker_restart_cooldown:
-                self._restart_worker(error)
-                restarted = self._worker_alive()
-            self.latest_response = {
-                "active": bool(detections),
-                "status": "ocr_worker_restarting" if restarted else "ocr_unavailable",
-                "instruction": self.latest_result,
-                "latest_instruction": self.latest_result,
-                "instruction_current": False,
-                "worker_ready": False,
-                "error": error,
-                "clear_result": clear_result,
-            }
-            return dict(self.latest_response)
-
         det = self.select_turnsign(detections)
+
         if det is None:
+            self._observe_confirmation_miss()
             if (
                 self.last_turnsign_seen_ts > 0.0
                 and ts - self.last_turnsign_seen_ts >= self.sign_absence_reset
+                and not result_received
+                and (
+                    not self.session_active
+                    or self.turnsign_snapshot_crop is None
+                    or self.session_resolved
+                )
             ):
                 self._invalidate_stable_result()
                 self.last_turnsign_seen_ts = 0.0
@@ -1375,71 +1468,106 @@ class AsyncTurnSignOcrApiProcessor:
                 self.bbox_mismatch_candidate = None
                 self.bbox_mismatch_count = 0
                 clear_result = True
-            return {
-                "active": False,
-                "status": "no_turnsign",
-                "instruction": fixed_unknown_result("", "no_turnsign"),
-                "latest_instruction": self.latest_result,
-                "instruction_current": False,
-                "worker_ready": self.worker_ready,
-                "error": self.worker_error or None,
-                "clear_result": clear_result,
-            }
-
-        current_bbox = det.get("bbox")
-        if (
-            self.last_turnsign_seen_ts > 0.0
-            and ts - self.last_turnsign_seen_ts >= self.sign_absence_reset
-        ):
-            self._invalidate_stable_result()
-            clear_result = True
-            self.last_turnsign_bbox = list(current_bbox) if current_bbox is not None else None
-        elif (
-            self.last_turnsign_bbox is not None
-            and current_bbox is not None
-            and self._bbox_iou(self.last_turnsign_bbox, current_bbox) < self.detection_iou_reset
-        ):
+        else:
+            current_bbox = det.get("bbox")
+            replacement_observed = False
             if (
-                self.bbox_mismatch_candidate is not None
-                and self._bbox_iou(self.bbox_mismatch_candidate, current_bbox) >= self.detection_iou_reset
+                self.session_active
+                and self.last_turnsign_bbox is not None
+                and current_bbox is not None
+                and self._bbox_iou(self.last_turnsign_bbox, current_bbox)
+                < self.detection_iou_reset
             ):
-                self.bbox_mismatch_count += 1
+                if (
+                    self.bbox_mismatch_candidate is not None
+                    and self._bbox_iou(
+                        self.bbox_mismatch_candidate, current_bbox
+                    ) >= max(self.detection_iou_reset, self.confirm_iou)
+                ):
+                    self.bbox_mismatch_count += 1
+                else:
+                    self.bbox_mismatch_candidate = list(current_bbox)
+                    self.bbox_mismatch_count = 1
+                if self.bbox_mismatch_count >= self.detection_reset_frames:
+                    replacement_count = self.bbox_mismatch_count
+                    self._invalidate_stable_result()
+                    clear_result = True
+                    self.last_turnsign_bbox = None
+                    # The mismatch frames already constitute observations of
+                    # the replacement sign. Carry them into its confirmation
+                    # so every sign still starts OCR on its third observation,
+                    # rather than requiring three additional frames.
+                    self.confirm_count = min(
+                        max(0, self.confirm_frames - 1),
+                        max(0, replacement_count - 1),
+                    )
+                    self.confirm_bbox = (
+                        list(current_bbox) if self.confirm_count > 0 else None
+                    )
+                    self._observe_for_confirmation(det)
+                    replacement_observed = True
             else:
-                self.bbox_mismatch_candidate = list(current_bbox)
-                self.bbox_mismatch_count = 1
-            if self.bbox_mismatch_count >= self.detection_reset_frames:
-                self._invalidate_stable_result()
-                clear_result = True
-                self.last_turnsign_bbox = list(current_bbox)
+                self.last_turnsign_bbox = (
+                    list(current_bbox) if current_bbox is not None else None
+                )
                 self.bbox_mismatch_candidate = None
                 self.bbox_mismatch_count = 0
-        else:
-            self.last_turnsign_bbox = list(current_bbox) if current_bbox is not None else None
-            self.bbox_mismatch_candidate = None
-            self.bbox_mismatch_count = 0
-        self.last_turnsign_seen_ts = ts
-        if self.last_turnsign_bbox is None and current_bbox is not None:
-            self.last_turnsign_bbox = list(current_bbox)
+
+            self.last_turnsign_seen_ts = ts
+            if not self.session_active and not replacement_observed:
+                self._observe_for_confirmation(det)
+            if self.last_turnsign_bbox is None and current_bbox is not None:
+                self.last_turnsign_bbox = list(current_bbox)
+
+        stop_size_reached = bool(
+            det is not None and self._snapshot_size_reached(det, frame)
+        )
+        if (
+            self.session_active
+            and not self.session_resolved
+            and stop_size_reached
+            and self.turnsign_snapshot_crop is None
+        ):
+            self._capture_turnsign_snapshot(frame, det, ts)
+
+        work_det = det or self.turnsign_snapshot_detection
 
         base = {
-            "active": True,
-            "detection": det,
+            "active": bool(det is not None or self.session_active),
+            "detection": work_det,
             "instruction": fixed_unknown_result("", "ocr_pending"),
             "latest_instruction": self.latest_result,
             "instruction_current": False,
             "worker_ready": self.worker_ready,
             "error": self.worker_error or None,
             "clear_result": clear_result,
+            "confirm_count": self.confirm_count,
+            "confirm_frames": self.confirm_frames,
+            "session_id": self.session_id if self.session_active else None,
+            "session_active": self.session_active,
+            "turnsign_resolved": self.session_resolved,
+            "stop_size_reached": stop_size_reached,
+            "area_ratio": (
+                self._detection_area_ratio(det, frame) if det is not None else None
+            ),
+            "snapshot_captured": self.turnsign_snapshot_crop is not None,
+            "snapshot_timestamp": self.turnsign_snapshot_ts or None,
         }
+
         if result_received:
             response = dict(self.latest_response or {})
             response.setdefault("active", True)
-            response.setdefault("detection", det)
+            response.setdefault("detection", work_det)
             response.setdefault("instruction", fixed_unknown_result("", "worker_result"))
             response.setdefault("latest_instruction", self.latest_result)
             response.setdefault("instruction_current", False)
             response["worker_ready"] = self.worker_ready
             response["clear_result"] = clear_result
+            response["session_id"] = self.session_id
+            response["session_active"] = self.session_active
+            response["turnsign_resolved"] = self.session_resolved
+            response["snapshot_captured"] = self.turnsign_snapshot_crop is not None
+            response["snapshot_timestamp"] = self.turnsign_snapshot_ts or None
             if self.worker_error:
                 response["error"] = self.worker_error
             if (
@@ -1448,7 +1576,7 @@ class AsyncTurnSignOcrApiProcessor:
             ):
                 return response
             held = self._stable_response(
-                det,
+                work_det,
                 ts,
                 refresh_pending=False,
                 refresh_status=response.get("status"),
@@ -1461,13 +1589,56 @@ class AsyncTurnSignOcrApiProcessor:
             self.parent_result_hold > 0.0
             and ts - self.latest_response_ts <= self.parent_result_hold
         ):
-            held = self._stable_response(det, ts)
+            held = self._stable_response(work_det, ts)
             if held is not None:
                 return held
 
+        if det is None and not self.session_active:
+            response = dict(base)
+            response["status"] = (
+                "turnsign_confirmation_paused"
+                if self.confirm_count > 0 else "no_turnsign"
+            )
+            return response
+
+        if not self.session_active:
+            response = dict(base)
+            response["status"] = "turnsign_confirming"
+            return response
+
+        if self.session_resolved:
+            response = dict(base)
+            response["active"] = False
+            response["status"] = "route_ready_held"
+            response["instruction"] = self.latest_result
+            response["latest_instruction"] = self.latest_result
+            return response
+
+        if not self._worker_alive():
+            self.pending = False
+            self.pending_since_ts = 0.0
+            self.pending_request_id = 0
+            error = self._worker_exit_error()
+            self.worker_ready = False
+            self.worker_error = error
+            if ts - self.last_worker_restart_ts >= self.worker_restart_cooldown:
+                self._restart_worker(error)
+            response = dict(base)
+            response["status"] = "ocr_worker_restarting"
+            response["worker_ready"] = False
+            response["error"] = error
+            return response
+
+        if self.turnsign_snapshot_crop is None:
+            response = dict(base)
+            response["status"] = (
+                "waiting_stop_size" if self.worker_ready else "ocr_prewarming"
+            )
+            return response
+
         if not self.worker_ready and not self.worker_error:
             response = dict(base)
-            response["status"] = "worker_starting"
+            response["status"] = "snapshot_waiting_worker"
             return response
 
         if self.pending:
@@ -1480,7 +1651,7 @@ class AsyncTurnSignOcrApiProcessor:
                 response["error"] = reason
                 return response
             held = self._stable_response(
-                det,
+                work_det,
                 ts,
                 refresh_pending=True,
                 refresh_status="ocr_pending",
@@ -1492,7 +1663,7 @@ class AsyncTurnSignOcrApiProcessor:
             return response
         if ts - self.last_submit_ts < self.ocr_interval:
             held = self._stable_response(
-                det,
+                work_det,
                 ts,
                 refresh_pending=False,
                 refresh_status="ocr_throttled",
@@ -1501,7 +1672,7 @@ class AsyncTurnSignOcrApiProcessor:
                 return held
             response = dict(base)
             response["active"] = True
-            response["detection"] = det
+            response["detection"] = work_det
             response["instruction"] = fixed_unknown_result("", "ocr_throttled")
             response["latest_instruction"] = self.latest_result
             response["instruction_current"] = False
@@ -1511,19 +1682,22 @@ class AsyncTurnSignOcrApiProcessor:
                 response["error"] = self.worker_error
             return response
 
-        crop = crop_bbox(frame, det.get("bbox"))
-        if crop is None or crop.size == 0:
+        frozen_crop = self.turnsign_snapshot_crop
+        if frozen_crop is None or frozen_crop.size == 0:
             response = dict(base)
             response["status"] = "bad_crop"
             return response
+        base["snapshot_captured"] = True
+        base["snapshot_timestamp"] = self.turnsign_snapshot_ts
 
         self.request_id += 1
         payload = {
             "type": "ocr",
             "request_id": self.request_id,
+            "session_id": self.session_id,
             "timestamp": ts,
-            "crop": crop,
-            "detection": det,
+            "crop": frozen_crop,
+            "detection": dict(self.turnsign_snapshot_detection or work_det or {}),
             "context": context or {},
         }
         queued = _queue_put_latest(self.request_queue, payload)
@@ -1532,7 +1706,7 @@ class AsyncTurnSignOcrApiProcessor:
             response["status"] = "ocr_queue_error"
             response["error"] = "failed to enqueue OCR request"
             held = self._stable_response(
-                det,
+                work_det,
                 ts,
                 refresh_pending=False,
                 refresh_status="ocr_queue_error",
@@ -1546,7 +1720,7 @@ class AsyncTurnSignOcrApiProcessor:
         self.pending_request_id = self.request_id
         self.last_submit_ts = ts
         held = self._stable_response(
-            det,
+            work_det,
             ts,
             refresh_pending=True,
             refresh_status="ocr_submitted",

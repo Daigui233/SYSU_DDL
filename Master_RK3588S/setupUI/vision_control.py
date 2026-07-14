@@ -268,7 +268,9 @@ class VisionControlConfig:
     coin_bottom_ratio: float = 0.55
     coin_lateral_ratio: float = 0.24
     sign_stop_height_ratio: float = 0.24
-    sign_stop_area_ratio: float = 0.035
+    # Measured from the live 640x480 AR Preview: the desired stop-size
+    # TurnSign box is about 140x69 px (9660 px^2, or 3.14% of the frame).
+    sign_stop_area_ratio: float = 0.031
     sign_stop_line_margin_ratio: float = 0.08
     sign_slow_min_score: float = 0.20
     sign_latch_frames: int = 3
@@ -401,7 +403,7 @@ class VisionControlConfig:
             coin_bottom_ratio=_clamp(_env_float("VISION_CONTROL_COIN_BOTTOM_RATIO", 0.55), 0.0, 1.0),
             coin_lateral_ratio=_clamp(_env_float("VISION_CONTROL_COIN_LATERAL_RATIO", 0.24), 0.01, 0.5),
             sign_stop_height_ratio=_clamp(_env_float("VISION_CONTROL_SIGN_STOP_HEIGHT_RATIO", 0.24), 0.01, 1.0),
-            sign_stop_area_ratio=_clamp(_env_float("VISION_CONTROL_SIGN_STOP_AREA_RATIO", 0.035), 0.001, 1.0),
+            sign_stop_area_ratio=_clamp(_env_float("VISION_CONTROL_SIGN_STOP_AREA_RATIO", 0.031), 0.001, 1.0),
             sign_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_SIGN_STOP_LINE_MARGIN_RATIO", 0.08), 0.0, 0.5),
             sign_slow_min_score=_clamp(_env_float("VISION_CONTROL_SIGN_SLOW_MIN_SCORE", 0.20), 0.0, 1.0),
             sign_latch_frames=max(1, _env_int("VISION_CONTROL_SIGN_LATCH_FRAMES", 3)),
@@ -1193,6 +1195,7 @@ class VisionControlPlanner:
         self.human_last_side = None
         self.human_pass_active = False
         self.human_pass_side = None
+        self.human_pass_offset_x = 0.0
         self.human_speed_hold_until = 0.0
         self.sign_ocr_active_since = None
         self.sign_ocr_pulse_until = 0.0
@@ -2707,8 +2710,14 @@ class VisionControlPlanner:
 
     def _build_command(self, selected, route_state, route_reason, result, image_shape, now, ocr_response=None):
         lookahead_y = image_shape[0] * self.config.lookahead_y_ratio
+        path_target = (
+            self._path_target_on_selected(selected, lookahead_y)
+            if selected is not None else None)
+        task_path_target_x = None if path_target is None else path_target[0]
         task_state, speed, task_reason, target_override_x = self._task_from_detections(
-            result, selected, image_shape, lookahead_y, route_state, now, ocr_response=ocr_response)
+            result, selected, image_shape, lookahead_y, route_state, now,
+            ocr_response=ocr_response,
+            path_target_x=task_path_target_x)
         if selected is None:
             age = now - self.last_valid_ts if self.last_valid_ts else 1e9
             held_target = self._held_path_target(now)
@@ -2741,7 +2750,6 @@ class VisionControlPlanner:
                 "task_reason": "ambiguous_stop",
             }
 
-        path_target = self._path_target_on_selected(selected, lookahead_y)
         if path_target is None:
             return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
                 "target_x": None,
@@ -2752,8 +2760,13 @@ class VisionControlPlanner:
                 "task_reason": task_reason,
             }
         path_target_x, path_target_y, path_target_adaptive = path_target
-        target_x = (float(target_override_x) if target_override_x is not None
-                    else float(path_target_x))
+        target_x = _clamp(
+            float(target_override_x) if target_override_x is not None
+            else float(path_target_x),
+            0.0,
+            float(max(0, image_shape[1] - 1)),
+        )
+        task_offset_x = float(target_x) - float(path_target_x)
         raw_error = (float(target_x) / float(max(1, image_shape[1])) - self.config.visual_center_x) * 640.0
         error = self._limit_error(raw_error)
         self.last_error = error
@@ -2771,6 +2784,8 @@ class VisionControlPlanner:
             "path_target_held": False,
             "path_target_adaptive_y": bool(path_target_adaptive),
             "lookahead_y": float(path_target_y),
+            "task_offset_x": float(task_offset_x),
+            "task_target_applied": target_override_x is not None,
             "track_error_640": float(error),
             "raw_track_error_640": float(raw_error),
             "reason": route_reason,
@@ -2810,7 +2825,9 @@ class VisionControlPlanner:
         return (float(self.last_path_target_x),
                 float(self.last_path_target_y))
 
-    def _task_from_detections(self, result, selected, image_shape, lookahead_y, route_state, now, ocr_response=None):
+    def _task_from_detections(
+            self, result, selected, image_shape, lookahead_y, route_state,
+            now, ocr_response=None, path_target_x=None):
         detections = result.get("detections") or []
         if selected is None:
             return STATE_RECOVER_LINE, self.config.recover_speed_mps, "no_path", None
@@ -2825,12 +2842,15 @@ class VisionControlPlanner:
             return STATE_SAFE_STOP, 0.0, "turnsign_stop", None
         if sign_mode == "pulse":
             return STATE_TRACK, self.config.sign_ocr_pulse_speed_mps, "turnsign_ocr_timeout_pulse", None
-        target_path_x = _interp_path_x(selected["points_xy"], image_shape[0] * 0.68)
+        # Route selection owns the baseline. All task targets must be derived
+        # from the exact lookahead point on that locked route, not from another
+        # row on the curve.
+        target_path_x = _finite_float(path_target_x)
+        if target_path_x is None:
+            target_path_x = _interp_path_x(selected["points_xy"], lookahead_y)
         if target_path_x is None:
             target_path_x = image_shape[1] * self.config.visual_center_x
-        lookahead_path_x = _interp_path_x(selected["points_xy"], lookahead_y)
-        if lookahead_path_x is None:
-            lookahead_path_x = target_path_x
+        lookahead_path_x = float(target_path_x)
         human_action = self._human_action(
             detections, selected, image_shape, lookahead_y, lookahead_path_x)
         if human_action is not None:
@@ -2838,7 +2858,18 @@ class VisionControlPlanner:
                 self.human_speed_hold_until = float(now) + self.config.human_speed_hold_s
             return human_action
         if now < self.human_speed_hold_until:
-            return STATE_AVOID_HUMAN, self.config.human_pass_speed_mps, "human_speed_hold", None
+            held_target_x = _clamp(
+                float(target_path_x) + float(self.human_pass_offset_x),
+                0.0,
+                float(max(0, image_shape[1] - 1)),
+            )
+            return (
+                STATE_AVOID_HUMAN,
+                self.config.human_pass_speed_mps,
+                "human_speed_hold",
+                held_target_x,
+            )
+        self.human_pass_offset_x = 0.0
         hazard_limit = image_shape[1] * self.config.hazard_lateral_ratio
         for det in detections:
             label = self._normalized_label(det)
@@ -2868,6 +2899,12 @@ class VisionControlPlanner:
 
     def _turnsign_action(self, detections, image_shape, lookahead_y, ocr_response, now):
         has_active_ocr = bool((ocr_response or {}).get("active"))
+        if bool((ocr_response or {}).get("turnsign_resolved")):
+            # A valid left/right result has already been accepted for this
+            # tracked sign session. Keep driving on the locked route even while
+            # the physical sign remains visible in the camera.
+            self._clear_turnsign_state()
+            return None
         if self._ocr_has_current_direction(ocr_response):
             self._clear_turnsign_state()
             return None
@@ -3016,6 +3053,7 @@ class VisionControlPlanner:
             0.0,
             float(max(0, image_shape[1] - 1)),
         )
+        self.human_pass_offset_x = float(target_x) - float(path_x)
         return STATE_AVOID_HUMAN, self.config.human_pass_speed_mps, "human_cross_pass", target_x
 
     def _human_on_stop_line(self, geom, image_shape, lookahead_y):
@@ -3035,21 +3073,15 @@ class VisionControlPlanner:
         self.human_pass_side = None
 
     def _sign_should_stop(self, geom, image_shape, lookahead_y):
-        height_ratio = float(geom["box_h"]) / float(max(1, image_shape[0]))
         area_ratio = geom.get("area_ratio")
         if area_ratio is None:
             area_ratio = (float(geom["box_w"]) * float(geom["box_h"])) / float(max(1, image_shape[0] * image_shape[1]))
-        large_enough = (
-            height_ratio >= self.config.sign_stop_height_ratio
-            or float(area_ratio) >= self.config.sign_stop_area_ratio
-        )
-        if not large_enough:
-            return False
-        line_margin = float(image_shape[0]) * self.config.sign_stop_line_margin_ratio
-        return (
-            float(geom["top"]) - line_margin <= float(lookahead_y) <= float(geom["bottom"]) + line_margin
-            or abs(float(geom["bottom"]) - float(lookahead_y)) <= line_margin
-        )
+        # TurnSign approach distance is represented by its apparent size. Once
+        # it reaches the calibrated Preview size, stop immediately and wait for
+        # a current left/right API result; do not also require it to intersect
+        # the path lookahead row. Keep this area gate identical to the OCR
+        # snapshot gate so stopping and OCR submission happen on the same frame.
+        return float(area_ratio) >= self.config.sign_stop_area_ratio
 
     def _best_coin(self, detections, image_shape, path_x):
         best = None
@@ -3333,15 +3365,22 @@ def render_vision_control_debug(frame, result):
             thickness=3 if int(line.get("slot", -1)) == selected_slot else 2)
 
     target = debug.get("control_target") or {}
-    target_x = _finite_float(
-        target.get("path_target_x"),
-        _finite_float(target.get("target_x")))
+    path_target_x = _finite_float(target.get("path_target_x"))
+    target_x = _finite_float(target.get("target_x"), path_target_x)
     lookahead_y = _finite_float(
         target.get("path_target_y"),
         _finite_float(target.get("lookahead_y"), h * 0.62))
     if target_x is not None:
         x = int(round(_clamp(target_x, 0, w - 1)))
         y = int(round(_clamp(lookahead_y, 0, h - 1)))
+        if path_target_x is not None and abs(float(target_x) - path_target_x) >= 0.5:
+            base_x = int(round(_clamp(path_target_x, 0, w - 1)))
+            cv2.circle(
+                frame, (base_x, y), 5, (255, 255, 255), 1,
+                cv2.LINE_AA)
+            cv2.line(
+                frame, (base_x, y), (x, y), (0, 165, 255), 2,
+                cv2.LINE_AA)
         cv2.circle(frame, (x, y), 7, (255, 0, 255), -1, cv2.LINE_AA)
         cv2.line(frame, (0, y), (w - 1, y), (255, 0, 255), 1, cv2.LINE_AA)
 

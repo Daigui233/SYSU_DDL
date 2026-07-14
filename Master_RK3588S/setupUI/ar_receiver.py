@@ -624,8 +624,14 @@ def create_ocr_processor():
 
         processor = AsyncTurnSignOcrApiProcessor(
             worker_cpu_set=os.environ.get("AR_TURNSIGN_OCR_CPUSET", "0-3"),
+            confirm_frames=max(1, int(env_float("AR_TURNSIGN_CONFIRM_FRAMES", 3))),
+            confirm_iou=env_float("AR_TURNSIGN_CONFIRM_IOU", 0.30),
+            confirm_max_misses=max(
+                0, int(env_float("AR_TURNSIGN_CONFIRM_MAX_MISSES", 2))),
             min_det_score=env_float("AR_TURNSIGN_MIN_DET_SCORE", 0.25),
-            min_area_ratio=env_float("AR_TURNSIGN_MIN_AREA_RATIO", 0.0004),
+            # The third tracked detection prewarms OCR. This separate size gate
+            # freezes/submits the image only at about 140x69 px in 640x480.
+            min_area_ratio=env_float("AR_TURNSIGN_MIN_AREA_RATIO", 0.031),
             min_ocr_confidence=env_float("AR_TURNSIGN_MIN_OCR_CONFIDENCE", 0.30),
             stable_frames=max(1, int(env_float("AR_TURNSIGN_STABLE_FRAMES", 2))),
             stable_duration_s=env_float("AR_TURNSIGN_STABLE_DURATION_S", 0.50),
@@ -637,7 +643,7 @@ def create_ocr_processor():
             async_api=True,
             log_func=lambda message: print(f"[OCR] {message}"),
         )
-        print("[OCR] TurnSign OCR/API enabled (read-only; not connected to vehicle control)")
+        print("[OCR] TurnSign OCR/API enabled (3 detections prewarm; 3.1% snapshot gate)")
         return processor
     except Exception as exc:
         print(f"[OCR] unavailable: {exc}")
@@ -700,6 +706,11 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     if not isinstance(ocr_response, dict):
         return frame
     status = str(ocr_response.get("status") or "-")
+    if status in {"turnsign_confirming", "turnsign_confirmation_paused"}:
+        status = (
+            f"{status} {int(ocr_response.get('confirm_count') or 0)}/"
+            f"{int(ocr_response.get('confirm_frames') or 3)}"
+        )
     instruction = ocr_response.get("instruction") or {}
     latest_instruction = ocr_response.get("latest_instruction") or {}
     choice = instruction_direction(instruction) or instruction_direction(latest_instruction) or "-"

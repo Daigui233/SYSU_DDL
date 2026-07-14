@@ -261,6 +261,29 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
         self.assertTrue(any(
             text.startswith("PATH COUNT: 2") for text in texts))
 
+    def test_ar_preview_draws_task_target_offset_from_path_baseline(self):
+        result = {
+            "vision_control": {
+                "selected_slot": 0,
+                "control_target": {
+                    "path_target_x": 200.0,
+                    "path_target_y": 300.0,
+                    "target_x": 255.0,
+                    "task_offset_x": 55.0,
+                },
+                "command": {"track_error": -65.0},
+            },
+            "heatmap_peak_detection": {},
+        }
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("vision_control.cv2.circle") as circle:
+            render_vision_control_debug(frame, result)
+
+        centers = [call.args[1] for call in circle.call_args_list]
+        self.assertIn((200, 300), centers)
+        self.assertIn((255, 300), centers)
+
     def test_short_occlusion_gap_is_reconnected_to_strong_lower_line(self):
         heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
         curve = lambda y: 70.0 + 0.10 * float(y)
@@ -943,6 +966,48 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertGreater(command["target_speed"], 0.0)
         self.assertEqual("car_in_path_bias", debug["control_target"]["task_reason"])
 
+    def test_locked_curve_is_baseline_for_car_avoidance_offset(self):
+        result = _curve_result_at(200.0, 430.0)
+        result["detections"] = [{
+            "label": "Car",
+            "score": 0.90,
+            "bbox": [160.0, 280.0, 220.0, 420.0],
+        }]
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+
+        _command, debug = planner.update(result, now=1.0)
+        target = debug["control_target"]
+
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertEqual("car_in_path_bias", target["task_reason"])
+        self.assertAlmostEqual(200.0, target["path_target_x"], delta=1.0)
+        self.assertGreater(target["target_x"], target["path_target_x"])
+        self.assertAlmostEqual(
+            target["target_x"] - target["path_target_x"],
+            target["task_offset_x"], delta=0.01)
+        self.assertTrue(target["task_target_applied"])
+
+    def test_locked_curve_is_baseline_for_coin_offset(self):
+        result = _curve_result_at(200.0, 430.0)
+        result["detections"] = [{
+            "label": "Coin",
+            "score": 0.90,
+            "bbox": [225.0, 300.0, 275.0, 420.0],
+        }]
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+
+        _command, debug = planner.update(result, now=1.0)
+        target = debug["control_target"]
+
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertEqual("coin_bias", target["task_reason"])
+        self.assertAlmostEqual(200.0, target["path_target_x"], delta=1.0)
+        self.assertGreater(target["target_x"], target["path_target_x"])
+        self.assertAlmostEqual(22.5, target["task_offset_x"], delta=1.0)
+        self.assertTrue(target["task_target_applied"])
+
     def test_turnsign_detection_slows_before_stop_line(self):
         detections = [{
             "label": "TurnSign",
@@ -1015,6 +1080,47 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(0.0, command["target_speed"])
         self.assertEqual(0, command["flags"])
         self.assertEqual("turnsign_stop", debug["control_target"]["task_reason"])
+
+    def test_preview_sized_turnsign_stops_before_lookahead(self):
+        detections = [{
+            "label": "TurnSign",
+            "score": 0.59,
+            "bbox": [285.0, 136.0, 425.0, 205.0],
+        }]
+        command, debug = VisionControlPlanner(config=_config()).update(
+            _result(_straight_heatmap(80), detections=detections),
+            {"active": True, "status": "ocr_pending"},
+            now=1.0,
+        )
+
+        self.assertEqual(STATE_SAFE_STOP, command["state_cmd"])
+        self.assertEqual(0.0, command["target_speed"])
+        self.assertEqual(0, command["flags"])
+        self.assertEqual("turnsign_stop", debug["control_target"]["task_reason"])
+
+    def test_resolved_turnsign_does_not_stop_again_while_still_visible(self):
+        detections = [{
+            "label": "TurnSign",
+            "score": 0.90,
+            "bbox": [285.0, 136.0, 425.0, 205.0],
+        }]
+        ocr_response = {
+            "active": False,
+            "status": "route_ready_held",
+            "turnsign_resolved": True,
+            "instruction_current": False,
+            "latest_instruction": {"direction": "right"},
+        }
+
+        command, debug = VisionControlPlanner(config=_config()).update(
+            _result(_straight_heatmap(80), detections=detections),
+            ocr_response,
+            now=1.0,
+        )
+
+        self.assertEqual(STATE_TRACK, command["state_cmd"])
+        self.assertGreater(command["target_speed"], 0.0)
+        self.assertEqual("track", debug["control_target"]["task_reason"])
 
     def test_active_ocr_turnsign_slows_until_near_lookahead_then_stops(self):
         far_sign = [{
@@ -1155,6 +1261,12 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(STATE_AVOID_HUMAN, hold_command["state_cmd"])
         self.assertAlmostEqual(0.35, hold_command["target_speed"])
         self.assertEqual("human_speed_hold", hold_debug["control_target"]["task_reason"])
+        self.assertAlmostEqual(
+            pass_debug["control_target"]["task_offset_x"],
+            hold_debug["control_target"]["task_offset_x"],
+            delta=0.01,
+        )
+        self.assertTrue(hold_debug["control_target"]["task_target_applied"])
         self.assertEqual(STATE_TRACK, resume_command["state_cmd"])
         self.assertEqual("track", resume_debug["control_target"]["task_reason"])
 
