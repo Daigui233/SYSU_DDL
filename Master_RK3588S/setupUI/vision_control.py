@@ -48,9 +48,9 @@ def _env_flag(name, default):
 def _path_source_from_env():
     value = os.environ.get(
         "VISION_CONTROL_PATH_SOURCE",
-        os.environ.get("MULTITASK_PATH_SOURCE", "heatmap"),
+        os.environ.get("MULTITASK_PATH_SOURCE", "skeleton"),
     ).strip().lower()
-    return value if value in {"curve", "heatmap"} else "heatmap"
+    return value if value in {"curve", "heatmap", "skeleton"} else "skeleton"
 
 
 def _finite_float(value, default=None):
@@ -63,6 +63,154 @@ def _finite_float(value, default=None):
 
 def _clamp(value, low, high):
     return max(float(low), min(float(high), float(value)))
+
+
+def _smooth_binary_mask_edges(mask, kernel_size=9):
+    """Round jagged binary-mask edges without returning grayscale pixels."""
+    mask = (np.asarray(mask) != 0).astype(np.uint8)
+    kernel_size = max(1, int(kernel_size))
+    if kernel_size <= 1 or not np.any(mask):
+        return mask
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    blurred = cv2.GaussianBlur(
+        mask * 255, (kernel_size, kernel_size), 0.0,
+        borderType=cv2.BORDER_REPLICATE)
+    return (blurred >= 127).astype(np.uint8)
+
+
+def _fill_binary_mask(mask):
+    """Fill every external binary contour, including its internal holes."""
+    mask = (np.asarray(mask) != 0).astype(np.uint8)
+    contours, _hierarchy = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(mask)
+    if contours:
+        cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
+    return filled
+
+
+def _connect_binary_mask_samples(
+        mask, max_gap=8, minimum_group_area=15, bridge_thickness=3):
+    """Connect nearby mask fragments as discrete samples.
+
+    Components whose dilated neighborhoods touch form one proximity group.
+    A minimum spanning forest then draws only the shortest bridges needed to
+    make each sufficiently large group continuous.  The work is performed on
+    component contours, never with Python loops over image pixels.
+    """
+    mask = (np.asarray(mask) != 0).astype(np.uint8)
+    if mask.ndim != 2 or not np.any(mask):
+        return mask
+
+    max_gap = max(0, int(max_gap))
+    minimum_group_area = max(1, int(minimum_group_area))
+    bridge_thickness = max(1, int(bridge_thickness))
+    component_count, labels, stats, _centroids = (
+        cv2.connectedComponentsWithStats(mask, connectivity=8))
+    if component_count <= 1:
+        return np.zeros_like(mask)
+
+    component_labels = np.arange(1, component_count, dtype=np.int32)
+    if max_gap > 0 and component_count > 2:
+        radius = max(1, int(math.ceil(float(max_gap) * 0.5)))
+        proximity_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+        proximity_mask = cv2.dilate(mask, proximity_kernel, iterations=1)
+        proximity_count, proximity_labels = cv2.connectedComponents(
+            proximity_mask, connectivity=8)
+        component_groups = np.zeros(component_count, dtype=np.int32)
+        foreground = labels != 0
+        np.maximum.at(
+            component_groups, labels[foreground],
+            proximity_labels[foreground])
+    else:
+        proximity_count = component_count
+        component_groups = np.arange(component_count, dtype=np.int32)
+
+    group_areas = np.bincount(
+        component_groups[1:],
+        weights=stats[1:, cv2.CC_STAT_AREA].astype(np.float64),
+        minlength=proximity_count)
+    valid_groups = np.flatnonzero(group_areas >= minimum_group_area)
+    valid_components = component_labels[np.isin(
+        component_groups[1:], valid_groups)]
+    if not len(valid_components):
+        return np.zeros_like(mask)
+
+    connected = np.isin(labels, valid_components).astype(np.uint8)
+    if max_gap <= 0 or len(valid_components) <= 1:
+        return connected
+
+    valid_component_set = set(valid_components.tolist())
+    boundary_parts = {}
+    contours, _hierarchy = cv2.findContours(
+        connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    for contour in contours:
+        points = contour.reshape((-1, 2))
+        if not len(points):
+            continue
+        component = int(labels[points[0, 1], points[0, 0]])
+        if component in valid_component_set:
+            boundary_parts.setdefault(component, []).append(points)
+    boundaries = {
+        component: np.concatenate(parts).astype(np.float32)
+        for component, parts in boundary_parts.items()
+    }
+
+    for group in valid_groups:
+        members = valid_components[
+            component_groups[valid_components] == int(group)]
+        if len(members) <= 1:
+            continue
+
+        edges = []
+        for first_index in range(len(members) - 1):
+            first_label = int(members[first_index])
+            first_points = boundaries.get(first_label)
+            if first_points is None or not len(first_points):
+                continue
+            for second_index in range(first_index + 1, len(members)):
+                second_label = int(members[second_index])
+                second_points = boundaries.get(second_label)
+                if second_points is None or not len(second_points):
+                    continue
+                distances, nearest = cv2.batchDistance(
+                    first_points, second_points, cv2.CV_32F,
+                    normType=cv2.NORM_L2, K=1)
+                nearest_first = int(np.argmin(distances[:, 0]))
+                distance = float(distances[nearest_first, 0])
+                if distance > float(max_gap):
+                    continue
+                nearest_second = int(nearest[nearest_first, 0])
+                edges.append((
+                    distance, first_index, second_index,
+                    first_points[nearest_first],
+                    second_points[nearest_second],
+                ))
+
+        parents = list(range(len(members)))
+
+        def find_root(index):
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        for _distance, first_index, second_index, first, second in sorted(
+                edges, key=lambda item: item[0]):
+            first_root = find_root(first_index)
+            second_root = find_root(second_index)
+            if first_root == second_root:
+                continue
+            parents[second_root] = first_root
+            cv2.line(
+                connected,
+                tuple(np.rint(first).astype(np.int32)),
+                tuple(np.rint(second).astype(np.int32)),
+                1, bridge_thickness, cv2.LINE_8)
+
+    return connected
 
 
 def _interp_path_x(points, target_y):
@@ -253,6 +401,13 @@ class VisionControlConfig:
     fragment_search_radius_px_640: float = 72.0
     fragment_max_tangent_delta_deg: float = 55.0
     heatmap_component_budget: int = 2
+    skeleton_threshold: float = 0.35
+    skeleton_min_area: int = 15
+    skeleton_min_length: int = 8
+    skeleton_close_iterations: int = 1
+    skeleton_edge_smooth_kernel: int = 9
+    skeleton_connect_max_gap: int = 8
+    skeleton_bridge_thickness: int = 3
     default_outer_after_s: float = 15.0
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
@@ -283,7 +438,7 @@ class VisionControlConfig:
     min_human_score: float = 0.35
     min_car_score: float = 0.35
     min_coin_score: float = 0.35
-    path_source: str = "heatmap"
+    path_source: str = "skeleton"
 
     @classmethod
     def from_env(cls):
@@ -372,6 +527,23 @@ class VisionControlConfig:
                 5.0, 85.0),
             heatmap_component_budget=max(
                 2, _env_int("VISION_CONTROL_HEATMAP_COMPONENT_BUDGET", 2)),
+            skeleton_threshold=_clamp(
+                _env_float("VISION_CONTROL_SKELETON_THRESHOLD", 0.35),
+                0.0, 0.99),
+            skeleton_min_area=max(
+                1, _env_int("VISION_CONTROL_SKELETON_MIN_AREA", 15)),
+            skeleton_min_length=max(
+                2, _env_int("VISION_CONTROL_SKELETON_MIN_LENGTH", 8)),
+            skeleton_close_iterations=max(
+                0, _env_int("VISION_CONTROL_SKELETON_CLOSE_ITERATIONS", 1)),
+            skeleton_edge_smooth_kernel=max(
+                1, _env_int("VISION_CONTROL_SKELETON_EDGE_KERNEL", 9)),
+            skeleton_connect_max_gap=max(
+                0, _env_int(
+                    "VISION_CONTROL_SKELETON_MAX_CONNECT_GAP", 8)),
+            skeleton_bridge_thickness=max(
+                1, _env_int(
+                    "VISION_CONTROL_SKELETON_BRIDGE_THICKNESS", 3)),
             default_outer_after_s=max(0.0, _env_float("VISION_CONTROL_DEFAULT_OUTER_AFTER", 15.0)),
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
@@ -1337,8 +1509,33 @@ class VisionControlPlanner:
                 road = result.get("road_mask")
             effective_maps, support_maps, _has_road = (
                 self._prepare_heatmap_support_maps(heatmaps, road))
-            candidates, peak_debug = self.peak_path_detector.extract(
-                effective_maps, image_shape=image_shape)
+            if self.config.path_source == "skeleton":
+                (candidates, invalid_slots, skeleton_masks,
+                 distribution_masks) = (
+                    self._extract_heatmap_debug_lines(
+                    effective_maps, road, image_shape,
+                    support_maps=support_maps, return_invalid=True,
+                    return_skeleton_masks=True))
+                result["semantic_skeleton_masks"] = skeleton_masks
+                result["semantic_heat_distribution_masks"] = (
+                    distribution_masks)
+                peak_debug = {
+                    "method": "semantic_skeleton",
+                    "binary_threshold": float(
+                        self.config.skeleton_threshold),
+                    "min_component_area": int(
+                        self.config.skeleton_min_area),
+                    "min_skeleton_length": int(
+                        self.config.skeleton_min_length),
+                    "max_connect_gap": int(
+                        self.config.skeleton_connect_max_gap),
+                    "detected_path_count": int(len(candidates)),
+                    "valid_path_count": int(len(candidates)),
+                    "invalid_slots": sorted(int(slot) for slot in invalid_slots),
+                }
+            else:
+                candidates, peak_debug = self.peak_path_detector.extract(
+                    effective_maps, image_shape=image_shape)
             result["heatmap_peak_detection"] = peak_debug
             result["detected_path_count"] = int(
                 peak_debug["detected_path_count"])
@@ -1401,9 +1598,16 @@ class VisionControlPlanner:
 
     def _extract_heatmap_debug_lines(
             self, heatmaps, road_mask, image_shape, support_maps=None,
-            return_invalid=False):
+            return_invalid=False, return_skeleton_masks=False):
         heatmaps = np.asarray(heatmaps, dtype=np.float32)
         if heatmaps.ndim != 3:
+            empty_masks = np.empty((0, 0, 0), dtype=np.uint8)
+            if return_invalid and return_skeleton_masks:
+                return [], set(), empty_masks, empty_masks
+            if return_invalid:
+                return [], set()
+            if return_skeleton_masks:
+                return [], empty_masks
             return []
         h, w = heatmaps.shape[1:3]
         road = HeatmapPathSearch._prepare_road(road_mask, (h, w))
@@ -1416,18 +1620,90 @@ class VisionControlPlanner:
             effective_maps = heatmaps
         lines = []
         invalid_slots = set()
+        skeleton_masks = []
+        distribution_masks = []
         component_groups = []
+        binary_threshold = float(self.config.skeleton_threshold)
+        close_iterations = max(
+            0, int(self.config.skeleton_close_iterations))
+        edge_smooth_kernel = max(
+            1, int(self.config.skeleton_edge_smooth_kernel))
+        reference_area = 120 * 160
+        heatmap_scale = math.sqrt(float(h * w) / float(reference_area))
+        connect_max_gap = max(
+            0, int(round(
+                float(self.config.skeleton_connect_max_gap) *
+                heatmap_scale)))
+        bridge_thickness = max(
+            1, int(round(
+                float(self.config.skeleton_bridge_thickness) *
+                heatmap_scale)))
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (3, 3))
+        minimum_area = max(
+            1,
+            int(round(
+                float(self.config.skeleton_min_area) * float(h * w) /
+                float(reference_area))),
+        )
         for slot in range(min(2, heatmaps.shape[0])):
             heatmap = np.clip(effective_maps[slot], 0.0, 1.0)
-            mask = heatmap >= float(self.config.heat_threshold)
+            mask = (
+                (heatmap >= binary_threshold)
+                if binary_threshold > 0.0 else (heatmap > 0.0)
+            ).astype(np.uint8)
             if has_road:
-                mask &= road >= road_threshold
+                mask &= (road >= road_threshold).astype(np.uint8)
+            mask = _connect_binary_mask_samples(
+                mask, max_gap=connect_max_gap,
+                minimum_group_area=minimum_area,
+                bridge_thickness=bridge_thickness)
+            if has_road:
+                mask &= (road >= road_threshold).astype(np.uint8)
+            if close_iterations:
+                mask = cv2.morphologyEx(
+                    mask, cv2.MORPH_CLOSE, close_kernel,
+                    iterations=close_iterations)
+                if has_road:
+                    mask &= (road >= road_threshold).astype(np.uint8)
+            mask = _smooth_binary_mask_edges(mask, edge_smooth_kernel)
+            if has_road:
+                mask &= (road >= road_threshold).astype(np.uint8)
+            mask = _fill_binary_mask(mask)
+            if has_road:
+                mask &= (road >= road_threshold).astype(np.uint8)
             components, labels, stats, _centroids = cv2.connectedComponentsWithStats(
-                mask.astype(np.uint8), connectivity=8)
-            minimum = max(4, self.config.min_path_points // 2)
+                mask, connectivity=8)
             valid_labels = np.flatnonzero(
-                (stats[1:, cv2.CC_STAT_AREA] >= minimum) &
-                (stats[1:, cv2.CC_STAT_HEIGHT] >= minimum)) + 1
+                stats[1:, cv2.CC_STAT_AREA] >= minimum_area) + 1
+            cleaned_mask = np.isin(labels, valid_labels).astype(np.uint8) * 255
+            # Publish the exact cleaned mask used for thinning and curve
+            # fitting, so the AR red overlay and blue/green lines share one
+            # geometric source of truth.
+            distribution_masks.append(
+                (cleaned_mask != 0).astype(np.uint8))
+            ximgproc = getattr(cv2, "ximgproc", None)
+            thinning = getattr(ximgproc, "thinning", None)
+            if callable(thinning) and np.any(cleaned_mask):
+                padded_mask = cv2.copyMakeBorder(
+                    cleaned_mask, 1, 1, 1, 1,
+                    cv2.BORDER_CONSTANT, value=0)
+                skeleton_mask = thinning(
+                    padded_mask,
+                    thinningType=getattr(
+                        ximgproc, "THINNING_ZHANGSUEN", 0))[1:-1, 1:-1]
+                skeleton_count, skeleton_labels, skeleton_stats, _ = (
+                    cv2.connectedComponentsWithStats(
+                        (skeleton_mask != 0).astype(np.uint8),
+                        connectivity=8))
+                valid_skeleton_labels = np.flatnonzero(
+                    skeleton_stats[1:, cv2.CC_STAT_AREA] >=
+                    int(self.config.skeleton_min_length)) + 1
+                skeleton_mask = np.isin(
+                    skeleton_labels, valid_skeleton_labels).astype(np.uint8)
+            else:
+                skeleton_mask = np.zeros_like(mask)
+            skeleton_masks.append(skeleton_mask)
             label_heat_sums = np.bincount(
                 labels.reshape(-1),
                 weights=heatmap.reshape(-1),
@@ -1440,8 +1716,10 @@ class VisionControlPlanner:
                 np.maximum(
                     1, stats[valid_labels, cv2.CC_STAT_AREA]))
             priorities = (
-                stats[valid_labels, cv2.CC_STAT_HEIGHT].astype(
-                    np.float32) * 4.0 +
+                np.maximum(
+                    stats[valid_labels, cv2.CC_STAT_HEIGHT],
+                    stats[valid_labels, cv2.CC_STAT_WIDTH],
+                ).astype(np.float32) * 4.0 +
                 np.sqrt(stats[valid_labels, cv2.CC_STAT_AREA].astype(
                     np.float32)) + mean_heat.astype(np.float32) * 0.01)
             order = np.argsort(priorities)[::-1]
@@ -1452,51 +1730,51 @@ class VisionControlPlanner:
                 for index in order
             ])
 
-        selected_components = []
-        budget = max(2, int(self.config.heatmap_component_budget))
-        # First preserve one globally strong region per populated channel;
-        # then spend any remaining budget on the strongest leftover regions.
-        for group in component_groups:
-            if group and len(selected_components) < budget:
-                selected_components.append(group.pop(0))
-        while len(selected_components) < budget:
-            available = [group[0] for group in component_groups if group]
-            if not available:
-                break
-            best = max(available, key=lambda item: item[0])
-            selected_components.append(best)
-            component_groups[int(best[1])].pop(0)
+        selected_components = [
+            component
+            for group in component_groups
+            for component in group
+        ]
+        selected_components.sort(key=lambda item: item[0], reverse=True)
 
         for (_priority, slot, label, heatmap, labels, stats,
              label_heat_sums) in selected_components:
-                points = self._component_centerline_points(
-                    labels, label, heatmap, image_shape,
-                    component_stats=stats[label])
-                if len(points) < max(3, self.config.min_path_points // 2):
-                    continue
-                item = {
-                    "slot": int(slot),
-                    "source_slot": int(slot),
-                    "source_slots": {int(slot)},
-                    "points_xy": points,
-                    "score": float(label_heat_sums[label]) /
-                    float(max(1, stats[label, cv2.CC_STAT_AREA])),
-                    "heat_mass": float(label_heat_sums[label]),
-                    "component_count": 1,
-                    "component_rows": int(stats[label, cv2.CC_STAT_HEIGHT]),
-                    "component_area": int(stats[label, cv2.CC_STAT_AREA]),
-                    "spatial_prefiltered": True,
-                }
-                self._refresh_fragment_geometry(item)
-                if self._annotate_heat_support(
-                        item, image_shape, support_maps):
-                    lines.append(item)
-                else:
-                    invalid_slots.add(int(slot))
+            points = self._component_centerline_points(
+                labels, label, heatmap, image_shape,
+                component_stats=stats[label])
+            if len(points) < int(self.config.skeleton_min_length):
+                continue
+            item = {
+                "slot": int(slot),
+                "source_slot": int(slot),
+                "source_slots": {int(slot)},
+                "points_xy": points,
+                "score": float(label_heat_sums[label]) /
+                float(max(1, stats[label, cv2.CC_STAT_AREA])),
+                "heat_mass": float(label_heat_sums[label]),
+                "component_count": 1,
+                "component_rows": int(stats[label, cv2.CC_STAT_HEIGHT]),
+                "component_area": int(stats[label, cv2.CC_STAT_AREA]),
+                "source": "semantic_skeleton",
+                "spatial_prefiltered": True,
+            }
+            self._refresh_fragment_geometry(item)
+            self._annotate_heat_support(
+                item, image_shape, support_maps)
+            lines.append(item)
         joined = self._join_heatmap_fragments(
             lines, image_shape, support_maps=support_maps)
+        joined = self._select_heatmap_lines(joined, image_shape)
+        skeleton_masks = np.asarray(skeleton_masks, dtype=np.uint8)
+        distribution_masks = np.asarray(
+            distribution_masks, dtype=np.uint8)
+        if return_invalid and return_skeleton_masks:
+            return (joined, invalid_slots, skeleton_masks,
+                    distribution_masks)
         if return_invalid:
             return joined, invalid_slots
+        if return_skeleton_masks:
+            return joined, skeleton_masks
         return joined
 
     def _find_heatmap_intersection(self, heatmaps, road, image_shape):
@@ -2095,13 +2373,15 @@ class VisionControlPlanner:
         if not lines:
             return []
         assigned = []
+        identity_source = "row_scan"
         if len(lines) == 1:
             item = dict(lines[0])
             scan_x = self._row_scan_path_position(
                 item.get("points_xy"), image_shape)
             center_x = (
                 float(image_shape[1]) * self.config.visual_center_x)
-            item["slot"] = 0 if scan_x is None or scan_x <= center_x else 1
+            item["slot"] = (
+                0 if scan_x is None or scan_x <= center_x else 1)
             assigned.append(item)
         else:
             first = dict(lines[0])
@@ -2111,7 +2391,8 @@ class VisionControlPlanner:
             second_x = self._row_scan_path_position(
                 second.get("points_xy"), image_shape)
             if first_x is not None and second_x is not None and abs(
-                    first_x - second_x) >= max(4.0, image_shape[1] * 0.008):
+                    first_x - second_x) >= max(
+                        4.0, image_shape[1] * 0.008):
                 ordered = (
                     [first, second] if first_x <= second_x
                     else [second, first])
@@ -2125,6 +2406,7 @@ class VisionControlPlanner:
                     self._path_distance_640(second.get("points_xy"), self.last_slot_points[0], image_shape)
                 )
                 ordered = [first, second] if direct <= swapped else [second, first]
+                identity_source = "temporal_match"
             else:
                 ordered = sorted(
                     (first, second),
@@ -2141,7 +2423,7 @@ class VisionControlPlanner:
             item["points_xy"] = np.asarray(item.get("points_xy"), dtype=np.float32)
             item["role"] = "left" if int(item["slot"]) == 0 else "right"
             item["identity"] = item["role"]
-            item["identity_source"] = "row_scan"
+            item["identity_source"] = identity_source
         return assigned
 
     @staticmethod
@@ -2160,6 +2442,148 @@ class VisionControlPlanner:
     @staticmethod
     def _component_centerline_points(
             labels, label, heatmap, image_shape, component_stats=None):
+        """Thin one component and keep its longest ego-rooted graph path."""
+        labels = np.asarray(labels)
+        heatmap = np.asarray(heatmap, dtype=np.float32)
+        if (labels.ndim != 2 or heatmap.shape != labels.shape or
+                labels.size == 0):
+            return np.empty((0, 2), dtype=np.float32)
+
+        if component_stats is None:
+            top = 0
+            left = 0
+            region = labels
+        else:
+            left = int(component_stats[cv2.CC_STAT_LEFT])
+            top = int(component_stats[cv2.CC_STAT_TOP])
+            width = int(component_stats[cv2.CC_STAT_WIDTH])
+            height = int(component_stats[cv2.CC_STAT_HEIGHT])
+            region = labels[top:top + height, left:left + width]
+
+        component_mask = np.where(
+            region == label, 255, 0).astype(np.uint8)
+        if not np.any(component_mask):
+            return np.empty((0, 2), dtype=np.float32)
+
+        ximgproc = getattr(cv2, "ximgproc", None)
+        thinning = getattr(ximgproc, "thinning", None)
+        if not callable(thinning):
+            return VisionControlPlanner._weighted_component_centerline_points(
+                labels, label, heatmap, image_shape,
+                component_stats=component_stats)
+
+        padding = 1
+        padded = cv2.copyMakeBorder(
+            component_mask, padding, padding, padding, padding,
+            cv2.BORDER_CONSTANT, value=0)
+        skeleton = thinning(
+            padded,
+            thinningType=getattr(
+                ximgproc, "THINNING_ZHANGSUEN", 0))
+        nonzero = cv2.findNonZero(skeleton)
+        if nonzero is None:
+            return np.empty((0, 2), dtype=np.float32)
+
+        coordinates = nonzero.reshape((-1, 2)).astype(np.float32)
+        coordinates[:, 0] += float(left - padding)
+        coordinates[:, 1] += float(top - padding)
+        if not len(coordinates):
+            return np.empty((0, 2), dtype=np.float32)
+
+        # Build an 8-neighbor graph with vectorized coordinate lookups. Short
+        # skeleton spurs then remain side branches instead of redirecting a
+        # greedy nearest-neighbor trace from frame to frame.
+        local_coordinates = np.rint(coordinates).astype(np.int32)
+        local_coordinates[:, 0] -= left - padding
+        local_coordinates[:, 1] -= top - padding
+        index_map = np.full(skeleton.shape, -1, dtype=np.int32)
+        index_map[
+            local_coordinates[:, 1], local_coordinates[:, 0]
+        ] = np.arange(len(coordinates), dtype=np.int32)
+        neighbor_offsets = np.asarray([
+            (-1, -1), (0, -1), (1, -1),
+            (-1, 0),            (1, 0),
+            (-1, 1),  (0, 1),  (1, 1),
+        ], dtype=np.int32)
+        neighbor_x = (
+            local_coordinates[:, 0, np.newaxis] +
+            neighbor_offsets[np.newaxis, :, 0])
+        neighbor_y = (
+            local_coordinates[:, 1, np.newaxis] +
+            neighbor_offsets[np.newaxis, :, 1])
+        in_bounds = (
+            (neighbor_x >= 0) & (neighbor_x < skeleton.shape[1]) &
+            (neighbor_y >= 0) & (neighbor_y < skeleton.shape[0]))
+        neighbors = np.full(neighbor_x.shape, -1, dtype=np.int32)
+        neighbors[in_bounds] = index_map[
+            neighbor_y[in_bounds], neighbor_x[in_bounds]]
+        degree = np.count_nonzero(neighbors >= 0, axis=1)
+
+        endpoints = np.flatnonzero(degree == 1)
+        root_candidates = (
+            endpoints if len(endpoints)
+            else np.arange(len(coordinates), dtype=np.int32))
+        center_x = float(max(labels.shape[1] - 1, 0)) * 0.5
+        root_order = np.lexsort((
+            np.abs(coordinates[root_candidates, 0] - center_x),
+            -coordinates[root_candidates, 1],
+        ))
+        root = int(root_candidates[int(root_order[0])])
+
+        distance = np.full(len(coordinates), -1, dtype=np.int32)
+        parent = np.full(len(coordinates), -1, dtype=np.int32)
+        queue = np.empty(len(coordinates), dtype=np.int32)
+        queue[0] = root
+        distance[root] = 0
+        head = 0
+        tail = 1
+        while head < tail:
+            current = int(queue[head])
+            head += 1
+            adjacent = neighbors[current]
+            adjacent = adjacent[adjacent >= 0]
+            unvisited = adjacent[distance[adjacent] < 0]
+            if not len(unvisited):
+                continue
+            distance[unvisited] = distance[current] + 1
+            parent[unvisited] = current
+            queue[tail:tail + len(unvisited)] = unvisited
+            tail += len(unvisited)
+
+        targets = endpoints[
+            (endpoints != root) & (distance[endpoints] >= 0)]
+        if not len(targets):
+            targets = np.flatnonzero(distance > 0)
+        if not len(targets):
+            return np.empty((0, 2), dtype=np.float32)
+        target_order = np.lexsort((
+            np.abs(coordinates[targets, 0] - center_x),
+            -distance[targets],
+        ))
+        current = int(targets[int(target_order[0])])
+        reverse_path = []
+        while current >= 0:
+            reverse_path.append(current)
+            if current == root:
+                break
+            current = int(parent[current])
+        if not reverse_path or reverse_path[-1] != root:
+            return np.empty((0, 2), dtype=np.float32)
+        heat_points = coordinates[
+            np.asarray(reverse_path[::-1], dtype=np.int32)]
+        img_h, img_w = image_shape[:2]
+        points = np.empty_like(heat_points, dtype=np.float32)
+        points[:, 0] = (
+            heat_points[:, 0] * float(max(img_w - 1, 1)) /
+            float(max(labels.shape[1] - 1, 1)))
+        points[:, 1] = (
+            heat_points[:, 1] * float(max(img_h - 1, 1)) /
+            float(max(labels.shape[0] - 1, 1)))
+        return points
+
+    @staticmethod
+    def _weighted_component_centerline_points(
+            labels, label, heatmap, image_shape, component_stats=None):
         if component_stats is None:
             top = 0
             left = 0
@@ -2173,7 +2597,7 @@ class VisionControlPlanner:
         ys, local_xs = np.nonzero(region == label)
         xs = local_xs + left
         if len(xs) == 0:
-            return []
+            return np.empty((0, 2), dtype=np.float32)
         absolute_ys = ys + top
         row_count = int(region.shape[0])
         weights = heatmap[absolute_ys, xs].astype(np.float64)
@@ -2973,6 +3397,7 @@ def render_vision_control_debug(frame, result):
     if not debug:
         return frame
     h, w = frame.shape[:2]
+    _draw_semantic_heat_distribution(frame, result)
     selected_slot = debug.get("selected_slot")
     center_x = int(round(w * _clamp(_env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8)))
     cv2.line(frame, (center_x, int(h * 0.45)), (center_x, h - 1), (210, 210, 210), 1, cv2.LINE_AA)
@@ -3025,6 +3450,81 @@ def render_vision_control_debug(frame, result):
         (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
         (30, 230, 255), 2, cv2.LINE_AA)
     return frame
+
+
+def _draw_semantic_heat_distribution(frame, result):
+    published_masks = result.get("semantic_heat_distribution_masks")
+    use_processed_masks = published_masks is not None
+    if use_processed_masks:
+        masks = np.asarray(published_masks, dtype=np.uint8)
+    else:
+        centerline = result.get("centerline") or {}
+        heatmaps = centerline.get("heatmaps")
+        if heatmaps is None:
+            heatmaps = result.get("path_heatmaps")
+        if heatmaps is None:
+            return
+        heatmaps = np.asarray(heatmaps, dtype=np.float32)
+        threshold = _clamp(_env_float(
+            "VISION_CONTROL_SKELETON_THRESHOLD", 0.35), 0.0, 0.99)
+        if threshold > 0.0:
+            masks = (heatmaps >= threshold).astype(np.uint8)
+        else:
+            masks = (heatmaps > 0.0).astype(np.uint8)
+    if masks.ndim == 2:
+        masks = masks[np.newaxis, ...]
+    if masks.ndim != 3 or not len(masks):
+        return
+
+    height, width = frame.shape[:2]
+    close_iterations = max(0, _env_int(
+        "VISION_CONTROL_SKELETON_CLOSE_ITERATIONS", 1))
+    edge_smooth_kernel = max(1, _env_int(
+        "VISION_CONTROL_SKELETON_EDGE_KERNEL", 9))
+    connect_max_gap = max(0, _env_int(
+        "VISION_CONTROL_SKELETON_MAX_CONNECT_GAP", 8))
+    bridge_thickness = max(1, _env_int(
+        "VISION_CONTROL_SKELETON_BRIDGE_THICKNESS", 3))
+    minimum_area = max(1, _env_int(
+        "VISION_CONTROL_SKELETON_MIN_AREA", 15))
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (3, 3))
+    coverage = np.zeros((height, width), dtype=np.float32)
+    for slot, mask in enumerate(masks[:2]):
+        mask = (mask != 0).astype(np.uint8)
+        if not use_processed_masks:
+            heat_h, heat_w = mask.shape
+            heatmap_scale = math.sqrt(
+                float(heat_h * heat_w) / float(120 * 160))
+            mask = _connect_binary_mask_samples(
+                mask,
+                max_gap=max(0, int(round(
+                    connect_max_gap * heatmap_scale))),
+                minimum_group_area=max(
+                    1, int(round(minimum_area * heatmap_scale ** 2))),
+                bridge_thickness=max(
+                    1, int(round(bridge_thickness * heatmap_scale))))
+            if close_iterations:
+                mask = cv2.morphologyEx(
+                    mask, cv2.MORPH_CLOSE, close_kernel,
+                    iterations=close_iterations)
+            mask = _smooth_binary_mask_edges(mask, edge_smooth_kernel)
+            mask = _fill_binary_mask(mask)
+        resized = cv2.resize(
+            mask.astype(np.float32), (width, height),
+            interpolation=cv2.INTER_LINEAR)
+        coverage = np.maximum(coverage, np.clip(resized, 0.0, 1.0))
+
+    active = coverage > 0.0
+    if not np.any(active):
+        return
+    # Keep the mask interior opaque red while using only the interpolated
+    # boundary coverage as alpha, eliminating 4x nearest-neighbor stair steps.
+    alpha = coverage[active, np.newaxis]
+    red = np.asarray((0.0, 0.0, 255.0), dtype=np.float32)
+    frame[active] = np.rint(
+        frame[active].astype(np.float32) * (1.0 - alpha) + red * alpha
+    ).astype(np.uint8)
 
 
 def _identity_probability_color(slot, probability):

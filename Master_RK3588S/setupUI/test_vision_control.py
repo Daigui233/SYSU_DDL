@@ -3,6 +3,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 
@@ -19,8 +20,11 @@ from vision_control import (  # noqa: E402
     STATE_TRACK,
     VisionControlConfig,
     VisionControlPlanner,
+    _connect_binary_mask_samples,
+    _draw_semantic_heat_distribution,
     _extract_heatmap_preview_lines,
     _identity_probability_color,
+    _smooth_binary_mask_edges,
     render_vision_control_debug,
 )
 
@@ -306,6 +310,236 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
         self.assertEqual(1, len(lower_paths))
         self.assertEqual("left_side", lower_paths[0]["exit_type"])
         self.assertEqual([], upper_paths)
+
+
+class SemanticSkeletonPathTest(unittest.TestCase):
+    def test_default_environment_uses_semantic_skeleton_path_source(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = VisionControlConfig.from_env()
+
+        self.assertEqual("skeleton", config.path_source)
+        self.assertEqual(0.35, config.skeleton_threshold)
+
+    def test_discrete_mask_samples_are_connected_but_far_noise_is_removed(self):
+        mask = np.zeros((60, 80), dtype=np.uint8)
+        mask[8:20, 38:41] = 1
+        mask[25:37, 38:41] = 1
+        mask[42:55, 38:41] = 1
+        mask[5, 5] = 1
+
+        connected = _connect_binary_mask_samples(
+            mask, max_gap=8, minimum_group_area=15,
+            bridge_thickness=3)
+
+        component_count, _labels = cv2.connectedComponents(
+            connected, connectivity=8)
+        self.assertEqual(2, component_count)
+        self.assertTrue(np.all(connected[19:44, 39] == 1))
+        self.assertEqual(0, int(connected[5, 5]))
+
+    def test_binary_edge_filter_rounds_corner_noise(self):
+        mask = np.zeros((40, 40), dtype=np.uint8)
+        mask[10:30, 10:30] = 1
+        mask[9, 20] = 1
+
+        smoothed = _smooth_binary_mask_edges(mask, kernel_size=5)
+
+        self.assertEqual(0, int(smoothed[9, 20]))
+        self.assertEqual(1, int(smoothed[20, 20]))
+        self.assertEqual(np.uint8, smoothed.dtype)
+        self.assertTrue(set(np.unique(smoothed)).issubset({0, 1}))
+
+    def test_preview_reads_raw_heatmaps_without_skeleton_path_source(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0, 40:50, 60:70] = 0.40
+        result = _result(heatmaps)
+        frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+
+        _draw_semantic_heat_distribution(frame, result)
+
+        self.assertTrue(np.array_equal(
+            np.asarray([0, 0, 255], dtype=np.uint8), frame[180, 260]))
+        self.assertTrue(np.array_equal(
+            np.asarray([100, 100, 100], dtype=np.uint8), frame[20, 20]))
+
+    def test_preview_renders_connected_mask_across_short_sampling_gap(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0, 35:55, 78:83] = 0.80
+        heatmaps[0, 61:82, 78:83] = 0.80
+        result = _result(heatmaps)
+        frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+
+        _draw_semantic_heat_distribution(frame, result)
+
+        self.assertTrue(np.array_equal(
+            np.asarray([0, 0, 255], dtype=np.uint8), frame[230, 320]))
+
+    def test_binary_heat_distribution_preview_uses_opaque_red(self):
+        frame = np.full((120, 160, 3), 100, dtype=np.uint8)
+        masks = np.zeros((2, 30, 40), dtype=np.uint8)
+        masks[0, 10:20, 12:18] = 1
+        masks[1, 10:20, 22:28] = 1
+
+        _draw_semantic_heat_distribution(frame, {
+            "semantic_heat_distribution_masks": masks,
+        })
+
+        first_channel_pixel = frame[60, 60]
+        second_channel_pixel = frame[60, 100]
+        self.assertTrue(np.array_equal(
+            np.asarray([0, 0, 255], dtype=np.uint8),
+            first_channel_pixel))
+        self.assertTrue(np.array_equal(
+            np.asarray([0, 0, 255], dtype=np.uint8),
+            second_channel_pixel))
+        self.assertTrue(np.array_equal(
+            np.asarray([100, 100, 100], dtype=np.uint8), frame[5, 5]))
+
+    def test_component_centerline_preserves_horizontal_geometry_and_scaling(self):
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        cv2.line(mask, (10, 60), (150, 60), 1, 9, cv2.LINE_8)
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            mask, connectivity=8)
+
+        points = VisionControlPlanner._component_centerline_points(
+            labels, 1, mask.astype(np.float32), (480, 640, 3),
+            component_stats=stats[1])
+
+        self.assertEqual(2, count)
+        self.assertEqual(np.float32, points.dtype)
+        self.assertEqual(2, points.shape[1])
+        self.assertGreater(float(np.ptp(points[:, 0])), 500.0)
+        self.assertLess(float(np.ptp(points[:, 1])), 8.0)
+
+    def test_short_skeleton_spur_does_not_redirect_primary_path(self):
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        cv2.line(mask, (80, 115), (80, 5), 1, 9, cv2.LINE_8)
+        cv2.line(mask, (80, 80), (110, 80), 1, 7, cv2.LINE_8)
+        _count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(mask, connectivity=8))
+
+        points = VisionControlPlanner._component_centerline_points(
+            labels, 1, mask.astype(np.float32), (120, 160, 3),
+            component_stats=stats[1])
+
+        self.assertGreater(float(np.ptp(points[:, 1])), 100.0)
+        self.assertLess(float(np.max(points[:, 0])), 90.0)
+
+    def test_fragmented_lane_becomes_one_continuous_skeleton(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0, 15:45, 78:83] = 0.80
+        heatmaps[0, 51:80, 78:83] = 0.80
+        heatmaps[0, 86:119, 78:83] = 0.80
+        result = _result(heatmaps)
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", skeleton_threshold=0.40,
+            skeleton_connect_max_gap=8, route_confirm_frames=1))
+
+        command, debug = planner.update(result, now=1.0)
+
+        self.assertIsNotNone(command)
+        self.assertEqual(1, debug["candidate_count"])
+        skeleton = result["semantic_skeleton_masks"][0]
+        component_count, _labels = cv2.connectedComponents(
+            skeleton.astype(np.uint8), connectivity=8)
+        self.assertEqual(2, component_count)
+        fitted_points = result["paths"][0]["points_xy"]
+        self.assertGreater(float(np.ptp(fitted_points[:, 1])), 380.0)
+        fitted_mask = result["semantic_heat_distribution_masks"][0]
+        fitted_x = np.clip(np.rint(
+            fitted_points[:, 0] * 159.0 / 639.0).astype(np.int32), 0, 159)
+        fitted_y = np.clip(np.rint(
+            fitted_points[:, 1] * 119.0 / 479.0).astype(np.int32), 0, 119)
+        self.assertTrue(np.all(fitted_mask[fitted_y, fitted_x] != 0))
+
+    def test_point_four_mask_is_kept_while_small_noise_is_removed(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0, 20:119, 79:82] = 0.40
+        heatmaps[0, 52:55, 18:21] = 0.90
+        result = _result(heatmaps)
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", skeleton_threshold=0.40,
+            skeleton_min_area=15, route_confirm_frames=1))
+
+        command, debug = planner.update(result, now=1.0)
+
+        self.assertIsNotNone(command)
+        self.assertEqual(1, debug["candidate_count"])
+        self.assertEqual(
+            0.40,
+            debug["heatmap_peak_detection"]["binary_threshold"])
+        self.assertGreater(debug["candidates"][0]["near_x"], 300.0)
+        self.assertLess(debug["candidates"][0]["near_x"], 350.0)
+        self.assertAlmostEqual(
+            0.40, result["paths"][0]["heat_support_min"], places=6)
+
+    def test_probability_below_mask_threshold_is_rejected(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0, 20:119, 79:82] = 0.399
+        result = _result(heatmaps)
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", skeleton_threshold=0.40))
+
+        command, debug = planner.update(result, now=1.0)
+
+        self.assertIsNotNone(command)
+        self.assertTrue(command["safe_stop"])
+        self.assertEqual(0, debug["candidate_count"])
+
+    def test_compact_blob_without_skeleton_continuity_is_rejected(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0, 50:60, 70:80] = 0.90
+        result = _result(heatmaps)
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", skeleton_threshold=0.40,
+            skeleton_min_area=15, skeleton_min_length=8))
+
+        command, debug = planner.update(result, now=1.0)
+
+        self.assertIsNotNone(command)
+        self.assertTrue(command["safe_stop"])
+        self.assertEqual(0, debug["candidate_count"])
+
+    def test_preview_strongly_colors_every_thresholded_heat_pixel(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        heatmaps[0, 20:119, 76:85] = 0.40
+        result = _result(heatmaps)
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", skeleton_threshold=0.40,
+            route_confirm_frames=1))
+        planner.update(result, now=1.0)
+        frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+
+        render_vision_control_debug(frame, result)
+
+        masks = result["semantic_heat_distribution_masks"]
+        self.assertEqual((1, 120, 160), masks.shape)
+        raw_mask = heatmaps[0] >= 0.40
+        self.assertGreater(
+            float(np.mean(masks[0][raw_mask] != 0)), 0.99)
+        # This point is inside the heat region but away from its centerline.
+        blue, green, red = frame[242, 338]
+        self.assertEqual(int(blue), int(green))
+        self.assertLess(int(green), 50)
+        self.assertGreater(int(red), 220)
+        self.assertTrue(np.all(frame[0, 0] == 200))
+
+    def test_full_skeleton_mask_keeps_components_beyond_control_limit(self):
+        heatmaps = np.zeros((1, 120, 160), dtype=np.float32)
+        for center_x in (30, 80, 130):
+            heatmaps[0, 20:119, center_x - 2:center_x + 3] = 0.80
+        result = _result(heatmaps)
+        planner = VisionControlPlanner(config=_config(
+            path_source="skeleton", skeleton_threshold=0.40,
+            skeleton_min_area=15, skeleton_min_length=8))
+
+        planner.update(result, now=1.0)
+
+        skeleton = result["semantic_skeleton_masks"][0]
+        component_count, _labels = cv2.connectedComponents(
+            skeleton.astype(np.uint8), connectivity=8)
+        self.assertEqual(4, component_count)
+        self.assertEqual(2, len(result["paths"]))
 
 
 class VisionControlPlannerTest(unittest.TestCase):

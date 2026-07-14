@@ -49,9 +49,36 @@ python3 ar_receiver.py
 
 `standalone_control_bridge.py` 只在不运行 `ar_receiver.py` 时使用，二者不能同时启动。后续多任务视觉控制通过 `ControlRuntime.update_vision_command()` 接入，不再创建第二条串口链路。
 
+## 语义 mask 骨架路径试验
+
+骨架路径源先以 `0.35` 阈值将中心线 heatmap 二值化为 Mask。相距不超过 8 个热力图像素的离散片段用 3 像素宽的最短桥接线连接，再经过 9×9 边缘平滑、小连通域过滤和 Zhang-Suen thinning。骨架像素从最大 Y 点开始按最近邻顺序追踪，遇到较大空间断点时停止。左路径显示为蓝线，右路径显示为绿线；AR Preview 同时以红色显示处理后的 Mask。
+
+首次配置或 OpenCV 依赖变更后执行：
+
+```bash
+cd ~/Desktop/setupUI
+./configure_skeleton_opencv.sh
+```
+
+试跑时加载配置再启动：
+
+```bash
+cd ~/Desktop/setupUI
+. ./vision_skeleton_env.sh
+python3 ar_receiver.py
+```
+
+恢复原热力图追踪器：
+
+```bash
+export VISION_CONTROL_PATH_SOURCE=heatmap
+```
+
+骨架模式的主要参数是 `VISION_CONTROL_SKELETON_THRESHOLD`、`VISION_CONTROL_SKELETON_MIN_AREA`、`VISION_CONTROL_SKELETON_MIN_LENGTH`、`VISION_CONTROL_SKELETON_CLOSE_ITERATIONS`、`VISION_CONTROL_SKELETON_EDGE_KERNEL`、`VISION_CONTROL_SKELETON_MAX_CONNECT_GAP` 和 `VISION_CONTROL_SKELETON_BRIDGE_THICKNESS`。如果运行环境缺少 `cv2.ximgproc.thinning`，代码会回退到原逐行加权中心算法。
+
 ## 不在本阶段实现
 
-- 旧分割中线和 fork 后处理。
+- 除上述试验性骨架路径外，旧版完整分割中线和 fork 后处理。
 - 旧目标检测后处理和多模型并行。
 - 旧任务/比赛状态机和风险阈值。
 - 旧局部规划、误差生成和控制仲裁。
