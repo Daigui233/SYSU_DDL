@@ -631,6 +631,70 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual("default", debug["branch_lock_source"])
         self.assertEqual(0, debug["selected_slot"])
 
+    def test_curve_locked_blue_keeps_target_during_ambiguous_geometry(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            overlap_px_640=20.0, branch_separation_px_640=70.0))
+
+        command, debug = planner.update(
+            _curve_result_at(290.0, 320.0), now=1.0)
+
+        self.assertEqual("AMBIGUOUS", debug["route_state"])
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertIsNotNone(debug["control_target"]["path_target_x"])
+        self.assertNotEqual(STATE_SAFE_STOP, command["state_cmd"])
+
+    def test_curve_uses_nearest_path_endpoint_when_lookahead_is_outside(self):
+        ys = np.linspace(460.0, 350.0, 12, dtype=np.float32)
+        points = np.stack((np.full_like(ys, 210.0), ys), axis=1)
+        result = {
+            "centerline": {"curve_paths": [{
+                "slot": 0, "role": "left", "score": 0.9,
+                "points_xy": points,
+            }]},
+            "image_shape": (480, 640, 3),
+            "detections": [],
+        }
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            lookahead_y_ratio=0.625))
+
+        _command, debug = planner.update(result, now=1.0)
+        target = debug["control_target"]
+
+        self.assertTrue(target["path_target_adaptive_y"])
+        self.assertAlmostEqual(210.0, target["path_target_x"], delta=1.0)
+        self.assertAlmostEqual(350.0, target["path_target_y"], delta=1.0)
+
+    def test_curve_brief_blue_loss_holds_last_route_marker(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            recover_hold_s=0.5))
+        planner.update(_curve_result_at(200.0, 430.0), now=1.0)
+
+        _command, debug = planner.update(
+            _curve_result_at(200.0, 430.0, slots=(1,)), now=1.1)
+
+        target = debug["control_target"]
+        self.assertIsNone(debug["selected_slot"])
+        self.assertTrue(target["path_target_held"])
+        self.assertAlmostEqual(200.0, target["path_target_x"], delta=1.0)
+
+    def test_turnsign_slow_does_not_pull_route_marker_off_blue(self):
+        result = _curve_result_at(200.0, 430.0)
+        result["detections"] = [{
+            "label": "TurnSign", "score": 0.90,
+            "bbox": [430.0, 80.0, 500.0, 150.0],
+        }]
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+
+        _command, debug = planner.update(result, now=1.0)
+        target = debug["control_target"]
+
+        self.assertEqual("turnsign_slow", target["task_reason"])
+        self.assertAlmostEqual(target["path_target_x"], target["target_x"])
+
     def test_locked_branch_never_falls_back_to_opposite_slot(self):
         planner = VisionControlPlanner(config=_config())
         _confirm_ocr(planner, start=2.0)

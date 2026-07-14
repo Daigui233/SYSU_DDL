@@ -1142,6 +1142,10 @@ class VisionControlPlanner:
         self.peak_path_detector = HeatmapPeakPathDetector(self.config)
         self.log_func = log_func
         self.last_selected_points = None
+        self.last_path_target_x = None
+        self.last_path_target_y = None
+        self.last_path_target_slot = None
+        self.last_path_target_ts = 0.0
         self.last_slot_points = {}
         self.last_valid_ts = 0.0
         self.last_error = 0.0
@@ -2537,10 +2541,14 @@ class VisionControlPlanner:
             result, selected, image_shape, lookahead_y, route_state, now, ocr_response=ocr_response)
         if selected is None:
             age = now - self.last_valid_ts if self.last_valid_ts else 1e9
+            held_target = self._held_path_target(now)
             if self.last_valid_ts and age <= self.config.recover_hold_s:
                 error = self.last_error
                 return self._command(error, self.config.recover_speed_mps, STATE_RECOVER_LINE), {
-                    "target_x": None,
+                    "target_x": None if held_target is None else held_target[0],
+                    "path_target_x": None if held_target is None else held_target[0],
+                    "path_target_y": None if held_target is None else held_target[1],
+                    "path_target_held": held_target is not None,
                     "track_error_640": error,
                     "reason": "recover_hold",
                     "task_reason": task_reason,
@@ -2552,7 +2560,10 @@ class VisionControlPlanner:
                 "reason": route_reason,
                 "task_reason": task_reason,
             }
-        if route_state == ROUTE_AMBIGUOUS:
+        curve_slot_is_locked = (
+            self.config.path_source == "curve" and
+            self.branch_lock in {"left", "right"})
+        if route_state == ROUTE_AMBIGUOUS and not curve_slot_is_locked:
             return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
                 "target_x": None,
                 "track_error_640": 0.0,
@@ -2560,30 +2571,71 @@ class VisionControlPlanner:
                 "task_reason": "ambiguous_stop",
             }
 
-        target_x = target_override_x
-        if target_x is None:
-            target_x = _interp_path_x(selected["points_xy"], lookahead_y)
-        if target_x is None:
+        path_target = self._path_target_on_selected(selected, lookahead_y)
+        if path_target is None:
             return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
                 "target_x": None,
+                "path_target_x": None,
+                "path_target_y": None,
                 "track_error_640": 0.0,
                 "reason": "missing_target_x",
                 "task_reason": task_reason,
             }
+        path_target_x, path_target_y, path_target_adaptive = path_target
+        target_x = (float(target_override_x) if target_override_x is not None
+                    else float(path_target_x))
         raw_error = (float(target_x) / float(max(1, image_shape[1])) - self.config.visual_center_x) * 640.0
         error = self._limit_error(raw_error)
         self.last_error = error
         self.last_valid_ts = now
         self.last_selected_points = np.asarray(selected["points_xy"], dtype=np.float32).copy()
         self.last_slot_points[int(selected["slot"])] = self.last_selected_points
+        self.last_path_target_x = float(path_target_x)
+        self.last_path_target_y = float(path_target_y)
+        self.last_path_target_slot = int(selected["slot"])
+        self.last_path_target_ts = float(now)
         return self._command(error, speed, task_state), {
             "target_x": float(target_x),
-            "lookahead_y": float(lookahead_y),
+            "path_target_x": float(path_target_x),
+            "path_target_y": float(path_target_y),
+            "path_target_held": False,
+            "path_target_adaptive_y": bool(path_target_adaptive),
+            "lookahead_y": float(path_target_y),
             "track_error_640": float(error),
             "raw_track_error_640": float(raw_error),
             "reason": route_reason,
             "task_reason": task_reason,
         }
+
+    @staticmethod
+    def _path_target_on_selected(selected, preferred_y):
+        points = np.asarray(
+            (selected or {}).get("points_xy", ()), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or not len(points):
+            return None
+        finite = np.all(np.isfinite(points), axis=1)
+        points = points[finite]
+        if not len(points):
+            return None
+        minimum_y = float(np.min(points[:, 1]))
+        maximum_y = float(np.max(points[:, 1]))
+        target_x = _interp_path_x(points, preferred_y)
+        if (target_x is not None and
+                minimum_y <= float(preferred_y) <= maximum_y):
+            return float(target_x), float(preferred_y), False
+        nearest = int(np.argmin(np.abs(points[:, 1] - float(preferred_y))))
+        return float(points[nearest, 0]), float(points[nearest, 1]), True
+
+    def _held_path_target(self, now):
+        if (self.last_path_target_x is None or
+                self.last_path_target_y is None or
+                self.last_path_target_slot is None or
+                self.selected_slot_lock != self.last_path_target_slot or
+                float(now) - self.last_path_target_ts >
+                self.config.recover_hold_s):
+            return None
+        return (float(self.last_path_target_x),
+                float(self.last_path_target_y))
 
     def _task_from_detections(self, result, selected, image_shape, lookahead_y, route_state, now, ocr_response=None):
         detections = result.get("detections") or []
@@ -2637,7 +2689,7 @@ class VisionControlPlanner:
                 STATE_TRACK,
                 min(self.config.normal_speed_mps, self.config.turnsign_slow_speed_mps),
                 "turnsign_slow",
-                sign_target_x,
+                None,
             )
         return STATE_TRACK, self.config.normal_speed_mps, "track", None
 
@@ -3108,8 +3160,12 @@ def render_vision_control_debug(frame, result):
             thickness=3 if int(line.get("slot", -1)) == selected_slot else 2)
 
     target = debug.get("control_target") or {}
-    target_x = _finite_float(target.get("target_x"))
-    lookahead_y = _finite_float(target.get("lookahead_y"), h * 0.62)
+    target_x = _finite_float(
+        target.get("path_target_x"),
+        _finite_float(target.get("target_x")))
+    lookahead_y = _finite_float(
+        target.get("path_target_y"),
+        _finite_float(target.get("lookahead_y"), h * 0.62))
     if target_x is not None:
         x = int(round(_clamp(target_x, 0, w - 1)))
         y = int(round(_clamp(lookahead_y, 0, h - 1)))
