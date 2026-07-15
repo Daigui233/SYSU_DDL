@@ -19,8 +19,12 @@ from vision_control import (  # noqa: E402
     STATE_TRACK,
     VisionControlConfig,
     VisionControlPlanner,
+    _adjust_point_display_confidences,
+    _associated_point_mask,
+    _densify_associated_lower_points,
     _extract_heatmap_preview_lines,
     _identity_probability_color,
+    _semantic_road_point_mask,
     render_vision_control_debug,
 )
 
@@ -296,6 +300,86 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
         self.assertTrue(any(
             text.startswith("PATH COUNT: 2") for text in texts))
 
+    def test_point_display_confidence_boosts_below_split_and_decays_above(self):
+        points = np.asarray([
+            [100.0, 277.0],
+            [100.0, 278.0],
+            [100.0, 320.0],
+        ], dtype=np.float32)
+        adjusted = _adjust_point_display_confidences(
+            points, np.asarray([0.8, 0.2, 0.6], dtype=np.float32),
+            split_y=278.0, lower_boost=0.35, upper_decay=0.55)
+
+        np.testing.assert_allclose(
+            adjusted, [0.44, 0.48, 0.74], atol=1e-6)
+
+    def test_raw_point_display_removes_low_association_outliers(self):
+        points = np.asarray([
+            [100.0, 400.0],
+            [110.0, 390.0],
+            [120.0, 380.0],
+            [130.0, 370.0],
+            [140.0, 360.0],
+            [500.0, 350.0],
+            [50.0, 340.0],
+            [500.0, 330.0],
+        ], dtype=np.float32)
+
+        mask = _associated_point_mask(points, image_width=640)
+
+        self.assertEqual(
+            mask.tolist(),
+            [True, True, True, True, True, False, False, False],
+        )
+
+    def test_raw_point_association_rejects_non_linear_three_point_turn(self):
+        points = np.asarray([
+            [100.0, 400.0],
+            [140.0, 390.0],
+            [100.0, 380.0],
+        ], dtype=np.float32)
+
+        mask = _associated_point_mask(points, image_width=640)
+
+        self.assertEqual(mask.tolist(), [False, False, False])
+
+    def test_sparse_associated_points_are_filled_only_in_lower_half(self):
+        points = np.asarray([
+            [100.0, 400.0],
+            [100.0, 370.0],
+            [100.0, 340.0],
+            [100.0, 200.0],
+            [100.0, 170.0],
+            [100.0, 140.0],
+        ], dtype=np.float32)
+        probabilities = np.full(6, 0.6, dtype=np.float32)
+        associated = np.ones(6, dtype=bool)
+
+        display_points, display_probabilities = (
+            _densify_associated_lower_points(
+                points, probabilities, associated,
+                image_width=640, image_height=480))
+
+        self.assertEqual(10, len(display_points))
+        self.assertEqual(7, int(np.sum(display_points[:, 1] >= 239.5)))
+        self.assertEqual(3, int(np.sum(display_points[:, 1] < 239.5)))
+        np.testing.assert_allclose(display_probabilities, 0.6, atol=1e-6)
+
+    def test_raw_point_display_drops_points_outside_semantic_road(self):
+        points = np.asarray([
+            [100.0, 400.0],
+            [130.0, 350.0],
+            [500.0, 300.0],
+            [100.0, 100.0],
+        ], dtype=np.float32)
+        road = np.zeros((12, 16), dtype=np.uint8)
+        road[:, 2:4] = 1
+
+        inside = _semantic_road_point_mask(
+            points, road, image_shape=(480, 640, 3))
+
+        self.assertEqual(inside.tolist(), [True, True, False, True])
+
     def test_ar_preview_draws_task_target_offset_from_path_baseline(self):
         result = {
             "vision_control": {
@@ -433,13 +517,17 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
 
 
 class VisionControlPlannerTest(unittest.TestCase):
-    def test_default_human_stop_line_is_twenty_pixels_below_lookahead(self):
-        planner = VisionControlPlanner(config=VisionControlConfig())
+    def test_default_lookahead_and_human_stop_line_move_forward(self):
+        config = VisionControlConfig()
+        planner = VisionControlPlanner(config=config)
+        lookahead_y = 480.0 * config.lookahead_y_ratio
 
-        stop_y = planner._human_stop_line_y((480, 640, 3), 300.0)
+        stop_y = planner._human_stop_line_y(
+            (480, 640, 3), lookahead_y)
 
-        self.assertAlmostEqual(320.0, stop_y)
-        self.assertAlmostEqual(20.0, stop_y - 300.0)
+        self.assertAlmostEqual(288.0, lookahead_y)
+        self.assertAlmostEqual(309.3333333333, stop_y, places=6)
+        self.assertLess(stop_y, 320.0)
 
     def test_human_touching_line_stops_even_far_from_planned_path(self):
         planner = VisionControlPlanner(config=_config())
@@ -516,7 +604,6 @@ class VisionControlPlannerTest(unittest.TestCase):
             "label": "Human", "score": 0.95,
             "bbox": [286.0, 330.0, 346.0, 430.0],
         }]
-
         first = _curve_result_at(320.0, 430.0)
         first["detections"] = far_left
         planner.update(first, now=1.0)
@@ -528,7 +615,6 @@ class VisionControlPlannerTest(unittest.TestCase):
         inside["detections"] = four_px_left
         inside_command, inside_debug = planner.update(
             inside, now=1.22)
-
         self.assertEqual(STATE_SAFE_STOP, outside_command["state_cmd"])
         self.assertEqual(
             "human_half_lookahead_stop",
@@ -573,7 +659,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         near_line_human = [{
             "label": "Human",
             "score": 0.95,
-            "bbox": [20.0, 230.0, 80.0, 315.0],
+            "bbox": [20.0, 210.0, 80.0, 303.0],
         }]
 
         seen, _ = planner.update(
@@ -1292,7 +1378,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         result = _curve_result_at(180.0, 430.0)
         green = result["centerline"]["curve_paths"][1]["points_xy"]
         result["centerline"]["curve_paths"][1]["points_xy"] = (
-            green[green[:, 1] >= 340.0])
+            green[green[:, 1] >= 310.0])
 
         command, debug = planner.update(
             result, _ocr_response("right"), now=2.0)
@@ -1521,7 +1607,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             ocr_right_lookahead_search_down_px_480=120.0,
             ocr_right_min_path_span_px_480=60.0,
         ))
-        rows = np.linspace(350.0, 460.0, 12, dtype=np.float32)
+        rows = np.linspace(310.0, 460.0, 16, dtype=np.float32)
         blue = {"raw_points_xy": np.stack((
             np.full_like(rows, 200.0), rows), axis=1)}
 
@@ -1530,9 +1616,9 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         self.assertTrue(metrics["ready"])
         self.assertAlmostEqual(
-            350.0, planner.ocr_right_blue_effective_lookahead_y)
+            310.0, planner.ocr_right_blue_effective_lookahead_y)
         self.assertAlmostEqual(
-            50.0, planner.ocr_right_blue_search_down_px_480)
+            22.0, planner.ocr_right_blue_search_down_px_480)
 
     def obsolete_ocr_right_fast_blue_motion_blocks_vertical_handoff(self):
         planner = VisionControlPlanner(config=_config(
@@ -1876,6 +1962,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         planner = VisionControlPlanner(config=_config(
             path_source="curve",
             path_smooth_window=1,
+            lookahead_y_ratio=0.625,
             turnsign_reverse_speed_mps=-0.08,
             turnsign_reverse_duration_s=0.5,
             turnsign_trim_low_separation_px_640=36.0,
@@ -2591,6 +2678,83 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         self.assertLess(float(np.std(smoothed_x)), float(np.std(xs)))
 
+    def test_human_occlusion_holds_blue_curve_geometry(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+        ))
+        planner.update(_curve_result_at(240.0, 400.0), now=1.0)
+        occluded = _curve_result_at(360.0, 430.0)
+        occluded["detections"] = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [205.0, 210.0, 275.0, 400.0],
+        }]
+
+        _command, debug = planner.update(occluded, now=1.04)
+        blue = next(
+            item for item in occluded["paths"] if item["slot"] == 0)
+
+        np.testing.assert_allclose(
+            blue["points_xy"][:, 0], 240.0, atol=1e-4)
+        self.assertTrue(debug["candidates"][0]["human_occlusion_hold"])
+
+    def test_human_far_from_blue_does_not_hold_curve(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+        ))
+        planner.update(_curve_result_at(240.0, 400.0), now=1.0)
+        far_human = _curve_result_at(360.0, 430.0)
+        far_human["detections"] = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [500.0, 210.0, 570.0, 400.0],
+        }]
+
+        _command, debug = planner.update(far_human, now=1.04)
+        blue = next(
+            item for item in far_human["paths"] if item["slot"] == 0)
+
+        np.testing.assert_allclose(
+            blue["points_xy"][:, 0], 360.0, atol=1e-4)
+        self.assertFalse(debug["candidates"][0]["human_occlusion_hold"])
+
+    def test_green_curve_limits_single_frame_lateral_jump(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+        ))
+        planner.update(_curve_result_at(240.0, 400.0), now=1.0)
+        jumped = _curve_result_at(240.0, 600.0)
+
+        _command, debug = planner.update(jumped, now=1.04)
+        green = next(
+            item for item in jumped["paths"] if item["slot"] == 1)
+
+        self.assertLess(float(np.max(green["points_xy"][:, 0])), 470.0)
+        self.assertLess(
+            float(debug["candidates"][1]["lookahead_x"]), 470.0)
+
+    def test_green_curve_short_loss_is_held_then_released(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+        planner.update(_curve_result_at(240.0, 400.0), now=1.0)
+        missing = _curve_result_at(240.0, 400.0, slots=(0,))
+
+        planner.update(missing, now=1.04)
+        self.assertTrue(any(
+            item["slot"] == 1 for item in missing["paths"]))
+        for index in range(1, 4):
+            missing = _curve_result_at(240.0, 400.0, slots=(0,))
+            planner.update(missing, now=1.04 + index * 0.04)
+        self.assertFalse(any(
+            item["slot"] == 1 for item in missing["paths"]))
+
     def test_no_current_ocr_defaults_to_outer_after_timeout(self):
         planner = VisionControlPlanner(config=_config(default_outer_after_s=15.0, outer_slot=0))
         planner.update(_result(_fork_heatmaps()), {"instruction_current": False}, now=10.0)
@@ -2637,7 +2801,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(200.0, target["path_target_x"], delta=1.0)
         self.assertGreater(target["target_x"], target["path_target_x"])
         self.assertAlmostEqual(
-            56.0 * 0.4 / 1.5,
+            60.0 * 0.4 / 1.5,
             target["task_offset_x"],
             delta=0.01,
         )
@@ -2677,7 +2841,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         return_start_target = return_start_debug["control_target"]
         return_mid_target = return_mid_debug["control_target"]
         self.assertAlmostEqual(0.0, start_target["task_offset_x"])
-        self.assertAlmostEqual(56.0, full_target["task_offset_x"], delta=0.01)
+        self.assertAlmostEqual(60.0, full_target["task_offset_x"], delta=0.01)
         self.assertEqual(STATE_AVOID_CAR, hold_command["state_cmd"])
         self.assertEqual("car_avoid_hold", hold_target["task_reason"])
         self.assertAlmostEqual(
@@ -2687,9 +2851,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         )
         self.assertEqual(STATE_AVOID_CAR, return_start_command["state_cmd"])
         self.assertEqual("car_avoid_return", return_start_target["task_reason"])
-        self.assertAlmostEqual(56.0, return_start_target["task_offset_x"], delta=0.01)
+        self.assertAlmostEqual(60.0, return_start_target["task_offset_x"], delta=0.01)
         self.assertEqual(STATE_AVOID_CAR, return_mid_command["state_cmd"])
-        self.assertAlmostEqual(28.0, return_mid_target["task_offset_x"], delta=0.01)
+        self.assertAlmostEqual(30.0, return_mid_target["task_offset_x"], delta=0.01)
         self.assertEqual(STATE_TRACK, resume_command["state_cmd"])
         self.assertEqual("track", resume_debug["control_target"]["task_reason"])
 
@@ -2714,7 +2878,7 @@ class VisionControlPlannerTest(unittest.TestCase):
                 # avoidance route. Generic human avoidance would steer left.
                 "label": "Human",
                 "score": 0.95,
-                "bbox": [270.0, 180.0, 330.0, 290.0],
+                "bbox": [270.0, 100.0, 330.0, 210.0],
             },
         ]
         crossed_human = _curve_result_at(200.0, 430.0)
@@ -2823,9 +2987,9 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         planner.update(result_with_human(230.0), now=1.0)
         outside_command, outside_debug = planner.update(
-            result_with_human(250.0), now=1.21)
+            result_with_human(254.0), now=1.21)
         inside_command, inside_debug = planner.update(
-            result_with_human(252.0), now=1.22)
+            result_with_human(256.0), now=1.22)
 
         self.assertEqual(STATE_SAFE_STOP, outside_command["state_cmd"])
         self.assertEqual(
@@ -2851,7 +3015,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         }
         preline = {
             "label": "Human", "score": 0.95,
-            "bbox": [270.0, 180.0, 330.0, 290.0],
+            "bbox": [270.0, 100.0, 330.0, 210.0],
         }
         blocking = {
             "label": "Human", "score": 0.95,
@@ -2867,11 +3031,11 @@ class VisionControlPlannerTest(unittest.TestCase):
         }
         new_upper = {
             "label": "Human", "score": 0.94,
-            "bbox": [270.0, 180.0, 330.0, 290.0],
+            "bbox": [270.0, 160.0, 330.0, 280.0],
         }
         new_at_line = {
             "label": "Human", "score": 0.94,
-            "bbox": [270.0, 220.0, 330.0, 330.0],
+            "bbox": [270.0, 200.0, 330.0, 321.0],
         }
 
         initial = _curve_result_at(200.0, 430.0)
@@ -2933,7 +3097,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             {
                 "label": "Human",
                 "score": 0.95,
-                "bbox": [270.0, 180.0, 330.0, 290.0],
+                "bbox": [270.0, 90.0, 330.0, 210.0],
             },
         ]
 
@@ -2989,7 +3153,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             {
                 "label": "Human",
                 "score": 0.95,
-                "bbox": [270.0, 230.0, 330.0, 315.0],
+                "bbox": [270.0, 210.0, 330.0, 303.0],
             },
         ]
         human_reappeared = _curve_result_at(200.0, 430.0)
@@ -3419,11 +3583,11 @@ class VisionControlPlannerTest(unittest.TestCase):
         }
         new_upper = {
             "label": "Human", "score": 0.94,
-            "bbox": [250.0, 180.0, 310.0, 290.0],
+            "bbox": [250.0, 160.0, 310.0, 280.0],
         }
         new_at_line = {
             "label": "Human", "score": 0.94,
-            "bbox": [250.0, 220.0, 310.0, 330.0],
+            "bbox": [250.0, 200.0, 310.0, 321.0],
         }
 
         planner.update(
@@ -3494,11 +3658,11 @@ class VisionControlPlannerTest(unittest.TestCase):
         }
         new_upper = {
             "label": "Human", "score": 0.94,
-            "bbox": [250.0, 180.0, 310.0, 290.0],
+            "bbox": [250.0, 160.0, 310.0, 280.0],
         }
         new_near_line = {
             "label": "Human", "score": 0.94,
-            "bbox": [250.0, 200.0, 310.0, 310.0],
+            "bbox": [250.0, 190.0, 310.0, 303.0],
         }
 
         planner.update(

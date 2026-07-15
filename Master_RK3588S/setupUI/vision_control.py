@@ -204,7 +204,7 @@ def _path_point_probabilities(points, image_shape, support_maps, source_slots):
 @dataclass
 class VisionControlConfig:
     visual_center_x: float = 0.50
-    lookahead_y_ratio: float = 0.625
+    lookahead_y_ratio: float = 0.60
     max_track_error_640: float = 160.0
     max_error_step_640: float = 32.0
     error_trend_window: int = 5
@@ -256,6 +256,9 @@ class VisionControlConfig:
     path_smooth_window: int = 5
     path_max_step_px_640: float = 40.0
     path_state_hold_frames: int = 8
+    curve_green_max_step_px_640: float = 20.0
+    curve_green_ema_alpha: float = 0.30
+    curve_green_hold_frames: int = 3
     route_confirm_frames: int = 6
     branch_release_frames: int = 20
     branch_separation_px_640: float = 70.0
@@ -345,7 +348,7 @@ class VisionControlConfig:
     human_pass_offset_px_640: float = 38.0
     human_speed_hold_s: float = 1.0
     human_absence_confirm_s: float = 1.5
-    car_avoid_offset_px_640: float = 56.0
+    car_avoid_offset_px_640: float = 60.0
     car_avoid_speed_mps: float = 0.10
     car_avoid_ramp_s: float = 1.5
     car_avoid_hold_s: float = 1.0
@@ -364,7 +367,7 @@ class VisionControlConfig:
     def from_env(cls):
         return cls(
             visual_center_x=_clamp(_env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8),
-            lookahead_y_ratio=_clamp(_env_float("VISION_CONTROL_LOOKAHEAD_Y_RATIO", 0.625), 0.25, 0.95),
+            lookahead_y_ratio=_clamp(_env_float("VISION_CONTROL_LOOKAHEAD_Y_RATIO", 0.60), 0.25, 0.95),
             max_track_error_640=max(1.0, _env_float("VISION_CONTROL_MAX_ERROR_640", 160.0)),
             max_error_step_640=max(1.0, _env_float("VISION_CONTROL_MAX_STEP_640", 32.0)),
             error_trend_window=max(
@@ -464,6 +467,13 @@ class VisionControlConfig:
             path_smooth_window=max(1, _env_int("VISION_CONTROL_PATH_SMOOTH_WINDOW", 5)),
             path_max_step_px_640=max(1.0, _env_float("VISION_CONTROL_PATH_MAX_STEP_640", 40.0)),
             path_state_hold_frames=max(1, _env_int("VISION_CONTROL_PATH_HOLD_FRAMES", 8)),
+            curve_green_max_step_px_640=max(
+                1.0, _env_float("VISION_CONTROL_CURVE_GREEN_MAX_STEP_640", 20.0)),
+            curve_green_ema_alpha=_clamp(
+                _env_float("VISION_CONTROL_CURVE_GREEN_EMA_ALPHA", 0.30),
+                0.05, 1.0),
+            curve_green_hold_frames=max(
+                0, _env_int("VISION_CONTROL_CURVE_GREEN_HOLD_FRAMES", 3)),
             route_confirm_frames=max(1, _env_int("VISION_CONTROL_ROUTE_CONFIRM_FRAMES", 6)),
             branch_release_frames=max(1, _env_int("VISION_CONTROL_BRANCH_RELEASE_FRAMES", 20)),
             branch_separation_px_640=max(1.0, _env_float("VISION_CONTROL_BRANCH_SEP_640", 70.0)),
@@ -648,7 +658,7 @@ class VisionControlConfig:
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 1.0)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
-            car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 56.0)),
+            car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 60.0)),
             car_avoid_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_SPEED", 0.10)),
             car_avoid_ramp_s=max(0.01, _env_float("VISION_CONTROL_CAR_AVOID_RAMP_S", 1.5)),
             car_avoid_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_HOLD_S", 1.0)),
@@ -1548,7 +1558,13 @@ class VisionControlPlanner:
         perception_result = perception_result if isinstance(perception_result, dict) else {}
         image_shape = self._image_shape(perception_result)
         candidates, search_ms = self._extract_candidates(perception_result, image_shape)
-        self._update_turnsign_curve_separation(candidates, image_shape)
+        # Short held paths are for the preview only. Route selection and
+        # steering must continue to use current-frame candidates.
+        control_candidates = [
+            item for item in candidates
+            if not item.get("temporal_hold")]
+        self._update_turnsign_curve_separation(
+            control_candidates, image_shape)
         response = ocr_response if isinstance(ocr_response, dict) else {}
         incoming_session_id = response.get("session_id")
         if (
@@ -1568,7 +1584,7 @@ class VisionControlPlanner:
         if self.turnsign_trim_session_adaptive:
             self._update_turnsign_line_history(now)
         raw_route_state, raw_route_reason = self._classify_routes(
-            candidates, image_shape)
+            control_candidates, image_shape)
         route_state, route_reason = self._stabilize_route_state(
             raw_route_state, raw_route_reason)
         raw_ocr_direction, raw_ocr_current = self._extract_ocr_direction(ocr_response)
@@ -1599,13 +1615,14 @@ class VisionControlPlanner:
             deferred_ocr_lock_applied = True
         ocr_right_green_missing_released = (
             self._release_ocr_right_when_green_missing_at_lookahead(
-                candidates, image_shape, now))
+                control_candidates, image_shape, now))
         self._update_default_outer(
             route_state, now,
             bool(ocr_current or deferred_ocr_lock_applied or
                  self.turnsign_trim_pending_ocr_direction))
-        self._update_curve_merge_continuity(candidates, image_shape)
-        selected = self._select_candidate(candidates, route_state, image_shape)
+        self._update_curve_merge_continuity(control_candidates, image_shape)
+        selected = self._select_candidate(
+            control_candidates, route_state, image_shape)
         command, control_target = self._build_command(
             selected, route_state, route_reason, perception_result,
             image_shape, now, ocr_response)
@@ -1891,8 +1908,15 @@ class VisionControlPlanner:
         if self.config.path_source != "curve":
             candidates = self._assign_heatmap_slots(candidates[:2], image_shape)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
+        blue_human_occluded = (
+            self.config.path_source == "curve" and
+            self._human_occludes_previous_blue(result, image_shape))
         candidates = self._smooth_candidates(
-            candidates, image_shape, support_maps=support_maps)
+            candidates, image_shape, support_maps=support_maps,
+            temporal_hold_slots=(
+                {0, 1} if blue_human_occluded
+                else ({1} if self.config.path_source == "curve" else set())),
+            freeze_slots={0, 1} if blue_human_occluded else set())
         candidates = self._constrain_candidates_to_road(
             candidates, road, image_shape)
         self._publish_filtered_paths(result, candidates)
@@ -2750,7 +2774,10 @@ class VisionControlPlanner:
         return points
 
     def _smooth_candidates(
-            self, candidates, image_shape, support_maps=None):
+            self, candidates, image_shape, support_maps=None,
+            temporal_hold_slots=None, freeze_slots=None):
+        temporal_hold_slots = set(temporal_hold_slots or ())
+        freeze_slots = set(freeze_slots or ())
         present_slots = set()
         smoothed_candidates = []
         for candidate in candidates:
@@ -2762,16 +2789,46 @@ class VisionControlPlanner:
             filtered = dict(candidate)
             filtered["raw_points_xy"] = points.copy()
             previous = self.last_slot_points.get(slot)
-            filtered_points = self._smooth_path_points(
-                points, previous, image_shape[1],
-                apply_spatial=not bool(candidate.get(
-                    "spatial_prefiltered", False)))
+            human_occlusion_hold = (
+                slot in freeze_slots and previous is not None and
+                len(previous) >= 2)
+            if human_occlusion_hold:
+                # The vehicle is already braking/stopped for this person.
+                # Keep the last validated blue geometry instead of learning
+                # the person's silhouette as a new path observation.
+                filtered_points = np.asarray(
+                    previous, dtype=np.float32).copy()
+                for key in (
+                    "row_indices", "row_confidences", "points_normalized",
+                    "display_segments_xy",
+                ):
+                    filtered.pop(key, None)
+            else:
+                green_curve_filter = (
+                    self.config.path_source == "curve" and slot == 1 and
+                    not self.turnsign_trim_session_adaptive)
+                filtered_points = self._smooth_path_points(
+                    points, previous, image_shape[1],
+                    apply_spatial=not bool(candidate.get(
+                        "spatial_prefiltered", False)),
+                    max_step_px_640=(
+                        self.config.curve_green_max_step_px_640
+                        if green_curve_filter
+                        else None),
+                    alpha_override=(
+                        self.config.curve_green_ema_alpha
+                        if green_curve_filter
+                        else None))
             filtered["points_xy"] = filtered_points
             filtered["spatial_smoothed"] = self.config.path_smooth_window > 1
             filtered["temporal_smoothed"] = previous is not None
             filtered["smoothing_rejected_low_heat"] = False
-            smoothing_changed = not np.allclose(
-                filtered_points, points, rtol=0.0, atol=0.05)
+            filtered["temporal_hold"] = False
+            filtered["human_occlusion_hold"] = bool(human_occlusion_hold)
+            smoothing_changed = (
+                filtered_points.shape != points.shape or
+                not np.allclose(
+                    filtered_points, points, rtol=0.0, atol=0.05))
             if (support_maps is not None and smoothing_changed and
                     not self._annotate_heat_support(
                         filtered, image_shape, support_maps)):
@@ -2800,10 +2857,70 @@ class VisionControlPlanner:
                 continue
             missing = self.path_missing_frames.get(slot, 0) + 1
             self.path_missing_frames[slot] = missing
+            hold_limit = (
+                self.config.curve_green_hold_frames
+                if self.config.path_source == "curve" and slot == 1 and
+                not self.turnsign_trim_session_adaptive
+                else self.config.path_state_hold_frames)
+            if (
+                slot in temporal_hold_slots and
+                missing <= hold_limit
+            ):
+                held_points = np.asarray(
+                    self.last_slot_points[slot], dtype=np.float32).copy()
+                smoothed_candidates.append({
+                    "slot": int(slot),
+                    "source_slot": int(slot),
+                    "source_slots": {int(slot)},
+                    "role": "left" if slot == 0 else "right",
+                    "identity": "left" if slot == 0 else "right",
+                    "source": "row_classifier",
+                    "score": 0.0,
+                    "coverage": 1.0,
+                    "points_xy": held_points,
+                    "raw_points_xy": np.empty((0, 2), dtype=np.float32),
+                    "spatial_smoothed": False,
+                    "temporal_smoothed": True,
+                    "temporal_hold": True,
+                    "human_occlusion_hold": slot in freeze_slots,
+                })
+                continue
             if missing > self.config.path_state_hold_frames:
                 self.last_slot_points.pop(slot, None)
                 self.path_missing_frames.pop(slot, None)
         return smoothed_candidates
+
+    def _human_occludes_previous_blue(self, result, image_shape):
+        previous = self.last_slot_points.get(0)
+        if previous is None or len(previous) < 2:
+            return False
+        previous = np.asarray(previous, dtype=np.float32)
+        low_y = float(np.min(previous[:, 1]))
+        high_y = float(np.max(previous[:, 1]))
+        margin = 28.0 * float(max(1, image_shape[1])) / 640.0
+        for detection in result.get("detections") or ():
+            if (
+                str(detection.get("label") or "") != "Human" or
+                float(detection.get("score", 0.0)) < self.config.min_human_score
+            ):
+                continue
+            bbox = detection.get("bbox") or ()
+            if len(bbox) != 4:
+                continue
+            left, top, right, bottom = [float(value) for value in bbox]
+            sample_low = max(low_y, min(top, bottom))
+            sample_high = min(high_y, max(top, bottom))
+            if sample_low > sample_high:
+                continue
+            sample_ys = np.linspace(sample_low, sample_high, 7)
+            path_xs = _interp_path_x_many(previous, sample_ys)
+            valid = np.isfinite(path_xs)
+            if np.any(
+                valid & (path_xs >= min(left, right) - margin) &
+                (path_xs <= max(left, right) + margin)
+            ):
+                return True
+        return False
 
     def _constrain_candidates_to_road(self, candidates, road_mask, image_shape):
         """Project post-smoothed paths back into the semantic-road support."""
@@ -2818,6 +2935,13 @@ class VisionControlPlanner:
         max_distance_sq = max_distance * max_distance
         constrained_candidates = []
         for candidate in candidates:
+            if (candidate.get("temporal_hold") or
+                    candidate.get("human_occlusion_hold")):
+                # These points were already road-constrained before the
+                # person covered them; do not bend them toward the current
+                # occluded road mask.
+                constrained_candidates.append(dict(candidate))
+                continue
             points = np.asarray(candidate.get("points_xy"), dtype=np.float32)
             if points.ndim != 2 or points.shape[1] != 2 or not len(points):
                 continue
@@ -2859,7 +2983,8 @@ class VisionControlPlanner:
         return constrained_candidates
 
     def _smooth_path_points(
-            self, points, previous, image_width, apply_spatial=True):
+            self, points, previous, image_width, apply_spatial=True,
+            max_step_px_640=None, alpha_override=None):
         points = np.asarray(points, dtype=np.float32).copy()
         window = max(1, int(self.config.path_smooth_window))
         if window % 2 == 0:
@@ -2893,11 +3018,14 @@ class VisionControlPlanner:
         projected_x = np.interp(
             points[overlap, 1], previous_y, previous_x).astype(np.float32)
         max_step = (
-            self.config.path_max_step_px_640 *
+            (self.config.path_max_step_px_640
+             if max_step_px_640 is None else max_step_px_640) *
             float(max(1, image_width)) / 640.0)
         bounded_x = projected_x + np.clip(
             points[overlap, 0] - projected_x, -max_step, max_step)
-        alpha = float(self.config.path_ema_alpha)
+        alpha = float(
+            self.config.path_ema_alpha
+            if alpha_override is None else alpha_override)
         points[overlap, 0] = (
             bounded_x * alpha + projected_x * (1.0 - alpha))
         return points
@@ -5893,6 +6021,8 @@ class VisionControlPlanner:
                 "occlusion_bridge_rows", 0)),
             "curve_fit_rmse": float(candidate.get(
                 "curve_fit_rmse", 0.0)),
+            "human_occlusion_hold": bool(candidate.get(
+                "human_occlusion_hold", False)),
             "near_x": None if len(points) == 0 else float(points[np.argmax(points[:, 1]), 0]),
             "lookahead_x": _interp_path_x(points, image_shape[0] * 0.62),
         }
@@ -5922,6 +6052,19 @@ def render_vision_control_debug(frame, result):
     center_x = int(round(w * _clamp(_env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8)))
     cv2.line(frame, (center_x, int(h * 0.45)), (center_x, h - 1), (210, 210, 210), 1, cv2.LINE_AA)
 
+    target = debug.get("control_target") or {}
+    path_target_x = _finite_float(target.get("path_target_x"))
+    target_x = _finite_float(target.get("target_x"), path_target_x)
+    lookahead_y = _finite_float(
+        target.get("path_target_y"),
+        _finite_float(target.get("lookahead_y"), h * 0.62))
+    confidence_split_y = _clamp(
+        float(lookahead_y) - 10.0, 0.0, float(max(0, h - 1)))
+    lower_confidence_boost = _clamp(_env_float(
+        "VISION_CONTROL_POINT_LOWER_CONFIDENCE_BOOST", 0.35), 0.0, 1.0)
+    upper_confidence_decay = _clamp(_env_float(
+        "VISION_CONTROL_POINT_UPPER_CONFIDENCE_DECAY", 0.55), 0.0, 1.0)
+
     peak_detection = result.get("heatmap_peak_detection") or {}
     scan_ratios = peak_detection.get("scan_ratios") or []
     if len(scan_ratios) == 2:
@@ -5938,17 +6081,39 @@ def render_vision_control_debug(frame, result):
             continue
         points[:, 0] = np.clip(points[:, 0], 0, w - 1)
         points[:, 1] = np.clip(points[:, 1], 0, h - 1)
+        probabilities = _adjust_point_display_confidences(
+            points, line.get("probabilities"), confidence_split_y,
+            lower_confidence_boost, upper_confidence_decay)
+        if line.get("raw_model_points"):
+            road_mask = (result.get("road") or {}).get("mask")
+            if road_mask is None:
+                road_mask = result.get("road_mask")
+            inside_road = _semantic_road_point_mask(
+                points, road_mask, frame.shape)
+            associated = _associated_point_mask(
+                points, w, eligible_mask=inside_road)
+            points, probabilities = _densify_associated_lower_points(
+                points, probabilities, associated, w, h,
+                lower_boundary_y=confidence_split_y)
+            inside_road = _semantic_road_point_mask(
+                points, road_mask, frame.shape)
+            points = points[inside_road]
+            probabilities = probabilities[inside_road]
+        if not len(points):
+            continue
         _draw_identity_probability_path(
-            frame, points, line.get("probabilities"),
+            frame, points, probabilities,
             int(line.get("slot", 0)),
             thickness=3 if int(line.get("slot", -1)) == selected_slot else 2)
 
-    target = debug.get("control_target") or {}
-    path_target_x = _finite_float(target.get("path_target_x"))
-    target_x = _finite_float(target.get("target_x"), path_target_x)
-    lookahead_y = _finite_float(
-        target.get("path_target_y"),
-        _finite_float(target.get("lookahead_y"), h * 0.62))
+    split_y = int(round(confidence_split_y))
+    cv2.line(
+        frame, (0, split_y), (w - 1, split_y),
+        (0, 165, 255), 1, cv2.LINE_AA)
+    cv2.putText(
+        frame, "POINT CONF", (4, max(14, split_y - 4)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1,
+        cv2.LINE_AA)
     human_stop_line_y = _finite_float(target.get("human_stop_line_y"))
     if human_stop_line_y is not None:
         stop_y = int(round(_clamp(human_stop_line_y, 0, h - 1)))
@@ -6009,20 +6174,175 @@ def _draw_identity_probability_path(
     probabilities = np.asarray(probabilities, dtype=np.float32)
     if len(probabilities) != len(points):
         probabilities = np.ones(len(points), dtype=np.float32)
-    for index in range(len(points) - 1):
-        probability = 0.5 * (
-            float(probabilities[index]) +
-            float(probabilities[index + 1]))
-        cv2.line(
-            frame, tuple(points[index]), tuple(points[index + 1]),
-            _identity_probability_color(slot, probability),
-            int(thickness), cv2.LINE_AA)
+    # The row head is already an ordered point sequence.  Drawing the
+    # anchors directly avoids turning one noisy segment into a large visual
+    # jump while keeping the blue/green slot identity obvious.
+    radius = max(2, int(thickness) + 1)
+    for point, probability in zip(points, probabilities):
+        center = (int(point[0]), int(point[1]))
+        color = _identity_probability_color(slot, float(probability))
+        cv2.circle(frame, center, radius + 1, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(frame, center, radius, color, -1, cv2.LINE_AA)
+
+
+def _adjust_point_display_confidences(
+        points, probabilities, split_y, lower_boost, upper_decay):
+    points = np.asarray(points, dtype=np.float32)
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float32)
+    adjusted = np.clip(probabilities, 0.0, 1.0).copy()
+    lower = points[:, 1] >= float(split_y)
+    boost = _clamp(float(lower_boost), 0.0, 1.0)
+    decay = _clamp(float(upper_decay), 0.0, 1.0)
+    adjusted[lower] += (1.0 - adjusted[lower]) * boost
+    adjusted[~lower] *= decay
+    return np.clip(adjusted, 0.0, 1.0)
+
+
+def _associated_point_mask(
+        points, image_width, max_anchor_gap=1,
+        jump_per_anchor_px_640=36.0, min_component_size=3,
+        eligible_mask=None, max_line_error_px_640=6.0,
+        min_direction_cosine=0.95):
+    """Keep points supported by a strongly linear three-anchor group."""
+    points = np.asarray(points, dtype=np.float32)
+    count = len(points)
+    required_points = max(3, int(min_component_size))
+    if count < required_points:
+        return np.zeros(count, dtype=bool)
+    if eligible_mask is None:
+        eligible = np.ones(count, dtype=bool)
+    else:
+        eligible = np.asarray(eligible_mask, dtype=bool)
+        if len(eligible) != count:
+            eligible = np.ones(count, dtype=bool)
+    width_scale = float(max(1, image_width)) / 640.0
+    keep = np.zeros(count, dtype=bool)
+    anchor_step = max(1, int(max_anchor_gap))
+    maximum_dx = float(jump_per_anchor_px_640) * width_scale * anchor_step
+    maximum_line_error = float(max_line_error_px_640) * width_scale
+    minimum_cosine = _clamp(float(min_direction_cosine), -1.0, 1.0)
+    for first in range(count - 2 * anchor_step):
+        indices = np.asarray([
+            first, first + anchor_step, first + 2 * anchor_step],
+            dtype=np.int32)
+        if not np.all(eligible[indices]):
+            continue
+        first_vector = points[indices[1]] - points[indices[0]]
+        second_vector = points[indices[2]] - points[indices[1]]
+        if (abs(float(first_vector[0])) > maximum_dx or
+                abs(float(second_vector[0])) > maximum_dx):
+            continue
+        first_length = float(np.linalg.norm(first_vector))
+        second_length = float(np.linalg.norm(second_vector))
+        if first_length <= 1e-6 or second_length <= 1e-6:
+            continue
+        direction_cosine = float(np.dot(first_vector, second_vector)) / (
+            first_length * second_length)
+        chord = points[indices[2]] - points[indices[0]]
+        chord_length = float(np.linalg.norm(chord))
+        if chord_length <= 1e-6:
+            continue
+        middle_offset = points[indices[1]] - points[indices[0]]
+        line_error = abs(float(
+            chord[0] * middle_offset[1] -
+            chord[1] * middle_offset[0])) / chord_length
+        if (direction_cosine >= minimum_cosine and
+                line_error <= maximum_line_error):
+            keep[indices] = True
+    return keep
+
+
+def _densify_associated_lower_points(
+        points, probabilities, associated_mask, image_width, image_height,
+        sparse_gap_px_480=18.0, target_spacing_px_480=12.0,
+        jump_per_anchor_px_640=36.0, max_insertions=3,
+        lower_boundary_y=None):
+    """Fill sparse connected display anchors, only in the lower half."""
+    points = np.asarray(points, dtype=np.float32)
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    associated_mask = np.asarray(associated_mask, dtype=bool)
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float32)
+    if len(associated_mask) != len(points):
+        associated_mask = np.ones(len(points), dtype=bool)
+
+    height_scale = float(max(1, image_height)) / 480.0
+    width_scale = float(max(1, image_width)) / 640.0
+    lower_half_y = (
+        0.5 * float(max(0, image_height - 1))
+        if lower_boundary_y is None else float(lower_boundary_y))
+    sparse_gap = max(1.0, float(sparse_gap_px_480) * height_scale)
+    target_spacing = max(1.0, float(target_spacing_px_480) * height_scale)
+    maximum_dx = float(jump_per_anchor_px_640) * width_scale
+    insertion_limit = max(0, int(max_insertions))
+
+    display_points = []
+    display_probabilities = []
+    for index, point in enumerate(points):
+        if not associated_mask[index]:
+            continue
+        display_points.append(point)
+        display_probabilities.append(probabilities[index])
+        next_index = index + 1
+        if next_index >= len(points) or not associated_mask[next_index]:
+            continue
+        next_point = points[next_index]
+        if (float(point[1]) < lower_half_y or
+                float(next_point[1]) < lower_half_y or
+                abs(float(next_point[0] - point[0])) > maximum_dx):
+            continue
+        distance = float(np.linalg.norm(next_point - point))
+        if distance <= sparse_gap:
+            continue
+        insertion_count = min(
+            insertion_limit,
+            max(1, int(math.ceil(distance / target_spacing)) - 1),
+        )
+        for insertion in range(1, insertion_count + 1):
+            ratio = float(insertion) / float(insertion_count + 1)
+            display_points.append(point + (next_point - point) * ratio)
+            display_probabilities.append(
+                probabilities[index] +
+                (probabilities[next_index] - probabilities[index]) * ratio)
+
+    if not display_points:
+        return (np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+    return (np.asarray(display_points, dtype=np.float32),
+            np.asarray(display_probabilities, dtype=np.float32))
+
+
+def _semantic_road_point_mask(points, road_mask, image_shape):
+    """Return points that land inside the semantic road segmentation."""
+    points = np.asarray(points, dtype=np.float32)
+    road = np.asarray(road_mask) if road_mask is not None else np.empty((0, 0))
+    if road.ndim != 2 or not road.size:
+        # Some synthetic/debug frames do not carry segmentation. Keep their
+        # points visible rather than silently changing the existing preview.
+        return np.ones(len(points), dtype=bool)
+    height, width = image_shape[:2]
+    road_height, road_width = road.shape
+    x = np.clip(
+        np.rint(points[:, 0] * float(road_width - 1) /
+               float(max(width - 1, 1))), 0, road_width - 1).astype(np.int32)
+    y = np.clip(
+        np.rint(points[:, 1] * float(road_height - 1) /
+               float(max(height - 1, 1))), 0, road_height - 1).astype(np.int32)
+    return np.asarray(road[y, x]) != 0
 
 
 def _extract_heatmap_preview_lines(result, image_shape, max_lines=2):
     if not isinstance(result, dict):
         return []
-    paths = result.get("display_paths")
+    # Preview the row head exactly as emitted: both slots and all 32 anchors.
+    # Route/control candidates remain separately filtered in ``paths``.
+    paths = result.get("raw_curve_paths")
+    if paths is None:
+        paths = (result.get("centerline") or {}).get("raw_curve_paths")
+    if paths is None:
+        paths = result.get("display_paths")
     if paths is None:
         paths = result.get("paths") or []
     lines = []
@@ -6039,6 +6359,8 @@ def _extract_heatmap_preview_lines(result, image_shape, max_lines=2):
         lines.append({
             "slot": int(path.get("slot", len(lines))),
             "identity": str(path.get("identity") or path.get("role") or ""),
+            "raw_model_points": (
+                str(path.get("source") or "") == "row_classifier_raw"),
             "points_xy": points,
             "probabilities": probabilities,
             "score": float(np.mean(probabilities)),

@@ -105,8 +105,18 @@ ROW_PATH_MIN_SCORE = float(np.clip(
     _env_float("MULTITASK_ROW_PATH_MIN_SCORE", 0.25), 0.0, 1.0))
 ROW_NO_PATH_THRESHOLD = float(np.clip(
     _env_float("MULTITASK_ROW_NO_PATH_THRESHOLD", 0.50), 0.0, 1.0))
+# Slot 1 is the green/right curve in the live preview.  It is consistently
+# weaker than slot 0 on the lowered camera view, so give only that slot a
+# softer gate while retaining continuity and road-mask validation below.
+ROW_GREEN_PATH_MIN_SCORE = float(np.clip(
+    _env_float("MULTITASK_ROW_GREEN_PATH_MIN_SCORE", 0.03), 0.0, 1.0))
+ROW_GREEN_NO_PATH_THRESHOLD = float(np.clip(
+    _env_float("MULTITASK_ROW_GREEN_NO_PATH_THRESHOLD", 0.93), 0.0, 1.0))
 ROW_MAX_MISSING_ANCHORS = max(
     0, _env_int("MULTITASK_ROW_MAX_MISSING_ANCHORS", 2))
+ROW_GREEN_MAX_MISSING_ANCHORS = max(
+    ROW_MAX_MISSING_ANCHORS,
+    _env_int("MULTITASK_ROW_GREEN_MAX_MISSING_ANCHORS", 6))
 ROW_MAX_LATERAL_JUMP_RATIO = float(np.clip(
     _env_float("MULTITASK_ROW_MAX_LATERAL_JUMP_RATIO", 0.18),
     0.02, 1.0))
@@ -470,14 +480,17 @@ def _row_anchor_y_normalized(count):
     return np.linspace(1.0, ROW_ANCHOR_TOP, count, dtype=np.float32)
 
 
-def _split_anchor_segments(points_xy, row_indices):
+def _split_anchor_segments(
+        points_xy, row_indices, max_missing_anchors=None):
     if len(points_xy) < 2:
         return []
+    if max_missing_anchors is None:
+        max_missing_anchors = ROW_MAX_MISSING_ANCHORS
     segments = []
     start = 0
     for index in range(1, len(points_xy)):
         if int(row_indices[index] - row_indices[index - 1]) > \
-                ROW_MAX_MISSING_ANCHORS + 1:
+                int(max_missing_anchors) + 1:
             if index - start >= 2:
                 segments.append(points_xy[start:index].copy())
             start = index
@@ -486,16 +499,19 @@ def _split_anchor_segments(points_xy, row_indices):
     return segments
 
 
-def _near_continuous_prefix(points, row_indices):
+def _near_continuous_prefix(
+        points, row_indices, max_missing_anchors=None):
     """Discard a far tail after the row head jumps to another branch."""
     points = np.asarray(points, dtype=np.float32)
     row_indices = np.asarray(row_indices, dtype=np.int32)
     if len(points) < 2:
         return points, row_indices
+    if max_missing_anchors is None:
+        max_missing_anchors = ROW_MAX_MISSING_ANCHORS
     end = len(points)
     for index in range(1, len(points)):
         row_gap = int(row_indices[index] - row_indices[index - 1])
-        if row_gap <= 0 or row_gap > ROW_MAX_MISSING_ANCHORS + 1:
+        if row_gap <= 0 or row_gap > int(max_missing_anchors) + 1:
             end = index
             break
         maximum_jump = ROW_MAX_LATERAL_JUMP_RATIO * float(row_gap)
@@ -581,32 +597,57 @@ def decode_curve_paths(row_path_logits, path_scores, path_count_scores,
         coordinate_mass[..., None], 1e-12)
     x_values = np.arange(ROW_BINS, dtype=np.float32)
     x_normalized = (conditional * x_values).sum(axis=-1) / float(ROW_BINS - 1)
-    row_visible = (
-        probabilities[..., -1] <= ROW_NO_PATH_THRESHOLD) & \
-        (coordinate_mass >= 1.0 - ROW_NO_PATH_THRESHOLD)
     y_normalized = _row_anchor_y_normalized(ROW_ANCHORS)
     model_path_count = int(np.argmax(path_count_scores))
     count_confidence = float(path_count_scores[model_path_count])
+    scale = np.asarray(
+        [max(width - 1, 0), max(height - 1, 0)], dtype=np.float32)
+    raw_paths = []
+    for slot in range(MAX_PATHS):
+        normalized = np.stack(
+            (x_normalized[slot], y_normalized), axis=1).astype(np.float32)
+        raw_paths.append({
+            "slot": int(slot),
+            "role": "left" if slot == 0 else "right",
+            "source": "row_classifier_raw",
+            "score": float(path_scores[slot]),
+            "row_support": int(ROW_ANCHORS),
+            "row_indices": np.arange(ROW_ANCHORS, dtype=np.int32),
+            "point_confidences": coordinate_mass[slot].astype(np.float32),
+            "points_normalized": normalized,
+            "points_xy": (normalized * scale).astype(np.float32),
+            "road_constrained": False,
+        })
     paths = []
     for slot in range(MAX_PATHS):
-        visible_indices = np.flatnonzero(row_visible[slot])
-        if (float(path_scores[slot]) < ROW_PATH_MIN_SCORE or
+        path_min_score = (
+            ROW_GREEN_PATH_MIN_SCORE if slot == 1 else ROW_PATH_MIN_SCORE)
+        no_path_threshold = (
+            ROW_GREEN_NO_PATH_THRESHOLD
+            if slot == 1 else ROW_NO_PATH_THRESHOLD)
+        max_missing_anchors = (
+            ROW_GREEN_MAX_MISSING_ANCHORS
+            if slot == 1 else ROW_MAX_MISSING_ANCHORS)
+        row_visible = (
+            probabilities[slot, :, -1] <= no_path_threshold) & \
+            (coordinate_mass[slot] >= 1.0 - no_path_threshold)
+        visible_indices = np.flatnonzero(row_visible)
+        if (float(path_scores[slot]) < path_min_score or
                 len(visible_indices) < 3):
             continue
         normalized = np.stack((x_normalized[slot, visible_indices],
                                y_normalized[visible_indices]), axis=1)
         normalized, visible_indices = _near_continuous_prefix(
-            normalized, visible_indices)
+            normalized, visible_indices, max_missing_anchors)
         normalized, keep, road_overlap = _project_normalized_points_to_road(
             normalized, road_mask)
         visible_indices = visible_indices[keep]
         normalized = normalized[keep]
         normalized, visible_indices = _near_continuous_prefix(
-            normalized, visible_indices)
+            normalized, visible_indices, max_missing_anchors)
         if len(normalized) < 3:
             continue
-        points_xy = normalized * np.asarray(
-            [max(width - 1, 0), max(height - 1, 0)], dtype=np.float32)
+        points_xy = normalized * scale
         row_confidences = coordinate_mass[slot, visible_indices]
         paths.append({
             "slot": int(slot),
@@ -622,14 +663,14 @@ def decode_curve_paths(row_path_logits, path_scores, path_count_scores,
             "road_overlap": road_overlap,
             "road_constrained": bool(PATH_CONSTRAIN_TO_ROAD),
             "display_segments_xy": _split_anchor_segments(
-                points_xy, visible_indices),
+                points_xy, visible_indices, max_missing_anchors),
         })
     if len(paths) == 1:
         paths[0]["role"] = "single"
     elif len(paths) >= 2:
         for path in paths:
             path["role"] = "left" if path["slot"] == 0 else "right"
-    return paths, model_path_count, count_confidence
+    return paths, model_path_count, count_confidence, raw_paths
 
 
 def _row_peaks(values, threshold, min_distance=3):
@@ -755,7 +796,8 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
     road_mask, road_quality = clean_road_mask(
         road_mask_raw, return_info=True)
-    curve_paths, model_path_count, count_confidence = decode_curve_paths(
+    curve_paths, model_path_count, count_confidence, raw_curve_paths = \
+        decode_curve_paths(
         row_path_logits, path_scores, path_count_scores, image_shape,
         road_mask=road_mask)
     raw_path_heatmaps = sigmoid(pixel_logits[1:])
@@ -788,6 +830,7 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "heatmaps": path_heatmaps,
         "paths": paths,
         "curve_paths": curve_paths,
+        "raw_curve_paths": raw_curve_paths,
         "heatmap_ridge_paths": heatmap_ridge_paths,
         "path_source": "row_classifier" if path_source == "curve" else "heatmap_ridge",
         "display_source": "row_classifier" if path_source == "curve" else "heatmap_ridge",
@@ -810,6 +853,7 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "path_count_scores": path_count_scores_list,
         "paths": paths,
         "curve_paths": curve_paths,
+        "raw_curve_paths": raw_curve_paths,
         "heatmap_ridge_paths": heatmap_ridge_paths,
         "path_source": path_source,
         "road": road,

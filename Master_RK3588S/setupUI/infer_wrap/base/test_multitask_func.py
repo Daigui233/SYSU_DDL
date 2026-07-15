@@ -185,6 +185,62 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(result["path_count"], 2)
         self.assertEqual(len(result["curve_paths"]), 2)
 
+    def test_green_curve_uses_its_lower_score_gate_only(self):
+        outputs = list(self.make_outputs())
+        outputs[4] = np.asarray([[0.02, 0.04]], dtype=np.float32)
+
+        result = decode_outputs(
+            outputs, (480, 640, 3), path_source="curve")
+
+        self.assertEqual(len(result["curve_paths"]), 1)
+        self.assertEqual(result["curve_paths"][0]["slot"], 1)
+
+    def test_green_curve_uses_relaxed_row_visibility_only(self):
+        outputs = list(self.make_outputs())
+        outputs[3][:] = -12.0
+        outputs[3][0, :, :, 108] = 0.0
+        # With one coordinate bin at 0.0 and the no-path bin at log(3),
+        # no-path probability is 0.75: rejected by slot 0's 0.50 gate but
+        # accepted by slot 1's deliberately relaxed 0.93 gate.
+        outputs[3][0, :, :, 160] = np.log(3.0)
+
+        result = decode_outputs(
+            outputs, (480, 640, 3), path_source="curve")
+
+        self.assertEqual(len(result["curve_paths"]), 1)
+        self.assertEqual(result["curve_paths"][0]["slot"], 1)
+
+    def test_green_curve_bridges_six_missing_row_anchors(self):
+        outputs = list(self.make_outputs())
+        outputs[3][0, 1, 2:8, :] = -8.0
+        outputs[3][0, 1, 2:8, 160] = 8.0
+
+        result = decode_outputs(
+            outputs, (480, 640, 3), path_source="curve")
+        green = next(
+            path for path in result["curve_paths"] if path["slot"] == 1)
+
+        self.assertIn(1, green["row_indices"])
+        self.assertIn(8, green["row_indices"])
+        self.assertEqual(len(green["display_segments_xy"]), 1)
+
+    def test_raw_curve_preview_keeps_all_points_without_gating(self):
+        outputs = list(self.make_outputs())
+        outputs[3][:] = -8.0
+        outputs[3][0, :, :, 160] = 8.0
+        outputs[4] = np.asarray([[0.0, 0.0]], dtype=np.float32)
+
+        result = decode_outputs(
+            outputs, (480, 640, 3), path_source="curve")
+
+        self.assertEqual(len(result["curve_paths"]), 0)
+        self.assertEqual(len(result["raw_curve_paths"]), 2)
+        self.assertEqual(
+            [len(path["points_xy"])
+             for path in result["raw_curve_paths"]],
+            [32, 32],
+        )
+
     def test_row_path_is_projected_inside_road_mask(self):
         outputs = list(self.make_outputs())
         outputs[3][0, 0, :, :] = -8.0
