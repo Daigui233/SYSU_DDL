@@ -252,7 +252,7 @@ class VisionControlConfig:
     road_penalty_weight: float = 0.75
     history_weight: float = 0.035
     jump_weight: float = 0.018
-    path_ema_alpha: float = 0.32
+    path_ema_alpha: float = 0.45
     path_smooth_window: int = 5
     path_max_step_px_640: float = 40.0
     path_state_hold_frames: int = 8
@@ -272,6 +272,13 @@ class VisionControlConfig:
     curve_merge_near_px_640: float = 36.0
     curve_merge_enter_evidence: int = 4
     curve_merge_release_frames: int = 30
+    curve_merge_fast_span_ratio: float = 0.55
+    curve_merge_fast_blue_jump_px_640: float = 60.0
+    curve_merge_fast_green_jump_px_640: float = 40.0
+    curve_merge_fast_recovery_frames: int = 2
+    curve_blue_angle_jump_deg: float = 12.0
+    curve_blue_instability_evidence: int = 3
+    curve_green_missing_release_frames: int = 3
     no_path_stop_s: float = 0.8
     recover_hold_s: float = 0.5
     hazard_bottom_ratio: float = 250.0 / 480.0
@@ -292,8 +299,7 @@ class VisionControlConfig:
     turnsign_edge_margin_ratio: float = 0.15
     turnsign_steer_gain: float = 1.5
     turnsign_reverse_speed_mps: float = -0.08
-    turnsign_reverse_duration_s: float = 2.0
-    turnsign_initial_brake_s: float = 0.5
+    turnsign_reverse_duration_s: float = 0.5
     human_stop_line_margin_ratio: float = 0.0
     human_stop_progress_ratio: float = 8.0 / 9.0
     human_preline_missing_px_480: float = 20.0
@@ -301,7 +307,7 @@ class VisionControlConfig:
     human_brake_reverse_duration_s: float = 0.2
     human_return_duration_s: float = 1.0
     human_return_error_640: float = 40.0
-    human_cross_release_px_640: float = 45.0
+    human_cross_release_px_640: float = 5.0
     human_pass_offset_px_640: float = 38.0
     human_speed_hold_s: float = 1.0
     human_absence_confirm_s: float = 1.5
@@ -420,7 +426,7 @@ class VisionControlConfig:
             road_penalty_weight=max(0.0, _env_float("VISION_CONTROL_ROAD_WEIGHT", 0.75)),
             history_weight=max(0.0, _env_float("VISION_CONTROL_HISTORY_WEIGHT", 0.035)),
             jump_weight=max(0.0, _env_float("VISION_CONTROL_JUMP_WEIGHT", 0.018)),
-            path_ema_alpha=_clamp(_env_float("VISION_CONTROL_PATH_EMA_ALPHA", 0.32), 0.0, 1.0),
+            path_ema_alpha=_clamp(_env_float("VISION_CONTROL_PATH_EMA_ALPHA", 0.45), 0.0, 1.0),
             path_smooth_window=max(1, _env_int("VISION_CONTROL_PATH_SMOOTH_WINDOW", 5)),
             path_max_step_px_640=max(1.0, _env_float("VISION_CONTROL_PATH_MAX_STEP_640", 40.0)),
             path_state_hold_frames=max(1, _env_int("VISION_CONTROL_PATH_HOLD_FRAMES", 8)),
@@ -454,6 +460,28 @@ class VisionControlConfig:
             curve_merge_release_frames=max(
                 1, _env_int(
                     "VISION_CONTROL_CURVE_MERGE_RELEASE_FRAMES", 30)),
+            curve_merge_fast_span_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CURVE_MERGE_FAST_SPAN_RATIO", 0.55),
+                0.0, 1.0),
+            curve_merge_fast_blue_jump_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CURVE_MERGE_FAST_BLUE_JUMP_640", 60.0)),
+            curve_merge_fast_green_jump_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CURVE_MERGE_FAST_GREEN_JUMP_640", 40.0)),
+            curve_merge_fast_recovery_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CURVE_MERGE_FAST_RECOVERY_FRAMES", 2)),
+            curve_blue_angle_jump_deg=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CURVE_BLUE_ANGLE_JUMP_DEG", 12.0)),
+            curve_blue_instability_evidence=max(
+                1, _env_int(
+                    "VISION_CONTROL_CURVE_BLUE_INSTABILITY_EVIDENCE", 3)),
+            curve_green_missing_release_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CURVE_GREEN_MISSING_RELEASE_FRAMES", 3)),
             no_path_stop_s=max(0.1, _env_float("VISION_CONTROL_NO_PATH_STOP_S", 0.8)),
             recover_hold_s=max(0.0, _env_float("VISION_CONTROL_RECOVER_HOLD_S", 0.5)),
             hazard_bottom_ratio=_clamp(_env_float("VISION_CONTROL_HAZARD_BOTTOM_RATIO", 250.0 / 480.0), 0.0, 1.0),
@@ -472,8 +500,7 @@ class VisionControlConfig:
             turnsign_edge_margin_ratio=_clamp(_env_float("VISION_CONTROL_TURNSIGN_EDGE_MARGIN_RATIO", 0.15), 0.0, 0.45),
             turnsign_steer_gain=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_STEER_GAIN", 1.5)),
             turnsign_reverse_speed_mps=-abs(_env_float("VISION_CONTROL_TURNSIGN_REVERSE_SPEED", -0.08)),
-            turnsign_reverse_duration_s=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_REVERSE_DURATION_S", 2.0)),
-            turnsign_initial_brake_s=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_INITIAL_BRAKE_S", 0.5)),
+            turnsign_reverse_duration_s=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_REVERSE_DURATION_S", 0.5)),
             human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
             human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 8.0 / 9.0), 0.0, 1.0),
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
@@ -481,7 +508,7 @@ class VisionControlConfig:
             human_brake_reverse_duration_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_BRAKE_REVERSE_DURATION_S", 0.2)),
             human_return_duration_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_RETURN_DURATION_S", 1.0)),
             human_return_error_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_RETURN_ERROR_640", 40.0)),
-            human_cross_release_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_CROSS_RELEASE_640", 45.0)),
+            human_cross_release_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_CROSS_RELEASE_640", 5.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 1.0)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
@@ -1256,8 +1283,17 @@ class VisionControlPlanner:
         self.selected_slot_lock = 0 if curve_defaults_blue else None
         self.selected_slot_missing_frames = 0
         self.curve_merge_override = False
+        self.curve_merge_fast_override = False
+        self.curve_merge_fast_recovery_frames = 0
+        self.curve_merge_last_raw_lookahead_x = {}
         self.curve_merge_bad_evidence = 0
         self.curve_merge_blue_stable_frames = 0
+        self.curve_flicker_green_lock_active = False
+        self.curve_blue_instability_score = 0
+        self.curve_blue_last_heading_deg = None
+        self.curve_blue_heading_deg = None
+        self.curve_blue_heading_jump_deg = 0.0
+        self.curve_green_missing_frames = 0
         self.curve_merge_reason = "inactive"
         self.curve_merge_metrics = {}
         self.selection_reason = "initial"
@@ -1269,10 +1305,16 @@ class VisionControlPlanner:
         self.ocr_pending_direction = None
         self.ocr_pending_frames = 0
         self.ocr_confirmed_current = False
+        self.ocr_right_green_lock_active = False
+        self.ocr_right_blue_fallback_completed_for_current = False
+        self.ocr_right_blue_available_at_lookahead = False
+        self.ocr_right_green_available_at_lookahead = False
+        self.ocr_right_green_missing_frames = 0
         self.human_waiting_cross = False
         self.human_last_side = None
+        self.human_last_path_distance_640 = None
+        self.human_path_launch_ready = False
         self.human_pass_active = False
-        self.human_pass_side = None
         self.human_pass_offset_x = 0.0
         self.human_speed_hold_until = 0.0
         self.human_detected_latched = False
@@ -1302,16 +1344,16 @@ class VisionControlPlanner:
         self.car_human_waiting_cross = False
         self.car_human_seen_avoid_side = False
         self.car_human_last_seen_ts = 0.0
+        self.car_human_last_path_distance_640 = None
+        self.car_human_path_launch_ready = False
         self.car_human_pass_until = 0.0
         self.sign_ocr_active_since = None
         self.sign_ocr_pulse_until = 0.0
         self.sign_ocr_pulse_sent = False
         self.sign_seen_frames = 0
         self.sign_latched_since = None
-        self.turnsign_reverse_until = 0.0
-        self.turnsign_post_reverse_stop = False
         self.turnsign_control_session_id = None
-        self.turnsign_brake_until = 0.0
+        self.turnsign_lock_reverse_until = 0.0
 
     def update(self, perception_result, ocr_response=None, now=None):
         now = float(time.monotonic() if now is None else now)
@@ -1331,12 +1373,27 @@ class VisionControlPlanner:
         if ocr_current:
             self.last_valid_ocr_ts = now
             self.last_ocr_direction = ocr_direction
-            self.branch_lock = ocr_direction
-            self.branch_lock_source = "ocr"
-            self.selected_slot_lock = 0 if ocr_direction == "left" else 1
-            self.selected_slot_missing_frames = 0
+            if ocr_direction == "right" and self.config.path_source == "curve":
+                if not self.ocr_right_blue_fallback_completed_for_current:
+                    if not self.ocr_right_green_lock_active:
+                        self.ocr_right_green_lock_active = True
+                        self.ocr_right_green_missing_frames = 0
+                    self.branch_lock = "right"
+                    self.branch_lock_source = "ocr"
+                    self.selected_slot_lock = 1
+                    self.selected_slot_missing_frames = 0
+            else:
+                self._reset_ocr_right_green_lock()
+                self.branch_lock = ocr_direction
+                self.branch_lock_source = "ocr"
+                self.selected_slot_lock = 0 if ocr_direction == "left" else 1
+                self.selected_slot_missing_frames = 0
         else:
+            self.ocr_right_blue_fallback_completed_for_current = False
             ocr_lock_expired = self._expire_ocr_lock(now)
+        ocr_right_green_missing_released = (
+            self._release_ocr_right_when_green_missing_at_lookahead(
+                candidates, image_shape))
         self._update_default_outer(route_state, now, ocr_current)
         self._update_curve_merge_continuity(candidates, image_shape)
         selected = self._select_candidate(candidates, route_state, image_shape)
@@ -1357,10 +1414,23 @@ class VisionControlPlanner:
             "selected_slot_lock": self.selected_slot_lock,
             "selection_reason": self.selection_reason,
             "curve_merge_override": bool(self.curve_merge_override),
+            "curve_merge_fast_override": bool(
+                self.curve_merge_fast_override),
+            "curve_merge_fast_recovery_frames": int(
+                self.curve_merge_fast_recovery_frames),
             "curve_merge_reason": self.curve_merge_reason,
             "curve_merge_bad_evidence": self.curve_merge_bad_evidence,
             "curve_merge_blue_stable_frames": (
                 self.curve_merge_blue_stable_frames),
+            "curve_flicker_green_lock_active": bool(
+                self.curve_flicker_green_lock_active),
+            "curve_blue_instability_score": int(
+                self.curve_blue_instability_score),
+            "curve_blue_heading_deg": self.curve_blue_heading_deg,
+            "curve_blue_heading_jump_deg": float(
+                self.curve_blue_heading_jump_deg),
+            "curve_green_missing_frames": int(
+                self.curve_green_missing_frames),
             "curve_merge_metrics": dict(self.curve_merge_metrics),
             "raw_ocr_direction": raw_ocr_direction if raw_ocr_current else None,
             "raw_ocr_current": bool(raw_ocr_current),
@@ -1372,6 +1442,16 @@ class VisionControlPlanner:
             "ocr_lock_expired": bool(ocr_lock_expired),
             "ocr_lock_age_s": self._ocr_lock_age(now),
             "ocr_lock_remaining_s": self._ocr_lock_remaining(now),
+            "ocr_right_green_lock_active": bool(
+                self.ocr_right_green_lock_active),
+            "ocr_right_blue_available_at_lookahead": bool(
+                self.ocr_right_blue_available_at_lookahead),
+            "ocr_right_green_available_at_lookahead": bool(
+                self.ocr_right_green_available_at_lookahead),
+            "ocr_right_green_missing_frames": int(
+                self.ocr_right_green_missing_frames),
+            "ocr_right_green_missing_released": bool(
+                ocr_right_green_missing_released),
             "default_outer_elapsed": self._default_outer_elapsed(now),
             "selected_slot": None if selected is None else int(selected.get("slot", -1)),
             "candidate_count": len(candidates),
@@ -2645,20 +2725,133 @@ class VisionControlPlanner:
         self.curve_merge_metrics = {}
         if self.config.path_source != "curve":
             return
-        if self.branch_lock != "left":
-            self.curve_merge_override = False
-            self.curve_merge_bad_evidence = 0
-            self.curve_merge_blue_stable_frames = 0
-            self.curve_merge_reason = (
-                "ocr_right" if self.branch_lock == "right" else "inactive")
-            return
 
+        height, width = image_shape[:2]
+        lookahead_y = float(height) * self.config.lookahead_y_ratio
         by_slot = {
             int(candidate.get("slot", -1)): candidate
             for candidate in candidates
         }
+        previous_raw_lookahead = dict(
+            self.curve_merge_last_raw_lookahead_x)
+        current_raw_lookahead = {}
+        for slot, candidate in by_slot.items():
+            raw_points = np.asarray(
+                candidate.get(
+                    "raw_points_xy", candidate.get("points_xy")),
+                dtype=np.float32,
+            )
+            if self._path_covers_y(raw_points, lookahead_y):
+                raw_x = _interp_path_x(raw_points, lookahead_y)
+                if raw_x is not None:
+                    current_raw_lookahead[slot] = float(raw_x)
+        self.curve_merge_last_raw_lookahead_x.update(
+            current_raw_lookahead)
+
         blue = by_slot.get(0)
         green = by_slot.get(1)
+        near_y = float(height) * 0.875
+        blue_points = np.asarray(
+            (blue or {}).get("points_xy", ()), dtype=np.float32)
+        green_points = np.asarray(
+            (green or {}).get("points_xy", ()), dtype=np.float32)
+        blue_available = bool(
+            self._path_covers_y(blue_points, lookahead_y)
+            and _interp_path_x(blue_points, lookahead_y) is not None)
+        green_available = bool(
+            self._path_covers_y(green_points, lookahead_y)
+            and _interp_path_x(green_points, lookahead_y) is not None)
+        blue_raw_points = np.asarray(
+            (blue or {}).get(
+                "raw_points_xy", (blue or {}).get("points_xy", ())),
+            dtype=np.float32)
+        previous_heading = self.curve_blue_last_heading_deg
+        blue_heading = self._path_heading_deg(
+            blue_raw_points, lookahead_y, near_y)
+        self.curve_blue_heading_deg = blue_heading
+        self.curve_blue_heading_jump_deg = 0.0
+        if blue_heading is not None and previous_heading is not None:
+            self.curve_blue_heading_jump_deg = abs(
+                float(blue_heading) - float(previous_heading))
+        self.curve_blue_last_heading_deg = blue_heading
+
+        if self.branch_lock != "left":
+            self.curve_merge_override = False
+            self.curve_merge_fast_override = False
+            self.curve_merge_fast_recovery_frames = 0
+            self.curve_merge_bad_evidence = 0
+            self.curve_merge_blue_stable_frames = 0
+            self.curve_flicker_green_lock_active = False
+            self.curve_blue_instability_score = 0
+            self.curve_green_missing_frames = 0
+            self.curve_merge_reason = (
+                "ocr_right" if self.branch_lock == "right" else "inactive")
+            return
+
+        blue_raw_x = current_raw_lookahead.get(0)
+        previous_blue_raw_x = previous_raw_lookahead.get(0)
+        blue_raw_jump_640 = (
+            abs(float(blue_raw_x) - float(previous_blue_raw_x)) *
+            640.0 / float(max(1, width))
+            if blue_raw_x is not None and previous_blue_raw_x is not None
+            else 0.0)
+        blue_unstable = bool(
+            self.curve_blue_heading_jump_deg >=
+                self.config.curve_blue_angle_jump_deg
+            or blue_raw_jump_640 >=
+                self.config.curve_merge_fast_blue_jump_px_640)
+        if not self.curve_flicker_green_lock_active:
+            if green_available and blue_available and blue_unstable:
+                self.curve_blue_instability_score = min(
+                    self.config.curve_blue_instability_evidence + 2,
+                    self.curve_blue_instability_score + 2)
+            elif blue_available and green_available:
+                self.curve_blue_instability_score = max(
+                    0, self.curve_blue_instability_score - 1)
+            else:
+                self.curve_blue_instability_score = max(
+                    0, self.curve_blue_instability_score - 1)
+            if (
+                green_available
+                and self.curve_blue_instability_score >=
+                    self.config.curve_blue_instability_evidence
+            ):
+                self.curve_flicker_green_lock_active = True
+                self.curve_green_missing_frames = 0
+
+        if self.curve_flicker_green_lock_active:
+            if blue_available and not green_available:
+                self.curve_green_missing_frames += 1
+            else:
+                self.curve_green_missing_frames = 0
+            if (
+                self.curve_green_missing_frames >=
+                self.config.curve_green_missing_release_frames
+            ):
+                self.curve_flicker_green_lock_active = False
+                self.curve_blue_instability_score = 0
+                self.curve_green_missing_frames = 0
+                self.curve_merge_override = False
+                self.curve_merge_fast_override = False
+                self.curve_merge_reason = "green_missing_return_blue"
+                self.selected_slot_lock = 0
+            else:
+                self.curve_merge_reason = "blue_flicker_green_lock"
+                self.selected_slot_lock = 1
+            self.curve_merge_metrics = {
+                "blue_covers_lookahead": bool(blue_available),
+                "green_covers_lookahead": bool(green_available),
+                "blue_heading_deg": blue_heading,
+                "blue_heading_jump_deg": float(
+                    self.curve_blue_heading_jump_deg),
+                "blue_raw_jump_640": float(blue_raw_jump_640),
+                "blue_instability_score": int(
+                    self.curve_blue_instability_score),
+                "green_missing_frames": int(
+                    self.curve_green_missing_frames),
+            }
+            return
+
         if blue is None or green is None:
             # Do not turn an ordinary missing-blue frame into an implicit
             # green fallback.  An already-active merge takeover stays latched
@@ -2670,15 +2863,13 @@ class VisionControlPlanner:
             self.curve_merge_reason = "waiting_for_both_paths"
             if self.curve_merge_override:
                 self.selected_slot_lock = 1
+            else:
+                self.curve_merge_fast_override = False
+                self.curve_merge_fast_recovery_frames = 0
             return
 
-        blue_points = np.asarray(blue.get("points_xy"), dtype=np.float32)
-        green_points = np.asarray(green.get("points_xy"), dtype=np.float32)
         if not len(blue_points) or not len(green_points):
             return
-        height, width = image_shape[:2]
-        lookahead_y = float(height) * self.config.lookahead_y_ratio
-        near_y = float(height) * 0.875
         blue_span = float(np.ptp(blue_points[:, 1]))
         green_span = float(np.ptp(green_points[:, 1]))
         blue_covers_lookahead = self._path_covers_y(
@@ -2707,6 +2898,32 @@ class VisionControlPlanner:
             blue_covers_lookahead and
             blue_span >= green_span * max(
                 0.85, self.config.curve_merge_support_ratio))
+        green_raw_x = current_raw_lookahead.get(1)
+        previous_green_raw_x = previous_raw_lookahead.get(1)
+        green_raw_jump_640 = (
+            abs(float(green_raw_x) - float(previous_green_raw_x)) *
+            640.0 / float(max(1, width))
+            if green_raw_x is not None and previous_green_raw_x is not None
+            else 1e9)
+        green_raw_stable = (
+            green_raw_x is not None
+            and previous_green_raw_x is not None
+            and green_raw_jump_640 <=
+                self.config.curve_merge_fast_green_jump_px_640)
+        hard_blue_structure_failure = (
+            not blue_covers_lookahead or
+            blue_span < (
+                green_span * self.config.curve_merge_fast_span_ratio))
+        hard_blue_jump = (
+            blue_raw_x is not None
+            and previous_blue_raw_x is not None
+            and blue_raw_jump_640 >=
+                self.config.curve_merge_fast_blue_jump_px_640)
+        fast_takeover_trigger = bool(
+            shared_near
+            and green_good
+            and green_raw_stable
+            and (hard_blue_structure_failure or hard_blue_jump))
         self.curve_merge_metrics = {
             "shared_near": bool(shared_near),
             "near_distance_640": float(near_distance_640),
@@ -2715,9 +2932,18 @@ class VisionControlPlanner:
             "blue_covers_lookahead": bool(blue_covers_lookahead),
             "green_covers_lookahead": bool(green_covers_lookahead),
             "blue_bad": bool(blue_bad),
+            "blue_raw_jump_640": float(blue_raw_jump_640),
+            "green_raw_jump_640": float(green_raw_jump_640),
+            "green_raw_stable": bool(green_raw_stable),
+            "hard_blue_structure_failure": bool(
+                hard_blue_structure_failure),
+            "hard_blue_jump": bool(hard_blue_jump),
+            "fast_takeover_trigger": bool(fast_takeover_trigger),
         }
 
         if self.curve_merge_override:
+            self.curve_merge_fast_override = False
+            self.curve_merge_fast_recovery_frames = 0
             if blue_recovered:
                 self.curve_merge_blue_stable_frames += 1
             else:
@@ -2734,6 +2960,25 @@ class VisionControlPlanner:
                 self.selected_slot_lock = 1
             return
 
+        if fast_takeover_trigger:
+            # This is a per-frame safety bypass, not a permanent route change.
+            # It removes the evidence-counter delay only when the two paths
+            # share the near-field trunk, green is temporally sane, and raw
+            # blue has a hard structural failure or implausible jump.
+            self.curve_merge_fast_override = True
+            self.curve_merge_fast_recovery_frames = 0
+        elif self.curve_merge_fast_override:
+            if blue_recovered and not bad_merge_frame:
+                self.curve_merge_fast_recovery_frames += 1
+                if (
+                    self.curve_merge_fast_recovery_frames >=
+                    self.config.curve_merge_fast_recovery_frames
+                ):
+                    self.curve_merge_fast_override = False
+                    self.curve_merge_fast_recovery_frames = 0
+            else:
+                self.curve_merge_fast_recovery_frames = 0
+
         if bad_merge_frame:
             # Bad frames add evidence faster than good frames remove it.  The
             # observed failure alternates full and truncated blue paths, so a
@@ -2747,8 +2992,17 @@ class VisionControlPlanner:
         if (self.curve_merge_bad_evidence >=
                 self.config.curve_merge_enter_evidence):
             self.curve_merge_override = True
+            self.curve_flicker_green_lock_active = True
+            self.curve_green_missing_frames = 0
+            self.curve_merge_fast_override = False
+            self.curve_merge_fast_recovery_frames = 0
             self.curve_merge_blue_stable_frames = 0
             self.curve_merge_reason = "enter_green_takeover"
+            self.selected_slot_lock = 1
+        elif self.curve_merge_fast_override:
+            self.curve_flicker_green_lock_active = True
+            self.curve_green_missing_frames = 0
+            self.curve_merge_reason = "fast_green_takeover"
             self.selected_slot_lock = 1
         else:
             self.selected_slot_lock = 0
@@ -2760,6 +3014,23 @@ class VisionControlPlanner:
             points.ndim == 2 and points.shape[1] == 2 and len(points) and
             float(np.min(points[:, 1])) <= float(target_y) <=
             float(np.max(points[:, 1])))
+
+    @staticmethod
+    def _path_heading_deg(points, upper_y, lower_y):
+        """Estimate direction from two fixed rows without fitting a curve."""
+        points = np.asarray(points, dtype=np.float32)
+        if (
+            not VisionControlPlanner._path_covers_y(points, upper_y)
+            or not VisionControlPlanner._path_covers_y(points, lower_y)
+        ):
+            return None
+        upper_x = _interp_path_x(points, upper_y)
+        lower_x = _interp_path_x(points, lower_y)
+        if upper_x is None or lower_x is None:
+            return None
+        dy = max(1e-6, float(lower_y) - float(upper_y))
+        return float(np.degrees(np.arctan2(
+            float(upper_x) - float(lower_x), dy)))
 
     def _select_candidate(self, candidates, route_state, image_shape):
         if not candidates:
@@ -2777,10 +3048,18 @@ class VisionControlPlanner:
             wanted_slot = (
                 1 if (self.branch_lock == "right" or
                       (self.branch_lock == "left" and
-                       self.curve_merge_override)) else 0)
+                       (self.curve_flicker_green_lock_active or
+                        self.curve_merge_override or
+                        self.curve_merge_fast_override))) else 0)
             self.selection_reason = (
-                "merge_continuity_green" if
+                "merge_fast_green" if
+                self.branch_lock == "left" and
+                self.curve_merge_fast_override
+                else "merge_continuity_green" if
                 self.branch_lock == "left" and self.curve_merge_override
+                else "blue_flicker_green" if
+                self.branch_lock == "left" and
+                self.curve_flicker_green_lock_active
                 else "locked_{}".format(self.branch_lock))
             for candidate in candidates:
                 if int(candidate.get("slot", -1)) == wanted_slot:
@@ -2833,8 +3112,9 @@ class VisionControlPlanner:
             self.branch_lock_source == "ocr" and
             self.branch_lock in {"left", "right"} and
             self.last_valid_ocr_ts > 0.0 and
-            float(now) - self.last_valid_ocr_ts <
-            self.config.ocr_lock_lifetime_s)
+            (self.ocr_right_green_lock_active or
+             float(now) - self.last_valid_ocr_ts <
+             self.config.ocr_lock_lifetime_s))
         selected_covers_lookahead = (
             selected is not None and self._path_covers_y(
                 selected.get("points_xy"), lookahead_y))
@@ -2949,7 +3229,9 @@ class VisionControlPlanner:
                     self.config.default_track_right_max_error_640)
                 error_step_limit = (
                     self.config.default_track_right_error_step_640)
-        if task_reason in {"turnsign_reverse", "human_brake_reverse"}:
+        if task_reason in {
+            "turnsign_lock_reverse", "human_brake_reverse"
+        }:
             self._reset_error_trend()
             error_trend_adjustment = 0.0
             error_trend_slope = 0.0
@@ -3128,20 +3410,23 @@ class VisionControlPlanner:
             and session_id != self.turnsign_control_session_id
         ):
             self.turnsign_control_session_id = session_id
-            self.turnsign_brake_until = (
-                float(now) + self.config.turnsign_initial_brake_s)
-            self.turnsign_reverse_until = 0.0
-            self.turnsign_post_reverse_stop = False
+            self.turnsign_lock_reverse_until = (
+                float(now) + self.config.turnsign_reverse_duration_s)
 
-        # The initial brake is a fixed safety interval. Even a very fast OCR
-        # result must not release the vehicle before the full 0.5 s expires.
-        if self.turnsign_brake_until > 0.0:
-            if float(now) < self.turnsign_brake_until:
-                response["control_phase"] = "turnsign_initial_brake"
+        # Start the reverse brake as soon as the detector locks a new sign.
+        # Even a very fast OCR result must not shorten this fixed interval.
+        if self.turnsign_lock_reverse_until > 0.0:
+            if float(now) < self.turnsign_lock_reverse_until:
+                response["control_phase"] = "turnsign_lock_reverse"
+                center_x = (
+                    float(image_shape[1]) * self.config.visual_center_x)
                 return (
-                    STATE_SAFE_STOP, 0.0,
-                    "turnsign_initial_brake", None)
-            self.turnsign_brake_until = 0.0
+                    STATE_TRACK,
+                    self.config.turnsign_reverse_speed_mps,
+                    "turnsign_lock_reverse",
+                    center_x,
+                )
+            self.turnsign_lock_reverse_until = 0.0
 
         if (
             bool(response.get("turnsign_resolved")) or
@@ -3150,50 +3435,17 @@ class VisionControlPlanner:
             # Once a valid OCR result is locked, the consumed physical sign no
             # longer changes speed or steering. Route availability is handled
             # separately by _build_command.
-            self.turnsign_reverse_until = 0.0
-            self.turnsign_post_reverse_stop = False
-            self.turnsign_brake_until = 0.0
+            self.turnsign_lock_reverse_until = 0.0
             self._clear_turnsign_state()
             if phase != "ocr_route_ready":
                 response["control_phase"] = "turnsign_consumed"
             return None
 
         if phase:
-            if self.turnsign_reverse_until > 0.0:
-                if float(now) < self.turnsign_reverse_until:
-                    response["control_phase"] = "turnsign_reverse"
-                    center_x = (
-                        float(image_shape[1]) *
-                        self.config.visual_center_x)
-                    return (
-                        STATE_TRACK,
-                        self.config.turnsign_reverse_speed_mps,
-                        "turnsign_reverse",
-                        center_x,
-                    )
-                self.turnsign_reverse_until = 0.0
-                self.turnsign_post_reverse_stop = True
-
-            if self.turnsign_post_reverse_stop:
-                self.turnsign_post_reverse_stop = False
-                response["control_phase"] = "turnsign_post_reverse_stop"
+            if phase == "turnsign_edge_over_line":
                 return (
                     STATE_SAFE_STOP, 0.0,
-                    "turnsign_post_reverse_stop", None)
-
-            if phase == "turnsign_edge_over_line":
-                self.turnsign_reverse_until = (
-                    float(now) +
-                    self.config.turnsign_reverse_duration_s)
-                response["control_phase"] = "turnsign_reverse"
-                center_x = (
-                    float(image_shape[1]) * self.config.visual_center_x)
-                return (
-                    STATE_TRACK,
-                    self.config.turnsign_reverse_speed_mps,
-                    "turnsign_reverse",
-                    center_x,
-                )
+                    "turnsign_edge_over_line", None)
 
             if phase in {
                 "turnsign_ocr_wait", "turnsign_position_ready",
@@ -3361,6 +3613,8 @@ class VisionControlPlanner:
             self.car_human_waiting_cross = False
             self.car_human_seen_avoid_side = False
             self.car_human_last_seen_ts = 0.0
+            self.car_human_last_path_distance_640 = None
+            self.car_human_path_launch_ready = False
         car = self._best_car(detections, image_shape, path_x)
         pass_holding = float(now) < self.car_human_pass_until
 
@@ -3420,6 +3674,13 @@ class VisionControlPlanner:
                 float(new_human["geom"]["cx"]) - float(human_reference_x))
             self.car_human_seen_avoid_side = (
                 human_side == self.car_avoid_side)
+            self.car_human_last_path_distance_640 = (
+                (float(new_human["geom"]["cx"]) -
+                 float(human_reference_x)) * 640.0 /
+                float(max(1, image_shape[1])))
+            self.car_human_path_launch_ready = (
+                abs(self.car_human_last_path_distance_640) <=
+                self.config.human_cross_release_px_640)
             return self._start_human_brake(now, avoid_target_x)
         if new_human_status == "missing_near":
             self._cancel_human_return()
@@ -3500,16 +3761,24 @@ class VisionControlPlanner:
 
             human_side = self._sign(
                 float(geom["cx"]) - float(human_reference_x))
+            human_distance_640 = (
+                (float(geom["cx"]) - float(human_reference_x)) *
+                640.0 / float(max(1, image_shape[1])))
             if human_side == self.car_avoid_side:
                 self.car_human_seen_avoid_side = True
 
-            crossed_to_other_side = (
-                self.car_human_waiting_cross
-                and self.car_human_seen_avoid_side
-                and human_side != 0
-                and human_side == -self.car_avoid_side
-            )
-            if crossed_to_other_side:
+            was_waiting_cross = self.car_human_waiting_cross
+            self.car_human_path_launch_ready = bool(
+                self.car_human_path_launch_ready
+                or abs(human_distance_640) <=
+                    self.config.human_cross_release_px_640
+                or self._human_approached_path_launch_distance(
+                    self.car_human_last_path_distance_640,
+                    human_distance_640))
+            reached_launch_distance = bool(
+                was_waiting_cross and self.car_human_path_launch_ready)
+            self.car_human_last_path_distance_640 = human_distance_640
+            if reached_launch_distance:
                 self.car_human_pass_until = (
                     float(now) + self.config.car_human_pass_hold_s)
                 self._schedule_human_return(
@@ -3556,6 +3825,8 @@ class VisionControlPlanner:
             self.car_human_waiting_cross = False
             self.car_human_seen_avoid_side = False
             self.car_human_last_seen_ts = 0.0
+            self.car_human_last_path_distance_640 = None
+            self.car_human_path_launch_ready = False
 
         elif self._human_preline_missing_waiting(now):
             return (
@@ -3674,6 +3945,8 @@ class VisionControlPlanner:
         self.car_human_waiting_cross = False
         self.car_human_seen_avoid_side = False
         self.car_human_last_seen_ts = 0.0
+        self.car_human_last_path_distance_640 = None
+        self.car_human_path_launch_ready = False
         self.car_human_pass_until = 0.0
 
     def _human_action(
@@ -3719,6 +3992,13 @@ class VisionControlPlanner:
                 float(lookahead_path_x))
             if side:
                 self.human_last_side = side
+            self.human_last_path_distance_640 = (
+                (float(new_human["geom"]["cx"]) -
+                 float(lookahead_path_x)) * 640.0 /
+                float(max(1, image_shape[1])))
+            self.human_path_launch_ready = (
+                abs(self.human_last_path_distance_640) <=
+                self.config.human_cross_release_px_640)
             return self._start_human_brake(now)
         if new_human_status == "missing_near":
             self._cancel_human_return()
@@ -3732,8 +4012,7 @@ class VisionControlPlanner:
                 and float(now) < self.human_speed_hold_until
             ):
                 return self._human_pass_command(
-                    lookahead_path_x, image_shape,
-                    self.human_pass_side or 1)
+                    lookahead_path_x, image_shape)
             self.human_pass_active = False
             self.human_pass_offset_x = 0.0
             # After the one-second launch, resume ordinary line following but
@@ -3784,31 +4063,37 @@ class VisionControlPlanner:
                 ),
             )
         geom = human["geom"]
-        side = human["side"] or self.human_last_side or 1
+        human_distance_640 = (
+            float(human["distance"]) * 640.0 /
+            float(max(1, image_shape[1])))
 
         if self.human_pass_active:
             return self._human_pass_command(
-                lookahead_path_x, image_shape,
-                self.human_pass_side or side)
+                lookahead_path_x, image_shape)
 
-        crossed = (
-            self.human_waiting_cross
-            and human["side"] != 0
-            and self.human_last_side is not None
-            and human["side"] != self.human_last_side
-        )
-        if crossed:
+        was_waiting_cross = self.human_waiting_cross
+        self.human_path_launch_ready = bool(
+            self.human_path_launch_ready
+            or abs(human_distance_640) <=
+                self.config.human_cross_release_px_640
+            or self._human_approached_path_launch_distance(
+                self.human_last_path_distance_640,
+                human_distance_640))
+        reached_launch_distance = bool(
+            was_waiting_cross and self.human_path_launch_ready)
+        self.human_last_path_distance_640 = human_distance_640
+        if reached_launch_distance:
             self.human_waiting_cross = False
             self.human_pass_active = True
-            self.human_pass_side = side
             self.human_speed_hold_until = (
                 float(now) + self.config.human_speed_hold_s)
             self._schedule_human_return(
-                self.human_speed_hold_until, side)
+                self.human_speed_hold_until, 1)
             self._begin_consumed_human(now)
             self.human_detected_latched = False
             self.human_last_seen_ts = 0.0
-            return self._human_pass_command(lookahead_path_x, image_shape, side)
+            return self._human_pass_command(
+                lookahead_path_x, image_shape)
 
         if self._human_on_stop_line(geom, image_shape, lookahead_y):
             first_line_contact = not self.human_waiting_cross
@@ -3829,11 +4114,28 @@ class VisionControlPlanner:
         self._record_human_preline_gap(geom, image_shape, lookahead_y)
         return None
 
-    def _human_pass_command(self, path_x, image_shape, human_side):
+    def _human_approached_path_launch_distance(
+            self, previous_distance_640, current_distance_640):
+        """Return true when a person approaches and reaches the 5 px gate."""
+        if previous_distance_640 is None:
+            return False
+        previous = float(previous_distance_640)
+        current = float(current_distance_640)
+        if not np.isfinite(previous) or not np.isfinite(current):
+            return False
+        threshold = float(self.config.human_cross_release_px_640)
+        if previous < 0.0:
+            return current > previous and current >= -threshold
+        if previous > 0.0:
+            return current < previous and current <= threshold
+        return abs(current) <= threshold
+
+    def _human_pass_command(self, path_x, image_shape):
+        """Pass a near-path pedestrian on the left side of the route."""
         scale = float(max(1, image_shape[1])) / 640.0
         offset = self.config.human_pass_offset_px_640 * scale
         target_x = _clamp(
-            float(path_x) - float(human_side or 1) * offset,
+            float(path_x) - offset,
             0.0,
             float(max(0, image_shape[1] - 1)),
         )
@@ -4124,8 +4426,9 @@ class VisionControlPlanner:
     def _clear_human_state(self, clear_detection=True):
         self.human_waiting_cross = False
         self.human_last_side = None
+        self.human_last_path_distance_640 = None
+        self.human_path_launch_ready = False
         self.human_pass_active = False
-        self.human_pass_side = None
         self.human_current_prefer_upper = False
         if clear_detection:
             self.human_detected_latched = False
@@ -4367,6 +4670,8 @@ class VisionControlPlanner:
     def _expire_ocr_lock(self, now):
         if self.branch_lock_source != "ocr" or self.last_valid_ocr_ts <= 0.0:
             return False
+        if self.ocr_right_green_lock_active:
+            return False
         if now - self.last_valid_ocr_ts < self.config.ocr_lock_lifetime_s:
             return False
         if self.config.path_source == "curve":
@@ -4374,6 +4679,62 @@ class VisionControlPlanner:
         else:
             self._clear_branch_lock()
         return True
+
+    def _release_ocr_right_when_green_missing_at_lookahead(
+            self, candidates, image_shape):
+        """Fall back permanently after green misses ahead for consecutive frames."""
+        self.ocr_right_blue_available_at_lookahead = False
+        self.ocr_right_green_available_at_lookahead = False
+        if (
+            self.config.path_source != "curve"
+            or not self.ocr_right_green_lock_active
+            or self.branch_lock_source != "ocr"
+            or self.branch_lock != "right"
+        ):
+            return False
+
+        by_slot = {
+            int(candidate.get("slot", -1)): candidate
+            for candidate in candidates
+        }
+        blue = by_slot.get(0)
+        green = by_slot.get(1)
+        lookahead_y = (
+            float(image_shape[0]) * self.config.lookahead_y_ratio)
+        self.ocr_right_blue_available_at_lookahead = bool(
+            blue is not None
+            and self._path_covers_y(blue.get("points_xy"), lookahead_y)
+            and _interp_path_x(blue.get("points_xy"), lookahead_y)
+            is not None)
+        self.ocr_right_green_available_at_lookahead = bool(
+            green is not None
+            and self._path_covers_y(green.get("points_xy"), lookahead_y)
+            and _interp_path_x(green.get("points_xy"), lookahead_y)
+            is not None)
+        if (
+            self.ocr_right_blue_available_at_lookahead
+            and not self.ocr_right_green_available_at_lookahead
+        ):
+            self.ocr_right_green_missing_frames += 1
+        else:
+            self.ocr_right_green_missing_frames = 0
+        if (
+            self.ocr_right_green_missing_frames <
+            self.config.curve_green_missing_release_frames
+        ):
+            return False
+
+        self.ocr_right_green_lock_active = False
+        self.ocr_right_blue_fallback_completed_for_current = True
+        self._set_default_curve_branch()
+        return True
+
+    def _reset_ocr_right_green_lock(self):
+        self.ocr_right_green_lock_active = False
+        self.ocr_right_blue_fallback_completed_for_current = False
+        self.ocr_right_blue_available_at_lookahead = False
+        self.ocr_right_green_available_at_lookahead = False
+        self.ocr_right_green_missing_frames = 0
 
     def _set_default_curve_branch(self):
         self.branch_lock = "left"
@@ -4394,6 +4755,8 @@ class VisionControlPlanner:
         return max(0.0, now - self.last_valid_ocr_ts)
 
     def _ocr_lock_remaining(self, now):
+        if self.ocr_right_green_lock_active:
+            return None
         age = self._ocr_lock_age(now)
         if age is None:
             return None
@@ -4537,7 +4900,10 @@ def render_vision_control_debug(frame, result):
         cv2.line(frame, (0, y), (w - 1, y), (255, 0, 255), 1, cv2.LINE_AA)
 
     command = debug.get("command") or {}
-    merge_tag = " MERGE->G" if debug.get("curve_merge_override") else ""
+    merge_tag = (
+        " FAST->G" if debug.get("curve_merge_fast_override")
+        else " MERGE->G" if debug.get("curve_merge_override")
+        else "")
     text = "{} raw={} lock={}/{} slot={}{} err={:.1f}".format(
         debug.get("route_state", "-"),
         debug.get("raw_route_state", "-"),

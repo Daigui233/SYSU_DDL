@@ -729,13 +729,11 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
         "turnsign_too_far": "TOO_FAR",
         "turnsign_bad_bbox": "BAD_BOX",
         "turnsign_confirming": "CONFIRM",
-        "turnsign_initial_brake": "BRAKE_0.5S",
+        "turnsign_lock_reverse": "LOCK_REVERSE_0.08_0.5S",
         "turnsign_approach": "APPROACH",
         "turnsign_edge_left": "EDGE_LEFT",
         "turnsign_edge_right": "EDGE_RIGHT",
-        "turnsign_edge_over_line": "EDGE_OVER_LINE",
-        "turnsign_reverse": "REVERSE_2S",
-        "turnsign_post_reverse_stop": "RECHECK_STOP",
+        "turnsign_edge_over_line": "EDGE_OVER_LINE_STOP",
         "turnsign_missing_hold": "MISS_HOLD",
         "turnsign_missing_stop": "MISS_STOP",
         "turnsign_ocr_wait": "STOP_WAIT_OCR",
@@ -983,8 +981,8 @@ def main():
                             latest_ocr_response,
                             now=time.monotonic(),
                         )
-                        # Vision control may refine the OCR phase to REVERSE,
-                        # WAIT_ROUTE or ROUTE_READY for the on-screen status.
+                        # Vision control may refine the OCR phase to the lock
+                        # reverse brake, WAIT_ROUTE or ROUTE_READY status.
                         state.update_ocr(latest_ocr_response)
                         state.update_perception(perception_result)
                         if vision_control_send and control_runtime is not None and command:

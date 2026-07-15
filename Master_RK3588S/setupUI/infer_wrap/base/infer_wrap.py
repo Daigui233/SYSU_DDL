@@ -30,9 +30,10 @@ class InferWrap:
                 "MULTITASK_NPU_MODE must be parallel or all_cores")
         use_all_cores = self.npu_mode == "all_cores"
         self.TPEs = 1 if use_all_cores else max(1, min(int(TPEs), 3))
+        default_depth = min(2, self.TPEs)
         try:
             requested_depth = int(os.environ.get(
-                "MULTITASK_PIPELINE_DEPTH", str(self.TPEs)))
+                "MULTITASK_PIPELINE_DEPTH", str(default_depth)))
         except ValueError:
             requested_depth = self.TPEs
         self.pipeline_depth = max(1, min(requested_depth, self.TPEs))
