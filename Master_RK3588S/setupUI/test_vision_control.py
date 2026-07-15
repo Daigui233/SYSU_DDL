@@ -1007,7 +1007,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             150.0, debug["control_target"]["target_x"], delta=1.0)
         self.assertLess(command["track_error"], 0.0)
 
-    def test_curve_merge_uses_stable_green_after_blue_support_collapses(self):
+    def test_curve_blue_support_collapse_stays_blue_without_right_ocr(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
             curve_merge_enter_evidence=4))
@@ -1018,15 +1018,12 @@ class VisionControlPlannerTest(unittest.TestCase):
             _curve_merge_result(blue_short=True), now=1.1)
 
         self.assertEqual(0, first["selected_slot"])
-        self.assertFalse(first["curve_merge_override"])
-        self.assertEqual(1, second["selected_slot"])
-        self.assertTrue(second["curve_merge_override"])
-        self.assertEqual(
-            "merge_continuity_green", second["selection_reason"])
-        self.assertAlmostEqual(
-            310.0, second["control_target"]["path_target_x"], delta=1.0)
+        self.assertEqual(0, second["selected_slot"])
+        self.assertFalse(second["curve_merge_override"])
+        self.assertFalse(second["curve_merge_fast_override"])
+        self.assertEqual("default_blue_only", second["curve_merge_reason"])
 
-    def test_curve_merge_hard_blue_failure_uses_green_in_first_bad_frame(self):
+    def test_curve_hard_blue_failure_does_not_use_green_without_right_ocr(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
             curve_merge_enter_evidence=4,
@@ -1038,14 +1035,9 @@ class VisionControlPlannerTest(unittest.TestCase):
             _curve_merge_result(blue_short=True), now=1.1)
 
         self.assertFalse(debug["curve_merge_override"])
-        self.assertTrue(debug["curve_merge_fast_override"])
-        self.assertEqual(1, debug["selected_slot"])
-        self.assertEqual("merge_fast_green", debug["selection_reason"])
-        self.assertTrue(
-            debug["curve_merge_metrics"][
-                "hard_blue_structure_failure"])
-        self.assertTrue(
-            debug["curve_merge_metrics"]["fast_takeover_trigger"])
+        self.assertFalse(debug["curve_merge_fast_override"])
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertEqual("default_blue_only", debug["curve_merge_reason"])
 
     def test_curve_merge_fast_takeover_rejects_unstable_green(self):
         planner = VisionControlPlanner(config=_config(
@@ -1063,12 +1055,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertFalse(debug["curve_merge_override"])
         self.assertFalse(debug["curve_merge_fast_override"])
         self.assertEqual(0, debug["selected_slot"])
-        self.assertFalse(
-            debug["curve_merge_metrics"]["green_raw_stable"])
-        self.assertFalse(
-            debug["curve_merge_metrics"]["fast_takeover_trigger"])
+        self.assertEqual({}, debug["curve_merge_metrics"])
 
-    def test_curve_merge_raw_blue_jump_uses_stable_green_immediately(self):
+    def test_curve_raw_blue_jump_stays_blue_without_right_ocr(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
             curve_merge_enter_evidence=10,
@@ -1082,17 +1071,12 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         _command, debug = planner.update(outlier, now=1.1)
 
-        self.assertTrue(debug["curve_merge_fast_override"])
+        self.assertFalse(debug["curve_merge_fast_override"])
         self.assertFalse(debug["curve_merge_override"])
-        self.assertEqual(1, debug["selected_slot"])
-        self.assertTrue(
-            debug["curve_merge_metrics"]["hard_blue_jump"])
-        self.assertGreaterEqual(
-            debug["curve_merge_metrics"]["blue_raw_jump_640"],
-            60.0,
-        )
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertEqual("default_blue_only", debug["curve_merge_reason"])
 
-    def test_repeated_blue_angle_flicker_locks_green(self):
+    def test_repeated_blue_angle_flicker_stays_blue_without_right_ocr(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve",
             path_smooth_window=1,
@@ -1113,17 +1097,13 @@ class VisionControlPlannerTest(unittest.TestCase):
             _curve_blue_angle_result(-30.0), now=1.3)
 
         self.assertEqual(0, first_jump["selected_slot"])
-        self.assertEqual(2, first_jump["curve_blue_instability_score"])
-        self.assertEqual(1, stable["curve_blue_instability_score"])
-        self.assertTrue(
-            second_jump["curve_flicker_green_lock_active"])
-        self.assertGreaterEqual(
-            second_jump["curve_blue_instability_score"], 3)
-        self.assertEqual(1, second_jump["selected_slot"])
-        self.assertEqual(
-            "blue_flicker_green", second_jump["selection_reason"])
+        self.assertEqual(0, first_jump["curve_blue_instability_score"])
+        self.assertEqual(0, stable["curve_blue_instability_score"])
+        self.assertFalse(second_jump["curve_flicker_green_lock_active"])
+        self.assertEqual(0, second_jump["curve_blue_instability_score"])
+        self.assertEqual(0, second_jump["selected_slot"])
 
-    def test_curve_merge_fast_takeover_holds_green_while_visible(self):
+    def test_curve_merge_does_not_take_green_without_right_ocr(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
             curve_merge_enter_evidence=10,
@@ -1138,13 +1118,13 @@ class VisionControlPlannerTest(unittest.TestCase):
         _command, second = planner.update(
             _curve_merge_result(blue_short=False), now=1.3)
 
-        self.assertTrue(first["curve_merge_fast_override"])
-        self.assertEqual(1, first["selected_slot"])
-        self.assertTrue(first["curve_flicker_green_lock_active"])
-        self.assertTrue(second["curve_flicker_green_lock_active"])
-        self.assertEqual(1, second["selected_slot"])
+        self.assertFalse(first["curve_merge_fast_override"])
+        self.assertEqual(0, first["selected_slot"])
+        self.assertFalse(first["curve_flicker_green_lock_active"])
+        self.assertFalse(second["curve_flicker_green_lock_active"])
+        self.assertEqual(0, second["selected_slot"])
 
-    def test_curve_merge_takeover_ignores_one_frame_blue_reappearance(self):
+    def test_curve_merge_keeps_blue_after_blue_reappearance(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
             curve_merge_enter_evidence=4,
@@ -1155,11 +1135,11 @@ class VisionControlPlannerTest(unittest.TestCase):
         _command, debug = planner.update(
             _curve_merge_result(blue_short=False), now=1.2)
 
-        self.assertTrue(debug["curve_merge_override"])
-        self.assertTrue(debug["curve_flicker_green_lock_active"])
-        self.assertEqual(1, debug["selected_slot"])
+        self.assertFalse(debug["curve_merge_override"])
+        self.assertFalse(debug["curve_flicker_green_lock_active"])
+        self.assertEqual(0, debug["selected_slot"])
 
-    def test_curve_merge_returns_blue_after_three_green_missing_frames(self):
+    def test_curve_without_right_ocr_never_leaves_blue(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
             curve_merge_enter_evidence=4,
@@ -1179,13 +1159,12 @@ class VisionControlPlannerTest(unittest.TestCase):
                 now=1.2 + index * 0.1)
             frames.append(debug)
 
-        self.assertTrue(frames[0]["curve_flicker_green_lock_active"])
-        self.assertTrue(frames[1]["curve_flicker_green_lock_active"])
+        self.assertFalse(frames[0]["curve_flicker_green_lock_active"])
+        self.assertFalse(frames[1]["curve_flicker_green_lock_active"])
         self.assertFalse(debug["curve_merge_override"])
         self.assertFalse(debug["curve_flicker_green_lock_active"])
         self.assertEqual(0, debug["selected_slot"])
-        self.assertEqual(
-            "green_missing_return_blue", debug["curve_merge_reason"])
+        self.assertEqual("default_blue_only", debug["curve_merge_reason"])
 
     def test_curve_short_blue_does_not_fall_back_if_paths_are_not_merged(self):
         result = _curve_merge_result(blue_short=True)
@@ -1199,7 +1178,7 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         self.assertFalse(debug["curve_merge_override"])
         self.assertEqual(0, debug["selected_slot"])
-        self.assertFalse(debug["curve_merge_metrics"]["shared_near"])
+        self.assertEqual({}, debug["curve_merge_metrics"])
 
     def test_curve_pending_right_ocr_stays_blue_until_confirmed(self):
         planner = VisionControlPlanner(config=_config(
@@ -1243,27 +1222,121 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertNotEqual(STATE_TRACK, command["state_cmd"])
         self.assertEqual(0.0, command["target_speed"])
 
-    def test_curve_right_lock_ignores_timeout_while_green_is_available(self):
+    def test_curve_right_lock_switches_to_blue_after_five_seconds(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
-            ocr_lock_lifetime_s=10.0))
+            ocr_lock_lifetime_s=10.0,
+            ocr_right_green_lock_s=5.0))
         planner.update(
             _curve_result_at(180.0, 430.0),
             _ocr_response("right"), now=2.0)
 
-        _command, debug = planner.update(
+        _command, before = planner.update(
             _curve_result_at(180.0, 430.0),
-            {"instruction_current": False}, now=12.0)
+            {"instruction_current": False}, now=6.99)
+        _command, switched = planner.update(
+            _curve_result_at(180.0, 430.0),
+            {"instruction_current": False}, now=7.0)
 
-        self.assertFalse(debug["ocr_lock_expired"])
-        self.assertTrue(debug["ocr_right_green_lock_active"])
-        self.assertTrue(debug["ocr_right_blue_available_at_lookahead"])
-        self.assertTrue(debug["ocr_right_green_available_at_lookahead"])
-        self.assertEqual("right", debug["branch_lock"])
-        self.assertEqual("ocr", debug["branch_lock_source"])
+        self.assertTrue(before["ocr_right_green_lock_active"])
+        self.assertEqual("follow_green", before["ocr_right_merge_phase"])
+        self.assertEqual(1, before["selected_slot"])
+        self.assertAlmostEqual(
+            0.01, before["ocr_right_green_lock_remaining_s"], places=5)
+        self.assertTrue(switched["ocr_right_green_missing_released"])
+        self.assertFalse(switched["ocr_right_green_lock_active"])
+        self.assertEqual("follow_blue", switched["ocr_right_merge_phase"])
+        self.assertEqual("left", switched["branch_lock"])
+        self.assertEqual("default", switched["branch_lock_source"])
+        self.assertEqual(0, switched["selected_slot"])
+        self.assertEqual(0.0, switched["ocr_right_green_lock_remaining_s"])
+
+    def test_curve_right_stays_on_blue_after_timed_switch(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            ocr_right_green_lock_s=5.0))
+        result = _curve_result_at(180.0, 430.0)
+
+        planner.update(result, _ocr_response("right"), now=2.0)
+        planner.update(
+            result, {"instruction_current": False}, now=7.0)
+        _command, debug = planner.update(
+            result, _ocr_response("right"), now=7.1)
+
+        self.assertEqual("follow_blue", debug["ocr_right_merge_phase"])
+        self.assertTrue(debug[
+            "ocr_right_blue_fallback_completed_for_current"])
+        self.assertFalse(debug["ocr_right_green_lock_active"])
+        self.assertEqual(0, debug["selected_slot"])
+        self.assertFalse(debug["turnsign_suppressed_right_merge"])
+
+    def test_ocr_right_merge_suppresses_turnsign_until_following_blue(self):
+        planner = VisionControlPlanner(VisionControlConfig(path_source="curve"))
+
+        self.assertFalse(planner.should_suppress_turnsign_detection())
+        planner.ocr_right_merge_phase = "follow_green"
+        self.assertTrue(planner.should_suppress_turnsign_detection())
+
+        planner.ocr_right_merge_phase = "follow_blue"
+        self.assertFalse(planner.should_suppress_turnsign_detection())
+
+    def test_ocr_right_green_searches_down_below_fixed_lookahead(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+            ocr_right_lookahead_search_down_px_480=120.0,
+            ocr_right_min_path_span_px_480=60.0,
+        ))
+        result = _curve_result_at(180.0, 430.0)
+        green = result["centerline"]["curve_paths"][1]["points_xy"]
+        result["centerline"]["curve_paths"][1]["points_xy"] = (
+            green[green[:, 1] >= 340.0])
+
+        command, debug = planner.update(
+            result, _ocr_response("right"), now=2.0)
+
+        self.assertTrue(debug[
+            "ocr_right_green_available_at_lookahead"])
+        self.assertTrue(debug["ocr_right_green_reliable"])
+        self.assertEqual("follow_green", debug["ocr_right_merge_phase"])
+        self.assertEqual(0, debug["ocr_right_green_missing_frames"])
         self.assertEqual(1, debug["selected_slot"])
+        self.assertGreater(debug[
+            "ocr_right_green_effective_lookahead_y"], 300.0)
+        self.assertGreater(debug[
+            "ocr_right_green_search_down_px_480"], 0.0)
+        self.assertTrue(debug["control_target"]["path_target_adaptive_y"])
+        self.assertAlmostEqual(0.15, command["target_speed"])
 
-    def test_curve_green_needs_three_missing_frames_to_fall_back_blue(self):
+    def test_ocr_right_green_rejects_short_fragment_below_lookahead(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+            ocr_right_min_path_span_px_480=60.0,
+        ))
+        result = _curve_result_at(180.0, 430.0)
+        green = result["centerline"]["curve_paths"][1]["points_xy"]
+        result["centerline"]["curve_paths"][1]["points_xy"] = (
+            green[green[:, 1] >= 420.0])
+
+        command, debug = planner.update(
+            result, _ocr_response("right"), now=2.0)
+
+        self.assertFalse(debug[
+            "ocr_right_green_available_at_lookahead"])
+        self.assertFalse(debug["ocr_right_green_reliable"])
+        self.assertEqual("follow_green", debug[
+            "ocr_right_merge_phase"])
+        self.assertTrue(debug["ocr_right_green_lock_active"])
+        self.assertEqual("ocr_wait_route", debug[
+            "control_target"]["task_reason"])
+        self.assertEqual(0.0, command["target_speed"])
+
+    def obsolete_curve_green_needs_three_missing_frames_to_fall_back_blue(self):
         planner = VisionControlPlanner(config=_config(
             path_source="curve",
             path_smooth_window=1,
@@ -1272,7 +1345,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             curve_green_missing_release_frames=3,
         ))
 
-        _command, locked_green = planner.update(
+        locked_command, locked_green = planner.update(
             _curve_result_at(180.0, 430.0),
             _ocr_response("right"),
             now=2.0,
@@ -1282,18 +1355,18 @@ class VisionControlPlannerTest(unittest.TestCase):
             "centerline"]["curve_paths"][1]["points_xy"]
         green_missing_at_lookahead[
             "centerline"]["curve_paths"][1]["points_xy"] = (
-                green_points[green_points[:, 1] > 350.0])
-        _command, first_missing = planner.update(
+                green_points[green_points[:, 1] > 400.0])
+        first_command, first_missing = planner.update(
             green_missing_at_lookahead,
             _ocr_response("right"),
             now=2.1,
         )
-        _command, second_missing = planner.update(
+        second_command, second_missing = planner.update(
             green_missing_at_lookahead,
             _ocr_response("right"),
             now=2.2,
         )
-        _command, third_missing = planner.update(
+        third_command, third_missing = planner.update(
             green_missing_at_lookahead,
             _ocr_response("right"),
             now=2.3,
@@ -1305,6 +1378,8 @@ class VisionControlPlannerTest(unittest.TestCase):
         )
 
         self.assertEqual(1, locked_green["selected_slot"])
+        self.assertEqual("follow_green", locked_green[
+            "ocr_right_merge_phase"])
         self.assertFalse(
             first_missing["ocr_right_green_missing_released"])
         self.assertEqual(
@@ -1313,6 +1388,15 @@ class VisionControlPlannerTest(unittest.TestCase):
             second_missing["ocr_right_green_missing_released"])
         self.assertEqual(
             2, second_missing["ocr_right_green_missing_frames"])
+        self.assertEqual("ocr_right_merge_hold", first_missing[
+            "control_target"]["task_reason"])
+        self.assertEqual("ocr_right_merge_hold", second_missing[
+            "control_target"]["task_reason"])
+        self.assertAlmostEqual(0.10, first_command["target_speed"])
+        self.assertAlmostEqual(0.10, second_command["target_speed"])
+        self.assertAlmostEqual(
+            locked_command["track_error"],
+            first_command["track_error"])
         self.assertTrue(
             third_missing["ocr_right_green_missing_released"])
         self.assertTrue(
@@ -1323,9 +1407,289 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual("left", third_missing["branch_lock"])
         self.assertEqual("default", third_missing["branch_lock_source"])
         self.assertEqual(0, third_missing["selected_slot"])
+        self.assertEqual("wait_blue_vertical", third_missing[
+            "ocr_right_merge_phase"])
+        self.assertAlmostEqual(0.10, third_command["target_speed"])
         self.assertFalse(repeated_current["ocr_right_green_lock_active"])
         self.assertEqual("left", repeated_current["branch_lock"])
         self.assertEqual(0, repeated_current["selected_slot"])
+
+    def obsolete_ocr_right_merge_holds_steering_until_blue_is_vertical(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+            curve_green_missing_release_frames=3,
+            ocr_right_merge_hold_min_s=0.35,
+            ocr_right_merge_hold_max_s=1.0,
+            ocr_right_blue_vertical_frames=3,
+            ocr_right_blue_vertical_angle_deg=30.0,
+            ocr_right_blue_local_angle_deg=45.0,
+            ocr_right_blue_blend_s=0.25,
+        ))
+
+        def green_missing(blue_angle_deg):
+            result = _curve_result_at(180.0, 430.0)
+            blue = result["centerline"]["curve_paths"][0]["points_xy"]
+            slope = float(np.tan(np.deg2rad(float(blue_angle_deg))))
+            blue[:, 0] = 180.0 + slope * (420.0 - blue[:, 1])
+            green = result["centerline"]["curve_paths"][1]["points_xy"]
+            result["centerline"]["curve_paths"][1]["points_xy"] = (
+                green[green[:, 1] > 400.0])
+            return result
+
+        locked_command, _debug = planner.update(
+            _curve_result_at(180.0, 430.0),
+            _ocr_response("right"), now=2.0)
+        frames = []
+        for index in range(3):
+            command, debug = planner.update(
+                green_missing(60.0), _ocr_response("right"),
+                now=2.1 + index * 0.1)
+            frames.append((command, debug))
+
+        self.assertEqual("wait_blue_vertical", frames[-1][1][
+            "ocr_right_merge_phase"])
+        self.assertFalse(frames[-1][1]["ocr_right_blue_vertical_ready"])
+        self.assertGreater(frames[-1][1][
+            "ocr_right_blue_heading_deg"], 30.0)
+        for command, debug in frames:
+            self.assertAlmostEqual(0.10, command["target_speed"])
+            self.assertAlmostEqual(
+                locked_command["track_error"], command["track_error"])
+            self.assertEqual("ocr_right_merge_hold", debug[
+                "control_target"]["task_reason"])
+
+        vertical = []
+        for index in range(3):
+            command, debug = planner.update(
+                green_missing(0.0), _ocr_response("right"),
+                now=2.4 + index * 0.1)
+            vertical.append((command, debug))
+
+        self.assertEqual(1, vertical[0][1][
+            "ocr_right_blue_vertical_frames"])
+        self.assertEqual(2, vertical[1][1][
+            "ocr_right_blue_vertical_frames"])
+        self.assertEqual("blend_blue", vertical[2][1][
+            "ocr_right_merge_phase"])
+        self.assertAlmostEqual(
+            locked_command["track_error"],
+            vertical[2][0]["track_error"])
+
+        blend_command, blend_debug = planner.update(
+            green_missing(0.0), _ocr_response("right"), now=2.7)
+        blue_command, blue_debug = planner.update(
+            green_missing(0.0), _ocr_response("right"), now=2.9)
+
+        self.assertEqual("ocr_right_blue_blend", blend_debug[
+            "control_target"]["task_reason"])
+        self.assertLess(
+            blend_command["track_error"],
+            locked_command["track_error"])
+        self.assertEqual("follow_blue", blue_debug[
+            "ocr_right_merge_phase"])
+        self.assertEqual(0, blue_debug["selected_slot"])
+        self.assertLess(blue_command["track_error"], 0.0)
+
+    def test_ocr_right_blue_local_horizontal_hook_is_not_vertical(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            ocr_right_blue_vertical_angle_deg=30.0,
+            ocr_right_blue_local_angle_deg=45.0,
+            ocr_right_blue_angle_sample_rows=6,
+        ))
+        rows = np.linspace(300.0, 420.0, 6, dtype=np.float32)
+        # The endpoints are vertically aligned, but the first two segments
+        # contain a large sideways hook like the merge frame in AR Preview.
+        xs = np.asarray(
+            [200.0, 270.0, 200.0, 200.0, 200.0, 200.0],
+            dtype=np.float32)
+        blue = {"raw_points_xy": np.stack((xs, rows), axis=1)}
+
+        metrics = planner._ocr_right_blue_vertical_metrics(
+            blue, (480, 640, 3))
+
+        self.assertLessEqual(metrics["heading_deg"], 30.0)
+        self.assertGreater(metrics["local_max_angle_deg"], 45.0)
+        self.assertFalse(metrics["ready"])
+
+    def test_ocr_right_blue_vertical_check_uses_downward_start(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            ocr_right_lookahead_search_down_px_480=120.0,
+            ocr_right_min_path_span_px_480=60.0,
+        ))
+        rows = np.linspace(350.0, 460.0, 12, dtype=np.float32)
+        blue = {"raw_points_xy": np.stack((
+            np.full_like(rows, 200.0), rows), axis=1)}
+
+        metrics = planner._ocr_right_blue_vertical_metrics(
+            blue, (480, 640, 3))
+
+        self.assertTrue(metrics["ready"])
+        self.assertAlmostEqual(
+            350.0, planner.ocr_right_blue_effective_lookahead_y)
+        self.assertAlmostEqual(
+            50.0, planner.ocr_right_blue_search_down_px_480)
+
+    def obsolete_ocr_right_fast_blue_motion_blocks_vertical_handoff(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+            curve_green_missing_release_frames=3,
+            ocr_right_blue_motion_window_frames=3,
+            ocr_right_blue_motion_threshold_ratio=0.50,
+        ))
+
+        def green_missing(blue_x):
+            result = _curve_result_at(float(blue_x), 430.0)
+            green = result["centerline"]["curve_paths"][1]["points_xy"]
+            result["centerline"]["curve_paths"][1]["points_xy"] = (
+                green[green[:, 1] > 400.0])
+            return result
+
+        planner.update(
+            _curve_result_at(0.0, 430.0),
+            _ocr_response("right"), now=2.0)
+        planner.update(
+            green_missing(0.0), _ocr_response("right"), now=2.1)
+        planner.update(
+            green_missing(320.0), _ocr_response("right"), now=2.2)
+        command, debug = planner.update(
+            green_missing(639.0), _ocr_response("right"), now=2.3)
+
+        self.assertTrue(debug["ocr_right_blue_motion_unstable"])
+        self.assertGreaterEqual(
+            debug["ocr_right_blue_motion_span_px_640"], 320.0)
+        self.assertEqual("wait_blue_vertical", debug[
+            "ocr_right_merge_phase"])
+        self.assertEqual(0, debug["ocr_right_blue_vertical_frames"])
+        self.assertEqual("ocr_right_merge_hold", debug[
+            "control_target"]["task_reason"])
+        self.assertAlmostEqual(0.10, command["target_speed"])
+
+    def obsolete_ocr_right_unstable_blue_returns_to_reliable_green(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+            ocr_right_blue_motion_window_frames=3,
+            ocr_right_blue_motion_threshold_ratio=0.50,
+            ocr_right_green_recovery_frames=3,
+        ))
+        planner.ocr_right_merge_phase = "follow_blue"
+        planner.ocr_right_blue_fallback_completed_for_current = True
+        planner._set_default_curve_branch()
+
+        for index in range(3):
+            _command, stable = planner.update(
+                _curve_result_at(100.0, 430.0),
+                {"instruction_current": False},
+                now=2.0 + index * 0.1)
+        self.assertEqual("follow_blue", stable[
+            "ocr_right_merge_phase"])
+        self.assertEqual(3, stable[
+            "ocr_right_green_recovery_frames"])
+
+        _command, switched = planner.update(
+            _curve_result_at(500.0, 430.0),
+            {"instruction_current": False}, now=2.3)
+
+        self.assertTrue(switched["ocr_right_blue_motion_unstable"])
+        self.assertEqual("follow_green", switched[
+            "ocr_right_merge_phase"])
+        self.assertEqual("right", switched["branch_lock"])
+        self.assertEqual(1, switched["selected_slot"])
+        self.assertTrue(switched["ocr_right_green_lock_active"])
+
+    def obsolete_ocr_right_merge_stops_if_blue_stays_horizontal_too_long(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+            curve_green_missing_release_frames=3,
+            ocr_right_merge_hold_max_s=1.0,
+        ))
+
+        def horizontal_blue_green_missing():
+            result = _curve_result_at(180.0, 430.0)
+            blue = result["centerline"]["curve_paths"][0]["points_xy"]
+            blue[:, 0] = 180.0 + np.tan(np.deg2rad(60.0)) * (
+                420.0 - blue[:, 1])
+            green = result["centerline"]["curve_paths"][1]["points_xy"]
+            result["centerline"]["curve_paths"][1]["points_xy"] = (
+                green[green[:, 1] > 400.0])
+            return result
+
+        planner.update(
+            _curve_result_at(180.0, 430.0),
+            _ocr_response("right"), now=2.0)
+        for now in (2.1, 2.2, 2.3):
+            planner.update(
+                horizontal_blue_green_missing(),
+                _ocr_response("right"), now=now)
+        command, debug = planner.update(
+            horizontal_blue_green_missing(),
+            _ocr_response("right"), now=3.11)
+
+        self.assertEqual(STATE_SAFE_STOP, command["state_cmd"])
+        self.assertEqual(0.0, command["target_speed"])
+        self.assertEqual("ocr_right_wait_blue_vertical", debug[
+            "control_target"]["task_reason"])
+        self.assertEqual("wait_blue_vertical", debug[
+            "ocr_right_merge_phase"])
+
+    def obsolete_ocr_right_merge_returns_to_reliably_recovered_green(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            path_ema_alpha=1.0,
+            path_max_step_px_640=1000.0,
+            curve_green_missing_release_frames=3,
+            ocr_right_green_recovery_frames=3,
+        ))
+
+        def green_missing():
+            result = _curve_result_at(180.0, 430.0)
+            green = result["centerline"]["curve_paths"][1]["points_xy"]
+            result["centerline"]["curve_paths"][1]["points_xy"] = (
+                green[green[:, 1] > 400.0])
+            return result
+
+        planner.update(
+            _curve_result_at(180.0, 430.0),
+            _ocr_response("right"), now=2.0)
+        for now in (2.1, 2.2, 2.3):
+            _command, committed = planner.update(
+                green_missing(), _ocr_response("right"), now=now)
+        self.assertEqual("wait_blue_vertical", committed[
+            "ocr_right_merge_phase"])
+
+        recovered = []
+        for now in (2.4, 2.5, 2.6):
+            _command, debug = planner.update(
+                _curve_result_at(180.0, 430.0),
+                _ocr_response("right"), now=now)
+            recovered.append(debug)
+
+        self.assertEqual(1, recovered[0][
+            "ocr_right_green_recovery_frames"])
+        self.assertEqual(2, recovered[1][
+            "ocr_right_green_recovery_frames"])
+        self.assertEqual("follow_green", recovered[2][
+            "ocr_right_merge_phase"])
+        self.assertTrue(recovered[2]["ocr_right_green_reliable"])
+        self.assertTrue(recovered[2]["ocr_right_green_lock_active"])
+        self.assertFalse(recovered[2][
+            "ocr_right_blue_fallback_completed_for_current"])
+        self.assertEqual("right", recovered[2]["branch_lock"])
+        self.assertEqual(1, recovered[2]["selected_slot"])
 
     def test_curve_locked_blue_keeps_target_during_ambiguous_geometry(self):
         planner = VisionControlPlanner(config=_config(
@@ -1586,6 +1950,18 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(0.08, command["target_speed"])
         self.assertAlmostEqual(32.0, command["track_error"])
         self.assertTrue(debug["turnsign_trim_current_centered"])
+
+    def test_turnsign_trim_defaults_use_larger_steering_ranges(self):
+        config = VisionControlConfig()
+
+        self.assertEqual(44.0, config.turnsign_trim_min_steer_px_640)
+        self.assertEqual(0.75, config.turnsign_trim_steer_gain)
+        self.assertEqual(100.0, config.turnsign_trim_max_steer_px_640)
+        self.assertEqual(1.05, config.turnsign_trim_missing_steer_gain)
+        self.assertEqual(135.0, config.turnsign_trim_missing_max_steer_px_640)
+        self.assertEqual(1.30, config.turnsign_trim_severe_steer_gain)
+        self.assertEqual(
+            165.0, config.turnsign_trim_severe_max_steer_px_640)
 
     def test_turnsign_stable_centered_stops_regardless_separation(self):
         planner = VisionControlPlanner(config=_config(
@@ -1858,6 +2234,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         planner = VisionControlPlanner(config=_config(
             path_source="curve", path_smooth_window=1,
             turnsign_reverse_duration_s=0.5,
+            turnsign_trim_min_steer_px_640=0.0,
             turnsign_trim_steer_gain=0.20,
             turnsign_trim_missing_steer_gain=0.45,
             turnsign_trim_severe_missing_frames=3,

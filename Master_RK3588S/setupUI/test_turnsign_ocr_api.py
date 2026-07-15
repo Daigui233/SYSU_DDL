@@ -95,6 +95,37 @@ class TurnSignOcrApiProcessorTest(unittest.TestCase):
         self.assertAlmostEqual(0.40, sync_processor.min_det_score)
         self.assertAlmostEqual(0.40, sync_processor.min_ocr_confidence)
 
+    def test_right_merge_suppression_ignores_sign_and_restarts_confirmation(self):
+        processor = AsyncTurnSignOcrApiProcessor(confirm_frames=3)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        sign = {
+            "label": "TurnSign", "score": 0.90,
+            "area_ratio": 0.04, "bbox": [280, 100, 360, 180],
+        }
+        processor.session_active = True
+        processor.session_resolved = True
+        processor.confirm_count = 3
+
+        ignored = processor.process(
+            frame, [sign], timestamp=1.0,
+            context={"suppress_turnsign_right_merge": True})
+        ignored_again = processor.process(
+            frame, [sign], timestamp=1.1,
+            context={"suppress_turnsign_right_merge": True})
+
+        self.assertEqual(
+            "turnsign_suppressed_right_merge", ignored["status"])
+        self.assertFalse(ignored["active"])
+        self.assertFalse(ignored["session_active"])
+        self.assertEqual(0, ignored["confirm_count"])
+        self.assertTrue(ignored["clear_result"])
+        self.assertFalse(ignored_again["clear_result"])
+        self.assertFalse(processor.session_active)
+
+        resumed = processor.process(frame, [sign], timestamp=1.2)
+        self.assertEqual("turnsign_confirming", resumed["status"])
+        self.assertEqual(1, resumed["confirm_count"])
+
     def test_ocr_waits_until_turnsign_reaches_stop_size(self):
         processor = TurnSignOcrApiProcessor(
             min_area_ratio=0.031,

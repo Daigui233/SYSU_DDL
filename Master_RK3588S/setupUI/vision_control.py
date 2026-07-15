@@ -279,6 +279,20 @@ class VisionControlConfig:
     curve_blue_angle_jump_deg: float = 12.0
     curve_blue_instability_evidence: int = 3
     curve_green_missing_release_frames: int = 3
+    ocr_right_green_lock_s: float = 5.0
+    ocr_right_merge_hold_min_s: float = 0.35
+    ocr_right_merge_hold_max_s: float = 1.0
+    ocr_right_merge_speed_mps: float = 0.10
+    ocr_right_blue_vertical_angle_deg: float = 30.0
+    ocr_right_blue_local_angle_deg: float = 45.0
+    ocr_right_blue_vertical_frames: int = 3
+    ocr_right_blue_angle_sample_rows: int = 6
+    ocr_right_blue_blend_s: float = 0.25
+    ocr_right_green_recovery_frames: int = 3
+    ocr_right_lookahead_search_down_px_480: float = 120.0
+    ocr_right_min_path_span_px_480: float = 60.0
+    ocr_right_blue_motion_window_frames: int = 3
+    ocr_right_blue_motion_threshold_ratio: float = 0.50
     no_path_stop_s: float = 0.8
     recover_hold_s: float = 0.5
     hazard_bottom_ratio: float = 250.0 / 480.0
@@ -312,14 +326,14 @@ class VisionControlConfig:
     turnsign_trim_collapse_frames: int = 2
     turnsign_trim_drop_px_640: float = 45.0
     turnsign_trim_steer_deadband_px_640: float = 4.0
-    turnsign_trim_min_steer_px_640: float = 32.0
-    turnsign_trim_steer_gain: float = 0.55
-    turnsign_trim_max_steer_px_640: float = 80.0
-    turnsign_trim_missing_steer_gain: float = 0.85
-    turnsign_trim_missing_max_steer_px_640: float = 110.0
+    turnsign_trim_min_steer_px_640: float = 44.0
+    turnsign_trim_steer_gain: float = 0.75
+    turnsign_trim_max_steer_px_640: float = 100.0
+    turnsign_trim_missing_steer_gain: float = 1.05
+    turnsign_trim_missing_max_steer_px_640: float = 135.0
     turnsign_trim_severe_missing_frames: int = 3
-    turnsign_trim_severe_steer_gain: float = 1.10
-    turnsign_trim_severe_max_steer_px_640: float = 140.0
+    turnsign_trim_severe_steer_gain: float = 1.30
+    turnsign_trim_severe_max_steer_px_640: float = 165.0
     human_stop_line_margin_ratio: float = 0.0
     human_stop_progress_ratio: float = 8.0 / 9.0
     human_preline_missing_px_480: float = 20.0
@@ -502,6 +516,49 @@ class VisionControlConfig:
             curve_green_missing_release_frames=max(
                 1, _env_int(
                     "VISION_CONTROL_CURVE_GREEN_MISSING_RELEASE_FRAMES", 3)),
+            ocr_right_green_lock_s=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_GREEN_LOCK_S", 5.0)),
+            ocr_right_merge_hold_min_s=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_MERGE_HOLD_MIN_S", 0.35)),
+            ocr_right_merge_hold_max_s=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_MERGE_HOLD_MAX_S", 1.0)),
+            ocr_right_merge_speed_mps=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_MERGE_SPEED", 0.10)),
+            ocr_right_blue_vertical_angle_deg=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_BLUE_VERTICAL_ANGLE_DEG", 30.0)),
+            ocr_right_blue_local_angle_deg=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_BLUE_LOCAL_ANGLE_DEG", 45.0)),
+            ocr_right_blue_vertical_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_OCR_RIGHT_BLUE_VERTICAL_FRAMES", 3)),
+            ocr_right_blue_angle_sample_rows=max(
+                3, _env_int(
+                    "VISION_CONTROL_OCR_RIGHT_BLUE_SAMPLE_ROWS", 6)),
+            ocr_right_blue_blend_s=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_BLUE_BLEND_S", 0.25)),
+            ocr_right_green_recovery_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_OCR_RIGHT_GREEN_RECOVERY_FRAMES", 3)),
+            ocr_right_lookahead_search_down_px_480=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_SEARCH_DOWN_PX_480", 120.0)),
+            ocr_right_min_path_span_px_480=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_MIN_PATH_SPAN_PX_480", 60.0)),
+            ocr_right_blue_motion_window_frames=max(
+                2, _env_int(
+                    "VISION_CONTROL_OCR_RIGHT_BLUE_MOTION_FRAMES", 3)),
+            ocr_right_blue_motion_threshold_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_BLUE_MOTION_RATIO", 0.50),
+                0.05, 1.0),
             no_path_stop_s=max(0.1, _env_float("VISION_CONTROL_NO_PATH_STOP_S", 0.8)),
             recover_hold_s=max(0.0, _env_float("VISION_CONTROL_RECOVER_HOLD_S", 0.5)),
             hazard_bottom_ratio=_clamp(_env_float("VISION_CONTROL_HAZARD_BOTTOM_RATIO", 250.0 / 480.0), 0.0, 1.0),
@@ -558,28 +615,28 @@ class VisionControlConfig:
                     "VISION_CONTROL_TURNSIGN_TRIM_STEER_DEADBAND_640", 4.0)),
             turnsign_trim_min_steer_px_640=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_MIN_STEER_640", 32.0)),
+                    "VISION_CONTROL_TURNSIGN_TRIM_MIN_STEER_640", 44.0)),
             turnsign_trim_steer_gain=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_STEER_GAIN", 0.55)),
+                    "VISION_CONTROL_TURNSIGN_TRIM_STEER_GAIN", 0.75)),
             turnsign_trim_max_steer_px_640=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_MAX_STEER_640", 80.0)),
+                    "VISION_CONTROL_TURNSIGN_TRIM_MAX_STEER_640", 100.0)),
             turnsign_trim_missing_steer_gain=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_STEER_GAIN", 0.85)),
+                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_STEER_GAIN", 1.05)),
             turnsign_trim_missing_max_steer_px_640=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_MAX_STEER_640", 110.0)),
+                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_MAX_STEER_640", 135.0)),
             turnsign_trim_severe_missing_frames=max(
                 1, _env_int(
                     "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_MISSING_FRAMES", 3)),
             turnsign_trim_severe_steer_gain=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_STEER_GAIN", 1.10)),
+                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_STEER_GAIN", 1.30)),
             turnsign_trim_severe_max_steer_px_640=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_MAX_STEER_640", 140.0)),
+                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_MAX_STEER_640", 165.0)),
             human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
             human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 8.0 / 9.0), 0.0, 1.0),
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
@@ -1389,6 +1446,28 @@ class VisionControlPlanner:
         self.ocr_right_blue_available_at_lookahead = False
         self.ocr_right_green_available_at_lookahead = False
         self.ocr_right_green_missing_frames = 0
+        self.ocr_right_merge_phase = "idle"
+        self.ocr_right_merge_session_id = None
+        self.ocr_right_green_lock_since = None
+        self.ocr_right_last_stable_green_error_640 = None
+        self.ocr_right_hold_error_640 = 0.0
+        self.ocr_right_merge_hold_since = 0.0
+        self.ocr_right_blue_vertical_frames = 0
+        self.ocr_right_blue_heading_deg = None
+        self.ocr_right_blue_local_max_angle_deg = None
+        self.ocr_right_blue_vertical_ready = False
+        self.ocr_right_blue_blend_started_ts = 0.0
+        self.ocr_right_green_recovery_frames = 0
+        self.ocr_right_green_reliable = False
+        self.ocr_right_green_last_raw_lookahead_x = None
+        self.ocr_right_green_last_effective_lookahead_y = None
+        self.ocr_right_green_effective_lookahead_y = None
+        self.ocr_right_green_search_down_px_480 = None
+        self.ocr_right_blue_effective_lookahead_y = None
+        self.ocr_right_blue_search_down_px_480 = None
+        self.ocr_right_blue_motion_x_history = []
+        self.ocr_right_blue_motion_span_px_640 = 0.0
+        self.ocr_right_blue_motion_unstable = False
         self.human_waiting_cross = False
         self.human_last_side = None
         self.human_last_path_distance_640 = None
@@ -1480,6 +1559,7 @@ class VisionControlPlanner:
             # Establish the session before OCR route selection. A very fast
             # API result on the first session frame must still wait until both
             # curve slots are distinguishable at the lookahead row.
+            self._reset_ocr_right_green_lock()
             self.turnsign_control_session_id = incoming_session_id
             self._reset_turnsign_trim_runtime()
             self.turnsign_trim_session_adaptive = (
@@ -1506,21 +1586,20 @@ class VisionControlPlanner:
             ):
                 self.turnsign_trim_pending_ocr_direction = ocr_direction
             else:
-                self._apply_ocr_direction_lock(ocr_direction)
+                self._apply_ocr_direction_lock(ocr_direction, now)
         else:
-            self.ocr_right_blue_fallback_completed_for_current = False
             ocr_lock_expired = self._expire_ocr_lock(now)
         if (
             self.turnsign_trim_pending_ocr_direction in {"left", "right"}
             and self.turnsign_trim_line_split_ready
         ):
             self._apply_ocr_direction_lock(
-                self.turnsign_trim_pending_ocr_direction)
+                self.turnsign_trim_pending_ocr_direction, now)
             self.turnsign_trim_pending_ocr_direction = None
             deferred_ocr_lock_applied = True
         ocr_right_green_missing_released = (
             self._release_ocr_right_when_green_missing_at_lookahead(
-                candidates, image_shape))
+                candidates, image_shape, now))
         self._update_default_outer(
             route_state, now,
             bool(ocr_current or deferred_ocr_lock_applied or
@@ -1574,6 +1653,8 @@ class VisionControlPlanner:
             "ocr_lock_remaining_s": self._ocr_lock_remaining(now),
             "ocr_right_green_lock_active": bool(
                 self.ocr_right_green_lock_active),
+            "ocr_right_blue_fallback_completed_for_current": bool(
+                self.ocr_right_blue_fallback_completed_for_current),
             "ocr_right_blue_available_at_lookahead": bool(
                 self.ocr_right_blue_available_at_lookahead),
             "ocr_right_green_available_at_lookahead": bool(
@@ -1582,6 +1663,44 @@ class VisionControlPlanner:
                 self.ocr_right_green_missing_frames),
             "ocr_right_green_missing_released": bool(
                 ocr_right_green_missing_released),
+            "ocr_right_merge_phase": self.ocr_right_merge_phase,
+            "ocr_right_merge_session_id": self.ocr_right_merge_session_id,
+            "ocr_right_green_lock_elapsed_s": (
+                self._ocr_right_green_lock_elapsed(now)),
+            "ocr_right_green_lock_remaining_s": max(
+                0.0,
+                float(self.config.ocr_right_green_lock_s)
+                - self._ocr_right_green_lock_elapsed(now)),
+            "ocr_right_last_stable_green_error_640": (
+                self.ocr_right_last_stable_green_error_640),
+            "ocr_right_hold_error_640": float(
+                self.ocr_right_hold_error_640),
+            "ocr_right_blue_vertical_frames": int(
+                self.ocr_right_blue_vertical_frames),
+            "ocr_right_blue_heading_deg": (
+                self.ocr_right_blue_heading_deg),
+            "ocr_right_blue_local_max_angle_deg": (
+                self.ocr_right_blue_local_max_angle_deg),
+            "ocr_right_blue_vertical_ready": bool(
+                self.ocr_right_blue_vertical_ready),
+            "ocr_right_green_recovery_frames": int(
+                self.ocr_right_green_recovery_frames),
+            "ocr_right_green_reliable": bool(
+                self.ocr_right_green_reliable),
+            "ocr_right_green_effective_lookahead_y": (
+                self.ocr_right_green_effective_lookahead_y),
+            "ocr_right_green_search_down_px_480": (
+                self.ocr_right_green_search_down_px_480),
+            "ocr_right_blue_effective_lookahead_y": (
+                self.ocr_right_blue_effective_lookahead_y),
+            "ocr_right_blue_search_down_px_480": (
+                self.ocr_right_blue_search_down_px_480),
+            "ocr_right_blue_motion_span_px_640": float(
+                self.ocr_right_blue_motion_span_px_640),
+            "ocr_right_blue_motion_unstable": bool(
+                self.ocr_right_blue_motion_unstable),
+            "turnsign_suppressed_right_merge": bool(
+                self.should_suppress_turnsign_detection()),
             "turnsign_trim_separation_640": (
                 self.turnsign_trim_separation_640),
             "turnsign_trim_lookahead_separation_640": (
@@ -2904,6 +3023,24 @@ class VisionControlPlanner:
         if self.config.path_source != "curve":
             return
 
+        # A physical right-to-left merge exists only after an OCR-confirmed
+        # right turn. Slot 1 is selected directly by that OCR lock and handed
+        # back to slot 0 by the dedicated merge state machine below. Never let
+        # generic blue flicker or short support select green on its own.
+        self.curve_merge_override = False
+        self.curve_merge_fast_override = False
+        self.curve_merge_fast_recovery_frames = 0
+        self.curve_merge_bad_evidence = 0
+        self.curve_merge_blue_stable_frames = 0
+        self.curve_flicker_green_lock_active = False
+        self.curve_blue_instability_score = 0
+        self.curve_green_missing_frames = 0
+        self.curve_merge_reason = (
+            "ocr_right_managed" if
+            self.ocr_right_merge_phase != "idle"
+            else "default_blue_only")
+        return
+
         height, width = image_shape[:2]
         lookahead_y = float(height) * self.config.lookahead_y_ratio
         by_slot = {
@@ -3420,7 +3557,19 @@ class VisionControlPlanner:
         selected_covers_lookahead = (
             selected is not None and self._path_covers_y(
                 selected.get("points_xy"), lookahead_y))
-        if ocr_route_locked and not selected_covers_lookahead:
+        if (
+            selected is not None
+            and self.ocr_right_merge_phase != "idle"
+            and self.config.path_source == "curve"
+        ):
+            selected_covers_lookahead = bool(
+                self._ocr_right_adaptive_lookahead(
+                    selected.get("points_xy"), image_shape) is not None)
+        merge_control = self._ocr_right_merge_control(now, image_shape)
+        if (
+            ocr_route_locked and not selected_covers_lookahead
+            and merge_control is None
+        ):
             self._reset_error_trend()
             if isinstance(ocr_response, dict):
                 ocr_response["control_phase"] = "ocr_wait_route"
@@ -3443,7 +3592,43 @@ class VisionControlPlanner:
             result, selected, image_shape, lookahead_y, route_state, now,
             ocr_response=ocr_response,
             path_target_x=task_path_target_x)
+        if merge_control is not None and task_reason == "track":
+            task_state, speed, task_reason, target_override_x = merge_control
+            if isinstance(ocr_response, dict):
+                ocr_response["control_phase"] = task_reason
+            if task_state == STATE_SAFE_STOP:
+                self._reset_error_trend()
+                return self._command(
+                    0.0, 0.0, STATE_SAFE_STOP, flags=0), {
+                    "target_x": None,
+                    "path_target_x": task_path_target_x,
+                    "path_target_y": float(lookahead_y),
+                    "track_error_640": 0.0,
+                    "reason": "blue_not_vertical_timeout",
+                    "task_reason": task_reason,
+                }
+        elif (
+            self.ocr_right_merge_phase == "blend_blue"
+            and task_reason == "track"
+        ):
+            task_reason = "ocr_right_blue_blend"
+            if isinstance(ocr_response, dict):
+                ocr_response["control_phase"] = task_reason
         if selected is None:
+            if task_reason == "ocr_right_merge_hold":
+                self._reset_error_trend()
+                error = float(self.ocr_right_hold_error_640)
+                self.last_error = error
+                self.last_valid_ts = float(now)
+                return self._command(error, speed, task_state), {
+                    "target_x": target_override_x,
+                    "path_target_x": None,
+                    "path_target_y": float(lookahead_y),
+                    "path_target_held": True,
+                    "track_error_640": error,
+                    "reason": "hold_last_green_steering",
+                    "task_reason": task_reason,
+                }
             self._reset_error_trend()
             age = now - self.last_valid_ts if self.last_valid_ts else 1e9
             held_target = self._held_path_target(now)
@@ -3500,6 +3685,18 @@ class VisionControlPlanner:
             self._human_return_extra_error(now)
             if task_reason == "human_return" else 0.0)
         steering_error = raw_error + human_return_extra_error
+        if task_reason == "ocr_right_blue_blend":
+            blend_duration = max(
+                1e-6, float(self.config.ocr_right_blue_blend_s))
+            blend_alpha = _clamp(
+                (float(now) -
+                 float(self.ocr_right_blue_blend_started_ts)) /
+                blend_duration,
+                0.0, 1.0)
+            steering_error = (
+                float(self.ocr_right_hold_error_640) *
+                (1.0 - blend_alpha)
+                + float(raw_error) * blend_alpha)
         default_track_error_gain = 1.0
         if task_reason == "track":
             if steering_error < 0.0:
@@ -3542,7 +3739,8 @@ class VisionControlPlanner:
             # the normal error slew retain a previous aggressive edge turn.
             error = 0.0
         elif task_reason in {
-            "turnsign_trim_forward", "turnsign_trim_reverse"
+            "turnsign_trim_forward", "turnsign_trim_reverse",
+            "ocr_right_merge_hold", "ocr_right_blue_blend",
         }:
             self._reset_error_trend()
             error_trend_adjustment = 0.0
@@ -3565,6 +3763,13 @@ class VisionControlPlanner:
         self.last_path_target_y = float(path_target_y)
         self.last_path_target_slot = int(selected["slot"])
         self.last_path_target_ts = float(now)
+        if (
+            self.ocr_right_merge_phase == "follow_green"
+            and int(selected.get("slot", -1)) == 1
+            and selected_covers_lookahead
+            and task_reason == "track"
+        ):
+            self.ocr_right_last_stable_green_error_640 = float(error)
         return self._command(error, speed, task_state), {
             "target_x": float(target_x),
             "path_target_x": float(path_target_x),
@@ -5254,7 +5459,7 @@ class VisionControlPlanner:
             return None, False
         return direction, True
 
-    def _apply_ocr_direction_lock(self, direction):
+    def _apply_ocr_direction_lock(self, direction, now=None):
         if direction not in {"left", "right"}:
             return
         if direction == "right" and self.config.path_source == "curve":
@@ -5263,6 +5468,28 @@ class VisionControlPlanner:
             if not self.ocr_right_green_lock_active:
                 self.ocr_right_green_lock_active = True
                 self.ocr_right_green_missing_frames = 0
+            if self.ocr_right_merge_phase == "idle":
+                self.ocr_right_merge_phase = "follow_green"
+                self.ocr_right_merge_session_id = (
+                    self.turnsign_control_session_id)
+                self.ocr_right_green_lock_since = float(
+                    time.monotonic() if now is None else now)
+                self.ocr_right_last_stable_green_error_640 = None
+                self.ocr_right_hold_error_640 = 0.0
+                self.ocr_right_merge_hold_since = 0.0
+                self.ocr_right_blue_vertical_frames = 0
+                self.ocr_right_blue_vertical_ready = False
+                self.ocr_right_green_recovery_frames = 0
+                self.ocr_right_green_reliable = False
+                self.ocr_right_green_last_raw_lookahead_x = None
+                self.ocr_right_green_last_effective_lookahead_y = None
+                self.ocr_right_green_effective_lookahead_y = None
+                self.ocr_right_green_search_down_px_480 = None
+                self.ocr_right_blue_effective_lookahead_y = None
+                self.ocr_right_blue_search_down_px_480 = None
+                self.ocr_right_blue_motion_x_history = []
+                self.ocr_right_blue_motion_span_px_640 = 0.0
+                self.ocr_right_blue_motion_unstable = False
             self.branch_lock = "right"
             self.branch_lock_source = "ocr"
             self.selected_slot_lock = 1
@@ -5288,15 +5515,13 @@ class VisionControlPlanner:
         return True
 
     def _release_ocr_right_when_green_missing_at_lookahead(
-            self, candidates, image_shape):
-        """Fall back permanently after green misses ahead for consecutive frames."""
+            self, candidates, image_shape, now):
+        """Follow green for a fixed interval, then switch directly to blue."""
         self.ocr_right_blue_available_at_lookahead = False
         self.ocr_right_green_available_at_lookahead = False
         if (
             self.config.path_source != "curve"
-            or not self.ocr_right_green_lock_active
-            or self.branch_lock_source != "ocr"
-            or self.branch_lock != "right"
+            or self.ocr_right_merge_phase == "idle"
         ):
             return False
 
@@ -5306,35 +5531,239 @@ class VisionControlPlanner:
         }
         blue = by_slot.get(0)
         green = by_slot.get(1)
-        lookahead_y = (
-            float(image_shape[0]) * self.config.lookahead_y_ratio)
+        blue_target = self._ocr_right_adaptive_lookahead(
+            None if blue is None else blue.get("points_xy"), image_shape)
+        green_target = self._ocr_right_adaptive_lookahead(
+            None if green is None else green.get("points_xy"), image_shape)
         self.ocr_right_blue_available_at_lookahead = bool(
-            blue is not None
-            and self._path_covers_y(blue.get("points_xy"), lookahead_y)
-            and _interp_path_x(blue.get("points_xy"), lookahead_y)
-            is not None)
+            blue_target is not None)
         self.ocr_right_green_available_at_lookahead = bool(
-            green is not None
-            and self._path_covers_y(green.get("points_xy"), lookahead_y)
-            and _interp_path_x(green.get("points_xy"), lookahead_y)
-            is not None)
+            green_target is not None)
+        self.ocr_right_blue_effective_lookahead_y = (
+            None if blue_target is None else blue_target["y"])
+        self.ocr_right_blue_search_down_px_480 = (
+            None if blue_target is None else blue_target["search_down_px_480"])
+        self.ocr_right_green_effective_lookahead_y = (
+            None if green_target is None else green_target["y"])
+        self.ocr_right_green_search_down_px_480 = (
+            None if green_target is None else
+            green_target["search_down_px_480"])
+        self.ocr_right_green_reliable = bool(green_target is not None)
+        self.ocr_right_green_missing_frames = 0
+        self.ocr_right_green_recovery_frames = 0
+        self.ocr_right_blue_vertical_frames = 0
+        self.ocr_right_blue_heading_deg = None
+        self.ocr_right_blue_local_max_angle_deg = None
+        self.ocr_right_blue_vertical_ready = False
+        self.ocr_right_blue_motion_x_history = []
+        self.ocr_right_blue_motion_span_px_640 = 0.0
+        self.ocr_right_blue_motion_unstable = False
+
         if (
-            self.ocr_right_blue_available_at_lookahead
-            and not self.ocr_right_green_available_at_lookahead
+            self.ocr_right_merge_phase == "follow_green"
+            and self._ocr_right_green_lock_elapsed(now) >=
+                self.config.ocr_right_green_lock_s
         ):
-            self.ocr_right_green_missing_frames += 1
+            self.ocr_right_green_lock_active = False
+            self.ocr_right_blue_fallback_completed_for_current = True
+            self.ocr_right_merge_phase = "follow_blue"
+            self._set_default_curve_branch()
+            return True
+        return False
+
+    def _resume_ocr_right_green(self):
+        self.ocr_right_green_lock_active = True
+        self.ocr_right_blue_fallback_completed_for_current = False
+        self.ocr_right_merge_phase = "follow_green"
+        self.ocr_right_green_missing_frames = 0
+        self.ocr_right_green_recovery_frames = 0
+        self.ocr_right_merge_hold_since = 0.0
+        self.ocr_right_blue_vertical_frames = 0
+        self.ocr_right_blue_vertical_ready = False
+        self.ocr_right_blue_blend_started_ts = 0.0
+        self.branch_lock = "right"
+        self.branch_lock_source = "ocr"
+        self.selected_slot_lock = 1
+        self.selected_slot_missing_frames = 0
+
+    def _ocr_right_adaptive_lookahead(self, points, image_shape):
+        """Use the preferred row or the nearest bounded row below it."""
+        points = np.asarray(points if points is not None else (), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+            return None
+        points = points[np.all(np.isfinite(points), axis=1)]
+        if len(points) < 3:
+            return None
+        height = float(max(1, image_shape[0]))
+        preferred_y = height * self.config.lookahead_y_ratio
+        minimum_y = float(np.min(points[:, 1]))
+        maximum_y = float(np.max(points[:, 1]))
+        max_search = (
+            self.config.ocr_right_lookahead_search_down_px_480 *
+            height / 480.0)
+        min_span = (
+            self.config.ocr_right_min_path_span_px_480 *
+            height / 480.0)
+        if minimum_y <= preferred_y <= maximum_y:
+            effective_y = float(preferred_y)
+        elif preferred_y < minimum_y <= preferred_y + max_search:
+            effective_y = float(minimum_y)
         else:
-            self.ocr_right_green_missing_frames = 0
+            return None
+        if maximum_y - effective_y < min_span:
+            return None
+        x = _interp_path_x(points, effective_y)
+        if x is None:
+            return None
+        return {
+            "x": float(x),
+            "y": float(effective_y),
+            "search_down_px_480": float(
+                max(0.0, effective_y - preferred_y) * 480.0 / height),
+            "remaining_span_px_480": float(
+                (maximum_y - effective_y) * 480.0 / height),
+        }
+
+    def _ocr_right_green_is_reliable(self, green, image_shape):
+        if green is None:
+            return False
+        points = np.asarray(
+            green.get("raw_points_xy", green.get("points_xy", ())),
+            dtype=np.float32)
+        target = self._ocr_right_adaptive_lookahead(points, image_shape)
+        if target is None:
+            return False
+        _height, width = image_shape[:2]
+        raw_x = float(target["x"])
+        effective_y = float(target["y"])
+        self.ocr_right_green_effective_lookahead_y = effective_y
+        self.ocr_right_green_search_down_px_480 = float(
+            target["search_down_px_480"])
+        previous_x = self.ocr_right_green_last_raw_lookahead_x
+        previous_y = self.ocr_right_green_last_effective_lookahead_y
+        self.ocr_right_green_last_raw_lookahead_x = float(raw_x)
+        self.ocr_right_green_last_effective_lookahead_y = effective_y
+        if previous_x is None:
+            return True
         if (
-            self.ocr_right_green_missing_frames <
-            self.config.curve_green_missing_release_frames
+            previous_y is not None
+            and abs(float(effective_y) - float(previous_y)) >
+                24.0 * float(max(1, image_shape[0])) / 480.0
         ):
             return False
+        jump_640 = (
+            abs(float(raw_x) - float(previous_x)) * 640.0 /
+            float(max(1, width)))
+        return bool(
+            jump_640 <= self.config.curve_merge_fast_green_jump_px_640)
 
-        self.ocr_right_green_lock_active = False
-        self.ocr_right_blue_fallback_completed_for_current = True
-        self._set_default_curve_branch()
-        return True
+    def _update_ocr_right_blue_motion(self, blue, image_shape):
+        points = None if blue is None else blue.get(
+            "raw_points_xy", blue.get("points_xy", ()))
+        target = self._ocr_right_adaptive_lookahead(points, image_shape)
+        if target is None:
+            self.ocr_right_blue_motion_x_history = []
+            self.ocr_right_blue_motion_span_px_640 = 0.0
+            self.ocr_right_blue_motion_unstable = False
+            return
+        width = float(max(1, image_shape[1]))
+        x_640 = float(target["x"]) * 640.0 / width
+        history = list(self.ocr_right_blue_motion_x_history)
+        history.append(x_640)
+        window = int(self.config.ocr_right_blue_motion_window_frames)
+        self.ocr_right_blue_motion_x_history = history[-window:]
+        if len(self.ocr_right_blue_motion_x_history) < window:
+            self.ocr_right_blue_motion_span_px_640 = 0.0
+            self.ocr_right_blue_motion_unstable = False
+            return
+        span = (
+            max(self.ocr_right_blue_motion_x_history)
+            - min(self.ocr_right_blue_motion_x_history))
+        self.ocr_right_blue_motion_span_px_640 = float(span)
+        self.ocr_right_blue_motion_unstable = bool(
+            span >=
+            self.config.ocr_right_blue_motion_threshold_ratio * 640.0)
+
+    def _ocr_right_blue_vertical_metrics(self, blue, image_shape):
+        result = {
+            "ready": False,
+            "heading_deg": None,
+            "local_max_angle_deg": None,
+        }
+        if blue is None:
+            return result
+        points = np.asarray(
+            blue.get("raw_points_xy", blue.get("points_xy", ())),
+            dtype=np.float32)
+        height = float(image_shape[0])
+        target = self._ocr_right_adaptive_lookahead(points, image_shape)
+        if target is None:
+            return result
+        upper_y = float(target["y"])
+        minimum_span = (
+            self.config.ocr_right_min_path_span_px_480 *
+            height / 480.0)
+        lower_y = min(
+            float(np.max(points[:, 1])),
+            max(height * 0.875, upper_y + minimum_span))
+        if lower_y <= upper_y:
+            return result
+        self.ocr_right_blue_effective_lookahead_y = upper_y
+        self.ocr_right_blue_search_down_px_480 = float(
+            target["search_down_px_480"])
+        rows = np.linspace(
+            upper_y, lower_y,
+            self.config.ocr_right_blue_angle_sample_rows,
+            dtype=np.float32)
+        xs = _interp_path_x_many(points, rows)
+        if not np.all(np.isfinite(xs)):
+            return result
+        dx = np.diff(xs.astype(np.float64))
+        dy = np.diff(rows.astype(np.float64))
+        local_angles = np.degrees(np.arctan2(np.abs(dx), np.abs(dy)))
+        heading = float(np.degrees(np.arctan2(
+            abs(float(xs[-1]) - float(xs[0])),
+            max(1e-6, abs(float(rows[-1]) - float(rows[0]))))))
+        local_max = float(np.max(local_angles)) if len(local_angles) else 90.0
+        result.update({
+            "heading_deg": heading,
+            "local_max_angle_deg": local_max,
+            "ready": bool(
+                heading <= self.config.ocr_right_blue_vertical_angle_deg
+                and local_max <=
+                    self.config.ocr_right_blue_local_angle_deg),
+        })
+        return result
+
+    def _ocr_right_merge_control(self, now, image_shape):
+        phase = self.ocr_right_merge_phase
+        if phase not in {
+            "hold_green_steer", "wait_blue_vertical",
+            "blue_unstable_hold",
+        }:
+            return None
+        hold_age = max(
+            0.0, float(now) - float(self.ocr_right_merge_hold_since))
+        if (
+            phase in {"wait_blue_vertical", "blue_unstable_hold"}
+            and hold_age >= self.config.ocr_right_merge_hold_max_s
+        ):
+            return (
+                STATE_SAFE_STOP, 0.0,
+                "ocr_right_wait_green_reliable" if
+                phase == "blue_unstable_hold"
+                else "ocr_right_wait_blue_vertical",
+                None)
+        width = float(max(1, image_shape[1]))
+        target_x = (
+            width * self.config.visual_center_x
+            + float(self.ocr_right_hold_error_640) * width / 640.0)
+        return (
+            STATE_TRACK,
+            self.config.ocr_right_merge_speed_mps,
+            "ocr_right_merge_hold",
+            _clamp(target_x, 0.0, float(max(0, image_shape[1] - 1))),
+        )
 
     def _reset_ocr_right_green_lock(self):
         self.ocr_right_green_lock_active = False
@@ -5342,6 +5771,44 @@ class VisionControlPlanner:
         self.ocr_right_blue_available_at_lookahead = False
         self.ocr_right_green_available_at_lookahead = False
         self.ocr_right_green_missing_frames = 0
+        self.ocr_right_merge_phase = "idle"
+        self.ocr_right_merge_session_id = None
+        self.ocr_right_green_lock_since = None
+        self.ocr_right_last_stable_green_error_640 = None
+        self.ocr_right_hold_error_640 = 0.0
+        self.ocr_right_merge_hold_since = 0.0
+        self.ocr_right_blue_vertical_frames = 0
+        self.ocr_right_blue_heading_deg = None
+        self.ocr_right_blue_local_max_angle_deg = None
+        self.ocr_right_blue_vertical_ready = False
+        self.ocr_right_blue_blend_started_ts = 0.0
+        self.ocr_right_green_recovery_frames = 0
+        self.ocr_right_green_reliable = False
+        self.ocr_right_green_last_raw_lookahead_x = None
+        self.ocr_right_green_last_effective_lookahead_y = None
+        self.ocr_right_green_effective_lookahead_y = None
+        self.ocr_right_green_search_down_px_480 = None
+        self.ocr_right_blue_effective_lookahead_y = None
+        self.ocr_right_blue_search_down_px_480 = None
+        self.ocr_right_blue_motion_x_history = []
+        self.ocr_right_blue_motion_span_px_640 = 0.0
+        self.ocr_right_blue_motion_unstable = False
+
+    def should_suppress_turnsign_detection(self):
+        """Ignore new signs until an OCR-right merge is back on blue."""
+        return bool(
+            self.config.path_source == "curve"
+            and self.ocr_right_merge_phase not in {"idle", "follow_blue"}
+        )
+
+    def _ocr_right_green_lock_elapsed(self, now):
+        if (
+            self.ocr_right_merge_phase == "idle"
+            or self.ocr_right_green_lock_since is None
+        ):
+            return 0.0
+        return max(
+            0.0, float(now) - float(self.ocr_right_green_lock_since))
 
     def _set_default_curve_branch(self):
         self.branch_lock = "left"
