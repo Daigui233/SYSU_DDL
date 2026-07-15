@@ -50,7 +50,7 @@ gamepad_control:
   steer_error_scale: 210.0
 output:
   coord_scale: 0.001
-  height_m: 0.16
+  height_m: 0.0
   x_sign: 1.0
   z_sign: 1.0
   yaw_sign: 1.0

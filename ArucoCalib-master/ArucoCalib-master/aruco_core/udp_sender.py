@@ -25,7 +25,7 @@ class UdpPoseSender:
         if enabled is not None:
             self.enabled = bool(enabled)
 
-    def make_packet(self, x_m, z_m, yaw_deg, height_m=0.16):
+    def make_packet(self, x_m, z_m, yaw_deg, height_m=0.0):
         # Map only at the Windows network boundary. The preview, filtering,
         # history, and calibration code continue using Windows (x, z).
         return {
@@ -34,7 +34,7 @@ class UdpPoseSender:
             "euler": [0.0, float(yaw_deg), 0.0],
         }
 
-    def send_pose(self, x_m, z_m, yaw_deg, height_m=0.16):
+    def send_pose(self, x_m, z_m, yaw_deg, height_m=0.0):
         if not self.enabled:
             return False
 

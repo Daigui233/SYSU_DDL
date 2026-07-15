@@ -75,7 +75,7 @@ gamepad_control:
 # This project stores world coordinates in millimeters; UI and UDP use meters.
 output:
   coord_scale: 0.001
-  height_m: 0.16
+  height_m: 0.0
   x_sign: 1.0
   z_sign: 1.0
   yaw_sign: 1.0

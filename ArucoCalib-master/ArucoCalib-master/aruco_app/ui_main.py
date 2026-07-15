@@ -749,7 +749,7 @@ class MainWindow(QMainWindow):
             x_m,
             z_m,
             yaw_deg,
-            height_m=float(getattr(self.cfg, "OUTPUT_HEIGHT_M", 0.16)),
+            height_m=float(getattr(self.cfg, "OUTPUT_HEIGHT_M", 0.0)),
         )
         self.pose_history.append((x_m, z_m, yaw_deg))
         if len(self.pose_history) > 3000:

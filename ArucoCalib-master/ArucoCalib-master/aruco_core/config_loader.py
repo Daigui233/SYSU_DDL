@@ -83,7 +83,7 @@ class Config:
 
         output_config = config_data.get("output", {}) or {}
         self.OUTPUT_COORD_SCALE = float(output_config.get("coord_scale", 0.001))
-        self.OUTPUT_HEIGHT_M = float(output_config.get("height_m", 0.16))
+        self.OUTPUT_HEIGHT_M = float(output_config.get("height_m", 0.0))
         self.OUTPUT_X_SIGN = float(output_config.get("x_sign", 1.0))
         self.OUTPUT_Z_SIGN = float(output_config.get("z_sign", 1.0))
         self.OUTPUT_YAW_SIGN = float(output_config.get("yaw_sign", 1.0))

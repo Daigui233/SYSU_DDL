@@ -66,7 +66,7 @@ EXE 使用 `dist/config.yaml`。源码运行使用根目录 `config.yaml`。
 定位包：
 
 ```json
-{"type":"robot_position","pos":[z,0.16,x],"euler":[0.0,yaw,0.0]}
+{"type":"robot_position","pos":[z,0,x],"euler":[0.0,yaw,0.0]}
 ```
 
 Windows 定位内部、预览、滤波和轨迹记录仍使用 `(x,z)`；仅在 UDP 组包时交换为官方 AR 轴顺序 `[z,height,x]`。RK3588S 不再二次交换坐标，只把该 JSON 原样转发到 `127.0.0.1:9006`。坐标单位为米，Yaw 单位为度。目标地址应填写 RK3588S 的局域网 IP，不要填写 Windows 自己的 `127.0.0.1`。
