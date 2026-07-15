@@ -687,12 +687,20 @@ def create_ocr_processor():
 
         processor = AsyncTurnSignOcrApiProcessor(
             worker_cpu_set=os.environ.get("AR_TURNSIGN_OCR_CPUSET", "0-3"),
-            confirm_frames=max(1, int(env_float("AR_TURNSIGN_CONFIRM_FRAMES", 3))),
+            confirm_frames=max(1, int(env_float("AR_TURNSIGN_CONFIRM_FRAMES", 1))),
+            snapshot_min_area_ratio=env_float(
+                "AR_TURNSIGN_SNAPSHOT_MIN_AREA_RATIO", 0.02),
+            snapshot_edge_margin_ratio=env_float(
+                "AR_TURNSIGN_SNAPSHOT_EDGE_MARGIN_RATIO", 0.10),
             confirm_iou=env_float("AR_TURNSIGN_CONFIRM_IOU", 0.30),
             confirm_max_misses=max(
                 0, int(env_float("AR_TURNSIGN_CONFIRM_MAX_MISSES", 2))),
             min_det_score=env_float("AR_TURNSIGN_MIN_DET_SCORE", 0.40),
             min_area_ratio=env_float("AR_TURNSIGN_MIN_AREA_RATIO", 0.01),
+            door_conflict_score=env_float(
+                "AR_TURNSIGN_DOOR_CONFLICT_SCORE", 0.80),
+            door_conflict_distance_px_640=env_float(
+                "AR_TURNSIGN_DOOR_CONFLICT_DISTANCE_PX_640", 120.0),
             detection_line_ratio=env_float(
                 "AR_TURNSIGN_DETECTION_LINE_RATIO", 185.0 / 480.0),
             preconfirm_line_distance_px_480=env_float(
@@ -718,8 +726,8 @@ def create_ocr_processor():
         )
         print(
             "[OCR] TurnSign OCR/API enabled "
-            "(3 valid frames; det/OCR confidence>=0.40; "
-            "area>=1%; line_y=185px and bbox_top<=230px@480p; "
+            "(1 complete box; det/OCR confidence>=0.40; "
+            "snapshot area>=2% in center 80%; "
             "exit after 3s no TurnSign or 10s no OCR response)")
         return processor
     except Exception as exc:
@@ -788,6 +796,8 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
         "turnsign_low_score": "LOW_SCORE",
         "turnsign_too_small": "TOO_SMALL",
         "turnsign_too_far": "TOO_FAR",
+        "turnsign_incomplete_bbox": "INCOMPLETE_BOX",
+        "turnsign_door_conflict": "IGNORE_NEAR_DOOR",
         "turnsign_bad_bbox": "BAD_BOX",
         "turnsign_confirming": "CONFIRM",
         "turnsign_lock_reverse": "LOCK_REVERSE_0.08_0.5S",
@@ -819,7 +829,7 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     if phase == "turnsign_confirming":
         status = (
             f"{status} {int(ocr_response.get('confirm_count') or 0)}/"
-            f"{int(ocr_response.get('confirm_frames') or 3)}")
+            f"{int(ocr_response.get('confirm_frames') or 1)}")
     instruction = ocr_response.get("instruction") or {}
     latest_instruction = ocr_response.get("latest_instruction") or {}
     choice = instruction_direction(instruction) or instruction_direction(latest_instruction) or "-"

@@ -83,17 +83,87 @@ class TurnSignOcrApiProcessorTest(unittest.TestCase):
         self.assertEqual("low_ocr_confidence", response["status"])
         self.assertFalse(response["instruction_current"])
 
-    def test_async_defaults_to_three_frames_and_point_four(self):
+    def test_async_defaults_to_immediate_complete_box_snapshot(self):
         processor = AsyncTurnSignOcrApiProcessor()
         sync_processor = TurnSignOcrApiProcessor()
 
-        self.assertEqual(3, processor.confirm_frames)
+        self.assertEqual(1, processor.confirm_frames)
         self.assertAlmostEqual(0.40, processor.min_det_score)
+        self.assertAlmostEqual(0.02, processor.snapshot_min_area_ratio)
+        self.assertAlmostEqual(0.10, processor.snapshot_edge_margin_ratio)
+        self.assertAlmostEqual(0.80, processor.door_conflict_score)
+        self.assertAlmostEqual(
+            120.0, processor.door_conflict_distance_px_640)
+        self.assertNotIn("snapshot_min_area_ratio", processor.processor_kwargs)
+        self.assertNotIn("snapshot_edge_margin_ratio", processor.processor_kwargs)
         self.assertAlmostEqual(185.0 / 480.0, processor.detection_line_ratio)
         self.assertAlmostEqual(3.0, processor.session_absence_timeout_s)
         self.assertAlmostEqual(10.0, processor.ocr_response_timeout_s)
         self.assertAlmostEqual(0.40, sync_processor.min_det_score)
         self.assertAlmostEqual(0.40, sync_processor.min_ocr_confidence)
+
+    def test_near_high_confidence_door_suppresses_turnsign(self):
+        processor = AsyncTurnSignOcrApiProcessor(
+            door_conflict_score=0.80,
+            door_conflict_distance_px_640=120.0,
+        )
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        detections = [
+            {"label": "TurnSign", "score": 0.91,
+             "area_ratio": 0.04, "bbox": [200, 100, 300, 200]},
+            {"label": "Door", "score": 0.94,
+             "area_ratio": 0.04, "bbox": [320, 100, 420, 200]},
+        ]
+
+        selected, status = processor._select_turnsign_with_status(
+            detections, frame)
+
+        self.assertIsNone(selected)
+        self.assertEqual("turnsign_door_conflict", status)
+
+    def test_far_or_low_confidence_door_does_not_suppress_turnsign(self):
+        processor = AsyncTurnSignOcrApiProcessor(
+            door_conflict_score=0.80,
+            door_conflict_distance_px_640=120.0,
+        )
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        sign = {"label": "TurnSign", "score": 0.91,
+                "area_ratio": 0.04, "bbox": [100, 100, 200, 200]}
+        far_door = {"label": "Door", "score": 0.94,
+                    "area_ratio": 0.04, "bbox": [500, 100, 600, 200]}
+        weak_near_door = {"label": "Door", "score": 0.79,
+                          "area_ratio": 0.04,
+                          "bbox": [220, 100, 320, 200]}
+
+        far_selected, far_status = processor._select_turnsign_with_status(
+            [sign, far_door], frame)
+        weak_selected, weak_status = processor._select_turnsign_with_status(
+            [sign, weak_near_door], frame)
+
+        self.assertIs(sign, far_selected)
+        self.assertEqual("turnsign_candidate", far_status)
+        self.assertIs(sign, weak_selected)
+        self.assertEqual("turnsign_candidate", weak_status)
+
+    def test_process_rejects_near_door_conflict_before_ocr_session(self):
+        processor = AsyncTurnSignOcrApiProcessor(
+            door_conflict_score=0.80,
+            door_conflict_distance_px_640=120.0,
+        )
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        detections = [
+            {"label": "TurnSign", "score": 0.91,
+             "area_ratio": 0.04, "bbox": [200, 100, 300, 200]},
+            {"label": "Door", "score": 0.94,
+             "area_ratio": 0.04, "bbox": [320, 100, 420, 200]},
+        ]
+
+        response = processor.process(frame, detections, timestamp=1.0)
+
+        self.assertEqual("turnsign_door_conflict", response["status"])
+        self.assertFalse(response["session_active"])
+        self.assertFalse(response["instruction_current"])
+        self.assertTrue(response["clear_result"])
 
     def test_right_merge_suppression_ignores_sign_and_restarts_confirmation(self):
         processor = AsyncTurnSignOcrApiProcessor(confirm_frames=3)
@@ -260,27 +330,73 @@ class TurnSignOcrApiProcessorTest(unittest.TestCase):
         self.assertFalse(np.array_equal(
             changed_frame[190:280, 260:440], frozen))
 
-    def test_async_rejects_top_more_than_45px_below_detection_line(self):
+    def test_async_rejects_incomplete_box_but_accepts_complete_box(self):
         processor = AsyncTurnSignOcrApiProcessor(
             confirm_frames=3,
             min_det_score=0.30,
             min_area_ratio=0.010,
         )
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        too_far = {
+        incomplete = {
             "label": "TurnSign", "score": 0.90,
             "area_ratio": 0.020,
-            "bbox": [250, 231, 390, 305],
+            "bbox": [-1, 231, 139, 305],
         }
-        boundary = dict(too_far, bbox=[250, 230, 390, 304])
+        complete = dict(incomplete, bbox=[250, 231, 390, 305])
 
-        rejected = processor.process(frame, [too_far], timestamp=1.0)
-        accepted = processor.process(frame, [boundary], timestamp=1.1)
+        rejected = processor.process(frame, [incomplete], timestamp=1.0)
+        accepted = processor.process(frame, [complete], timestamp=1.1)
 
-        self.assertEqual("turnsign_too_far", rejected["candidate_status"])
+        self.assertEqual(
+            "turnsign_incomplete_bbox", rejected["candidate_status"])
         self.assertEqual(0, rejected["confirm_count"])
         self.assertEqual("turnsign_confirming", accepted["status"])
         self.assertEqual(1, accepted["confirm_count"])
+
+    def test_snapshot_gate_uses_complete_two_percent_box_in_center_eighty(self):
+        processor = AsyncTurnSignOcrApiProcessor()
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        standard = {
+            "label": "TurnSign", "score": 0.90,
+            "area_ratio": 0.0227, "bbox": [330, 149, 446, 209],
+        }
+        too_small = dict(standard, area_ratio=0.0199)
+        edge = dict(standard, bbox=[0, 149, 100, 209])
+        incomplete = dict(standard, bbox=[580, 149, 660, 209])
+
+        self.assertTrue(processor._snapshot_ready(standard, frame))
+        self.assertFalse(processor._snapshot_ready(too_small, frame))
+        self.assertFalse(processor._snapshot_ready(edge, frame))
+        self.assertFalse(processor._snapshot_ready(incomplete, frame))
+
+    def test_first_eligible_box_immediately_freezes_ocr_snapshot(self):
+        processor = AsyncTurnSignOcrApiProcessor(
+            min_det_score=0.30,
+            min_area_ratio=0.010,
+            snapshot_min_area_ratio=0.020,
+            snapshot_edge_margin_ratio=0.10,
+        )
+
+        def start_worker():
+            processor.process_handle = FakeAliveProcess()
+            processor.request_queue = queue.Queue(maxsize=1)
+            processor.result_queue = queue.Queue(maxsize=3)
+            return True
+
+        processor._start_worker = start_worker
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        sign = {
+            "label": "TurnSign", "score": 0.90,
+            "area_ratio": 0.0227, "bbox": [330, 149, 446, 209],
+        }
+
+        response = processor.process(frame, [sign], timestamp=1.0)
+
+        self.assertTrue(response["session_active"])
+        self.assertEqual(1, response["confirm_count"])
+        self.assertTrue(response["snapshot_ready"])
+        self.assertTrue(response["snapshot_captured"])
+        self.assertEqual("snapshot_waiting_worker", response["status"])
 
     def test_async_three_frames_need_not_have_same_bbox(self):
         processor = AsyncTurnSignOcrApiProcessor(

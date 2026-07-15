@@ -1,4 +1,5 @@
 import json
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -12,8 +13,8 @@ import cv2
 import numpy as np
 
 
-DEFAULT_API_TYPE = "aistudio-v3"
-DEFAULT_API_BASE_URL = "https://aistudio.baidu.com/llm/lmapi/v3"
+DEFAULT_API_TYPE = "qianfan-v2"
+DEFAULT_API_BASE_URL = "https://qianfan.baidubce.com/v2"
 DEFAULT_MODEL = "ernie-4.5-turbo-32k"
 API_CACHE_VERSION = os.environ.get("AR_TURNSIGN_API_CACHE_VERSION", "api_v3_left_right")
 
@@ -41,6 +42,67 @@ DEFAULT_SYSTEM_PROMPT = """你是智能车路牌语义决策器。赛道在每�
 
 def now_seconds():
     return time.time()
+
+
+def _compact_detection_label(det):
+    return str(
+        (det or {}).get("label") or (det or {}).get("category") or ""
+    ).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def _bbox_gap_px(first, second):
+    """Return the shortest pixel gap between two boxes (0 when touching)."""
+    try:
+        ax0, ay0, ax1, ay1 = [float(value) for value in first[:4]]
+        bx0, by0, bx1, by1 = [float(value) for value in second[:4]]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if ax1 <= ax0 or ay1 <= ay0 or bx1 <= bx0 or by1 <= by0:
+        return None
+    dx = max(ax0 - bx1, bx0 - ax1, 0.0)
+    dy = max(ay0 - by1, by0 - ay1, 0.0)
+    return float(math.hypot(dx, dy))
+
+
+def _near_door_turnsign_conflict(
+        detections, score_threshold=0.80, distance_px_640=120.0, frame=None):
+    """Detect a likely Door/TurnSign duplicate near the same physical object."""
+    try:
+        threshold = float(score_threshold)
+        max_distance = float(distance_px_640)
+    except (TypeError, ValueError):
+        return False
+    if threshold <= 0.0:
+        threshold = 0.80
+    if max_distance < 0.0:
+        max_distance = 0.0
+    width = 640.0
+    try:
+        if frame is not None and len(frame.shape) >= 2:
+            width = float(max(1, int(frame.shape[1])))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    max_distance *= width / 640.0
+    doors = []
+    signs = []
+    for det in detections or []:
+        try:
+            score = float((det or {}).get("score", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if score < threshold:
+            continue
+        label = _compact_detection_label(det)
+        if label == "door":
+            doors.append(det)
+        elif label == "turnsign":
+            signs.append(det)
+    for door in doors:
+        for sign in signs:
+            gap = _bbox_gap_px(door.get("bbox"), sign.get("bbox"))
+            if gap is not None and gap <= max_distance:
+                return True
+    return False
 
 
 def load_local_ocr_env(base_dir=None):
@@ -350,7 +412,8 @@ class WenxinRouteInterpreter:
         api_url=None,
     ):
         # api_key remains supported for old callers; both names contain the
-        # AI Studio access token used by its OpenAI-compatible endpoint.
+        # Qianfan bearer API key (the old AI Studio access-token name remains
+        # supported for backwards-compatible environment configurations).
         load_local_ocr_env()
         self.access_token = (
             access_token
@@ -418,7 +481,7 @@ class WenxinRouteInterpreter:
             result["ocr_confidence"] = float(ocr_confidence or 0.0)
             return result
         except Exception as exc:
-            self.log_func(f"turnsign AI Studio v3 call failed: {exc}")
+            self.log_func(f"turnsign Qianfan v2 call failed: {exc}")
             result = fixed_unknown_result(source_text, "api_request_failed")
             result["api_error"] = str(exc)
             result["api_type"] = self.api_type
@@ -542,6 +605,8 @@ class TurnSignOcrApiProcessor:
         ocr_interval=0.25,
         api_cooldown=2.0,
         cache_ttl=30.0,
+        door_conflict_score=0.80,
+        door_conflict_distance_px_640=120.0,
         async_api=True,
         ocr_reader=None,
         interpreter=None,
@@ -566,6 +631,11 @@ class TurnSignOcrApiProcessor:
         self.ocr_interval = float(ocr_interval)
         self.api_cooldown = float(api_cooldown)
         self.cache_ttl = float(cache_ttl)
+        self.door_conflict_score = float(os.environ.get(
+            "AR_TURNSIGN_DOOR_CONFLICT_SCORE", door_conflict_score))
+        self.door_conflict_distance_px_640 = float(os.environ.get(
+            "AR_TURNSIGN_DOOR_CONFLICT_DISTANCE_PX_640",
+            door_conflict_distance_px_640))
         self.async_api = bool(async_api)
         self.log_func = log_func or (lambda message: None)
 
@@ -601,6 +671,11 @@ class TurnSignOcrApiProcessor:
         return label in {"turnsign", "turn sign"} or category in {"turnsign", "turn sign"}
 
     def select_turnsign(self, detections):
+        if _near_door_turnsign_conflict(
+                detections,
+                self.door_conflict_score,
+                self.door_conflict_distance_px_640):
+            return None
         candidates = []
         for det in detections or []:
             if not self.is_turnsign_detection(det):
@@ -621,6 +696,19 @@ class TurnSignOcrApiProcessor:
 
     def process(self, frame, detections, timestamp=None, context=None):
         ts = float(timestamp if timestamp is not None else now_seconds())
+        if _near_door_turnsign_conflict(
+                detections,
+                self.door_conflict_score,
+                self.door_conflict_distance_px_640,
+                frame):
+            return {
+                "active": False,
+                "status": "turnsign_door_conflict",
+                "instruction": fixed_unknown_result(
+                    "", "turnsign_door_conflict"),
+                "latest_instruction": self.latest_result,
+                "instruction_current": False,
+            }
         det = self.select_turnsign(detections)
         if det is None:
             return {
@@ -1044,7 +1132,7 @@ class AsyncTurnSignOcrApiProcessor:
         worker_cpu_set="0-3",
         mp_start_method=None,
         log_func=None,
-        confirm_frames=3,
+        confirm_frames=1,
         confirm_iou=0.30,
         confirm_max_misses=2,
         detection_line_ratio=185.0 / 480.0,
@@ -1063,6 +1151,17 @@ class AsyncTurnSignOcrApiProcessor:
 
         self.min_det_score = float(self.processor_kwargs.get("min_det_score", 0.40))
         self.min_area_ratio = float(self.processor_kwargs.get("min_area_ratio", 0.031))
+        self.door_conflict_score = float(self.processor_kwargs.get(
+            "door_conflict_score", 0.80))
+        self.door_conflict_distance_px_640 = float(
+            self.processor_kwargs.get("door_conflict_distance_px_640", 120.0))
+        # These gates belong to the async snapshot/session controller.  Do not
+        # forward them to TurnSignOcrApiProcessor in the worker process.
+        self.snapshot_min_area_ratio = float(
+            self.processor_kwargs.pop("snapshot_min_area_ratio", 0.02))
+        self.snapshot_edge_margin_ratio = clamp(
+            float(self.processor_kwargs.pop("snapshot_edge_margin_ratio", 0.10)),
+            0.0, 0.45)
         self.ocr_interval = float(self.processor_kwargs.get("ocr_interval", 0.25))
         self.confirm_frames = max(1, int(confirm_frames))
         self.confirm_iou = clamp(confirm_iou, 0.0, 1.0)
@@ -1229,26 +1328,55 @@ class AsyncTurnSignOcrApiProcessor:
         return 480, 640
 
     def _candidate_gate(self, det, frame=None):
-        height, _width = self._frame_size(frame)
+        height, width = self._frame_size(frame)
         area = self._detection_area_ratio(det, frame)
         if area < self.min_area_ratio:
             return False, "turnsign_too_small"
         try:
-            top = float((det or {}).get("bbox")[1])
+            left, top, right, bottom = [
+                float(value) for value in (det or {}).get("bbox")[:4]]
         except (TypeError, ValueError, IndexError):
             return False, "turnsign_bad_bbox"
-        line_y = float(height) * self.detection_line_ratio
-        max_gap = (
-            self.preconfirm_line_distance_px_480 *
-            float(max(1, height)) / 480.0)
-        # Image y grows downward. At 480p the line is y=185, so only a box
-        # whose top has gone below y=230 is too far past the detection line.
-        if top > line_y + max_gap:
-            return False, "turnsign_too_far"
+        if (
+            right <= left or bottom <= top
+            or left < 0.0 or top < 0.0
+            or right > float(width) or bottom > float(height)
+        ):
+            return False, "turnsign_incomplete_bbox"
         return True, "turnsign_candidate"
+
+    def _snapshot_ready(self, det, frame=None):
+        """Complete, sufficiently large box in the central 80% of the frame."""
+        if det is None:
+            return False
+        height, width = self._frame_size(frame)
+        if self._detection_area_ratio(det, frame) < self.snapshot_min_area_ratio:
+            return False
+        try:
+            left, top, right, bottom = [
+                float(value) for value in (det or {}).get("bbox")[:4]]
+        except (TypeError, ValueError, IndexError):
+            return False
+        if (
+            right <= left or bottom <= top
+            or left < 0.0 or top < 0.0
+            or right > float(width) or bottom > float(height)
+        ):
+            return False
+        center_x = 0.5 * (left + right)
+        return bool(
+            float(width) * self.snapshot_edge_margin_ratio <= center_x <=
+            float(width) * (1.0 - self.snapshot_edge_margin_ratio)
+        )
 
     def _select_turnsign_with_status(self, detections, frame=None):
         """Select one valid TurnSign and retain why rejected boxes failed."""
+        if _near_door_turnsign_conflict(
+                detections,
+                self.door_conflict_score,
+                self.door_conflict_distance_px_640,
+                frame):
+            return None, "turnsign_door_conflict"
         candidates = []
         rejected = []
         for det in detections or []:
@@ -1269,7 +1397,8 @@ class AsyncTurnSignOcrApiProcessor:
             candidates.append((score + area * 4.0, det))
         if not candidates:
             priority = (
-                "turnsign_too_small", "turnsign_too_far",
+                "turnsign_door_conflict", "turnsign_too_small",
+                "turnsign_incomplete_bbox",
                 "turnsign_low_score", "turnsign_bad_bbox")
             status = next(
                 (item for item in priority if item in rejected),
@@ -1549,6 +1678,39 @@ class AsyncTurnSignOcrApiProcessor:
         self.latest_response_ts = float(timestamp)
         return response
 
+    def _door_conflict_response(self, timestamp):
+        """Reject a nearby high-confidence Door/TurnSign duplicate."""
+        self._invalidate_stable_result()
+        self.last_turnsign_seen_ts = 0.0
+        self.last_turnsign_bbox = None
+        self.last_position_detection = None
+        self.tracking_misses = 0
+        result = fixed_unknown_result("", "turnsign_door_conflict")
+        response = {
+            "active": False,
+            "status": "turnsign_door_conflict",
+            "control_phase": "turnsign_door_conflict",
+            "instruction": result,
+            "latest_instruction": result,
+            "instruction_current": False,
+            "worker_ready": self.worker_ready,
+            "error": self.worker_error or None,
+            "clear_result": True,
+            "confirm_count": 0,
+            "confirm_frames": self.confirm_frames,
+            "session_id": None,
+            "session_active": False,
+            "turnsign_resolved": False,
+            "candidate_status": "turnsign_door_conflict",
+            "current_detection_fresh": False,
+            "stop_size_reached": False,
+            "position_ready": False,
+            "snapshot_captured": False,
+        }
+        self.latest_response = dict(response)
+        self.latest_response_ts = float(timestamp)
+        return response
+
     def _abort_unresolved_session(self, status, control_phase, timestamp):
         """Release one unresolved sign session and reject its late result."""
         self.min_result_request_id = max(
@@ -1680,6 +1842,12 @@ class AsyncTurnSignOcrApiProcessor:
         context = context if isinstance(context, dict) else {}
         if bool(context.get("suppress_turnsign_right_merge")):
             return self._right_merge_suppressed_response(ts)
+        if _near_door_turnsign_conflict(
+                detections,
+                self.door_conflict_score,
+                self.door_conflict_distance_px_640,
+                frame):
+            return self._door_conflict_response(ts)
         if self.turnsign_suppressed:
             # Re-enable with a clean confirmation window. The next road sign
             # must independently satisfy the normal consecutive-frame gate.
@@ -1692,7 +1860,12 @@ class AsyncTurnSignOcrApiProcessor:
             detections, frame)
         fresh_turnsign_detected = det is not None
         continuation = False
-        if det is None and self.session_active and not self.session_resolved:
+        if (
+            det is None
+            and candidate_status != "turnsign_door_conflict"
+            and self.session_active
+            and not self.session_resolved
+        ):
             det = self._select_tracking_continuation(detections, frame)
             continuation = det is not None
             if continuation:
@@ -1776,10 +1949,11 @@ class AsyncTurnSignOcrApiProcessor:
         position_ready = (
             position_info.get("control_phase") ==
             "turnsign_position_ready")
+        snapshot_ready = self._snapshot_ready(position_det, frame)
         if (
             self.session_active
             and not self.session_resolved
-            and position_ready
+            and snapshot_ready
             and self.turnsign_snapshot_crop is None
         ):
             self._capture_turnsign_snapshot(frame, position_det, ts)
@@ -1787,7 +1961,7 @@ class AsyncTurnSignOcrApiProcessor:
 
         # Keep the old field for callers that already consume it, while the
         # new field names the actual line-and-edge positioning condition.
-        stop_size_reached = bool(position_ready)
+        stop_size_reached = bool(snapshot_ready)
         work_det = (
             position_det or self.turnsign_snapshot_detection or
             self.last_position_detection)
@@ -1811,6 +1985,7 @@ class AsyncTurnSignOcrApiProcessor:
             "class_continuation": bool(continuation),
             "stop_size_reached": stop_size_reached,
             "position_ready": bool(position_ready),
+            "snapshot_ready": bool(snapshot_ready),
             "area_ratio": (
                 self._detection_area_ratio(det, frame) if det is not None else None
             ),
@@ -1862,12 +2037,8 @@ class AsyncTurnSignOcrApiProcessor:
                 "ocr_unavailable", "api_done", "api_done_recent",
                 "cache_hit",
             }
-            fresh_position = (
-                det is not None
-                and self._position_info(det, frame).get("control_phase") ==
-                "turnsign_position_ready"
-            )
-            if terminal_retry and fresh_position:
+            fresh_snapshot = self._snapshot_ready(det, frame)
+            if terminal_retry and fresh_snapshot:
                 refreshed = self._refresh_turnsign_snapshot(frame, det, ts)
                 response["snapshot_refreshed"] = refreshed is not None
                 response["snapshot_captured"] = refreshed is not None
