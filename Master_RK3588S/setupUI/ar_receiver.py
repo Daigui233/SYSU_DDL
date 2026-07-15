@@ -140,7 +140,9 @@ class RuntimeState:
                 self._ocr_text = ""
                 self._api_choice = ""
                 self._api_reason = ""
-            self._ocr_status = str(response.get("status") or "not_started")
+            self._ocr_status = str(
+                response.get("control_phase") or
+                response.get("status") or "not_started")
             if next_text:
                 self._ocr_text = next_text
             if next_choice in {"left", "right"}:
@@ -628,11 +630,21 @@ def create_ocr_processor():
             confirm_iou=env_float("AR_TURNSIGN_CONFIRM_IOU", 0.30),
             confirm_max_misses=max(
                 0, int(env_float("AR_TURNSIGN_CONFIRM_MAX_MISSES", 2))),
-            min_det_score=env_float("AR_TURNSIGN_MIN_DET_SCORE", 0.25),
-            # The third tracked detection prewarms OCR. This separate size gate
-            # freezes/submits the image only at about 140x69 px in 640x480.
-            min_area_ratio=env_float("AR_TURNSIGN_MIN_AREA_RATIO", 0.031),
-            min_ocr_confidence=env_float("AR_TURNSIGN_MIN_OCR_CONFIDENCE", 0.30),
+            min_det_score=env_float("AR_TURNSIGN_MIN_DET_SCORE", 0.40),
+            min_area_ratio=env_float("AR_TURNSIGN_MIN_AREA_RATIO", 0.01),
+            detection_line_ratio=env_float(
+                "AR_TURNSIGN_DETECTION_LINE_RATIO", 185.0 / 480.0),
+            preconfirm_line_distance_px_480=env_float(
+                "AR_TURNSIGN_PRECONFIRM_LINE_DISTANCE_480", 45.0),
+            edge_margin_ratio=env_float(
+                "AR_TURNSIGN_EDGE_MARGIN_RATIO", 0.15),
+            confirmed_max_misses=max(
+                0, int(env_float("AR_TURNSIGN_CONFIRMED_MAX_MISSES", 3))),
+            session_absence_timeout_s=env_float(
+                "AR_TURNSIGN_SESSION_ABSENCE_TIMEOUT_S", 3.0),
+            ocr_response_timeout_s=env_float(
+                "AR_TURNSIGN_RESPONSE_TIMEOUT_S", 10.0),
+            min_ocr_confidence=env_float("AR_TURNSIGN_MIN_OCR_CONFIDENCE", 0.40),
             stable_frames=max(1, int(env_float("AR_TURNSIGN_STABLE_FRAMES", 2))),
             stable_duration_s=env_float("AR_TURNSIGN_STABLE_DURATION_S", 0.50),
             stable_bypass_confidence=env_float("AR_TURNSIGN_STABLE_BYPASS_CONFIDENCE", 0.90),
@@ -643,7 +655,11 @@ def create_ocr_processor():
             async_api=True,
             log_func=lambda message: print(f"[OCR] {message}"),
         )
-        print("[OCR] TurnSign OCR/API enabled (3 detections prewarm; 3.1% snapshot gate)")
+        print(
+            "[OCR] TurnSign OCR/API enabled "
+            "(3 valid frames; det/OCR confidence>=0.40; "
+            "area>=1%; line_y=185px and bbox_top<=230px@480p; "
+            "exit after 3s no TurnSign or 10s no OCR response)")
         return processor
     except Exception as exc:
         print(f"[OCR] unavailable: {exc}")
@@ -705,12 +721,36 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     )
     if not isinstance(ocr_response, dict):
         return frame
-    status = str(ocr_response.get("status") or "-")
-    if status in {"turnsign_confirming", "turnsign_confirmation_paused"}:
+    phase = str(ocr_response.get("control_phase") or "")
+    phase_labels = {
+        "no_turnsign": "NONE",
+        "turnsign_low_score": "LOW_SCORE",
+        "turnsign_too_small": "TOO_SMALL",
+        "turnsign_too_far": "TOO_FAR",
+        "turnsign_bad_bbox": "BAD_BOX",
+        "turnsign_confirming": "CONFIRM",
+        "turnsign_initial_brake": "BRAKE_0.5S",
+        "turnsign_approach": "APPROACH",
+        "turnsign_edge_left": "EDGE_LEFT",
+        "turnsign_edge_right": "EDGE_RIGHT",
+        "turnsign_edge_over_line": "EDGE_OVER_LINE",
+        "turnsign_reverse": "REVERSE_2S",
+        "turnsign_post_reverse_stop": "RECHECK_STOP",
+        "turnsign_missing_hold": "MISS_HOLD",
+        "turnsign_missing_stop": "MISS_STOP",
+        "turnsign_ocr_wait": "STOP_WAIT_OCR",
+        "turnsign_consumed": "RESULT_LATCHED",
+        "turnsign_exit_no_sign": "EXIT_NO_SIGN_3S",
+        "turnsign_exit_ocr_timeout": "EXIT_TIMEOUT_10S",
+        "ocr_wait_route": "WAIT_ROUTE",
+        "ocr_route_ready": "ROUTE_READY",
+    }
+    status = phase_labels.get(
+        phase, str(ocr_response.get("status") or "-"))
+    if phase == "turnsign_confirming":
         status = (
             f"{status} {int(ocr_response.get('confirm_count') or 0)}/"
-            f"{int(ocr_response.get('confirm_frames') or 3)}"
-        )
+            f"{int(ocr_response.get('confirm_frames') or 3)}")
     instruction = ocr_response.get("instruction") or {}
     latest_instruction = ocr_response.get("latest_instruction") or {}
     choice = instruction_direction(instruction) or instruction_direction(latest_instruction) or "-"
@@ -723,6 +763,21 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
         (0, 255, 255),
         2,
     )
+    line_y = int(round(float(ocr_response.get(
+        "detection_line_y", frame.shape[0] * (185.0 / 480.0)))))
+    left_edge = int(round(float(ocr_response.get(
+        "left_edge_x", frame.shape[1] * 0.15))))
+    right_edge = int(round(float(ocr_response.get(
+        "right_edge_x", frame.shape[1] * 0.85))))
+    cv2.line(
+        frame, (0, line_y), (frame.shape[1] - 1, line_y),
+        (0, 200, 255), 1, cv2.LINE_AA)
+    cv2.line(
+        frame, (left_edge, 0), (left_edge, line_y),
+        (0, 200, 255), 1, cv2.LINE_AA)
+    cv2.line(
+        frame, (right_edge, 0), (right_edge, line_y),
+        (0, 200, 255), 1, cv2.LINE_AA)
     return frame
 
 
@@ -928,6 +983,9 @@ def main():
                             latest_ocr_response,
                             now=time.monotonic(),
                         )
+                        # Vision control may refine the OCR phase to REVERSE,
+                        # WAIT_ROUTE or ROUTE_READY for the on-screen status.
+                        state.update_ocr(latest_ocr_response)
                         state.update_perception(perception_result)
                         if vision_control_send and control_runtime is not None and command:
                             control_runtime.update_vision_command(

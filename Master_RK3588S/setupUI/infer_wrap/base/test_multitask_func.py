@@ -4,6 +4,8 @@ import numpy as np
 
 from .func import (
     CLASSES,
+    DET_SCORE_THRESHOLD,
+    DET_TURNSIGN_SCORE_THRESHOLD,
     PATH_SOURCE,
     RENDER_MODE,
     _is_oversized_render_box,
@@ -18,6 +20,28 @@ from .func import (
 
 
 class MultiTaskPostprocessTest(unittest.TestCase):
+    def test_turnsign_threshold_is_point_four_while_other_classes_use_point_five(self):
+        self.assertAlmostEqual(0.50, DET_SCORE_THRESHOLD)
+        self.assertAlmostEqual(0.40, DET_TURNSIGN_SCORE_THRESHOLD)
+
+        boxes = np.asarray([
+            [0.0, 0.0, 20.0, 20.0],
+            [30.0, 0.0, 50.0, 20.0],
+            [60.0, 0.0, 80.0, 20.0],
+        ], dtype=np.float32)
+        scores = np.zeros((3, len(CLASSES)), dtype=np.float32)
+        scores[0, CLASSES.index("TurnSign")] = 0.35
+        scores[1, CLASSES.index("TurnSign")] = 0.45
+        scores[2, CLASSES.index("Human")] = 0.55
+
+        results = detection_nms(boxes, scores)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual(
+            {CLASSES.index("TurnSign"), CLASSES.index("Human")},
+            {item[0] for item in results},
+        )
+
     def make_outputs(self):
         boxes = np.zeros((1, 6300, 4), dtype=np.float32)
         scores = np.zeros((1, 6300, 8), dtype=np.float32)

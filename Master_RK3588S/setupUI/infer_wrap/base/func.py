@@ -58,6 +58,8 @@ def _env_bool(name, default):
 
 
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.50)
+DET_TURNSIGN_SCORE_THRESHOLD = _env_float(
+    "MULTITASK_TURNSIGN_THRESHOLD", 0.40)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.45)
 DET_PRE_NMS_TOP_K = max(1, _env_int("MULTITASK_PRE_NMS_TOP_K", 1000))
 MAX_DETECTIONS = max(1, _env_int("MULTITASK_MAX_DETECTIONS", 100))
@@ -361,7 +363,8 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
                   iou_threshold=DET_NMS_THRESHOLD,
                   pre_nms_top_k=DET_PRE_NMS_TOP_K,
                   max_detections=MAX_DETECTIONS,
-                  coin_min_short_side=COIN_MIN_SHORT_SIDE):
+                  coin_min_short_side=COIN_MIN_SHORT_SIDE,
+                  turnsign_score_threshold=DET_TURNSIGN_SCORE_THRESHOLD):
     """Apply main-branch argmax filtering and class-wise NMS."""
     results = []
     pre_nms_top_k = max(1, int(pre_nms_top_k))
@@ -373,10 +376,19 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
     best_classes = np.argmax(scores, axis=1).astype(np.int32, copy=False)
     best_scores = scores[
         np.arange(scores.shape[0], dtype=np.int32), best_classes]
-    eligible = valid_boxes & (best_scores >= float(score_threshold))
+    turnsign_class_id = CLASSES.index("TurnSign")
+    class_thresholds = np.where(
+        best_classes == turnsign_class_id,
+        float(turnsign_score_threshold),
+        float(score_threshold),
+    )
+    eligible = valid_boxes & (best_scores >= class_thresholds)
 
     for class_id in np.unique(best_classes[eligible]):
         class_valid = eligible & (best_classes == class_id)
+        if CLASSES[class_id] == "TurnSign":
+            class_valid = class_valid & (
+                best_scores >= float(turnsign_score_threshold))
         if CLASSES[class_id] == "Coin" and coin_min_short_side > 0.0:
             # Training ignores Coin boxes whose short side is below 10 px in
             # the fixed 640x480 input. Apply the same rule before NMS so tiny
