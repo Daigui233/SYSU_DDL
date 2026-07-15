@@ -1746,6 +1746,7 @@ class AsyncTurnSignOcrApiProcessor:
 
         base = {
             "active": bool(det is not None or self.session_active),
+            "current_detection_fresh": bool(det is not None),
             "detection": work_det,
             "instruction": fixed_unknown_result("", "ocr_pending"),
             "latest_instruction": self.latest_result,
@@ -1788,7 +1789,8 @@ class AsyncTurnSignOcrApiProcessor:
             for key in (
                 "detection_line_y", "left_edge_x", "right_edge_x",
                 "bbox_top", "bbox_center_x", "edge_side",
-                "detection_fresh", "tracking_misses",
+                "detection_fresh", "current_detection_fresh",
+                "tracking_misses",
             ):
                 if key in base:
                     response[key] = base[key]

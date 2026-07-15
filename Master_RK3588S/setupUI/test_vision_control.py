@@ -150,6 +150,33 @@ def _curve_blue_angle_result(angle_deg):
     return result
 
 
+def _curve_trim_result(far_gap_640, lookahead_gap_640=None):
+    ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+    lookahead_gap = (
+        float(far_gap_640) if lookahead_gap_640 is None
+        else float(lookahead_gap_640))
+    # At 480p the trim band is y=168..300. Keep the requested far gap above
+    # the band and taper it toward the independently controlled lookahead gap.
+    blend = np.clip((ys - 168.0) / (300.0 - 168.0), 0.0, 1.0)
+    gaps = float(far_gap_640) * (1.0 - blend) + lookahead_gap * blend
+    blue_x = np.full_like(ys, 260.0)
+    green_x = blue_x + gaps.astype(np.float32)
+    return {
+        "centerline": {"curve_paths": [
+            {
+                "slot": 0, "role": "left", "score": 0.9,
+                "points_xy": np.stack((blue_x, ys), axis=1),
+            },
+            {
+                "slot": 1, "role": "right", "score": 0.9,
+                "points_xy": np.stack((green_x, ys), axis=1),
+            },
+        ]},
+        "image_shape": (480, 640, 3),
+        "detections": [],
+    }
+
+
 def _ocr_response(direction="right", active=False):
     return {
         "active": active,
@@ -1480,6 +1507,534 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(STATE_TRACK, released["state_cmd"])
         self.assertEqual(
             "track", released_debug["control_target"]["task_reason"])
+
+    def test_turnsign_trim_uses_far_band_when_lookahead_gap_is_small(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve",
+            path_smooth_window=1,
+            turnsign_reverse_speed_mps=-0.08,
+            turnsign_reverse_duration_s=0.5,
+            turnsign_trim_low_separation_px_640=36.0,
+            turnsign_trim_high_separation_px_640=70.0,
+        ))
+        response = {
+            "active": True,
+            "session_active": True,
+            "session_id": 21,
+            "control_phase": "turnsign_approach",
+            "bbox_center_x": 400.0,
+            "current_detection_fresh": True,
+        }
+
+        command, debug = planner.update(
+            _curve_trim_result(100.0, lookahead_gap_640=20.0),
+            response, now=1.0)
+
+        self.assertAlmostEqual(-0.08, command["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_reverse",
+            debug["control_target"]["task_reason"])
+        self.assertLess(
+            debug["turnsign_trim_lookahead_separation_640"], 36.0)
+        self.assertGreater(
+            debug["turnsign_trim_separation_640"], 70.0)
+
+    def test_turnsign_trim_forward_steers_toward_last_left_sign(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_reverse_speed_mps=-0.08,
+            turnsign_reverse_duration_s=0.5,
+        ))
+        response = {
+            "active": True,
+            "session_active": True,
+            "session_id": 22,
+            "control_phase": "turnsign_approach",
+            "bbox_center_x": 200.0,
+            "current_detection_fresh": True,
+        }
+
+        command, debug = planner.update(
+            _curve_trim_result(20.0), response, now=1.0)
+
+        self.assertAlmostEqual(0.08, command["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_forward",
+            debug["control_target"]["task_reason"])
+        self.assertLess(command["track_error"], 0.0)
+
+    def test_turnsign_trim_small_offset_uses_minimum_steering(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_trim_center_deadband_px_640=24.0,
+            turnsign_trim_steer_deadband_px_640=4.0,
+            turnsign_trim_min_steer_px_640=32.0,
+        ))
+        response = {
+            "active": True,
+            "session_active": True,
+            "session_id": 37,
+            "control_phase": "turnsign_ocr_wait",
+            "bbox_center_x": 330.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+        }
+
+        command, debug = planner.update(
+            _curve_trim_result(20.0), response, now=1.0)
+
+        self.assertAlmostEqual(0.08, command["target_speed"])
+        self.assertAlmostEqual(32.0, command["track_error"])
+        self.assertTrue(debug["turnsign_trim_current_centered"])
+
+    def test_turnsign_stable_centered_stops_regardless_separation(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_trim_low_separation_px_640=175.0,
+            turnsign_trim_high_separation_px_640=220.0,
+        ))
+        response = {
+            "active": True,
+            "session_active": True,
+            "session_id": 26,
+            "control_phase": "turnsign_ocr_wait",
+            "bbox_center_x": 320.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+        }
+
+        command, debug = planner.update(
+            _curve_trim_result(300.0), response, now=1.0)
+
+        self.assertEqual(STATE_SAFE_STOP, command["state_cmd"])
+        self.assertEqual(0.0, command["target_speed"])
+        self.assertEqual(
+            "turnsign_ocr_wait",
+            debug["control_target"]["task_reason"])
+        self.assertEqual(0, debug["turnsign_trim_direction"])
+        self.assertTrue(debug["turnsign_trim_stop_ready"])
+
+    def test_turnsign_trim_in_range_but_off_center_still_pulses(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_trim_low_separation_px_640=175.0,
+            turnsign_trim_high_separation_px_640=220.0,
+        ))
+        response = {
+            "active": True,
+            "session_active": True,
+            "session_id": 27,
+            "control_phase": "turnsign_ocr_wait",
+            "bbox_center_x": 400.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+        }
+
+        command, debug = planner.update(
+            _curve_trim_result(180.0), response, now=1.0)
+
+        self.assertAlmostEqual(0.08, command["target_speed"])
+        self.assertGreater(command["track_error"], 0.0)
+        self.assertEqual(
+            "turnsign_trim_forward",
+            debug["control_target"]["task_reason"])
+        self.assertFalse(debug["turnsign_trim_stop_ready"])
+
+    def test_turnsign_trim_verifies_centered_sign_for_three_frames(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_trim_stable_frames=3,
+        ))
+
+        def response():
+            return {
+                "active": True,
+                "session_active": True,
+                "session_id": 28,
+                "control_phase": "turnsign_ocr_wait",
+                "bbox_center_x": 320.0,
+                "current_detection_fresh": True,
+            }
+
+        first, first_debug = planner.update(
+            _curve_trim_result(200.0), response(), now=1.0)
+        second, second_debug = planner.update(
+            _curve_trim_result(200.0), response(), now=1.05)
+        third, third_debug = planner.update(
+            _curve_trim_result(200.0), response(), now=1.10)
+
+        self.assertEqual(0.0, first["target_speed"])
+        self.assertEqual(0.0, second["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_verify",
+            first_debug["control_target"]["task_reason"])
+        self.assertEqual(
+            "turnsign_trim_verify",
+            second_debug["control_target"]["task_reason"])
+        self.assertEqual(0.0, third["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_ready",
+            third_debug["control_target"]["task_reason"])
+        self.assertTrue(third_debug["turnsign_trim_stop_ready"])
+
+    def test_turnsign_trim_one_line_before_any_split_moves_forward(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+        response = {
+            "active": True,
+            "session_active": True,
+            "session_id": 31,
+            "control_phase": "turnsign_ocr_wait",
+            "bbox_center_x": 320.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+        }
+
+        command, debug = planner.update(
+            _curve_result_at(260.0, 420.0, slots=(0,)),
+            response, now=1.0)
+
+        self.assertAlmostEqual(0.08, command["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_forward",
+            debug["control_target"]["task_reason"])
+        self.assertFalse(debug["turnsign_trim_line_ever_split"])
+
+    def test_turnsign_trim_split_then_one_line_latches_reverse(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_trim_split_px_640=36.0,
+            turnsign_trim_split_frames=3,
+            turnsign_trim_collapse_frames=2,
+            turnsign_trim_settle_s=0.8,
+        ))
+
+        def response():
+            return {
+                "active": True,
+                "session_active": True,
+                "session_id": 32,
+                "control_phase": "turnsign_ocr_wait",
+                "bbox_center_x": 400.0,
+                "current_detection_fresh": True,
+                "confirm_count": 3,
+            }
+
+        planner.update(_curve_trim_result(100.0), response(), now=1.0)
+        planner.update(_curve_trim_result(100.0), response(), now=1.1)
+        _command, split_debug = planner.update(
+            _curve_trim_result(100.0), response(), now=1.2)
+        planner.update(
+            _curve_result_at(260.0, 420.0, slots=(0,)),
+            response(), now=1.5)
+        _command, collapsed_debug = planner.update(
+            _curve_result_at(260.0, 420.0, slots=(0,)),
+            response(), now=1.6)
+        command, debug = planner.update(
+            _curve_result_at(260.0, 420.0, slots=(0,)),
+            response(), now=2.3)
+
+        self.assertTrue(split_debug["turnsign_trim_line_ever_split"])
+        self.assertTrue(collapsed_debug[
+            "turnsign_trim_overshoot_latched"])
+        self.assertAlmostEqual(-0.08, command["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_reverse",
+            debug["control_target"]["task_reason"])
+
+    def test_turnsign_trim_large_to_small_separation_latches_reverse(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_trim_split_px_640=36.0,
+            turnsign_trim_split_frames=3,
+            turnsign_trim_collapse_frames=2,
+            turnsign_trim_drop_px_640=45.0,
+            turnsign_trim_settle_s=0.8,
+        ))
+
+        def response():
+            return {
+                "active": True,
+                "session_active": True,
+                "session_id": 33,
+                "control_phase": "turnsign_ocr_wait",
+                "bbox_center_x": 400.0,
+                "current_detection_fresh": True,
+                "confirm_count": 3,
+            }
+
+        planner.update(_curve_trim_result(120.0), response(), now=1.0)
+        planner.update(_curve_trim_result(120.0), response(), now=1.1)
+        planner.update(_curve_trim_result(120.0), response(), now=1.2)
+        planner.update(_curve_trim_result(40.0), response(), now=1.5)
+        planner.update(_curve_trim_result(40.0), response(), now=1.6)
+        planner.update(_curve_trim_result(40.0), response(), now=1.7)
+        _command, dropped_debug = planner.update(
+            _curve_trim_result(40.0), response(), now=1.8)
+        command, debug = planner.update(
+            _curve_trim_result(40.0), response(), now=2.3)
+
+        self.assertTrue(dropped_debug[
+            "turnsign_trim_overshoot_latched"])
+        self.assertAlmostEqual(-0.08, command["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_reverse",
+            debug["control_target"]["task_reason"])
+
+    def test_turnsign_trim_defers_api_route_until_two_lines_are_clear(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_trim_split_px_640=36.0,
+            turnsign_trim_split_frames=3,
+        ))
+        active = {
+            "active": True,
+            "session_active": True,
+            "session_id": 34,
+            "control_phase": "turnsign_ocr_wait",
+            "bbox_center_x": 400.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+        }
+        api = dict(
+            active,
+            instruction_current=True,
+            instruction={"direction": "right"},
+            turnsign_resolved=True,
+        )
+        held = dict(
+            active,
+            instruction_current=False,
+            turnsign_resolved=True,
+        )
+
+        planner.update(
+            _curve_result_at(260.0, 420.0, slots=(0,)),
+            active, now=1.0)
+        _command, pending_debug = planner.update(
+            _curve_result_at(260.0, 420.0, slots=(0,)),
+            api, now=1.1)
+        planner.update(_curve_trim_result(100.0), held, now=1.5)
+        planner.update(_curve_trim_result(100.0), held, now=1.6)
+        _command, ready_debug = planner.update(
+            _curve_trim_result(100.0), held, now=1.7)
+
+        self.assertEqual("left", pending_debug["branch_lock"])
+        self.assertEqual(
+            "right", pending_debug["turnsign_trim_pending_ocr_direction"])
+        self.assertEqual("right", ready_debug["branch_lock"])
+        self.assertIsNone(
+            ready_debug["turnsign_trim_pending_ocr_direction"])
+
+    def test_turnsign_trim_defers_api_arriving_on_first_session_frame(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+        api = {
+            "active": True,
+            "session_active": True,
+            "session_id": 36,
+            "control_phase": "turnsign_consumed",
+            "bbox_center_x": 400.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+            "instruction_current": True,
+            "instruction": {"direction": "right"},
+            "turnsign_resolved": True,
+        }
+
+        command, debug = planner.update(
+            _curve_result_at(260.0, 420.0, slots=(0,)),
+            api, now=1.0)
+
+        self.assertEqual("left", debug["branch_lock"])
+        self.assertEqual(
+            "right", debug["turnsign_trim_pending_ocr_direction"])
+        self.assertAlmostEqual(0.08, command["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_forward",
+            debug["control_target"]["task_reason"])
+
+    def test_turnsign_trim_steering_grows_with_missing_severity(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_reverse_duration_s=0.5,
+            turnsign_trim_steer_gain=0.20,
+            turnsign_trim_missing_steer_gain=0.45,
+            turnsign_trim_severe_missing_frames=3,
+            turnsign_trim_severe_steer_gain=0.70,
+        ))
+        visible = {
+            "active": True,
+            "session_active": True,
+            "session_id": 35,
+            "control_phase": "turnsign_ocr_wait",
+            "bbox_center_x": 400.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+        }
+        missing = {
+            "active": True,
+            "session_active": True,
+            "session_id": 35,
+            "control_phase": "turnsign_missing_hold",
+            "detection": {"bbox": [350.0, 80.0, 450.0, 150.0]},
+            "current_detection_fresh": False,
+        }
+
+        visible_command, _debug = planner.update(
+            _curve_trim_result(20.0), visible, now=1.0)
+        mild_command, _debug = planner.update(
+            _curve_trim_result(20.0), missing, now=1.1)
+        planner.update(_curve_trim_result(20.0), missing, now=1.2)
+        severe_command, severe_debug = planner.update(
+            _curve_trim_result(20.0), missing, now=1.3)
+
+        self.assertLess(
+            abs(visible_command["track_error"]),
+            abs(mild_command["track_error"]))
+        self.assertLess(
+            abs(mild_command["track_error"]),
+            abs(severe_command["track_error"]))
+        self.assertEqual(3, severe_debug["turnsign_trim_missing_frames"])
+
+    def test_turnsign_trim_in_range_missing_sign_restarts_forward_pulse(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+        visible = {
+            "active": True,
+            "session_active": True,
+            "session_id": 29,
+            "control_phase": "turnsign_ocr_wait",
+            "bbox_center_x": 315.0,
+            "current_detection_fresh": True,
+            "confirm_count": 3,
+        }
+        missing = {
+            "active": True,
+            "session_active": True,
+            "session_id": 29,
+            "control_phase": "turnsign_missing_hold",
+            "detection": {"bbox": [265.0, 80.0, 365.0, 150.0]},
+            "current_detection_fresh": False,
+        }
+
+        stopped, stopped_debug = planner.update(
+            _curve_trim_result(180.0), visible, now=1.0)
+        command, debug = planner.update(
+            _curve_trim_result(180.0), missing, now=1.1)
+
+        self.assertEqual(0.0, stopped["target_speed"])
+        self.assertTrue(stopped_debug["turnsign_trim_stop_ready"])
+        self.assertAlmostEqual(0.08, command["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_forward",
+            debug["control_target"]["task_reason"])
+        self.assertFalse(debug["turnsign_trim_stop_ready"])
+
+    def test_turnsign_trim_waits_point_eight_seconds_before_retry(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_reverse_duration_s=0.5,
+            turnsign_trim_settle_s=0.8,
+        ))
+
+        def response():
+            return {
+                "active": True,
+                "session_active": True,
+                "session_id": 30,
+                "control_phase": "turnsign_ocr_wait",
+                "bbox_center_x": 400.0,
+                "current_detection_fresh": True,
+                "confirm_count": 3,
+            }
+
+        first, first_debug = planner.update(
+            _curve_trim_result(180.0), response(), now=1.0)
+        settled, settled_debug = planner.update(
+            _curve_trim_result(180.0), response(), now=1.5)
+        waiting, waiting_debug = planner.update(
+            _curve_trim_result(180.0), response(), now=2.29)
+        retried, retried_debug = planner.update(
+            _curve_trim_result(180.0), response(), now=2.30)
+
+        self.assertAlmostEqual(0.08, first["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_forward",
+            first_debug["control_target"]["task_reason"])
+        self.assertEqual(0.0, settled["target_speed"])
+        self.assertEqual(0.0, waiting["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_settle",
+            settled_debug["control_target"]["task_reason"])
+        self.assertEqual(
+            "turnsign_trim_settle",
+            waiting_debug["control_target"]["task_reason"])
+        self.assertAlmostEqual(0.08, retried["target_speed"])
+        self.assertEqual(
+            "turnsign_trim_forward",
+            retried_debug["control_target"]["task_reason"])
+
+    def test_turnsign_trim_reverse_steers_opposite_last_lost_side(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1,
+            turnsign_reverse_speed_mps=-0.08,
+            turnsign_reverse_duration_s=0.5,
+            turnsign_trim_settle_s=0.15,
+        ))
+        visible = {
+            "active": True,
+            "session_active": True,
+            "session_id": 23,
+            "control_phase": "turnsign_approach",
+            "bbox_center_x": 200.0,
+            "current_detection_fresh": True,
+        }
+        missing = {
+            "active": True,
+            "session_active": True,
+            "session_id": 23,
+            "control_phase": "turnsign_missing_hold",
+            "detection": {"bbox": [150.0, 80.0, 250.0, 150.0]},
+            "current_detection_fresh": False,
+        }
+
+        planner.update(_curve_trim_result(300.0), visible, now=1.0)
+        _settle, settle_debug = planner.update(
+            _curve_trim_result(300.0), missing, now=1.5)
+        command, debug = planner.update(
+            _curve_trim_result(300.0), missing, now=1.65)
+
+        self.assertEqual(
+            "turnsign_trim_settle",
+            settle_debug["control_target"]["task_reason"])
+        self.assertAlmostEqual(-120.0, debug[
+            "turnsign_last_lost_delta_640"])
+        self.assertAlmostEqual(-0.08, command["target_speed"])
+        self.assertGreater(command["track_error"], 0.0)
+
+    def test_turnsign_trim_right_correction_flips_with_motion_direction(self):
+        common = {
+            "active": True,
+            "session_active": True,
+            "control_phase": "turnsign_approach",
+            "bbox_center_x": 440.0,
+            "current_detection_fresh": True,
+        }
+        forward_planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+        reverse_planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+
+        forward, forward_debug = forward_planner.update(
+            _curve_trim_result(20.0),
+            dict(common, session_id=24), now=1.0)
+        reverse, reverse_debug = reverse_planner.update(
+            _curve_trim_result(300.0),
+            dict(common, session_id=25), now=1.0)
+
+        self.assertGreater(forward["track_error"], 0.0)
+        self.assertLess(reverse["track_error"], 0.0)
 
     def test_explicit_turnsign_edge_uses_gain_one_point_five(self):
         planner = VisionControlPlanner(config=_config())

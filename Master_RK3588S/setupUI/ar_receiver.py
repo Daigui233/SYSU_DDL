@@ -229,6 +229,29 @@ class RuntimeState:
                     "ocr_lock_expired", False)),
                 "ocr_lock_remaining_s": vision_control.get(
                     "ocr_lock_remaining_s"),
+                "turnsign_trim_separation_640": vision_control.get(
+                    "turnsign_trim_separation_640"),
+                "turnsign_trim_lookahead_separation_640": (
+                    vision_control.get(
+                        "turnsign_trim_lookahead_separation_640")),
+                "turnsign_trim_direction": vision_control.get(
+                    "turnsign_trim_direction"),
+                "turnsign_trim_position_delta_640": vision_control.get(
+                    "turnsign_trim_position_delta_640"),
+                "turnsign_trim_fresh_frames": vision_control.get(
+                    "turnsign_trim_fresh_frames"),
+                "turnsign_trim_current_centered": vision_control.get(
+                    "turnsign_trim_current_centered"),
+                "turnsign_trim_stop_ready": vision_control.get(
+                    "turnsign_trim_stop_ready"),
+                "turnsign_trim_line_split_ready": vision_control.get(
+                    "turnsign_trim_line_split_ready"),
+                "turnsign_trim_line_ever_split": vision_control.get(
+                    "turnsign_trim_line_ever_split"),
+                "turnsign_trim_overshoot_latched": vision_control.get(
+                    "turnsign_trim_overshoot_latched"),
+                "turnsign_trim_accept_ready": vision_control.get(
+                    "turnsign_trim_accept_ready"),
                 "timings_ms": {
                     "path_search": float(
                         vision_timings.get("path_search", 0.0)),
@@ -730,6 +753,11 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
         "turnsign_bad_bbox": "BAD_BOX",
         "turnsign_confirming": "CONFIRM",
         "turnsign_lock_reverse": "LOCK_REVERSE_0.08_0.5S",
+        "turnsign_trim_forward": "TRIM_FORWARD_0.08_0.5S",
+        "turnsign_trim_reverse": "TRIM_REVERSE_0.08_0.5S",
+        "turnsign_trim_settle": "TRIM_OBSERVE_0.8S",
+        "turnsign_trim_verify": "TRIM_VERIFY_SIGN",
+        "turnsign_trim_ready": "TRIM_READY_TWO_LINES",
         "turnsign_approach": "APPROACH",
         "turnsign_edge_left": "EDGE_LEFT",
         "turnsign_edge_right": "EDGE_RIGHT",

@@ -300,6 +300,26 @@ class VisionControlConfig:
     turnsign_steer_gain: float = 1.5
     turnsign_reverse_speed_mps: float = -0.08
     turnsign_reverse_duration_s: float = 0.5
+    turnsign_trim_far_y_ratio: float = 0.35
+    turnsign_trim_sample_rows: int = 6
+    turnsign_trim_low_separation_px_640: float = 175.0
+    turnsign_trim_high_separation_px_640: float = 220.0
+    turnsign_trim_settle_s: float = 0.8
+    turnsign_trim_stable_frames: int = 3
+    turnsign_trim_center_deadband_px_640: float = 24.0
+    turnsign_trim_split_px_640: float = 36.0
+    turnsign_trim_split_frames: int = 3
+    turnsign_trim_collapse_frames: int = 2
+    turnsign_trim_drop_px_640: float = 45.0
+    turnsign_trim_steer_deadband_px_640: float = 4.0
+    turnsign_trim_min_steer_px_640: float = 32.0
+    turnsign_trim_steer_gain: float = 0.55
+    turnsign_trim_max_steer_px_640: float = 80.0
+    turnsign_trim_missing_steer_gain: float = 0.85
+    turnsign_trim_missing_max_steer_px_640: float = 110.0
+    turnsign_trim_severe_missing_frames: int = 3
+    turnsign_trim_severe_steer_gain: float = 1.10
+    turnsign_trim_severe_max_steer_px_640: float = 140.0
     human_stop_line_margin_ratio: float = 0.0
     human_stop_progress_ratio: float = 8.0 / 9.0
     human_preline_missing_px_480: float = 20.0
@@ -501,6 +521,65 @@ class VisionControlConfig:
             turnsign_steer_gain=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_STEER_GAIN", 1.5)),
             turnsign_reverse_speed_mps=-abs(_env_float("VISION_CONTROL_TURNSIGN_REVERSE_SPEED", -0.08)),
             turnsign_reverse_duration_s=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_REVERSE_DURATION_S", 0.5)),
+            turnsign_trim_far_y_ratio=_clamp(
+                _env_float("VISION_CONTROL_TURNSIGN_TRIM_FAR_Y_RATIO", 0.35),
+                0.05, 0.90),
+            turnsign_trim_sample_rows=max(
+                2, _env_int("VISION_CONTROL_TURNSIGN_TRIM_SAMPLE_ROWS", 6)),
+            turnsign_trim_low_separation_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_LOW_SEPARATION_640", 175.0)),
+            turnsign_trim_high_separation_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_HIGH_SEPARATION_640", 220.0)),
+            turnsign_trim_settle_s=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_SETTLE_S", 0.8)),
+            turnsign_trim_stable_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_TURNSIGN_TRIM_STABLE_FRAMES", 3)),
+            turnsign_trim_center_deadband_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_CENTER_DEADBAND_640", 24.0)),
+            turnsign_trim_split_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_SPLIT_640", 36.0)),
+            turnsign_trim_split_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_TURNSIGN_TRIM_SPLIT_FRAMES", 3)),
+            turnsign_trim_collapse_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_TURNSIGN_TRIM_COLLAPSE_FRAMES", 2)),
+            turnsign_trim_drop_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_DROP_640", 45.0)),
+            turnsign_trim_steer_deadband_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_STEER_DEADBAND_640", 4.0)),
+            turnsign_trim_min_steer_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_MIN_STEER_640", 32.0)),
+            turnsign_trim_steer_gain=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_STEER_GAIN", 0.55)),
+            turnsign_trim_max_steer_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_MAX_STEER_640", 80.0)),
+            turnsign_trim_missing_steer_gain=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_STEER_GAIN", 0.85)),
+            turnsign_trim_missing_max_steer_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_MAX_STEER_640", 110.0)),
+            turnsign_trim_severe_missing_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_MISSING_FRAMES", 3)),
+            turnsign_trim_severe_steer_gain=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_STEER_GAIN", 1.10)),
+            turnsign_trim_severe_max_steer_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_MAX_STEER_640", 140.0)),
             human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
             human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 8.0 / 9.0), 0.0, 1.0),
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
@@ -1353,7 +1432,35 @@ class VisionControlPlanner:
         self.sign_seen_frames = 0
         self.sign_latched_since = None
         self.turnsign_control_session_id = None
+        self.turnsign_new_session_pending = False
         self.turnsign_lock_reverse_until = 0.0
+        self.turnsign_trim_direction = 0
+        self.turnsign_trim_adaptive_pulse = False
+        self.turnsign_trim_session_adaptive = False
+        self.turnsign_trim_settle_until = 0.0
+        self.turnsign_trim_separation_640 = None
+        self.turnsign_trim_lookahead_separation_640 = None
+        self.turnsign_trim_separation_samples_640 = []
+        self.turnsign_last_seen_delta_640 = None
+        self.turnsign_last_lost_delta_640 = None
+        self.turnsign_trim_position_delta_640 = None
+        self.turnsign_detection_was_fresh = False
+        self.turnsign_trim_fresh_frames = 0
+        self.turnsign_trim_current_fresh = False
+        self.turnsign_trim_current_centered = False
+        self.turnsign_trim_stop_ready = False
+        self.turnsign_trim_missing_frames = 0
+        self.turnsign_trim_line_split_frames = 0
+        self.turnsign_trim_line_collapse_frames = 0
+        self.turnsign_trim_line_ever_split = False
+        self.turnsign_trim_line_split_ready = False
+        self.turnsign_trim_line_clear_current = False
+        self.turnsign_trim_overshoot_latched = False
+        self.turnsign_trim_max_lookahead_separation_640 = 0.0
+        self.turnsign_trim_line_history_ts = None
+        self.turnsign_trim_pending_ocr_direction = None
+        self.turnsign_trim_api_ready = False
+        self.turnsign_trim_accept_ready = False
 
     def update(self, perception_result, ocr_response=None, now=None):
         now = float(time.monotonic() if now is None else now)
@@ -1362,6 +1469,24 @@ class VisionControlPlanner:
         perception_result = perception_result if isinstance(perception_result, dict) else {}
         image_shape = self._image_shape(perception_result)
         candidates, search_ms = self._extract_candidates(perception_result, image_shape)
+        self._update_turnsign_curve_separation(candidates, image_shape)
+        response = ocr_response if isinstance(ocr_response, dict) else {}
+        incoming_session_id = response.get("session_id")
+        if (
+            bool(response.get("session_active"))
+            and incoming_session_id is not None
+            and incoming_session_id != self.turnsign_control_session_id
+        ):
+            # Establish the session before OCR route selection. A very fast
+            # API result on the first session frame must still wait until both
+            # curve slots are distinguishable at the lookahead row.
+            self.turnsign_control_session_id = incoming_session_id
+            self._reset_turnsign_trim_runtime()
+            self.turnsign_trim_session_adaptive = (
+                self.config.path_source == "curve")
+            self.turnsign_new_session_pending = True
+        if self.turnsign_trim_session_adaptive:
+            self._update_turnsign_line_history(now)
         raw_route_state, raw_route_reason = self._classify_routes(
             candidates, image_shape)
         route_state, route_reason = self._stabilize_route_state(
@@ -1370,31 +1495,36 @@ class VisionControlPlanner:
         ocr_direction, ocr_current = self._confirm_ocr_direction(
             raw_ocr_direction, raw_ocr_current)
         ocr_lock_expired = False
+        deferred_ocr_lock_applied = False
         if ocr_current:
             self.last_valid_ocr_ts = now
             self.last_ocr_direction = ocr_direction
-            if ocr_direction == "right" and self.config.path_source == "curve":
-                if not self.ocr_right_blue_fallback_completed_for_current:
-                    if not self.ocr_right_green_lock_active:
-                        self.ocr_right_green_lock_active = True
-                        self.ocr_right_green_missing_frames = 0
-                    self.branch_lock = "right"
-                    self.branch_lock_source = "ocr"
-                    self.selected_slot_lock = 1
-                    self.selected_slot_missing_frames = 0
+            self.turnsign_trim_api_ready = True
+            if (
+                self.turnsign_trim_session_adaptive
+                and not self.turnsign_trim_line_split_ready
+            ):
+                self.turnsign_trim_pending_ocr_direction = ocr_direction
             else:
-                self._reset_ocr_right_green_lock()
-                self.branch_lock = ocr_direction
-                self.branch_lock_source = "ocr"
-                self.selected_slot_lock = 0 if ocr_direction == "left" else 1
-                self.selected_slot_missing_frames = 0
+                self._apply_ocr_direction_lock(ocr_direction)
         else:
             self.ocr_right_blue_fallback_completed_for_current = False
             ocr_lock_expired = self._expire_ocr_lock(now)
+        if (
+            self.turnsign_trim_pending_ocr_direction in {"left", "right"}
+            and self.turnsign_trim_line_split_ready
+        ):
+            self._apply_ocr_direction_lock(
+                self.turnsign_trim_pending_ocr_direction)
+            self.turnsign_trim_pending_ocr_direction = None
+            deferred_ocr_lock_applied = True
         ocr_right_green_missing_released = (
             self._release_ocr_right_when_green_missing_at_lookahead(
                 candidates, image_shape))
-        self._update_default_outer(route_state, now, ocr_current)
+        self._update_default_outer(
+            route_state, now,
+            bool(ocr_current or deferred_ocr_lock_applied or
+                 self.turnsign_trim_pending_ocr_direction))
         self._update_curve_merge_continuity(candidates, image_shape)
         selected = self._select_candidate(candidates, route_state, image_shape)
         command, control_target = self._build_command(
@@ -1452,6 +1582,54 @@ class VisionControlPlanner:
                 self.ocr_right_green_missing_frames),
             "ocr_right_green_missing_released": bool(
                 ocr_right_green_missing_released),
+            "turnsign_trim_separation_640": (
+                self.turnsign_trim_separation_640),
+            "turnsign_trim_lookahead_separation_640": (
+                self.turnsign_trim_lookahead_separation_640),
+            "turnsign_trim_separation_samples_640": list(
+                self.turnsign_trim_separation_samples_640),
+            "turnsign_trim_direction": int(
+                self.turnsign_trim_direction),
+            "turnsign_trim_pulse_remaining_s": max(
+                0.0, float(self.turnsign_lock_reverse_until) - now),
+            "turnsign_trim_settle_remaining_s": max(
+                0.0, float(self.turnsign_trim_settle_until) - now),
+            "turnsign_last_seen_delta_640": (
+                self.turnsign_last_seen_delta_640),
+            "turnsign_last_lost_delta_640": (
+                self.turnsign_last_lost_delta_640),
+            "turnsign_trim_position_delta_640": (
+                self.turnsign_trim_position_delta_640),
+            "turnsign_trim_fresh_frames": int(
+                self.turnsign_trim_fresh_frames),
+            "turnsign_trim_current_fresh": bool(
+                self.turnsign_trim_current_fresh),
+            "turnsign_trim_current_centered": bool(
+                self.turnsign_trim_current_centered),
+            "turnsign_trim_stop_ready": bool(
+                self.turnsign_trim_stop_ready),
+            "turnsign_trim_missing_frames": int(
+                self.turnsign_trim_missing_frames),
+            "turnsign_trim_line_split_frames": int(
+                self.turnsign_trim_line_split_frames),
+            "turnsign_trim_line_collapse_frames": int(
+                self.turnsign_trim_line_collapse_frames),
+            "turnsign_trim_line_ever_split": bool(
+                self.turnsign_trim_line_ever_split),
+            "turnsign_trim_line_split_ready": bool(
+                self.turnsign_trim_line_split_ready),
+            "turnsign_trim_line_clear_current": bool(
+                self.turnsign_trim_line_clear_current),
+            "turnsign_trim_overshoot_latched": bool(
+                self.turnsign_trim_overshoot_latched),
+            "turnsign_trim_max_lookahead_separation_640": float(
+                self.turnsign_trim_max_lookahead_separation_640),
+            "turnsign_trim_pending_ocr_direction": (
+                self.turnsign_trim_pending_ocr_direction),
+            "turnsign_trim_api_ready": bool(
+                self.turnsign_trim_api_ready),
+            "turnsign_trim_accept_ready": bool(
+                self.turnsign_trim_accept_ready),
             "default_outer_elapsed": self._default_outer_elapsed(now),
             "selected_slot": None if selected is None else int(selected.get("slot", -1)),
             "candidate_count": len(candidates),
@@ -3032,6 +3210,130 @@ class VisionControlPlanner:
         return float(np.degrees(np.arctan2(
             float(upper_x) - float(lower_x), dy)))
 
+    def _update_turnsign_curve_separation(self, candidates, image_shape):
+        """Measure blue/green separation from lookahead toward image top."""
+        self.turnsign_trim_separation_640 = None
+        self.turnsign_trim_lookahead_separation_640 = None
+        self.turnsign_trim_separation_samples_640 = []
+        if self.config.path_source != "curve":
+            return
+        by_slot = {
+            int(item.get("slot", -1)): item
+            for item in candidates
+            if int(item.get("slot", -1)) in {0, 1}
+        }
+        if 0 not in by_slot or 1 not in by_slot:
+            return
+        blue = np.asarray(by_slot[0].get("points_xy", ()), dtype=np.float32)
+        green = np.asarray(by_slot[1].get("points_xy", ()), dtype=np.float32)
+        height, width = image_shape[:2]
+        lookahead_y = float(height) * self.config.lookahead_y_ratio
+        far_y = min(
+            lookahead_y,
+            float(height) * self.config.turnsign_trim_far_y_ratio)
+        rows = np.linspace(
+            far_y, lookahead_y,
+            self.config.turnsign_trim_sample_rows, dtype=np.float32)
+        scale = 640.0 / float(max(1, width))
+        samples = []
+        for row_y in rows:
+            row_y = float(row_y)
+            if not (
+                self._path_covers_y(blue, row_y)
+                and self._path_covers_y(green, row_y)
+            ):
+                continue
+            blue_x = _interp_path_x(blue, row_y)
+            green_x = _interp_path_x(green, row_y)
+            if blue_x is None or green_x is None:
+                continue
+            samples.append(abs(float(green_x) - float(blue_x)) * scale)
+        self.turnsign_trim_separation_samples_640 = [
+            float(value) for value in samples]
+        if samples:
+            # A high quantile sees a fork visible toward the image top without
+            # allowing one noisy row to own the longitudinal decision.
+            ordered = sorted(samples)
+            index = int(math.ceil(0.75 * float(len(ordered) - 1)))
+            self.turnsign_trim_separation_640 = float(ordered[index])
+        if (
+            self._path_covers_y(blue, lookahead_y)
+            and self._path_covers_y(green, lookahead_y)
+        ):
+            blue_x = _interp_path_x(blue, lookahead_y)
+            green_x = _interp_path_x(green, lookahead_y)
+            if blue_x is not None and green_x is not None:
+                self.turnsign_trim_lookahead_separation_640 = (
+                    abs(float(green_x) - float(blue_x)) * scale)
+
+    def _update_turnsign_line_history(self, now):
+        """Remember split-then-collapse geometry for one TurnSign session."""
+        now = float(now)
+        if self.turnsign_trim_line_history_ts == now:
+            return
+        self.turnsign_trim_line_history_ts = now
+        separation = _finite_float(
+            self.turnsign_trim_lookahead_separation_640)
+        clear_now = bool(
+            separation is not None
+            and separation >= self.config.turnsign_trim_split_px_640)
+        self.turnsign_trim_line_clear_current = clear_now
+        previous_max = float(
+            self.turnsign_trim_max_lookahead_separation_640)
+        if separation is not None:
+            self.turnsign_trim_max_lookahead_separation_640 = max(
+                previous_max, float(separation))
+
+        if self.turnsign_trim_overshoot_latched:
+            if clear_now:
+                self.turnsign_trim_line_split_frames += 1
+                if (
+                    self.turnsign_trim_line_split_frames >=
+                    self.config.turnsign_trim_split_frames
+                ):
+                    self.turnsign_trim_line_split_ready = True
+                    self.turnsign_trim_line_ever_split = True
+                    self.turnsign_trim_overshoot_latched = False
+                    self.turnsign_trim_line_collapse_frames = 0
+                    self.turnsign_trim_max_lookahead_separation_640 = float(
+                        separation)
+            else:
+                self.turnsign_trim_line_split_frames = 0
+                self.turnsign_trim_line_split_ready = False
+            return
+
+        dropped_after_split = bool(
+            self.turnsign_trim_line_ever_split
+            and separation is not None
+            and previous_max - float(separation) >=
+                self.config.turnsign_trim_drop_px_640)
+        collapse_now = bool(
+            self.turnsign_trim_line_ever_split
+            and (not clear_now or dropped_after_split))
+        if collapse_now:
+            self.turnsign_trim_line_collapse_frames += 1
+            self.turnsign_trim_line_split_frames = 0
+            self.turnsign_trim_line_split_ready = False
+            if (
+                self.turnsign_trim_line_collapse_frames >=
+                self.config.turnsign_trim_collapse_frames
+            ):
+                self.turnsign_trim_overshoot_latched = True
+            return
+
+        self.turnsign_trim_line_collapse_frames = 0
+        if clear_now:
+            self.turnsign_trim_line_split_frames += 1
+            if (
+                self.turnsign_trim_line_split_frames >=
+                self.config.turnsign_trim_split_frames
+            ):
+                self.turnsign_trim_line_split_ready = True
+                self.turnsign_trim_line_ever_split = True
+        else:
+            self.turnsign_trim_line_split_frames = 0
+            self.turnsign_trim_line_split_ready = False
+
     def _select_candidate(self, candidates, route_state, image_shape):
         if not candidates:
             self.selection_reason = "no_candidate"
@@ -3239,6 +3541,16 @@ class VisionControlPlanner:
             # Reverse must start with a straight steering target. Do not let
             # the normal error slew retain a previous aggressive edge turn.
             error = 0.0
+        elif task_reason in {
+            "turnsign_trim_forward", "turnsign_trim_reverse"
+        }:
+            self._reset_error_trend()
+            error_trend_adjustment = 0.0
+            error_trend_slope = 0.0
+            error_trend_frames = 0
+            # A trim pulse names an explicit servo direction. Do not let the
+            # previous path-following slew delay or invert that correction.
+            error = _clamp(steering_error, -error_limit, error_limit)
         else:
             error = self._limit_error(
                 steering_error,
@@ -3402,44 +3714,96 @@ class VisionControlPlanner:
             path_x):
         response = ocr_response if isinstance(ocr_response, dict) else {}
         phase = str(response.get("control_phase") or "")
-
+        session_active = bool(response.get("session_active"))
         session_id = response.get("session_id")
-        if (
-            bool(response.get("session_active"))
-            and session_id is not None
-            and session_id != self.turnsign_control_session_id
-        ):
-            self.turnsign_control_session_id = session_id
-            self.turnsign_lock_reverse_until = (
-                float(now) + self.config.turnsign_reverse_duration_s)
+        new_session = bool(
+            session_active and session_id is not None
+            and session_id == self.turnsign_control_session_id
+            and self.turnsign_new_session_pending)
+        if new_session:
+            self.turnsign_new_session_pending = False
+        self._remember_turnsign_position(response, phase, image_shape)
+        if self.turnsign_trim_session_adaptive:
+            self._update_turnsign_line_history(now)
+        api_result_ready = bool(
+            response.get("turnsign_resolved")
+            or self._ocr_has_current_direction(response)
+            or self.turnsign_trim_pending_ocr_direction in {"left", "right"})
+        if api_result_ready:
+            self.turnsign_trim_api_ready = True
+        self._refresh_turnsign_trim_accept_ready()
+        self._publish_turnsign_trim_info(response)
 
-        # Start the reverse brake as soon as the detector locks a new sign.
-        # Even a very fast OCR result must not shorten this fixed interval.
+        if new_session:
+            trim_direction = self._turnsign_trim_required_direction(phase)
+            if trim_direction is None:
+                # Preserve the previous immediate reverse when the two curve
+                # slots cannot both be measured.
+                self._start_turnsign_trim_pulse(now, -1, adaptive=False)
+            else:
+                if trim_direction:
+                    self._start_turnsign_trim_pulse(
+                        now, trim_direction, adaptive=True)
+
+        if not session_active and self.turnsign_lock_reverse_until > 0.0:
+            self.turnsign_lock_reverse_until = 0.0
+            self.turnsign_trim_direction = 0
+            self.turnsign_trim_adaptive_pulse = False
+
+        # A resolved OCR result cannot shorten a pulse that has already begun.
         if self.turnsign_lock_reverse_until > 0.0:
             if float(now) < self.turnsign_lock_reverse_until:
-                response["control_phase"] = "turnsign_lock_reverse"
-                center_x = (
-                    float(image_shape[1]) * self.config.visual_center_x)
-                return (
-                    STATE_TRACK,
-                    self.config.turnsign_reverse_speed_mps,
-                    "turnsign_lock_reverse",
-                    center_x,
-                )
+                return self._active_turnsign_trim_action(
+                    response, image_shape, path_x)
+            adaptive_pulse = bool(self.turnsign_trim_adaptive_pulse)
             self.turnsign_lock_reverse_until = 0.0
+            self.turnsign_trim_direction = 0
+            self.turnsign_trim_adaptive_pulse = False
+            if adaptive_pulse:
+                self.turnsign_trim_settle_until = (
+                    float(now) + self.config.turnsign_trim_settle_s)
 
-        if (
-            bool(response.get("turnsign_resolved")) or
-            self._ocr_has_current_direction(response)
+        if api_result_ready and (
+            not self.turnsign_trim_session_adaptive
+            or self.turnsign_trim_line_split_ready
         ):
             # Once a valid OCR result is locked, the consumed physical sign no
-            # longer changes speed or steering. Route availability is handled
-            # separately by _build_command.
+            # longer changes speed or steering, but a curve session must first
+            # expose both route slots at the lookahead row.
             self.turnsign_lock_reverse_until = 0.0
             self._clear_turnsign_state()
             if phase != "ocr_route_ready":
                 response["control_phase"] = "turnsign_consumed"
             return None
+
+        if (
+            self.turnsign_trim_session_adaptive
+            and (session_active or self.turnsign_trim_api_ready)
+        ):
+            if self.turnsign_trim_accept_ready:
+                response["control_phase"] = "turnsign_trim_ready"
+                self._publish_turnsign_trim_info(response)
+                return (
+                    STATE_SAFE_STOP, 0.0,
+                    "turnsign_trim_ready", None)
+            if float(now) < self.turnsign_trim_settle_until:
+                response["control_phase"] = "turnsign_trim_settle"
+                self._publish_turnsign_trim_info(response)
+                return (
+                    STATE_SAFE_STOP, 0.0,
+                    "turnsign_trim_settle", None)
+            trim_direction = self._turnsign_trim_required_direction(phase)
+            if trim_direction:
+                self._start_turnsign_trim_pulse(
+                    now, trim_direction, adaptive=True)
+                return self._active_turnsign_trim_action(
+                    response, image_shape, path_x)
+            if trim_direction == 0 and not self.turnsign_trim_stop_ready:
+                response["control_phase"] = "turnsign_trim_verify"
+                self._publish_turnsign_trim_info(response)
+                return (
+                    STATE_SAFE_STOP, 0.0,
+                    "turnsign_trim_verify", None)
 
         if phase:
             if phase == "turnsign_edge_over_line":
@@ -3501,6 +3865,227 @@ class VisionControlPlanner:
         return self._legacy_turnsign_action(
             detections, image_shape, lookahead_y, response, now)
 
+    def _turnsign_trim_motion_direction(self):
+        if self.turnsign_trim_overshoot_latched:
+            return -1
+        separation = _finite_float(self.turnsign_trim_separation_640)
+        if separation is None:
+            if self.config.path_source == "curve":
+                return -1 if self.turnsign_trim_line_ever_split else 1
+            return None
+        low = min(
+            self.config.turnsign_trim_low_separation_px_640,
+            self.config.turnsign_trim_high_separation_px_640)
+        high = max(
+            self.config.turnsign_trim_low_separation_px_640,
+            self.config.turnsign_trim_high_separation_px_640)
+        target = 0.5 * (float(low) + float(high))
+        return 1 if separation <= target else -1
+
+    def _turnsign_trim_required_direction(self, phase):
+        distance_direction = self._turnsign_trim_motion_direction()
+        if distance_direction is None:
+            return None
+        if self.turnsign_trim_accept_ready:
+            return 0
+        # Once both branches are visible, give a centered sign a few stationary
+        # frames to prove stability. Before the split is clear, longitudinal
+        # micro-adjustment must continue even if the sign is already centered.
+        if (
+            self.turnsign_trim_line_clear_current
+            and (self.turnsign_trim_api_ready
+                 or (self.turnsign_trim_current_fresh
+                     and self.turnsign_trim_current_centered))
+        ):
+            return 0
+        # Separation owns only the longitudinal direction; it is deliberately
+        # not part of the final parking acceptance condition.
+        return distance_direction
+
+    def _refresh_turnsign_trim_accept_ready(self):
+        self.turnsign_trim_accept_ready = bool(
+            self.turnsign_trim_line_split_ready
+            and (self.turnsign_trim_stop_ready
+                 or self.turnsign_trim_api_ready))
+
+    def _start_turnsign_trim_pulse(self, now, direction, adaptive):
+        self.turnsign_trim_direction = self._sign(direction)
+        self.turnsign_trim_adaptive_pulse = bool(adaptive)
+        self.turnsign_trim_settle_until = 0.0
+        self.turnsign_lock_reverse_until = (
+            float(now) + self.config.turnsign_reverse_duration_s)
+
+    def _active_turnsign_trim_action(
+            self, response, image_shape, path_x):
+        direction = self._sign(self.turnsign_trim_direction)
+        if not self.turnsign_trim_adaptive_pulse:
+            response["control_phase"] = "turnsign_lock_reverse"
+            target_x = (
+                float(image_shape[1]) * self.config.visual_center_x)
+            reason = "turnsign_lock_reverse"
+        else:
+            reason = (
+                "turnsign_trim_forward" if direction > 0
+                else "turnsign_trim_reverse")
+            response["control_phase"] = reason
+            target_x = self._turnsign_trim_target_x(
+                path_x, image_shape, direction)
+        self._publish_turnsign_trim_info(response)
+        speed = abs(float(self.config.turnsign_reverse_speed_mps)) * direction
+        return STATE_TRACK, speed, reason, target_x
+
+    def _turnsign_trim_target_x(self, path_x, image_shape, direction):
+        delta_640 = _finite_float(self.turnsign_trim_position_delta_640)
+        width = float(max(1, image_shape[1]))
+        visual_center = width * self.config.visual_center_x
+        if (
+            delta_640 is None
+            or abs(delta_640) <=
+                self.config.turnsign_trim_steer_deadband_px_640
+        ):
+            return float(visual_center)
+        if self.turnsign_trim_current_fresh:
+            steer_gain = self.config.turnsign_trim_steer_gain
+            max_steer = self.config.turnsign_trim_max_steer_px_640
+        elif (
+            self.turnsign_trim_missing_frames >=
+            self.config.turnsign_trim_severe_missing_frames
+        ):
+            steer_gain = self.config.turnsign_trim_severe_steer_gain
+            max_steer = (
+                self.config.turnsign_trim_severe_max_steer_px_640)
+        else:
+            steer_gain = self.config.turnsign_trim_missing_steer_gain
+            max_steer = (
+                self.config.turnsign_trim_missing_max_steer_px_640)
+        correction_640 = (
+            float(direction) * float(steer_gain)
+            * float(delta_640))
+        if correction_640 != 0.0:
+            correction_640 = math.copysign(
+                max(
+                    abs(float(correction_640)),
+                    float(self.config.turnsign_trim_min_steer_px_640)),
+                correction_640)
+        correction_640 = _clamp(
+            correction_640, -float(max_steer), float(max_steer))
+        return _clamp(
+            float(visual_center) + correction_640 * width / 640.0,
+            0.0, float(max(0, image_shape[1] - 1)))
+
+    def _remember_turnsign_position(self, response, phase, image_shape):
+        center_x = _finite_float(response.get("bbox_center_x"))
+        if center_x is None:
+            geom = self._detection_geom(
+                response.get("detection") or {}, image_shape)
+            center_x = None if geom is None else float(geom["cx"])
+        fresh_marker = response.get("current_detection_fresh")
+        if fresh_marker is None:
+            fresh_marker = response.get("detection_fresh")
+        if fresh_marker is None:
+            fresh_marker = not str(phase).startswith("turnsign_missing")
+        is_fresh = bool(center_x is not None and fresh_marker)
+        if is_fresh:
+            width = float(max(1, image_shape[1]))
+            visual_center = width * self.config.visual_center_x
+            self.turnsign_last_seen_delta_640 = (
+                (float(center_x) - visual_center) * 640.0 / width)
+            try:
+                confirmed_frames = int(response.get("confirm_count") or 0)
+            except (TypeError, ValueError):
+                confirmed_frames = 0
+            self.turnsign_trim_fresh_frames = min(
+                self.config.turnsign_trim_stable_frames,
+                max(
+                    self.turnsign_trim_fresh_frames + 1,
+                    confirmed_frames))
+            self.turnsign_trim_missing_frames = 0
+        elif (
+            self.turnsign_detection_was_fresh
+            and self.turnsign_last_seen_delta_640 is not None
+        ):
+            self.turnsign_last_lost_delta_640 = float(
+                self.turnsign_last_seen_delta_640)
+        if (
+            not is_fresh
+            and self.turnsign_last_lost_delta_640 is None
+            and self.turnsign_last_seen_delta_640 is not None
+        ):
+            self.turnsign_last_lost_delta_640 = float(
+                self.turnsign_last_seen_delta_640)
+        if not is_fresh:
+            self.turnsign_trim_fresh_frames = 0
+            self.turnsign_trim_missing_frames += 1
+        self.turnsign_detection_was_fresh = is_fresh
+        self.turnsign_trim_current_fresh = is_fresh
+        self.turnsign_trim_current_centered = bool(
+            is_fresh
+            and self.turnsign_last_seen_delta_640 is not None
+            and abs(float(self.turnsign_last_seen_delta_640)) <=
+                self.config.turnsign_trim_center_deadband_px_640)
+        self.turnsign_trim_position_delta_640 = (
+            self.turnsign_last_seen_delta_640 if is_fresh
+            else self.turnsign_last_lost_delta_640)
+        self.turnsign_trim_stop_ready = bool(
+            self.turnsign_trim_current_centered
+            and self.turnsign_trim_fresh_frames >=
+                self.config.turnsign_trim_stable_frames)
+
+    def _publish_turnsign_trim_info(self, response):
+        response["turnsign_trim_separation_640"] = (
+            self.turnsign_trim_separation_640)
+        response["turnsign_trim_lookahead_separation_640"] = (
+            self.turnsign_trim_lookahead_separation_640)
+        response["turnsign_trim_direction"] = int(
+            self.turnsign_trim_direction)
+        response["turnsign_trim_position_delta_640"] = (
+            self.turnsign_trim_position_delta_640)
+        response["turnsign_trim_fresh_frames"] = int(
+            self.turnsign_trim_fresh_frames)
+        response["turnsign_trim_missing_frames"] = int(
+            self.turnsign_trim_missing_frames)
+        response["turnsign_trim_current_centered"] = bool(
+            self.turnsign_trim_current_centered)
+        response["turnsign_trim_stop_ready"] = bool(
+            self.turnsign_trim_stop_ready)
+        response["turnsign_trim_line_split_ready"] = bool(
+            self.turnsign_trim_line_split_ready)
+        response["turnsign_trim_line_clear_current"] = bool(
+            self.turnsign_trim_line_clear_current)
+        response["turnsign_trim_line_ever_split"] = bool(
+            self.turnsign_trim_line_ever_split)
+        response["turnsign_trim_overshoot_latched"] = bool(
+            self.turnsign_trim_overshoot_latched)
+        response["turnsign_trim_accept_ready"] = bool(
+            self.turnsign_trim_accept_ready)
+
+    def _reset_turnsign_trim_runtime(self):
+        self.turnsign_lock_reverse_until = 0.0
+        self.turnsign_trim_direction = 0
+        self.turnsign_trim_adaptive_pulse = False
+        self.turnsign_trim_session_adaptive = False
+        self.turnsign_trim_settle_until = 0.0
+        self.turnsign_last_seen_delta_640 = None
+        self.turnsign_last_lost_delta_640 = None
+        self.turnsign_trim_position_delta_640 = None
+        self.turnsign_detection_was_fresh = False
+        self.turnsign_trim_fresh_frames = 0
+        self.turnsign_trim_current_fresh = False
+        self.turnsign_trim_current_centered = False
+        self.turnsign_trim_stop_ready = False
+        self.turnsign_trim_missing_frames = 0
+        self.turnsign_trim_line_split_frames = 0
+        self.turnsign_trim_line_collapse_frames = 0
+        self.turnsign_trim_line_ever_split = False
+        self.turnsign_trim_line_split_ready = False
+        self.turnsign_trim_line_clear_current = False
+        self.turnsign_trim_overshoot_latched = False
+        self.turnsign_trim_max_lookahead_separation_640 = 0.0
+        self.turnsign_trim_line_history_ts = None
+        self.turnsign_trim_pending_ocr_direction = None
+        self.turnsign_trim_api_ready = False
+        self.turnsign_trim_accept_ready = False
+
     def _legacy_turnsign_action(
             self, detections, image_shape, lookahead_y, response, now):
         has_active_ocr = bool(response.get("active"))
@@ -3548,6 +4133,8 @@ class VisionControlPlanner:
 
     def _clear_turnsign_state(self):
         self._clear_sign_ocr_state()
+        self._reset_turnsign_trim_runtime()
+        self.turnsign_new_session_pending = False
         self.sign_seen_frames = 0
         self.sign_latched_since = None
 
@@ -4666,6 +5253,26 @@ class VisionControlPlanner:
         if not self.ocr_confirmed_current:
             return None, False
         return direction, True
+
+    def _apply_ocr_direction_lock(self, direction):
+        if direction not in {"left", "right"}:
+            return
+        if direction == "right" and self.config.path_source == "curve":
+            if self.ocr_right_blue_fallback_completed_for_current:
+                return
+            if not self.ocr_right_green_lock_active:
+                self.ocr_right_green_lock_active = True
+                self.ocr_right_green_missing_frames = 0
+            self.branch_lock = "right"
+            self.branch_lock_source = "ocr"
+            self.selected_slot_lock = 1
+            self.selected_slot_missing_frames = 0
+            return
+        self._reset_ocr_right_green_lock()
+        self.branch_lock = direction
+        self.branch_lock_source = "ocr"
+        self.selected_slot_lock = 0 if direction == "left" else 1
+        self.selected_slot_missing_frames = 0
 
     def _expire_ocr_lock(self, now):
         if self.branch_lock_source != "ocr" or self.last_valid_ocr_ts <= 0.0:

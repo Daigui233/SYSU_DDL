@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+base_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+shim="$base_dir/lib/libxverse_white_camera_fallback.so"
+
+if [ ! -r "$shim" ]; then
+    echo "white camera fallback shim not found: $shim" >&2
+    exit 1
+fi
+
+export XVERSE_WHITE_CAMERA_FALLBACK=1
+if [ -n "${LD_PRELOAD:-}" ]; then
+    export LD_PRELOAD="$shim:$LD_PRELOAD"
+else
+    export LD_PRELOAD="$shim"
+fi
+
+exec "$base_dir/setup_webui" "$@"
