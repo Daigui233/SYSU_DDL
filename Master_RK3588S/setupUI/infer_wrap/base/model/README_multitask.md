@@ -221,15 +221,17 @@ Debug rendering is performed by the drop-frame preview thread, not by an NPU
 worker. Select it with:
 
 ```bash
-export MULTITASK_RENDER_MODE=heatmap  # off, heatmap, drive, debug, or full
+export MULTITASK_RENDER_MODE=drive  # off, heatmap, drive, debug, or full
 export MULTITASK_ROAD_OVERLAY_ALPHA=0.28
 export MULTITASK_PATH_HEATMAP_ALPHA=0.45
 export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 ```
 
 - `off`: no perception drawing.
-- `heatmap`: diagnostic default. Draw every post-NMS detection as a full box,
-  overlay both raw sigmoid path heatmaps, and draw the active path source.
+- `drive`: realtime default. Draw compact detections and the active control
+  paths without calculating or overlaying path heatmaps.
+- `heatmap`: offline diagnostic mode. Draw every post-NMS detection as a full
+  box and overlay heatmaps only when they were explicitly decoded.
   The default active source is the row-classifier curve; use the heatmap source
   switch only for comparison. Frame-spanning boxes are hidden from rendering only and
   remain available to OCR/control.

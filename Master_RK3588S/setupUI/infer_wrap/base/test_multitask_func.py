@@ -425,8 +425,8 @@ class MultiTaskPostprocessTest(unittest.TestCase):
     def test_default_path_source_is_curve(self):
         self.assertEqual(PATH_SOURCE, "curve")
 
-    def test_default_render_mode_is_raw_heatmap(self):
-        self.assertEqual(RENDER_MODE, "heatmap")
+    def test_default_render_mode_is_drive(self):
+        self.assertEqual(RENDER_MODE, "drive")
 
     def test_worker_prepares_rgb_uint8_without_copying_source_frame(self):
         outputs = self.make_outputs()
@@ -449,8 +449,12 @@ class MultiTaskPostprocessTest(unittest.TestCase):
                                       [30, 20, 10])
         self.assertIs(result["_source_frame"], image)
         self.assertIs(result["frame"], image)
-        self.assertIsNotNone(result["path_heatmaps"])
-        self.assertIsNotNone(result["road_probability"])
+        self.assertIsNone(result["path_heatmaps"])
+        self.assertIsNone(result["road_probability"])
+        self.assertNotIn("_pixel_logits", result)
+        self.assertEqual(result["curve_paths"], [])
+        self.assertEqual(result["paths"], [])
+        self.assertEqual(len(result["raw_curve_paths"]), 2)
         self.assertNotIn("temporal", result)
 
     def test_rejects_old_four_output_model(self):

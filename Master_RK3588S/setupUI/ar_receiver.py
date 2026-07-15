@@ -1074,7 +1074,6 @@ def main():
                         # Vision control may refine the OCR phase to the lock
                         # reverse brake, WAIT_ROUTE or ROUTE_READY status.
                         state.update_ocr(latest_ocr_response)
-                        state.update_perception(perception_result)
                         if vision_control_send and control_runtime is not None and command:
                             control_runtime.update_vision_command(
                                 command["track_error"],

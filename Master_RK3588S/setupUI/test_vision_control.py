@@ -19,10 +19,12 @@ from vision_control import (  # noqa: E402
     STATE_TRACK,
     VisionControlConfig,
     VisionControlPlanner,
+    _DisplayCurveTemporalTracker,
     _adjust_point_display_confidences,
     _associated_point_mask,
     _densify_associated_lower_points,
     _extract_heatmap_preview_lines,
+    _fit_smooth_majority_curve,
     _identity_probability_color,
     _semantic_road_point_mask,
     render_vision_control_debug,
@@ -380,6 +382,105 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
 
         self.assertEqual(inside.tolist(), [True, True, False, True])
 
+    def test_curve_fit_uses_smooth_majority_and_ignores_outliers(self):
+        y = np.linspace(180.0, 460.0, 21, dtype=np.float32)
+        expected_x = 220.0 + 0.0015 * (y - 320.0) ** 2
+        points = np.stack((expected_x, y), axis=1)
+        outlier_indices = np.asarray([4, 11, 17], dtype=np.int32)
+        points[outlier_indices, 0] += 180.0
+        probabilities = np.full(len(points), 0.8, dtype=np.float32)
+
+        fitted, fitted_probabilities, inliers = (
+            _fit_smooth_majority_curve(
+                points, probabilities, image_width=640))
+
+        self.assertGreater(len(fitted), len(points))
+        self.assertTrue(np.all(~inliers[outlier_indices]))
+        self.assertGreaterEqual(int(np.count_nonzero(inliers)), 18)
+        expected_fitted_x = (
+            220.0 + 0.0015 * (fitted[:, 1] - 320.0) ** 2)
+        self.assertLess(
+            float(np.max(np.abs(fitted[:, 0] - expected_fitted_x))), 2.0)
+        np.testing.assert_allclose(fitted_probabilities, 0.8, atol=1e-6)
+
+    def test_curve_fit_safely_extends_selected_curve_to_lookahead(self):
+        y = np.linspace(320.0, 460.0, 15, dtype=np.float32)
+        x = 210.0 + 0.08 * (y - 390.0)
+        points = np.stack((x, y), axis=1)
+        probabilities = np.full(len(points), 0.75, dtype=np.float32)
+
+        fitted, _probabilities, inliers = _fit_smooth_majority_curve(
+            points, probabilities, image_width=640, extend_to_y=288.0)
+
+        self.assertGreaterEqual(int(np.count_nonzero(inliers)), 14)
+        self.assertTrue(np.any(np.isclose(fitted[:, 1], 288.0)))
+
+    def test_curve_fit_rejects_unsafe_lookahead_extension(self):
+        y = np.linspace(350.0, 460.0, 16, dtype=np.float32)
+        x = 200.0 + 0.01 * (y - 400.0) ** 2
+        points = np.stack((x, y), axis=1)
+        probabilities = np.full(len(points), 0.8, dtype=np.float32)
+
+        fitted, _probabilities, _inliers = _fit_smooth_majority_curve(
+            points, probabilities, image_width=640, extend_to_y=288.0)
+
+        self.assertGreaterEqual(float(np.min(fitted[:, 1])), 349.0)
+
+    def test_display_curve_temporal_tracker_uses_normal_current_frame(self):
+        tracker = _DisplayCurveTemporalTracker(
+            jump_threshold_px_640=24.0,
+            confirm_tolerance_px_640=12.0, timeout_s=0.5)
+        y = np.linspace(200.0, 460.0, 20, dtype=np.float32)
+        first = np.stack((np.full_like(y, 200.0), y), axis=1)
+        current = np.stack((np.full_like(y, 210.0), y), axis=1)
+        confidence = np.full(len(y), 0.8, dtype=np.float32)
+
+        tracker.update(
+            0, first, confidence, (480, 640, 3), now=1.0)
+        tracked, _ = tracker.update(
+            0, current, confidence, (480, 640, 3), now=1.04)
+
+        np.testing.assert_allclose(tracked, current, atol=1e-5)
+
+    def test_display_curve_temporal_tracker_confirms_large_jump_one_frame(self):
+        tracker = _DisplayCurveTemporalTracker(
+            jump_threshold_px_640=24.0,
+            confirm_tolerance_px_640=12.0,
+            hold_frames=0, timeout_s=0.5)
+        y = np.linspace(200.0, 460.0, 20, dtype=np.float32)
+        first = np.stack((np.full_like(y, 200.0), y), axis=1)
+        jumped = np.stack((np.full_like(y, 260.0), y), axis=1)
+        confidence = np.full(len(y), 0.8, dtype=np.float32)
+
+        tracker.update(
+            0, first, confidence, (480, 640, 3), now=1.0)
+        pending, _ = tracker.update(
+            0, jumped, confidence, (480, 640, 3), now=1.04)
+        confirmed, _ = tracker.update(
+            0, jumped, confidence, (480, 640, 3), now=1.08)
+        missing, _ = tracker.update(
+            0, np.empty((0, 2)), np.empty((0,)),
+            (480, 640, 3), now=1.12)
+
+        np.testing.assert_allclose(pending, first, atol=1e-5)
+        np.testing.assert_allclose(confirmed, jumped, atol=1e-5)
+        self.assertEqual(0, len(missing))
+
+    def test_display_curve_temporal_tracker_resets_after_timeout(self):
+        tracker = _DisplayCurveTemporalTracker(
+            jump_threshold_px_640=24.0, timeout_s=0.5)
+        y = np.linspace(200.0, 460.0, 20, dtype=np.float32)
+        first = np.stack((np.full_like(y, 200.0), y), axis=1)
+        later = np.stack((np.full_like(y, 300.0), y), axis=1)
+        confidence = np.full(len(y), 0.8, dtype=np.float32)
+
+        tracker.update(
+            1, first, confidence, (480, 640, 3), now=1.0)
+        reset_curve, _ = tracker.update(
+            1, later, confidence, (480, 640, 3), now=1.6)
+
+        np.testing.assert_allclose(reset_curve[:, 0], 300.0, atol=1e-5)
+
     def test_ar_preview_draws_task_target_offset_from_path_baseline(self):
         result = {
             "vision_control": {
@@ -517,6 +618,71 @@ class HeatmapPeakPathDetectorTest(unittest.TestCase):
 
 
 class VisionControlPlannerTest(unittest.TestCase):
+    def test_raw_fitted_curves_replace_legacy_control_and_display_paths(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+        result = _curve_result_at(80.0, 560.0)
+        y = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        raw_paths = []
+        for slot, x in ((0, 220.0), (1, 420.0)):
+            raw_paths.append({
+                "slot": slot,
+                "role": "left" if slot == 0 else "right",
+                "source": "row_classifier_raw",
+                "score": 0.9,
+                "point_confidences": np.full(32, 0.8, dtype=np.float32),
+                "points_xy": np.stack((np.full_like(y, x), y), axis=1),
+            })
+        result["raw_curve_paths"] = raw_paths
+        result["centerline"]["raw_curve_paths"] = raw_paths
+        result["road"] = {
+            "mask": np.ones((120, 160), dtype=np.uint8)}
+
+        _command, debug = planner.update(result, now=1.0)
+
+        fitted = result["fitted_control_paths"]
+        self.assertEqual(2, len(fitted))
+        self.assertTrue(all(
+            item["source"] == "fitted_control_curve"
+            for item in result["paths"]))
+        self.assertAlmostEqual(
+            220.0, float(np.mean(result["paths"][0]["points_xy"][:, 0])),
+            delta=1.0)
+        self.assertAlmostEqual(
+            420.0, float(np.mean(result["paths"][1]["points_xy"][:, 0])),
+            delta=1.0)
+        self.assertAlmostEqual(
+            220.0, debug["control_target"]["path_target_x"], delta=1.0)
+        np.testing.assert_allclose(
+            result["display_paths"][0]["points_xy"],
+            result["paths"][0]["points_xy"], atol=1e-5)
+        preview = _extract_heatmap_preview_lines(result, (480, 640, 3))
+        np.testing.assert_allclose(
+            preview[0]["points_xy"], result["paths"][0]["points_xy"],
+            atol=1e-5)
+
+    def test_invalid_raw_fitted_curves_do_not_fall_back_to_legacy_paths(self):
+        planner = VisionControlPlanner(config=_config(
+            path_source="curve", path_smooth_window=1))
+        result = _curve_result_at(80.0, 560.0)
+        invalid = [{
+            "slot": slot,
+            "source": "row_classifier_raw",
+            "score": 0.9,
+            "points_xy": np.asarray(
+                [[200.0, 400.0], [210.0, 390.0]], dtype=np.float32),
+        } for slot in (0, 1)]
+        result["raw_curve_paths"] = invalid
+        result["centerline"]["raw_curve_paths"] = invalid
+        result["road"] = {
+            "mask": np.ones((120, 160), dtype=np.uint8)}
+
+        planner.update(result, now=1.0)
+
+        self.assertEqual([], result["fitted_control_paths"])
+        self.assertEqual([], result["paths"])
+        self.assertEqual([], result["display_paths"])
+
     def test_default_lookahead_and_human_stop_line_move_forward(self):
         config = VisionControlConfig()
         planner = VisionControlPlanner(config=config)

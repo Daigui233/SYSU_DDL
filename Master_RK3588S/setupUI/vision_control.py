@@ -1406,6 +1406,7 @@ class VisionControlPlanner:
         self.config = config or VisionControlConfig.from_env()
         self.path_search = HeatmapPathSearch(self.config)
         self.peak_path_detector = HeatmapPeakPathDetector(self.config)
+        self.fitted_control_tracker = _DisplayCurveTemporalTracker()
         self.log_func = log_func
         self.last_selected_points = None
         self.last_path_target_x = None
@@ -1557,7 +1558,8 @@ class VisionControlPlanner:
         start = time.perf_counter()
         perception_result = perception_result if isinstance(perception_result, dict) else {}
         image_shape = self._image_shape(perception_result)
-        candidates, search_ms = self._extract_candidates(perception_result, image_shape)
+        candidates, search_ms = self._extract_candidates(
+            perception_result, image_shape, now=now)
         # Short held paths are for the preview only. Route selection and
         # steering must continue to use current-frame candidates.
         control_candidates = [
@@ -1857,16 +1859,28 @@ class VisionControlPlanner:
                 start = None
         return segments
 
-    def _extract_candidates(self, result, image_shape):
+    def _extract_candidates(self, result, image_shape, now=None):
         started = time.perf_counter()
         centerline = result.get("centerline") or {}
         support_maps = None
         road = (result.get("road") or {}).get("mask")
         if road is None:
             road = result.get("road_mask")
+        uses_fitted_control = False
         if self.config.path_source == "curve":
-            paths = (centerline.get("curve_paths") or
-                     result.get("curve_paths") or [])
+            raw_curve_paths = result.get("raw_curve_paths")
+            if raw_curve_paths is None:
+                raw_curve_paths = centerline.get("raw_curve_paths")
+            uses_fitted_control = raw_curve_paths is not None
+            paths = (
+                self._build_fitted_control_paths(
+                    raw_curve_paths or [], road, image_shape, now=now)
+                if uses_fitted_control else
+                (centerline.get("curve_paths") or
+                 result.get("curve_paths") or []))
+            if uses_fitted_control:
+                result["fitted_control_paths"] = list(paths)
+                centerline["fitted_control_paths"] = list(paths)
             candidates = []
             for path in paths:
                 points = np.asarray(path.get("points_xy"), dtype=np.float32)
@@ -1874,13 +1888,13 @@ class VisionControlPlanner:
                     continue
                 candidate = dict(path)
                 candidate["points_xy"] = points
-                candidate["source"] = "row_classifier"
+                candidate["source"] = (
+                    "fitted_control_curve" if uses_fitted_control
+                    else "row_classifier")
                 candidate["source_slot"] = int(path.get("slot", len(candidates)))
                 candidate["source_slots"] = {candidate["source_slot"]}
                 candidate["coverage"] = 1.0
                 candidate["road_support"] = path.get("road_overlap")
-                # This keeps only the existing small moving-average filter;
-                # no B-spline fit or unsupported-point extrapolation is used.
                 candidates.append(candidate)
             candidates = candidates[:2]
         else:
@@ -1908,20 +1922,90 @@ class VisionControlPlanner:
         if self.config.path_source != "curve":
             candidates = self._assign_heatmap_slots(candidates[:2], image_shape)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
-        blue_human_occluded = (
-            self.config.path_source == "curve" and
-            self._human_occludes_previous_blue(result, image_shape))
-        candidates = self._smooth_candidates(
-            candidates, image_shape, support_maps=support_maps,
-            temporal_hold_slots=(
-                {0, 1} if blue_human_occluded
-                else ({1} if self.config.path_source == "curve" else set())),
-            freeze_slots={0, 1} if blue_human_occluded else set())
-        candidates = self._constrain_candidates_to_road(
-            candidates, road, image_shape)
+        if not uses_fitted_control:
+            blue_human_occluded = (
+                self.config.path_source == "curve" and
+                self._human_occludes_previous_blue(result, image_shape))
+            candidates = self._smooth_candidates(
+                candidates, image_shape, support_maps=support_maps,
+                temporal_hold_slots=(
+                    {0, 1} if blue_human_occluded
+                    else ({1} if self.config.path_source == "curve" else set())),
+                freeze_slots={0, 1} if blue_human_occluded else set())
+            candidates = self._constrain_candidates_to_road(
+                candidates, road, image_shape)
         self._publish_filtered_paths(result, candidates)
         elapsed = (time.perf_counter() - started) * 1000.0
         return candidates, elapsed
+
+    def _build_fitted_control_paths(
+            self, raw_paths, road_mask, image_shape, now=None):
+        height, width = image_shape[:2]
+        lookahead_y = float(height) * self.config.lookahead_y_ratio
+        confidence_split_y = max(0.0, lookahead_y - 10.0)
+        timestamp = time.monotonic() if now is None else float(now)
+        fitted_paths = []
+        present_slots = set()
+        for raw_path in list(raw_paths)[:2]:
+            slot = int(raw_path.get("slot", len(fitted_paths)))
+            present_slots.add(slot)
+            points = np.asarray(
+                raw_path.get("points_xy"), dtype=np.float32)
+            if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+                self.fitted_control_tracker.update(
+                    slot, np.empty((0, 2)), np.empty((0,)),
+                    image_shape, now=timestamp)
+                continue
+            points = points.copy()
+            points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+            points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+            probabilities = np.asarray(
+                raw_path.get("point_confidences", []), dtype=np.float32)
+            if len(probabilities) != len(points):
+                probabilities = np.full(
+                    len(points), float(raw_path.get("score", 1.0)),
+                    dtype=np.float32)
+            inside_road = _semantic_road_point_mask(
+                points, road_mask, image_shape)
+            associated = _associated_point_mask(
+                points, width, eligible_mask=inside_road)
+            points, probabilities = _densify_associated_lower_points(
+                points, probabilities, associated, width, height,
+                lower_boundary_y=confidence_split_y)
+            inside_road = _semantic_road_point_mask(
+                points, road_mask, image_shape)
+            points = points[inside_road]
+            probabilities = probabilities[inside_road]
+            points, probabilities, inliers = _fit_smooth_majority_curve(
+                points, probabilities, width, extend_to_y=lookahead_y)
+            points, probabilities = self.fitted_control_tracker.update(
+                slot, points, probabilities, image_shape, now=timestamp)
+            inside_road = _semantic_road_point_mask(
+                points, road_mask, image_shape)
+            points, probabilities = _select_control_curve_segment(
+                points, probabilities, inside_road, lookahead_y)
+            if len(points) < 3:
+                continue
+            fitted_paths.append({
+                "slot": slot,
+                "role": "left" if slot == 0 else "right",
+                "identity": "left" if slot == 0 else "right",
+                "source": "fitted_control_curve",
+                "score": float(raw_path.get("score", 1.0)),
+                "coverage": float(len(points)) / max(1.0, float(height)),
+                "row_support": int(np.count_nonzero(inliers)),
+                "point_confidences": probabilities.astype(np.float32),
+                "points_xy": points.astype(np.float32),
+                "spatial_prefiltered": True,
+                "fitted_control": True,
+            })
+        for slot in (0, 1):
+            if slot not in present_slots:
+                self.fitted_control_tracker.update(
+                    slot, np.empty((0, 2)), np.empty((0,)),
+                    image_shape, now=timestamp)
+        fitted_paths.sort(key=lambda item: int(item.get("slot", 99)))
+        return fitted_paths[:2]
 
     def _prepare_heatmap_support_maps(self, heatmaps, road_mask):
         heatmaps = np.clip(
@@ -3031,9 +3115,15 @@ class VisionControlPlanner:
         return points
 
     def _publish_filtered_paths(self, result, candidates):
-        raw_paths = list(result.get("paths") or [])
+        fitted_control = (
+            "fitted_control_paths" in result or any(
+                item.get("source") == "fitted_control_curve"
+                for item in candidates))
+        raw_paths = list(
+            result.get("raw_curve_paths") or result.get("paths") or [])
         result["raw_paths"] = raw_paths
         result["paths"] = candidates
+        result["path_count"] = len(candidates)
         result["display_paths"] = list(candidates[:2])
         # ARPreview lets the vision-control overlay draw these once with
         # probability-segmented identity colors.
@@ -3041,13 +3131,18 @@ class VisionControlPlanner:
         result["temporal"] = {
             "enabled": True,
             "status": "tracking" if candidates else "path_unavailable",
-            "alpha": float(self.config.path_ema_alpha),
-            "source": "vision_control_slot_filter",
+            "alpha": 1.0 if fitted_control else float(
+                self.config.path_ema_alpha),
+            "source": (
+                "fitted_control_curve" if fitted_control
+                else "vision_control_slot_filter"),
         }
         centerline = result.get("centerline")
         if isinstance(centerline, dict):
             centerline["raw_paths"] = raw_paths
             centerline["paths"] = candidates
+            centerline["path_count"] = len(candidates)
+            centerline["valid_path_count"] = len(candidates)
             centerline["display_paths"] = list(candidates[:2])
             centerline["temporal"] = result["temporal"]
 
@@ -6075,6 +6170,10 @@ def render_vision_control_debug(frame, result):
             (w - 1, max(scan_top, scan_bottom)),
             (30, 230, 255), 1, cv2.LINE_AA)
 
+    display_timestamp = time.monotonic()
+    road_mask = (result.get("road") or {}).get("mask")
+    if road_mask is None:
+        road_mask = result.get("road_mask")
     for line in _extract_heatmap_preview_lines(result, frame.shape):
         points = np.rint(line["points_xy"]).astype(np.int32)
         if len(points) < 2:
@@ -6085,9 +6184,6 @@ def render_vision_control_debug(frame, result):
             points, line.get("probabilities"), confidence_split_y,
             lower_confidence_boost, upper_confidence_decay)
         if line.get("raw_model_points"):
-            road_mask = (result.get("road") or {}).get("mask")
-            if road_mask is None:
-                road_mask = result.get("road_mask")
             inside_road = _semantic_road_point_mask(
                 points, road_mask, frame.shape)
             associated = _associated_point_mask(
@@ -6099,12 +6195,24 @@ def render_vision_control_debug(frame, result):
                 points, road_mask, frame.shape)
             points = points[inside_road]
             probabilities = probabilities[inside_road]
-        if not len(points):
+        if not line.get("fitted_control_curve"):
+            points, probabilities, _inliers = _fit_smooth_majority_curve(
+                points, probabilities, w, extend_to_y=lookahead_y)
+            points, probabilities = _DISPLAY_CURVE_TEMPORAL_TRACKER.update(
+                int(line.get("slot", 0)), points, probabilities,
+                frame.shape, now=display_timestamp)
+        if len(points) < 2:
             continue
-        _draw_identity_probability_path(
+        visible = _semantic_road_point_mask(
+            points, road_mask, frame.shape) if (
+                line.get("raw_model_points") or
+                line.get("fitted_control_curve")) else np.ones(
+                    len(points), dtype=bool)
+        _draw_identity_probability_curve(
             frame, points, probabilities,
             int(line.get("slot", 0)),
-            thickness=3 if int(line.get("slot", -1)) == selected_slot else 2)
+            thickness=3 if int(line.get("slot", -1)) == selected_slot else 2,
+            visible_mask=visible)
 
     split_y = int(round(confidence_split_y))
     cv2.line(
@@ -6169,20 +6277,348 @@ def _identity_probability_color(slot, probability):
     return (intensity, 0, 0) if int(slot) == 0 else (0, intensity, 0)
 
 
-def _draw_identity_probability_path(
-        frame, points, probabilities, slot, thickness=2):
+def _draw_identity_probability_curve(
+        frame, points, probabilities, slot, thickness=2,
+        visible_mask=None):
+    points = np.rint(np.asarray(points, dtype=np.float32)).astype(np.int32)
     probabilities = np.asarray(probabilities, dtype=np.float32)
     if len(probabilities) != len(points):
         probabilities = np.ones(len(points), dtype=np.float32)
-    # The row head is already an ordered point sequence.  Drawing the
-    # anchors directly avoids turning one noisy segment into a large visual
-    # jump while keeping the blue/green slot identity obvious.
-    radius = max(2, int(thickness) + 1)
-    for point, probability in zip(points, probabilities):
-        center = (int(point[0]), int(point[1]))
-        color = _identity_probability_color(slot, float(probability))
-        cv2.circle(frame, center, radius + 1, (0, 0, 0), -1, cv2.LINE_AA)
-        cv2.circle(frame, center, radius, color, -1, cv2.LINE_AA)
+    if visible_mask is None:
+        visible = np.ones(len(points), dtype=bool)
+    else:
+        visible = np.asarray(visible_mask, dtype=bool)
+        if len(visible) != len(points):
+            visible = np.ones(len(points), dtype=bool)
+    line_thickness = max(1, int(thickness))
+    for index in range(len(points) - 1):
+        if not (visible[index] and visible[index + 1]):
+            continue
+        start = tuple(int(value) for value in points[index])
+        end = tuple(int(value) for value in points[index + 1])
+        probability = 0.5 * float(
+            probabilities[index] + probabilities[index + 1])
+        color = _identity_probability_color(slot, probability)
+        cv2.line(
+            frame, start, end, (0, 0, 0), line_thickness + 2,
+            cv2.LINE_AA)
+        cv2.line(
+            frame, start, end, color, line_thickness, cv2.LINE_AA)
+
+
+def _fit_smooth_majority_curve(
+        points, probabilities, image_width, inlier_px_640=10.0,
+        sample_step_px=4.0, extend_to_y=None,
+        max_extension_y_px_480=64.0,
+        max_extension_deviation_px_640=18.0,
+        max_extension_lateral_px_640=48.0):
+    """Fit a low-order curve, favoring maximum support then smoothness."""
+    points = np.asarray(points, dtype=np.float64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    empty_points = np.empty((0, 2), dtype=np.float32)
+    empty_probabilities = np.empty((0,), dtype=np.float32)
+    if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 3):
+        return empty_points, empty_probabilities, np.zeros(len(points), bool)
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float64)
+
+    order = np.argsort(points[:, 1], kind="stable")
+    sorted_points = points[order]
+    sorted_probabilities = probabilities[order]
+    center_y = float(np.mean(sorted_points[:, 1]))
+    scale_y = max(1.0, 0.5 * float(np.ptp(sorted_points[:, 1])))
+    normalized_y = (sorted_points[:, 1] - center_y) / scale_y
+    threshold = max(
+        2.0, float(inlier_px_640) * float(max(1, image_width)) / 640.0)
+
+    # Six evenly spread anchors provide 35 deterministic line/quadratic
+    # hypotheses, enough for minority-outlier rejection without burdening
+    # every preview frame with an exhaustive fit.
+    sample_count = min(6, len(sorted_points))
+    sample_indices = np.unique(np.rint(np.linspace(
+        0, len(sorted_points) - 1, sample_count)).astype(np.int32))
+    candidates = []
+    try:
+        candidates.append((1, np.polyfit(
+            normalized_y, sorted_points[:, 0], 1)))
+    except (ValueError, np.linalg.LinAlgError):
+        pass
+    line_pairs = np.asarray([
+        (sample_indices[first], sample_indices[second])
+        for first in range(len(sample_indices) - 1)
+        for second in range(first + 1, len(sample_indices))
+    ], dtype=np.int32)
+    if len(line_pairs):
+        first_y = normalized_y[line_pairs[:, 0]]
+        second_y = normalized_y[line_pairs[:, 1]]
+        denominator = second_y - first_y
+        valid = np.abs(denominator) > 1e-6
+        slopes = (
+            sorted_points[line_pairs[valid, 1], 0] -
+            sorted_points[line_pairs[valid, 0], 0]) / denominator[valid]
+        intercepts = (
+            sorted_points[line_pairs[valid, 0], 0] -
+            slopes * first_y[valid])
+        candidates.extend(
+            (1, np.asarray([slope, intercept], dtype=np.float64))
+            for slope, intercept in zip(slopes, intercepts))
+
+    try:
+        candidates.append((2, np.polyfit(
+            normalized_y, sorted_points[:, 0], 2)))
+    except (ValueError, np.linalg.LinAlgError):
+        pass
+    quadratic_groups = np.asarray([
+        (sample_indices[first], sample_indices[second],
+         sample_indices[third])
+        for first in range(len(sample_indices) - 2)
+        for second in range(first + 1, len(sample_indices) - 1)
+        for third in range(second + 1, len(sample_indices))
+    ], dtype=np.int32)
+    if len(quadratic_groups):
+        group_y = normalized_y[quadratic_groups]
+        matrices = np.stack((
+            group_y * group_y, group_y,
+            np.ones_like(group_y)), axis=2)
+        determinants = np.linalg.det(matrices)
+        valid = np.abs(determinants) > 1e-9
+        if np.any(valid):
+            coefficients = np.linalg.solve(
+                matrices[valid],
+                sorted_points[quadratic_groups[valid], 0])
+            candidates.extend(
+                (2, coefficient) for coefficient in coefficients)
+
+    evaluated = []
+    if candidates:
+        degrees = np.asarray(
+            [item[0] for item in candidates], dtype=np.int32)
+        coefficient_matrix = np.zeros(
+            (len(candidates), 3), dtype=np.float64)
+        for index, (degree, coefficients) in enumerate(candidates):
+            coefficient_matrix[index, -len(coefficients):] = coefficients
+        design = np.stack((
+            normalized_y * normalized_y,
+            normalized_y,
+            np.ones_like(normalized_y)), axis=1)
+        predictions = design @ coefficient_matrix.T
+        all_residuals = np.abs(
+            sorted_points[:, 0, None] - predictions)
+        all_inliers = all_residuals <= threshold
+        counts = np.count_nonzero(all_inliers, axis=0)
+        for index, (degree, coefficients) in enumerate(candidates):
+            count = int(counts[index])
+            if count < max(3, degree + 2):
+                continue
+            inliers = all_inliers[:, index]
+            median_error = float(np.median(
+                all_residuals[inliers, index]))
+            curvature = (
+                2.0 * abs(float(coefficient_matrix[index, 0]))
+                if degree == 2 else 0.0)
+            evaluated.append({
+                "degree": degree,
+                "coefficients": coefficients,
+                "inliers": inliers,
+                "count": count,
+                "smooth_cost": (
+                    median_error + 0.04 * curvature + 0.15 * degree),
+            })
+    if not evaluated:
+        return empty_points, empty_probabilities, np.zeros(len(points), bool)
+
+    maximum_support = max(item["count"] for item in evaluated)
+    near_maximum = [
+        item for item in evaluated
+        if item["count"] >= maximum_support - 1]
+    best = min(near_maximum, key=lambda item: item["smooth_cost"])
+    degree = int(best["degree"])
+    inliers = np.asarray(best["inliers"], dtype=bool)
+    coefficients = np.asarray(best["coefficients"], dtype=np.float64)
+    for _iteration in range(2):
+        if int(np.count_nonzero(inliers)) < degree + 2:
+            break
+        coefficients = np.polyfit(
+            normalized_y[inliers], sorted_points[inliers, 0], degree)
+        residuals = np.abs(
+            sorted_points[:, 0] - np.polyval(coefficients, normalized_y))
+        refined = residuals <= threshold
+        if np.array_equal(refined, inliers):
+            break
+        inliers = refined
+
+    if int(np.count_nonzero(inliers)) < 3:
+        return empty_points, empty_probabilities, np.zeros(len(points), bool)
+    inlier_points = sorted_points[inliers]
+    inlier_probabilities = sorted_probabilities[inliers]
+    inlier_order = np.argsort(inlier_points[:, 1], kind="stable")
+    inlier_points = inlier_points[inlier_order]
+    inlier_probabilities = inlier_probabilities[inlier_order]
+    start_y = float(inlier_points[0, 1])
+    end_y = float(inlier_points[-1, 1])
+    extend_to_y = _finite_float(extend_to_y)
+    include_extension_y = False
+    if extend_to_y is not None:
+        if start_y <= extend_to_y <= end_y:
+            include_extension_y = True
+        else:
+            edge_y = start_y if extend_to_y < start_y else end_y
+            vertical_gap = abs(float(extend_to_y) - edge_y)
+            edge_count = min(6, len(inlier_points))
+            edge_points = (
+                inlier_points[:edge_count]
+                if extend_to_y < start_y else inlier_points[-edge_count:])
+            polynomial_x = float(np.polyval(
+                coefficients, (float(extend_to_y) - center_y) / scale_y))
+            tangent_coefficients = np.polyfit(
+                edge_points[:, 1], edge_points[:, 0], 1)
+            tangent_x = float(np.polyval(
+                tangent_coefficients, float(extend_to_y)))
+            edge_x = float(edge_points[0, 0] if extend_to_y < start_y
+                           else edge_points[-1, 0])
+            width_scale = float(max(1, image_width)) / 640.0
+            extension_safe = (
+                vertical_gap <= float(max_extension_y_px_480) and
+                abs(polynomial_x - tangent_x) <=
+                float(max_extension_deviation_px_640) * width_scale and
+                abs(polynomial_x - edge_x) <=
+                float(max_extension_lateral_px_640) * width_scale)
+            if extension_safe:
+                start_y = min(start_y, float(extend_to_y))
+                end_y = max(end_y, float(extend_to_y))
+                include_extension_y = True
+    sample_count = max(
+        2, int(math.ceil((end_y - start_y) /
+                         max(1.0, float(sample_step_px)))) + 1)
+    fitted_y = np.linspace(start_y, end_y, sample_count, dtype=np.float64)
+    if include_extension_y:
+        fitted_y = np.unique(np.append(fitted_y, float(extend_to_y)))
+    fitted_x = np.polyval(
+        coefficients, (fitted_y - center_y) / scale_y)
+    fitted_x = np.clip(fitted_x, 0.0, float(max(0, image_width - 1)))
+    fitted_probabilities = np.interp(
+        fitted_y, inlier_points[:, 1], inlier_probabilities)
+    fitted_points = np.stack((fitted_x, fitted_y), axis=1).astype(np.float32)
+
+    original_inliers = np.zeros(len(points), dtype=bool)
+    original_inliers[order] = inliers
+    return (fitted_points,
+            np.clip(fitted_probabilities, 0.0, 1.0).astype(np.float32),
+            original_inliers)
+
+
+class _DisplayCurveTemporalTracker:
+    """Low-latency per-slot tracker for fitted preview curves."""
+
+    def __init__(self, jump_threshold_px_640=24.0,
+                 confirm_tolerance_px_640=12.0,
+                 hold_frames=0, timeout_s=0.5, hold_decay=0.72):
+        self.jump_threshold_px_640 = max(
+            0.0, float(jump_threshold_px_640))
+        self.confirm_tolerance_px_640 = max(
+            0.0, float(confirm_tolerance_px_640))
+        self.hold_frames = max(0, int(hold_frames))
+        self.timeout_s = max(0.0, float(timeout_s))
+        self.hold_decay = _clamp(float(hold_decay), 0.0, 1.0)
+        self._slots = {}
+
+    @staticmethod
+    def _empty():
+        return (np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+
+    def reset(self, slot=None):
+        if slot is None:
+            self._slots.clear()
+        else:
+            self._slots.pop(int(slot), None)
+
+    @staticmethod
+    def _median_curve_distance(first, second):
+        first = np.asarray(first, dtype=np.float32)
+        second = np.asarray(second, dtype=np.float32)
+        if len(first) < 2 or len(second) < 2:
+            return None
+        y = second[:, 1]
+        overlap = (
+            (y >= float(first[0, 1])) &
+            (y <= float(first[-1, 1])))
+        if int(np.count_nonzero(overlap)) < 2:
+            return None
+        first_x = np.interp(
+            y[overlap], first[:, 1], first[:, 0]).astype(np.float32)
+        return float(np.median(np.abs(second[overlap, 0] - first_x)))
+
+    def update(self, slot, points, probabilities, image_shape, now=None):
+        slot = int(slot)
+        now = time.monotonic() if now is None else float(now)
+        points = np.asarray(points, dtype=np.float32)
+        probabilities = np.asarray(probabilities, dtype=np.float32)
+        if len(probabilities) != len(points):
+            probabilities = np.ones(len(points), dtype=np.float32)
+        shape = tuple(int(value) for value in image_shape[:2])
+        previous = self._slots.get(slot)
+        if previous is not None and (
+                previous["shape"] != shape or
+                now - float(previous["seen_at"]) > self.timeout_s):
+            self._slots.pop(slot, None)
+            previous = None
+
+        valid_current = (
+            points.ndim == 2 and points.shape[1] == 2 and len(points) >= 2)
+        if not valid_current:
+            if previous is None:
+                return self._empty()
+            misses = int(previous["misses"]) + 1
+            if misses > self.hold_frames:
+                self._slots.pop(slot, None)
+                return self._empty()
+            previous["misses"] = misses
+            held_probabilities = (
+                previous["probabilities"] * self.hold_decay ** misses)
+            return (previous["points"].copy(),
+                    held_probabilities.astype(np.float32))
+
+        order = np.argsort(points[:, 1], kind="stable")
+        tracked_points = points[order].copy()
+        tracked_probabilities = np.clip(
+            probabilities[order], 0.0, 1.0).astype(np.float32)
+        if previous is not None:
+            width_scale = float(max(1, shape[1])) / 640.0
+            displacement = self._median_curve_distance(
+                previous["points"], tracked_points)
+            if (displacement is not None and
+                    displacement > self.jump_threshold_px_640 * width_scale):
+                pending = previous.get("pending")
+                pending_distance = (
+                    self._median_curve_distance(
+                        pending["points"], tracked_points)
+                    if pending is not None else None)
+                confirmed = (
+                    pending_distance is not None and
+                    pending_distance <=
+                    self.confirm_tolerance_px_640 * width_scale)
+                if not confirmed:
+                    previous["pending"] = {
+                        "points": tracked_points.copy(),
+                        "probabilities": tracked_probabilities.copy(),
+                        "seen_at": now,
+                    }
+                    return (previous["points"].copy(),
+                            previous["probabilities"].copy())
+
+        self._slots[slot] = {
+            "points": tracked_points.copy(),
+            "probabilities": tracked_probabilities.copy(),
+            "shape": shape,
+            "seen_at": now,
+            "misses": 0,
+            "pending": None,
+        }
+        return tracked_points, tracked_probabilities
+
+
+_DISPLAY_CURVE_TEMPORAL_TRACKER = _DisplayCurveTemporalTracker()
 
 
 def _adjust_point_display_confidences(
@@ -6333,12 +6769,49 @@ def _semantic_road_point_mask(points, road_mask, image_shape):
     return np.asarray(road[y, x]) != 0
 
 
+def _select_control_curve_segment(
+        points, probabilities, visible_mask, lookahead_y):
+    """Choose one semantic-road segment, preferring lookahead coverage."""
+    points = np.asarray(points, dtype=np.float32)
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    visible = np.asarray(visible_mask, dtype=bool)
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float32)
+    if len(visible) != len(points):
+        visible = np.ones(len(points), dtype=bool)
+    segments = []
+    start = None
+    for index, is_visible in enumerate(visible.tolist() + [False]):
+        if is_visible and start is None:
+            start = index
+        elif not is_visible and start is not None:
+            if index - start >= 3:
+                segment_points = points[start:index]
+                distance = (
+                    0.0 if float(segment_points[0, 1]) <= lookahead_y <=
+                    float(segment_points[-1, 1]) else
+                    float(np.min(np.abs(
+                        segment_points[:, 1] - float(lookahead_y)))))
+                segments.append((distance, -(index - start), start, index))
+            start = None
+    if not segments:
+        return (np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+    _distance, _negative_length, start, end = min(segments)
+    return points[start:end].copy(), probabilities[start:end].copy()
+
+
 def _extract_heatmap_preview_lines(result, image_shape, max_lines=2):
     if not isinstance(result, dict):
         return []
     # Preview the row head exactly as emitted: both slots and all 32 anchors.
     # Route/control candidates remain separately filtered in ``paths``.
-    paths = result.get("raw_curve_paths")
+    paths = result.get("fitted_control_paths")
+    if paths is None:
+        paths = (result.get("centerline") or {}).get(
+            "fitted_control_paths")
+    if paths is None:
+        paths = result.get("raw_curve_paths")
     if paths is None:
         paths = (result.get("centerline") or {}).get("raw_curve_paths")
     if paths is None:
@@ -6361,6 +6834,8 @@ def _extract_heatmap_preview_lines(result, image_shape, max_lines=2):
             "identity": str(path.get("identity") or path.get("role") or ""),
             "raw_model_points": (
                 str(path.get("source") or "") == "row_classifier_raw"),
+            "fitted_control_curve": (
+                str(path.get("source") or "") == "fitted_control_curve"),
             "points_xy": points,
             "probabilities": probabilities,
             "score": float(np.mean(probabilities)),

@@ -126,11 +126,11 @@ PATH_ROAD_SNAP_RADIUS = max(
 PATH_SOURCE = _env_choice(
     "MULTITASK_PATH_SOURCE", "curve", {"curve", "heatmap"})
 RENDER_MODE = os.environ.get(
-    "MULTITASK_RENDER_MODE", "heatmap").strip().lower()
+    "MULTITASK_RENDER_MODE", "drive").strip().lower()
 RENDER_MODE = {"path": "drive", "road": "debug"}.get(
     RENDER_MODE, RENDER_MODE)
 if RENDER_MODE not in {"off", "heatmap", "drive", "debug", "full"}:
-    RENDER_MODE = "heatmap"
+    RENDER_MODE = "drive"
 
 PATH_COLORS = {
     "single": (255, 0, 0),
@@ -587,7 +587,8 @@ def _constrain_path_to_road(path, road_mask, image_shape):
 
 
 def decode_curve_paths(row_path_logits, path_scores, path_count_scores,
-                       image_shape, road_mask=None):
+                       image_shape, road_mask=None,
+                       include_filtered_paths=True):
     """Decode the UFLD-style row head; no B-spline fitting or extrapolation."""
     height, width = image_shape[:2]
     probabilities = softmax(row_path_logits, axis=-1)
@@ -618,6 +619,11 @@ def decode_curve_paths(row_path_logits, path_scores, path_count_scores,
             "points_xy": (normalized * scale).astype(np.float32),
             "road_constrained": False,
         })
+    # The live controller consumes these raw anchors with its robust fitted
+    # curve pipeline. Skip only the superseded legacy filtering/projection
+    # loop; raw coordinates, point confidence and semantic road output remain.
+    if not include_filtered_paths:
+        return [], model_path_count, count_confidence, raw_paths
     paths = []
     for slot in range(MAX_PATHS):
         path_min_score = (
@@ -778,7 +784,8 @@ def decode_heatmap_paths(path_heatmaps, path_scores, path_count_scores,
 
 
 def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
-                   path_source=None):
+                   path_source=None, include_legacy_curve_paths=True,
+                   include_debug_probabilities=True):
     """Decode all model tasks without performing route selection.
 
     ``curve`` is the default active path source.  ``heatmap`` restores the
@@ -791,16 +798,20 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
     boxes, scores, pixel_logits, row_path_logits, path_scores, path_count_scores = (
         parse_outputs(outputs))
 
-    road_probability = sigmoid(pixel_logits[0])
+    road_probability = (
+        sigmoid(pixel_logits[0]) if include_debug_probabilities else None)
     road_mask_raw = (
         pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
     road_mask, road_quality = clean_road_mask(
         road_mask_raw, return_info=True)
     curve_paths, model_path_count, count_confidence, raw_curve_paths = \
         decode_curve_paths(
-        row_path_logits, path_scores, path_count_scores, image_shape,
-        road_mask=road_mask)
-    raw_path_heatmaps = sigmoid(pixel_logits[1:])
+            row_path_logits, path_scores, path_count_scores, image_shape,
+            road_mask=road_mask,
+            include_filtered_paths=include_legacy_curve_paths)
+    raw_path_heatmaps = (
+        sigmoid(pixel_logits[1:])
+        if include_path_heatmaps or path_source == "heatmap" else None)
     heatmap_ridge_paths = []
     if path_source == "heatmap":
         legacy_paths = decode_heatmap_paths(
@@ -858,8 +869,7 @@ def decode_outputs(outputs, image_shape, include_path_heatmaps=True,
         "path_source": path_source,
         "road": road,
         "centerline": centerline,
-        # Kept as a view so path heatmaps can be materialized only when the
-        # full debug renderer needs them.
+        # Offline diagnostics may explicitly request and render heatmaps.
         "_pixel_logits": pixel_logits,
     }
 
@@ -989,13 +999,13 @@ def _draw_path_curve(image, points, color, dashed=False):
 
 
 def render_result(image, result, mode=None):
-    """Draw boxes, raw heatmaps, and the configured active path source."""
+    """Draw detections and the configured active path source."""
     mode = str(mode or RENDER_MODE).strip().lower()
     mode = {"path": "drive", "road": "debug"}.get(mode, mode)
     if mode == "off":
         return image
     if mode not in {"heatmap", "drive", "debug", "full"}:
-        mode = "heatmap"
+        mode = "drive"
 
     if mode in {"debug", "full"}:
         _overlay_binary_mask(
@@ -1004,9 +1014,6 @@ def render_result(image, result, mode=None):
 
     if mode in {"heatmap", "full"}:
         heatmaps = result.get("path_heatmaps")
-        if heatmaps is None:
-            logits = result.get("_pixel_logits")
-            heatmaps = sigmoid(logits[1:]) if logits is not None else None
         if heatmaps is not None:
             first_role = "single" if result.get("path_count") == 1 else "left"
             _overlay_path_heatmaps(
@@ -1138,7 +1145,12 @@ def finalize_inference(worker_result):
     source_frame = worker_result["source_frame"]
     result = decode_outputs(
         worker_result["outputs"], worker_result["image_shape"],
-        include_path_heatmaps=True)
+        include_path_heatmaps=False,
+        include_legacy_curve_paths=False,
+        include_debug_probabilities=False)
+    # The realtime controller only needs the semantic road mask and raw row
+    # anchors. Do not retain pixel logits for deferred preview heatmaps.
+    result.pop("_pixel_logits", None)
     postprocess_ms = (time.perf_counter() - started) * 1000.0
     worker_timings = worker_result.get("timings_ms") or {}
     preprocess_ms = float(worker_timings.get("preprocess", 0.0))

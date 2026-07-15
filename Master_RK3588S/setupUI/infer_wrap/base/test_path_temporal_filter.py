@@ -179,7 +179,9 @@ class PathTemporalFilterTest(unittest.TestCase):
 
         self.assertTrue(ready)
         self.assertNotIn("temporal", result)
-        self.assertEqual(result["path_count"], 1)
+        self.assertEqual(result["path_count"], 0)
+        self.assertEqual(result["curve_paths"], [])
+        self.assertEqual(len(result["raw_curve_paths"]), 2)
         self.assertIn("inference", result["timings_ms"])
         self.assertIn("fifo_wait", result["timings_ms"])
         self.assertEqual(result["timings_ms"]["temporal_filter"], 0.0)
