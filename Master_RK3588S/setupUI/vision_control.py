@@ -139,7 +139,7 @@ class VisionControlConfig:
     straight_path_max_residual_640: float = 6.0
     straight_edge_max_residual_640: float = 10.0
     normal_speed_mps: float = 0.06
-    recover_speed_mps: float = 0.06
+    recover_speed_mps: float = 0.04
     human_pass_speed_mps: float = 0.30
     collect_speed_mps: float = 0.06
     turnsign_slow_speed_mps: float = 0.08
@@ -187,7 +187,8 @@ class VisionControlConfig:
     turnsign_trim_steer_gain: float = 0.75
     turnsign_trim_max_steer_px_640: float = 100.0
     human_stop_line_margin_ratio: float = 0.0
-    human_stop_progress_ratio: float = 0.78
+    # Larger values move the human stop line upward, so braking starts sooner.
+    human_stop_progress_ratio: float = 0.84
     human_preline_missing_px_480: float = 20.0
     human_pass_offset_px_640: float = 38.0
     human_speed_hold_s: float = 0.5
@@ -300,7 +301,7 @@ class VisionControlConfig:
                 0.5, _env_float(
                     "VISION_CONTROL_STRAIGHT_EDGE_MAX_RESIDUAL_640", 10.0)),
             normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.06)),
-            recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.06)),
+            recover_speed_mps=max(0.031, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.04)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
             collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.06)),
             turnsign_slow_speed_mps=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_SLOW_SPEED", 0.08)),
@@ -387,7 +388,7 @@ class VisionControlConfig:
                 0.0, _env_float(
                     "VISION_CONTROL_TURNSIGN_TRIM_MAX_STEER_640", 100.0)),
             human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
-            human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 0.78), 0.0, 1.0),
+            human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 0.84), 0.0, 1.0),
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
@@ -1567,17 +1568,15 @@ class VisionControlPlanner:
 
     def _line_loss_hold_command(
             self, reason, task_reason, now, lookahead_y):
-        """Keep the latest forward command indefinitely while the path is lost."""
+        """Hold the latest steering, but slow down until the path returns."""
         age = now - self.last_valid_ts if self.last_valid_ts else 1e9
         held_target = self._held_path_target(now)
         error = float(self.last_error)
-        speed = float(self.last_forward_speed_mps)
-        if speed <= 0.0:
-            speed = max(
-                0.01,
-                float(self.config.normal_speed_mps),
-                float(self.config.recover_speed_mps),
-            )
+        previous_speed = float(self.last_forward_speed_mps)
+        if previous_speed <= 0.0:
+            previous_speed = max(0.031, float(self.config.normal_speed_mps))
+        recover_speed = max(0.031, float(self.config.recover_speed_mps))
+        speed = min(previous_speed, recover_speed)
         return self._command(error, speed, STATE_RECOVER_LINE), {
             "target_x": (
                 None if held_target is None else held_target[0]),
@@ -1593,7 +1592,9 @@ class VisionControlPlanner:
             "line_loss_hold": True,
             "line_loss_indefinite": True,
             "line_loss_age_s": float(age),
+            "line_loss_previous_speed_mps": float(previous_speed),
             "line_loss_held_speed_mps": float(speed),
+            "line_loss_speed_reduced": bool(speed < previous_speed),
         }
 
     @staticmethod

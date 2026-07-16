@@ -201,7 +201,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.car_avoid_offset_px_640, 55.0)
         self.assertEqual(config.car_avoid_hold_s, 2.0)
         self.assertEqual(config.normal_speed_mps, 0.06)
-        self.assertEqual(config.recover_speed_mps, 0.06)
+        self.assertEqual(config.recover_speed_mps, 0.04)
         self.assertEqual(config.collect_speed_mps, 0.06)
         self.assertEqual(config.track_deadband_px_640, 0.0)
         self.assertEqual(config.track_small_error_gain, 0.20)
@@ -219,6 +219,19 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.human_stop_reverse_speed_mps, -0.05)
         self.assertEqual(config.human_stop_reverse_duration_s, 0.30)
         self.assertEqual(config.human_speed_hold_s, 0.5)
+        self.assertEqual(config.human_stop_progress_ratio, 0.84)
+
+    def test_default_human_stop_line_triggers_about_eleven_pixels_earlier(self):
+        planner = VisionControlPlanner(config=VisionControlConfig())
+        image_shape = (480, 640, 3)
+        lookahead_y = 300.0
+        stop_y = planner._human_stop_line_y(image_shape, lookahead_y)
+
+        self.assertAlmostEqual(stop_y, 328.8)
+        self.assertTrue(planner._human_on_stop_line(
+            {"bottom": 330.0}, image_shape, lookahead_y))
+        self.assertFalse(planner._human_on_stop_line(
+            {"bottom": 327.0}, image_shape, lookahead_y))
 
     def test_raw_curves_are_replaced_by_one_fitted_control_contract(self):
         planner = VisionControlPlanner(config=_config())
@@ -253,7 +266,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(command["state_cmd"], STATE_RECOVER_LINE)
         self.assertGreater(command["target_speed"], 0.0)
 
-    def test_line_loss_holds_last_control_without_eventual_stop(self):
+    def test_line_loss_holds_angle_but_reduces_speed_until_reacquired(self):
         planner = VisionControlPlanner(config=_config())
         first_command, _debug = planner.update(
             _raw_result_at(260.0, 400.0), now=1.0)
@@ -264,15 +277,25 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(held_command["state_cmd"], STATE_RECOVER_LINE)
         self.assertAlmostEqual(
             held_command["track_error"], first_command["track_error"])
+        self.assertAlmostEqual(held_command["target_speed"], 0.04)
         self.assertTrue(held["control_target"]["line_loss_hold"])
+        self.assertTrue(
+            held["control_target"]["line_loss_speed_reduced"])
+        self.assertAlmostEqual(
+            held["control_target"]["line_loss_previous_speed_mps"],
+            first_command["target_speed"])
         self.assertEqual(long_held_command["state_cmd"], STATE_RECOVER_LINE)
         self.assertAlmostEqual(
             long_held_command["track_error"], first_command["track_error"])
-        self.assertAlmostEqual(
-            long_held_command["target_speed"],
-            first_command["target_speed"])
+        self.assertAlmostEqual(long_held_command["target_speed"], 0.04)
         self.assertTrue(
             long_held["control_target"]["line_loss_indefinite"])
+
+        reacquired_command, reacquired = planner.update(
+            _raw_result_at(260.0, 400.0), now=10.1)
+        self.assertEqual(reacquired["control_target"]["task_reason"], "track")
+        self.assertEqual(reacquired_command["state_cmd"], STATE_TRACK)
+        self.assertAlmostEqual(reacquired_command["target_speed"], 0.06)
 
     def test_detached_near_path_is_treated_as_line_loss(self):
         planner = VisionControlPlanner(config=_config())
@@ -288,6 +311,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertIsNone(detached["selected_slot"])
         self.assertEqual(detached["raw_selected_slot"], 0)
         self.assertEqual(command["state_cmd"], STATE_RECOVER_LINE)
+        self.assertAlmostEqual(command["target_speed"], 0.04)
         self.assertAlmostEqual(
             command["track_error"], previous_command["track_error"])
 
@@ -386,7 +410,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             (480, 640, 3), now=1.0)
 
         self.assertEqual(command["state_cmd"], STATE_RECOVER_LINE)
-        self.assertAlmostEqual(command["target_speed"], 0.06)
+        self.assertAlmostEqual(command["target_speed"], 0.04)
         self.assertEqual(
             target["reason"], "adaptive_path_no_previous_target")
         self.assertTrue(target["path_target_adaptive_y"])

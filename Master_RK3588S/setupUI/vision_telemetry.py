@@ -215,8 +215,12 @@ class VisionTelemetryLogger:
                     target.get("line_loss_hold", False)),
                 "line_loss_indefinite": bool(
                     target.get("line_loss_indefinite", False)),
+                "line_loss_previous_speed_mps": _number(
+                    target.get("line_loss_previous_speed_mps")),
                 "line_loss_held_speed_mps": _number(
                     target.get("line_loss_held_speed_mps")),
+                "line_loss_speed_reduced": bool(
+                    target.get("line_loss_speed_reduced", False)),
             },
             "selection": {
                 "selected_slot": debug.get("selected_slot"),
