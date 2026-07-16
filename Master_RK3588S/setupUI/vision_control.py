@@ -2747,6 +2747,541 @@ def _draw_identity_probability_curve(
             frame, start, end, color, line_thickness, cv2.LINE_AA)
 
 
+def _birdseye_debug_default_source_quad():
+    top_y = _clamp(
+        _env_float("AR_BIRDSEYE_SRC_TOP_Y", 0.52), 0.05, 0.85)
+    bottom_y = _clamp(
+        _env_float("AR_BIRDSEYE_SRC_BOTTOM_Y", 0.95),
+        top_y + 0.05, 1.0)
+    top_left_x = _clamp(
+        _env_float("AR_BIRDSEYE_SRC_TOP_LEFT_X", 0.44), 0.0, 0.90)
+    top_right_x = _clamp(
+        _env_float("AR_BIRDSEYE_SRC_TOP_RIGHT_X", 0.56),
+        top_left_x + 0.02, 1.0)
+    bottom_left_x = _clamp(
+        _env_float("AR_BIRDSEYE_SRC_BOTTOM_LEFT_X", 0.22), 0.0, 0.90)
+    bottom_right_x = _clamp(
+        _env_float("AR_BIRDSEYE_SRC_BOTTOM_RIGHT_X", 0.78),
+        bottom_left_x + 0.02, 1.0)
+    return np.asarray([
+        [top_left_x, top_y],
+        [top_right_x, top_y],
+        [bottom_right_x, bottom_y],
+        [bottom_left_x, bottom_y],
+    ], dtype=np.float32)
+
+
+def _birdseye_debug_homography(
+        image_shape, source_quad_normalized=None):
+    """Build the display-only image-to-ground homography for the preview."""
+    height, width = image_shape[:2]
+    width_scale = float(max(1, width - 1))
+    height_scale = float(max(1, height - 1))
+
+    source_normalized = np.asarray(
+        (_birdseye_debug_default_source_quad()
+         if source_quad_normalized is None else source_quad_normalized),
+        dtype=np.float32)
+    if source_normalized.shape != (4, 2):
+        source_normalized = _birdseye_debug_default_source_quad()
+    source_normalized = np.clip(source_normalized, 0.0, 1.0)
+    destination_left_x = _clamp(
+        _env_float("AR_BIRDSEYE_DST_LEFT_X", 0.18), 0.0, 0.45)
+    destination_right_x = _clamp(
+        _env_float("AR_BIRDSEYE_DST_RIGHT_X", 0.82),
+        destination_left_x + 0.10, 1.0)
+    destination_top_y = _clamp(
+        _env_float("AR_BIRDSEYE_DST_TOP_Y", 0.02), 0.0, 0.30)
+    destination_bottom_y = _clamp(
+        _env_float("AR_BIRDSEYE_DST_BOTTOM_Y", 0.98),
+        destination_top_y + 0.20, 1.0)
+
+    source = source_normalized * np.asarray(
+        [width_scale, height_scale], dtype=np.float32)
+    destination = np.asarray([
+        [destination_left_x * width_scale,
+         destination_top_y * height_scale],
+        [destination_right_x * width_scale,
+         destination_top_y * height_scale],
+        [destination_right_x * width_scale,
+         destination_bottom_y * height_scale],
+        [destination_left_x * width_scale,
+         destination_bottom_y * height_scale],
+    ], dtype=np.float32)
+    return cv2.getPerspectiveTransform(source, destination), source, destination
+
+
+def _birdseye_debug_result_road_mask(result):
+    if not isinstance(result, dict):
+        return None
+    road = result.get("road") or {}
+    road_mask = road.get("mask") if isinstance(road, dict) else None
+    if road_mask is None:
+        road_mask = result.get("road_mask")
+    road_mask = np.asarray(
+        road_mask) if road_mask is not None else np.empty((0, 0))
+    if road_mask.ndim != 2 or road_mask.size == 0:
+        return None
+    return (road_mask != 0).astype(np.uint8)
+
+
+def _birdseye_debug_path_reference_x(result, image_y, image_width):
+    debug = (
+        (result.get("vision_control") if isinstance(result, dict) else None)
+        or {})
+    selected_path = debug.get("selected_path")
+    if selected_path is not None:
+        points = np.asarray(selected_path, dtype=np.float32)
+        if points.ndim == 2 and points.shape[1:] == (2,) and len(points) >= 2:
+            path_x = _interp_path_x(points, float(image_y))
+            if path_x is not None:
+                return _clamp(path_x, 0.0, float(max(0, image_width - 1)))
+    target = debug.get("control_target") or {}
+    target_x = _finite_float(
+        target.get("path_target_x"), target.get("target_x"))
+    if target_x is not None:
+        return _clamp(target_x, 0.0, float(max(0, image_width - 1)))
+    return 0.5 * float(max(0, image_width - 1))
+
+
+def _birdseye_debug_mask_run(
+        road_mask, row, reference_x, band_rows=2, search_rows=8):
+    height, width = road_mask.shape
+    offsets = [0]
+    for distance in range(1, max(0, int(search_rows)) + 1):
+        offsets.extend((-distance, distance))
+    for offset in offsets:
+        center_row = int(np.clip(int(row) + offset, 0, height - 1))
+        row_start = max(0, center_row - max(0, int(band_rows)))
+        row_end = min(height, center_row + max(0, int(band_rows)) + 1)
+        occupied = np.any(road_mask[row_start:row_end] != 0, axis=0)
+        padded = np.pad(occupied.astype(np.int8), (1, 1))
+        transitions = np.diff(padded)
+        starts = np.flatnonzero(transitions == 1)
+        ends = np.flatnonzero(transitions == -1) - 1
+        runs = [
+            (int(start), int(end))
+            for start, end in zip(starts, ends)
+            if end - start + 1 >= 2
+        ]
+        if not runs:
+            continue
+
+        def run_distance(run):
+            start, end = run
+            if start <= reference_x <= end:
+                return 0.0
+            return min(abs(reference_x - start), abs(reference_x - end))
+
+        return min(
+            runs,
+            key=lambda run: (
+                run_distance(run),
+                abs(0.5 * (run[0] + run[1]) - reference_x),
+                -(run[1] - run[0])),
+        )
+    return None
+
+
+def _birdseye_debug_source_quad_from_road(result, image_shape):
+    """Fit the display ROI to the selected semantic-road component."""
+    if not _env_bool("AR_BIRDSEYE_FOLLOW_ROAD_MASK", True):
+        return None
+    road_mask = _birdseye_debug_result_road_mask(result)
+    if road_mask is None or not np.any(road_mask):
+        return None
+    image_height, image_width = image_shape[:2]
+    mask_height, mask_width = road_mask.shape
+    fixed_quad = _birdseye_debug_default_source_quad()
+    top_y = float(fixed_quad[0, 1])
+    bottom_y = float(fixed_quad[2, 1])
+    band_rows = max(0, _env_int("AR_BIRDSEYE_MASK_BAND_ROWS", 2))
+    search_rows = max(0, _env_int("AR_BIRDSEYE_MASK_SEARCH_ROWS", 8))
+
+    def find_run(y_normalized):
+        image_y = y_normalized * float(max(1, image_height - 1))
+        reference_image_x = _birdseye_debug_path_reference_x(
+            result, image_y, image_width)
+        reference_mask_x = (
+            reference_image_x * float(max(1, mask_width - 1)) /
+            float(max(1, image_width - 1)))
+        mask_y = int(round(
+            y_normalized * float(max(1, mask_height - 1))))
+        return _birdseye_debug_mask_run(
+            road_mask, mask_y, reference_mask_x,
+            band_rows=band_rows, search_rows=search_rows)
+
+    top_run = find_run(top_y)
+    bottom_run = find_run(bottom_y)
+    if top_run is None or bottom_run is None:
+        return None
+    margin = _clamp(
+        _env_float("AR_BIRDSEYE_MASK_MARGIN_X", 0.006), 0.0, 0.08)
+    top_left = _clamp(
+        float(top_run[0]) / float(max(1, mask_width - 1)) - margin,
+        0.0, 0.98)
+    top_right = _clamp(
+        float(top_run[1]) / float(max(1, mask_width - 1)) + margin,
+        top_left + 0.01, 1.0)
+    bottom_left = _clamp(
+        float(bottom_run[0]) / float(max(1, mask_width - 1)) - margin,
+        0.0, 0.98)
+    bottom_right = _clamp(
+        float(bottom_run[1]) / float(max(1, mask_width - 1)) + margin,
+        bottom_left + 0.01, 1.0)
+    top_width = top_right - top_left
+    bottom_width = bottom_right - bottom_left
+    if not (0.025 <= top_width <= 0.60):
+        return None
+    if not (0.08 <= bottom_width <= 0.98):
+        return None
+    if bottom_width < top_width * 1.12:
+        return None
+    return np.asarray([
+        [top_left, top_y],
+        [top_right, top_y],
+        [bottom_right, bottom_y],
+        [bottom_left, bottom_y],
+    ], dtype=np.float32)
+
+
+def _project_birdseye_debug_points(points, homography, source_quad,
+                                    output_shape):
+    """Project only points inside the configured ground-plane trapezoid."""
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) == 0:
+        return np.empty((0, 2), dtype=np.float32), np.zeros(0, dtype=bool)
+
+    finite = np.isfinite(points).all(axis=1)
+    top_y = 0.5 * float(source_quad[0, 1] + source_quad[1, 1])
+    bottom_y = 0.5 * float(source_quad[2, 1] + source_quad[3, 1])
+    source_visible = (
+        finite
+        & (points[:, 1] >= top_y)
+        & (points[:, 1] <= bottom_y)
+    )
+    projected = np.full(points.shape, np.nan, dtype=np.float32)
+    if np.any(source_visible):
+        projected[source_visible] = cv2.perspectiveTransform(
+            points[source_visible].reshape(-1, 1, 2), homography
+        ).reshape(-1, 2)
+    height, width = output_shape[:2]
+    output_visible = (
+        source_visible
+        & np.isfinite(projected).all(axis=1)
+        & (projected[:, 0] >= 0.0)
+        & (projected[:, 0] <= max(0, width - 1))
+        & (projected[:, 1] >= 0.0)
+        & (projected[:, 1] <= max(0, height - 1))
+    )
+    return projected, output_visible
+
+
+def _draw_birdseye_debug_curve(
+        frame, points, probabilities, slot, homography, source_quad,
+        thickness=2):
+    projected, visible = _project_birdseye_debug_points(
+        points, homography, source_quad, frame.shape)
+    if len(projected) < 2:
+        return
+    projected = np.where(np.isfinite(projected), projected, 0.0)
+    _draw_identity_probability_curve(
+        frame, projected, probabilities, slot, thickness=thickness,
+        visible_mask=visible)
+
+
+def _birdseye_debug_road_geometry(
+        result, source_quad, output_shape):
+    road_mask = _birdseye_debug_result_road_mask(result)
+    if road_mask is None:
+        return None
+
+    output_height, output_width = output_shape[:2]
+    mask_height, mask_width = road_mask.shape
+    source_to_mask = np.asarray([
+        [float(max(1, mask_width - 1)) /
+         float(max(1, output_width - 1)), 0.0, 0.0],
+        [0.0, float(max(1, mask_height - 1)) /
+         float(max(1, output_height - 1)), 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    ground_mask = road_mask.copy()
+    ground_roi = np.zeros_like(ground_mask, dtype=np.uint8)
+    mask_quad = cv2.perspectiveTransform(
+        source_quad.reshape(-1, 1, 2), source_to_mask
+    ).reshape(-1, 2)
+    cv2.fillConvexPoly(
+        ground_roi, np.rint(mask_quad).astype(np.int32), 1,
+        lineType=cv2.LINE_8)
+    ground_mask &= ground_roi
+    mask_to_source = np.asarray([
+        [float(max(1, output_width - 1)) /
+         float(max(1, mask_width - 1)), 0.0, 0.0],
+        [0.0, float(max(1, output_height - 1)) /
+         float(max(1, mask_height - 1)), 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    return ground_mask, mask_to_source
+
+
+def _draw_birdseye_debug_road(
+        frame, result, homography, source_quad):
+    geometry = _birdseye_debug_road_geometry(
+        result, source_quad, frame.shape)
+    if geometry is None:
+        return
+    ground_mask, mask_to_source = geometry
+    if not np.any(ground_mask):
+        return
+    mask_to_birdseye = (
+        np.asarray(homography, dtype=np.float64) @ mask_to_source)
+    road_color = (55, 55, 220)
+
+    contours, _hierarchy = cv2.findContours(
+        ground_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        if len(contour) < 2:
+            continue
+        projected = cv2.perspectiveTransform(
+            contour.astype(np.float32), mask_to_birdseye)
+        cv2.polylines(
+            frame, [np.rint(projected).astype(np.int32)], True,
+            road_color, 2, cv2.LINE_AA)
+
+    # Sparse dots communicate the segmented area without a second full-size
+    # warp/blend, which keeps this display-only overlay cheap on the RK3588.
+    stride = max(4, _env_int("AR_BIRDSEYE_ROAD_SAMPLE_STRIDE", 8))
+    sampled_y, sampled_x = np.nonzero(ground_mask[::stride, ::stride])
+    if len(sampled_x) == 0:
+        return
+    sampled = np.stack(
+        (sampled_x * stride, sampled_y * stride), axis=1
+    ).astype(np.float32)
+    projected = cv2.perspectiveTransform(
+        sampled.reshape(-1, 1, 2), mask_to_birdseye).reshape(-1, 2)
+    height, width = frame.shape[:2]
+    visible = (
+        np.isfinite(projected).all(axis=1)
+        & (projected[:, 0] >= 0.0)
+        & (projected[:, 0] < width)
+        & (projected[:, 1] >= 0.0)
+        & (projected[:, 1] < height)
+    )
+    for point in np.rint(projected[visible]).astype(np.int32):
+        cv2.circle(frame, tuple(point), 1, road_color, -1, cv2.LINE_8)
+
+
+def render_vision_control_birdseye(
+        frame, result, source_quad_normalized=None):
+    """Render an IPM debug panel without feeding anything back to control."""
+    if frame is None or frame.size == 0:
+        return frame
+    if source_quad_normalized is None:
+        source_quad_normalized = _birdseye_debug_source_quad_from_road(
+            result, frame.shape)
+    height, width = frame.shape[:2]
+    homography, source_quad, destination_quad = (
+        _birdseye_debug_homography(
+            frame.shape, source_quad_normalized=source_quad_normalized))
+    panel = cv2.warpPerspective(
+        frame, homography, (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(12, 12, 12))
+    if _env_bool("AR_BIRDSEYE_ROAD_OVERLAY", True):
+        _draw_birdseye_debug_road(
+            panel, result, homography, source_quad)
+
+    # A lightweight visual grid helps judge geometry; it is deliberately not
+    # labelled in metres because this preview has no camera calibration yet.
+    grid_color = (72, 72, 72)
+    destination_left = int(round(destination_quad[0, 0]))
+    destination_right = int(round(destination_quad[1, 0]))
+    destination_top = int(round(destination_quad[0, 1]))
+    destination_bottom = int(round(destination_quad[2, 1]))
+    for fraction in (0.20, 0.40, 0.60, 0.80):
+        grid_y = int(round(
+            destination_top + fraction *
+            (destination_bottom - destination_top)))
+        cv2.line(
+            panel, (destination_left, grid_y),
+            (destination_right, grid_y), grid_color, 1, cv2.LINE_AA)
+    for fraction in (0.25, 0.50, 0.75):
+        grid_x = int(round(
+            destination_left + fraction *
+            (destination_right - destination_left)))
+        cv2.line(
+            panel, (grid_x, destination_top),
+            (grid_x, destination_bottom), grid_color, 1, cv2.LINE_AA)
+
+    debug = (
+        (result.get("vision_control") if isinstance(result, dict) else None)
+        or {})
+    selected_slot = debug.get("selected_slot")
+    if isinstance(result, dict):
+        for line in _extract_curve_preview_lines(result):
+            _draw_birdseye_debug_curve(
+                panel, line["points_xy"], line.get("probabilities"),
+                int(line.get("slot", 0)), homography, source_quad,
+                thickness=(
+                    4 if int(line.get("slot", -1)) == selected_slot else 2))
+
+    selected_path_value = debug.get("selected_path")
+    selected_path = np.asarray(
+        [] if selected_path_value is None else selected_path_value,
+        dtype=np.float32)
+    if (selected_path.ndim == 2 and selected_path.shape[1:] == (2,)
+            and len(selected_path) >= 2):
+        selected_projected, selected_visible = (
+            _project_birdseye_debug_points(
+                selected_path, homography, source_quad, panel.shape))
+        selected_pixels = np.rint(np.where(
+            np.isfinite(selected_projected), selected_projected, 0.0)
+        ).astype(np.int32)
+        for index in range(len(selected_pixels) - 1):
+            if not (selected_visible[index] and selected_visible[index + 1]):
+                continue
+            cv2.line(
+                panel, tuple(selected_pixels[index]),
+                tuple(selected_pixels[index + 1]),
+                (0, 0, 0), 6, cv2.LINE_AA)
+            cv2.line(
+                panel, tuple(selected_pixels[index]),
+                tuple(selected_pixels[index + 1]),
+                (0, 255, 255), 3, cv2.LINE_AA)
+
+    center_x = float(width) * _clamp(
+        _env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8)
+    car_source = np.asarray([
+        [center_x, source_quad[2, 1]],
+    ], dtype=np.float32)
+    car_projected = cv2.perspectiveTransform(
+        car_source.reshape(-1, 1, 2), homography).reshape(-1, 2)[0]
+    car_x = int(round(_clamp(car_projected[0], 0, width - 1)))
+    car_y = int(round(_clamp(car_projected[1], 0, height - 1)))
+    cv2.drawMarker(
+        panel, (car_x, car_y), (255, 255, 255), cv2.MARKER_TRIANGLE_UP,
+        max(12, int(round(width * 0.035))), 2, cv2.LINE_AA)
+
+    target = debug.get("control_target") or {}
+    path_target_x = _finite_float(target.get("path_target_x"))
+    target_x = _finite_float(target.get("target_x"), path_target_x)
+    lookahead_y = _finite_float(
+        target.get("path_target_y"),
+        _finite_float(target.get("lookahead_y"), height * 0.62))
+
+    def project_target(x_value):
+        if x_value is None or lookahead_y is None:
+            return None
+        source_point = np.asarray(
+            [[float(x_value), float(lookahead_y)]], dtype=np.float32)
+        projected, visible = _project_birdseye_debug_points(
+            source_point, homography, source_quad, panel.shape)
+        if len(visible) != 1 or not visible[0]:
+            return None
+        return tuple(np.rint(projected[0]).astype(np.int32))
+
+    path_target_point = project_target(path_target_x)
+    control_target_point = project_target(target_x)
+    if path_target_point is not None:
+        cv2.circle(
+            panel, path_target_point, 6, (255, 255, 255), 2,
+            cv2.LINE_AA)
+    if control_target_point is not None:
+        cv2.line(
+            panel, (car_x, car_y), control_target_point,
+            (255, 0, 255), 2, cv2.LINE_AA)
+        cv2.circle(
+            panel, control_target_point, 8, (255, 0, 255), -1,
+            cv2.LINE_AA)
+        cv2.circle(
+            panel, control_target_point, 10, (255, 255, 255), 1,
+            cv2.LINE_AA)
+
+    overlay_height = max(52, int(round(height * 0.12)))
+    cv2.rectangle(panel, (0, 0), (width - 1, overlay_height),
+                  (0, 0, 0), -1)
+    cv2.putText(
+        panel, "BIRD'S-EYE / IPM DEBUG", (10, 23),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2,
+        cv2.LINE_AA)
+    cv2.putText(
+        panel, "DISPLAY ONLY - CONTROL UNCHANGED", (10, 47),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (190, 190, 190), 1,
+        cv2.LINE_AA)
+    if not debug:
+        cv2.putText(
+            panel, "WAITING FOR PATH DEBUG", (10, overlay_height + 25),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 2,
+            cv2.LINE_AA)
+    return panel
+
+
+class VisionControlBirdseyeRenderer:
+    """Stateful, smoothed display renderer for the local preview only."""
+
+    def __init__(self):
+        self.source_quad_normalized = None
+        self.source_status = "FIXED FALLBACK"
+        self.missing_mask_frames = 0
+
+    def _update_source_quad(self, result, image_shape):
+        fixed = _birdseye_debug_default_source_quad()
+        candidate = _birdseye_debug_source_quad_from_road(
+            result, image_shape)
+        hold_frames = max(
+            0, _env_int("AR_BIRDSEYE_MASK_HOLD_FRAMES", 8))
+        if candidate is None:
+            self.missing_mask_frames += 1
+            if (self.source_quad_normalized is None
+                    or self.missing_mask_frames > hold_frames):
+                self.source_quad_normalized = fixed
+                self.source_status = "FIXED FALLBACK"
+            else:
+                self.source_status = "ROAD MASK HOLD"
+            return self.source_quad_normalized
+
+        self.missing_mask_frames = 0
+        if self.source_quad_normalized is None:
+            self.source_quad_normalized = candidate
+        else:
+            alpha = _clamp(
+                _env_float("AR_BIRDSEYE_MASK_SMOOTH_ALPHA", 0.30),
+                0.02, 1.0)
+            max_step = _clamp(
+                _env_float("AR_BIRDSEYE_MASK_MAX_STEP_X", 0.035),
+                0.002, 0.20)
+            delta = alpha * (
+                candidate[:, 0] - self.source_quad_normalized[:, 0])
+            self.source_quad_normalized[:, 0] += np.clip(
+                delta, -max_step, max_step)
+            self.source_quad_normalized[:, 1] = candidate[:, 1]
+        self.source_status = "ROAD MASK"
+        return self.source_quad_normalized
+
+    def __call__(self, frame, result):
+        source_quad = self._update_source_quad(result, frame.shape)
+        return render_vision_control_birdseye(
+            frame, result, source_quad_normalized=source_quad)
+
+    def draw_source_roi(self, frame):
+        if (frame is None or frame.size == 0
+                or not _env_bool("AR_BIRDSEYE_SHOW_SOURCE_ROI", True)):
+            return frame
+        _homography, source, _destination = _birdseye_debug_homography(
+            frame.shape, source_quad_normalized=self.source_quad_normalized)
+        source_pixels = np.rint(source).astype(np.int32)
+        cv2.polylines(
+            frame, [source_pixels], True, (0, 0, 255), 2, cv2.LINE_AA)
+        label_y = max(18, int(np.min(source_pixels[:, 1])) - 7)
+        cv2.putText(
+            frame, "IPM ROI: {}".format(self.source_status),
+            (max(4, int(source_pixels[0, 0])), label_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1,
+            cv2.LINE_AA)
+        return frame
+
+
 def _fit_smooth_majority_curve(
         points, probabilities, image_width, inlier_px_640=10.0,
         sample_step_px=4.0, extend_to_y=None,
