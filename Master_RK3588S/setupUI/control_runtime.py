@@ -63,6 +63,7 @@ class ControlRuntime:
         self._thread = None
         self._vision_command = None
         self._vision_timestamp = 0.0
+        self._vision_hold_until = 0.0
         self._control_source = "IDLE"
         self._last_command = None
 
@@ -113,12 +114,36 @@ class ControlRuntime:
                 "flags": flags,
             }
             self._vision_timestamp = time.monotonic()
+            self._vision_hold_until = 0.0
         return True
+
+    def begin_vision_command_hold(self, duration_s):
+        """Keep the last visual command alive for one non-extending window."""
+        duration = _finite_float(duration_s)
+        if duration is None:
+            return False
+        duration = max(0.0, duration)
+        now = time.monotonic()
+        with self._lock:
+            if self._vision_command is None or not self._vision_timestamp:
+                return False
+            # Repeated invalid frames must not extend the deadline forever.
+            # A new valid vision command resets this field to zero.
+            if self._vision_hold_until <= 0.0:
+                self._vision_hold_until = now + duration
+            return now < self._vision_hold_until
+
+    def vision_hold_remaining(self):
+        with self._lock:
+            if self._vision_hold_until <= 0.0:
+                return 0.0
+            return max(0.0, self._vision_hold_until - time.monotonic())
 
     def clear_vision_command(self):
         with self._lock:
             self._vision_command = None
             self._vision_timestamp = 0.0
+            self._vision_hold_until = 0.0
 
     def snapshot(self):
         with self._lock:
@@ -127,6 +152,8 @@ class ControlRuntime:
                 if self._vision_timestamp
                 else None
             )
+            vision_hold_remaining = max(
+                0.0, self._vision_hold_until - time.monotonic())
             source = self._control_source
             command = dict(self._last_command) if self._last_command else None
         serial_status = self.car_link.get_feedback()
@@ -139,6 +166,7 @@ class ControlRuntime:
             "last_command": command,
             "vision_age": vision_age,
             "vision_ttl": self.vision_ttl,
+            "vision_hold_remaining": vision_hold_remaining,
             "pose": self.pose_bridge.snapshot(),
             "gamepad": self.gamepad_receiver.snapshot(),
             "serial": serial_status,
@@ -205,7 +233,13 @@ class ControlRuntime:
         with self._lock:
             if self._vision_command is None or not self._vision_timestamp:
                 return None
-            if time.monotonic() - self._vision_timestamp > self.vision_ttl:
+            now = time.monotonic()
+            command_fresh = (
+                now - self._vision_timestamp <= self.vision_ttl)
+            hold_active = (
+                self._vision_hold_until > 0.0
+                and now < self._vision_hold_until)
+            if not command_fresh and not hold_active:
                 return None
             return dict(self._vision_command)
 

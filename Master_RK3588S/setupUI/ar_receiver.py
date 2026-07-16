@@ -23,6 +23,8 @@ SHM_HEADER_SIZE = 16
 PREVIEW_TITLE = "AR Preview"
 INSTANCE_LOCK_PATH = "/tmp/sysu_ddl_ar_receiver.lock"
 VISION_CONTROL_SEND_DEFAULT = True
+CAMERA_INVALID_HOLD_SECONDS = 3.0
+CAMERA_STALE_SECONDS = 0.15
 
 
 def acquire_instance_lock():
@@ -85,6 +87,23 @@ def env_int(name, default):
         return int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return int(default)
+
+
+def camera_frame_is_blank(
+        frame, uniform_std=2.0, white_level=248.0, black_level=7.0):
+    """Detect a uniform white/black camera failure without rejecting scenery."""
+    if not isinstance(frame, np.ndarray) or frame.size == 0:
+        return True
+    # Sampling is sufficient for a uniform-failure check and avoids scanning
+    # every pixel of each camera frame.
+    sample = frame[::16, ::16]
+    if sample.size == 0:
+        sample = frame
+    mean = float(np.mean(sample))
+    deviation = float(np.std(sample))
+    return bool(
+        deviation <= float(uniform_std)
+        and (mean >= float(white_level) or mean <= float(black_level)))
 
 
 def instruction_direction(instruction):
@@ -816,6 +835,24 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     return frame
 
 
+def add_camera_fault_overlay(
+        frame, message="CAMERA FRAME INVALID"):
+    height, width = frame.shape[:2]
+    cv2.rectangle(
+        frame, (0, max(0, height // 2 - 34)),
+        (max(0, width - 1), min(height - 1, height // 2 + 34)),
+        (255, 255, 255), -1)
+    cv2.putText(
+        frame, str(message),
+        (12, height // 2 + 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA)
+    return frame
+
+
 def read_frame(shm):
     header = bytes(shm.buf[:SHM_HEADER_SIZE])
     frame_id, width, height = struct.unpack("QII", header)
@@ -885,12 +922,30 @@ def main():
     control_runtime = create_control_runtime(state)
     vision_control_planner, render_vision_control = create_vision_control_planner()
     vision_control_send = env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT)
+    camera_invalid_hold_s = max(
+        0.0, env_float(
+            "AR_CAMERA_INVALID_HOLD_SECONDS",
+            CAMERA_INVALID_HOLD_SECONDS))
+    camera_stale_s = max(
+        0.02, env_float(
+            "AR_CAMERA_STALE_SECONDS", CAMERA_STALE_SECONDS))
+    telemetry_logger = None
+    if env_flag("AR_VISION_TELEMETRY", False):
+        try:
+            from vision_telemetry import VisionTelemetryLogger
+
+            telemetry_logger = VisionTelemetryLogger.from_env()
+            if telemetry_logger is not None:
+                print(f"[VISION TELEMETRY] writing {telemetry_logger.path}")
+        except Exception as exc:
+            print(f"[VISION TELEMETRY] unavailable: {exc}")
 
     print("[AR_RECEIVER] ready; waiting for camera shared memory...")
     print(f"[AR_RECEIVER] DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}")
     sys.stdout.flush()
 
     shm = None
+    last_frame_id = 0
     last_ocr_log_key = None
     next_control_status_ts = 0.0
 
@@ -925,13 +980,14 @@ def main():
                     time.sleep(0.5)
                     continue
 
-            last_frame_id = 0
             fps_started = time.time()
             fps_frames = 0
             current_fps = 0.0
             inference_frames = 0
             current_inference_fps = 0.0
             latest_ocr_response = None
+            last_new_frame_ts = time.monotonic()
+            stale_hold_announced = False
 
             while shm is not None:
                 refresh_control_status()
@@ -940,7 +996,18 @@ def main():
                 try:
                     frame_id, frame = read_frame(shm)
                 except (ValueError, struct.error, BufferError, FileNotFoundError):
-                    print("[AR_RECEIVER] camera signal lost; waiting for recovery")
+                    hold_started = False
+                    if vision_control_send and control_runtime is not None:
+                        hold_started = control_runtime.begin_vision_command_hold(
+                            camera_invalid_hold_s)
+                    print(
+                        "[AR_RECEIVER] camera signal lost; "
+                        + (
+                            "holding last steering for {:.1f}s".format(
+                                camera_invalid_hold_s)
+                            if hold_started else
+                            "no valid steering command to hold"
+                        ))
                     try:
                         shm.close()
                     except Exception:
@@ -951,14 +1018,71 @@ def main():
                     break
 
                 if frame is None or frame_id == last_frame_id:
+                    stale_age = time.monotonic() - last_new_frame_ts
+                    if (
+                        stale_age >= camera_stale_s
+                        and not stale_hold_announced
+                    ):
+                        hold_started = False
+                        if vision_control_send and control_runtime is not None:
+                            hold_started = (
+                                control_runtime.begin_vision_command_hold(
+                                    camera_invalid_hold_s))
+                        print(
+                            "[AR_RECEIVER] camera frame stalled; "
+                            + (
+                                "holding last steering for {:.1f}s".format(
+                                    camera_invalid_hold_s)
+                                if hold_started else
+                                "no valid steering command to hold"
+                            ))
+                        stale_hold_announced = True
                     time.sleep(0.002)
                     continue
                 last_frame_id = frame_id
+                last_new_frame_ts = time.monotonic()
+                stale_hold_announced = False
+
+                if camera_frame_is_blank(frame):
+                    state.update_perception(error="camera frame is uniformly blank")
+                    hold_remaining = 0.0
+                    if vision_control_send and control_runtime is not None:
+                        control_runtime.begin_vision_command_hold(
+                            camera_invalid_hold_s)
+                        hold_remaining = (
+                            control_runtime.vision_hold_remaining())
+                    if telemetry_logger is not None:
+                        telemetry_logger.log_frame(
+                            frame_id, frame, camera_status=(
+                                "blank_hold" if hold_remaining > 0.0
+                                else "blank_stop"))
+                    if state.preview_enabled():
+                        fault_message = (
+                            "CAMERA INVALID - HOLD STEERING {:.1f}S".format(
+                                hold_remaining)
+                            if hold_remaining > 0.0 else
+                            "CAMERA INVALID - CONTROL STOPPED")
+
+                        def render_camera_fault(
+                                target,
+                                process_fps=current_fps,
+                                inference_fps=current_inference_fps,
+                                message=fault_message):
+                            add_runtime_overlay(
+                                target, process_fps, inference_fps, None)
+                            return add_camera_fault_overlay(
+                                target, message=message)
+
+                        preview.show(frame, renderer=render_camera_fault)
+                    time.sleep(0.01)
+                    continue
 
                 display_frame = frame
                 detections = []
                 ocr_source_frame = frame
                 perception_result = None
+                command = None
+                vision_debug = None
                 if infer is not None:
                     try:
                         infer_result, ready = infer.infer(frame)
@@ -1013,7 +1137,7 @@ def main():
 
                 if vision_control_planner is not None and perception_result is not None:
                     try:
-                        command, _vision_debug = vision_control_planner.update(
+                        command, vision_debug = vision_control_planner.update(
                             perception_result,
                             latest_ocr_response,
                             now=time.monotonic(),
@@ -1032,6 +1156,17 @@ def main():
                         print(f"[VISION CONTROL] process error: {exc}")
                         if vision_control_send and control_runtime is not None:
                             control_runtime.clear_vision_command()
+                runtime_snapshot = None
+                if (telemetry_logger is not None and control_runtime is not None
+                        and int(frame_id) % 5 == 0):
+                    try:
+                        runtime_snapshot = control_runtime.snapshot()
+                    except Exception:
+                        runtime_snapshot = None
+                if telemetry_logger is not None:
+                    telemetry_logger.log_frame(
+                        frame_id, frame, perception_result, command,
+                        vision_debug, runtime_snapshot)
                 if perception_result is not None:
                     state.update_perception(perception_result)
 
@@ -1068,6 +1203,8 @@ def main():
         web.stop()
         if control_runtime is not None:
             control_runtime.stop()
+        if telemetry_logger is not None:
+            telemetry_logger.close()
         if ocr_processor is not None and hasattr(ocr_processor, "close"):
             ocr_processor.close()
         if infer is not None:

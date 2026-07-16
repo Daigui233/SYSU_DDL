@@ -38,6 +38,13 @@ def _env_int(name, default):
         return int(default)
 
 
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _finite_float(value, default=None):
     try:
         result = float(value)
@@ -86,10 +93,21 @@ class VisionControlConfig:
     lookahead_y_ratio: float = 0.625
     max_track_error_640: float = 160.0
     max_error_step_640: float = 24.0
-    normal_speed_mps: float = 0.15
-    recover_speed_mps: float = 0.15
+    track_deadband_px_640: float = 4.0
+    track_small_error_px_640: float = 18.0
+    track_small_error_gain: float = 0.35
+    track_fast_error_px_640: float = 36.0
+    track_fast_step_scale: float = 2.0
+    track_reverse_step_scale: float = 0.50
+    path_heading_feedforward_gain: float = 0.35
+    path_heading_feedforward_max_px_640: float = 80.0
+    path_heading_deadband_px_640: float = 6.0
+    curve_feedforward_gain: float = 0.60
+    curve_feedforward_max_px_640: float = 24.0
+    normal_speed_mps: float = 0.10
+    recover_speed_mps: float = 0.08
     human_pass_speed_mps: float = 0.30
-    collect_speed_mps: float = 0.15
+    collect_speed_mps: float = 0.08
     turnsign_slow_speed_mps: float = 0.08
     route_confirm_frames: int = 6
     branch_separation_px_640: float = 70.0
@@ -103,6 +121,8 @@ class VisionControlConfig:
     curve_merge_release_frames: int = 30
     no_path_stop_s: float = 0.8
     recover_hold_s: float = 0.5
+    line_anchor_y_ratio: float = 0.78
+    line_anchor_max_offset_px_640: float = 200.0
     hazard_bottom_ratio: float = 0.58
     hazard_lateral_ratio: float = 0.18
     coin_bottom_ratio: float = 0.55
@@ -116,6 +136,9 @@ class VisionControlConfig:
     turnsign_reverse_speed_mps: float = -0.08
     turnsign_reverse_duration_s: float = 0.5
     turnsign_trim_far_y_ratio: float = 0.35
+    # Keep OCR parking micro-adjustment disabled until it is revalidated.
+    # OCR route selection remains enabled independently of this switch.
+    turnsign_trim_enabled: bool = False
     turnsign_trim_sample_rows: int = 6
     turnsign_trim_low_separation_px_640: float = 175.0
     turnsign_trim_high_separation_px_640: float = 220.0
@@ -130,11 +153,6 @@ class VisionControlConfig:
     turnsign_trim_min_steer_px_640: float = 44.0
     turnsign_trim_steer_gain: float = 0.75
     turnsign_trim_max_steer_px_640: float = 100.0
-    turnsign_trim_missing_steer_gain: float = 1.05
-    turnsign_trim_missing_max_steer_px_640: float = 135.0
-    turnsign_trim_severe_missing_frames: int = 3
-    turnsign_trim_severe_steer_gain: float = 1.30
-    turnsign_trim_severe_max_steer_px_640: float = 165.0
     human_stop_line_margin_ratio: float = 0.0
     human_stop_progress_ratio: float = 0.78
     human_preline_missing_px_480: float = 20.0
@@ -142,6 +160,8 @@ class VisionControlConfig:
     human_speed_hold_s: float = 0.5
     human_absence_confirm_s: float = 1.5
     car_avoid_offset_px_640: float = 55.0
+    car_avoid_steer_gain: float = 0.70
+    car_avoid_max_offset_px_640: float = 44.0
     car_avoid_hold_s: float = 2.0
     car_human_pass_speed_mps: float = 0.30
     car_human_pass_hold_s: float = 2.0
@@ -160,10 +180,37 @@ class VisionControlConfig:
             lookahead_y_ratio=_clamp(_env_float("VISION_CONTROL_LOOKAHEAD_Y_RATIO", 0.625), 0.25, 0.95),
             max_track_error_640=max(1.0, _env_float("VISION_CONTROL_MAX_ERROR_640", 160.0)),
             max_error_step_640=max(1.0, _env_float("VISION_CONTROL_MAX_STEP_640", 24.0)),
-            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.15)),
-            recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.15)),
+            track_deadband_px_640=max(
+                0.0, _env_float("VISION_CONTROL_TRACK_DEADBAND_640", 4.0)),
+            track_small_error_px_640=max(
+                1.0, _env_float("VISION_CONTROL_TRACK_SMALL_ERROR_640", 18.0)),
+            track_small_error_gain=_clamp(
+                _env_float("VISION_CONTROL_TRACK_SMALL_GAIN", 0.35), 0.0, 1.0),
+            track_fast_error_px_640=max(
+                1.0, _env_float("VISION_CONTROL_TRACK_FAST_ERROR_640", 36.0)),
+            track_fast_step_scale=max(
+                1.0, _env_float("VISION_CONTROL_TRACK_FAST_STEP_SCALE", 2.0)),
+            track_reverse_step_scale=_clamp(
+                _env_float("VISION_CONTROL_TRACK_REVERSE_STEP_SCALE", 0.50),
+                0.1, 1.0),
+            path_heading_feedforward_gain=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_PATH_HEADING_FF_GAIN", 0.35)),
+            path_heading_feedforward_max_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_PATH_HEADING_FF_MAX_640", 80.0)),
+            path_heading_deadband_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_PATH_HEADING_DEADBAND_640", 6.0)),
+            curve_feedforward_gain=_clamp(
+                _env_float("VISION_CONTROL_CURVE_FF_GAIN", 0.60),
+                0.0, 1.0),
+            curve_feedforward_max_px_640=max(
+                0.0, _env_float("VISION_CONTROL_CURVE_FF_MAX_640", 24.0)),
+            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.10)),
+            recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.08)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
-            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.15)),
+            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.08)),
             turnsign_slow_speed_mps=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_SLOW_SPEED", 0.08)),
             route_confirm_frames=max(1, _env_int("VISION_CONTROL_ROUTE_CONFIRM_FRAMES", 6)),
             branch_separation_px_640=max(1.0, _env_float("VISION_CONTROL_BRANCH_SEP_640", 70.0)),
@@ -186,6 +233,12 @@ class VisionControlConfig:
                     "VISION_CONTROL_CURVE_MERGE_RELEASE_FRAMES", 30)),
             no_path_stop_s=max(0.1, _env_float("VISION_CONTROL_NO_PATH_STOP_S", 0.8)),
             recover_hold_s=max(0.0, _env_float("VISION_CONTROL_RECOVER_HOLD_S", 0.5)),
+            line_anchor_y_ratio=_clamp(
+                _env_float("VISION_CONTROL_LINE_ANCHOR_Y_RATIO", 0.78),
+                0.50, 0.98),
+            line_anchor_max_offset_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_LINE_ANCHOR_MAX_OFFSET_640", 200.0)),
             hazard_bottom_ratio=_clamp(_env_float("VISION_CONTROL_HAZARD_BOTTOM_RATIO", 0.58), 0.0, 1.0),
             hazard_lateral_ratio=_clamp(_env_float("VISION_CONTROL_HAZARD_LATERAL_RATIO", 0.18), 0.01, 0.5),
             coin_bottom_ratio=_clamp(_env_float("VISION_CONTROL_COIN_BOTTOM_RATIO", 0.55), 0.0, 1.0),
@@ -199,6 +252,8 @@ class VisionControlConfig:
             turnsign_trim_far_y_ratio=_clamp(
                 _env_float("VISION_CONTROL_TURNSIGN_TRIM_FAR_Y_RATIO", 0.35),
                 0.05, 0.90),
+            turnsign_trim_enabled=_env_bool(
+                "VISION_CONTROL_TURNSIGN_TRIM_ENABLED", False),
             turnsign_trim_sample_rows=max(
                 2, _env_int("VISION_CONTROL_TURNSIGN_TRIM_SAMPLE_ROWS", 6)),
             turnsign_trim_low_separation_px_640=max(
@@ -240,21 +295,6 @@ class VisionControlConfig:
             turnsign_trim_max_steer_px_640=max(
                 0.0, _env_float(
                     "VISION_CONTROL_TURNSIGN_TRIM_MAX_STEER_640", 100.0)),
-            turnsign_trim_missing_steer_gain=max(
-                0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_STEER_GAIN", 1.05)),
-            turnsign_trim_missing_max_steer_px_640=max(
-                0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_MISSING_MAX_STEER_640", 135.0)),
-            turnsign_trim_severe_missing_frames=max(
-                1, _env_int(
-                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_MISSING_FRAMES", 3)),
-            turnsign_trim_severe_steer_gain=max(
-                0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_STEER_GAIN", 1.30)),
-            turnsign_trim_severe_max_steer_px_640=max(
-                0.0, _env_float(
-                    "VISION_CONTROL_TURNSIGN_TRIM_SEVERE_MAX_STEER_640", 165.0)),
             human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
             human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 0.78), 0.0, 1.0),
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
@@ -262,6 +302,12 @@ class VisionControlConfig:
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
             car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 55.0)),
+            car_avoid_steer_gain=_clamp(
+                _env_float("VISION_CONTROL_CAR_AVOID_STEER_GAIN", 0.70),
+                0.0, 1.0),
+            car_avoid_max_offset_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CAR_AVOID_MAX_OFFSET_640", 44.0)),
             car_avoid_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_HOLD_S", 2.0)),
             car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.30)),
             car_human_pass_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S", 2.0)),
@@ -287,6 +333,9 @@ class VisionControlPlanner:
         self.last_path_target_ts = 0.0
         self.last_valid_ts = 0.0
         self.last_error = 0.0
+        self.track_error_trend_sign = 0
+        self.track_error_trend_frames = 0
+        self.track_error_response = "initial"
         self.route_state = ROUTE_NONE
         self.route_reason = "initial"
         self.route_initialized = False
@@ -341,7 +390,6 @@ class VisionControlPlanner:
         self.turnsign_trim_current_fresh = False
         self.turnsign_trim_current_centered = False
         self.turnsign_trim_stop_ready = False
-        self.turnsign_trim_missing_frames = 0
         self.turnsign_trim_line_split_frames = 0
         self.turnsign_trim_line_collapse_frames = 0
         self.turnsign_trim_line_ever_split = False
@@ -373,9 +421,18 @@ class VisionControlPlanner:
         ):
             self.turnsign_control_session_id = incoming_session_id
             self._reset_turnsign_trim_runtime()
-            self.turnsign_trim_session_adaptive = True
-            self.turnsign_new_session_pending = True
-        if self.turnsign_trim_session_adaptive:
+            self.turnsign_trim_session_adaptive = bool(
+                self.config.turnsign_trim_enabled)
+            self.turnsign_new_session_pending = bool(
+                self.config.turnsign_trim_enabled)
+        if (not self.config.turnsign_trim_enabled and
+                (self.turnsign_trim_session_adaptive or
+                 self.turnsign_trim_pulse_until > 0.0)):
+            self._reset_turnsign_trim_runtime()
+        if (
+            self.config.turnsign_trim_enabled
+            and self.turnsign_trim_session_adaptive
+        ):
             self._update_turnsign_line_history(now)
 
         raw_route_state, raw_route_reason = self._classify_routes(
@@ -391,7 +448,8 @@ class VisionControlPlanner:
             self.last_valid_ocr_ts = now
             self.turnsign_trim_api_ready = True
             if (
-                self.turnsign_trim_session_adaptive
+                self.config.turnsign_trim_enabled
+                and self.turnsign_trim_session_adaptive
                 and not self.turnsign_trim_line_split_ready
             ):
                 self.turnsign_trim_pending_ocr_direction = ocr_direction
@@ -400,7 +458,8 @@ class VisionControlPlanner:
         else:
             ocr_lock_expired = self._expire_ocr_lock(now)
         if (
-            self.turnsign_trim_pending_ocr_direction in {"left", "right"}
+            self.config.turnsign_trim_enabled
+            and self.turnsign_trim_pending_ocr_direction in {"left", "right"}
             and self.turnsign_trim_line_split_ready
         ):
             self._apply_ocr_direction_lock(
@@ -408,10 +467,22 @@ class VisionControlPlanner:
             self.turnsign_trim_pending_ocr_direction = None
 
         self._update_curve_merge_continuity(candidates, image_shape)
-        selected = self._select_candidate(candidates)
+        raw_selected = self._select_candidate(candidates)
+        line_connected, line_connection_reason, line_connection_metrics = (
+            self._path_connection_status(raw_selected, image_shape))
+        line_loss_reason = None
+        selected = raw_selected
+        if raw_selected is not None and not line_connected:
+            line_loss_reason = line_connection_reason
+            selected = None
+            self.selection_reason = "line_loss_{}".format(
+                line_connection_reason)
+        elif raw_selected is None and not candidates:
+            line_loss_reason = "no_candidate"
         command, control_target = self._build_command(
             selected, route_reason, perception_result,
-            image_shape, now, ocr_response)
+            image_shape, now, ocr_response,
+            line_loss_reason=line_loss_reason)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         debug = {
             "enabled": True,
@@ -425,6 +496,14 @@ class VisionControlPlanner:
             "branch_lock_source": self.branch_lock_source,
             "selected_slot_lock": self.selected_slot_lock,
             "selection_reason": self.selection_reason,
+            "line_loss_active": line_loss_reason is not None,
+            "line_loss_reason": line_loss_reason,
+            "line_connected": bool(line_connected),
+            "line_connection_reason": line_connection_reason,
+            "line_connection_metrics": line_connection_metrics,
+            "raw_selected_slot": (
+                None if raw_selected is None
+                else int(raw_selected.get("slot", -1))),
             "curve_merge_override": bool(self.curve_merge_override),
             "curve_merge_reason": self.curve_merge_reason,
             "curve_merge_bad_evidence": self.curve_merge_bad_evidence,
@@ -443,6 +522,8 @@ class VisionControlPlanner:
             "ocr_lock_age_s": self._ocr_lock_age(now),
             "ocr_lock_remaining_s": self._ocr_lock_remaining(now),
             "turnsign_trim_separation_640": self.turnsign_trim_separation_640,
+            "turnsign_trim_enabled": bool(
+                self.config.turnsign_trim_enabled),
             "turnsign_trim_lookahead_separation_640": (
                 self.turnsign_trim_lookahead_separation_640),
             "turnsign_trim_separation_samples_640": list(
@@ -464,8 +545,6 @@ class VisionControlPlanner:
                 self.turnsign_trim_current_centered),
             "turnsign_trim_stop_ready": bool(
                 self.turnsign_trim_stop_ready),
-            "turnsign_trim_missing_frames": int(
-                self.turnsign_trim_missing_frames),
             "turnsign_trim_line_split_frames": int(
                 self.turnsign_trim_line_split_frames),
             "turnsign_trim_line_collapse_frames": int(
@@ -608,7 +687,7 @@ class VisionControlPlanner:
             "status": (
                 "fitted_curve_tracking" if candidates
                 else "path_unavailable"),
-            "mode": "large_jump_confirmation",
+            "mode": "adaptive_curve_tracking",
             "source": "fitted_control_curve",
         }
         centerline = result.get("centerline")
@@ -925,7 +1004,49 @@ class VisionControlPlanner:
                 return candidate
         return None
 
-    def _build_command(self, selected, route_reason, result, image_shape, now, ocr_response=None):
+    def _path_connection_status(self, selected, image_shape):
+        """Reject a fitted path whose near end no longer reaches the car."""
+        if selected is None:
+            return False, "no_selected_route", {}
+        points = np.asarray(
+            selected.get("points_xy", ()), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+            return False, "invalid_path", {}
+        finite = np.all(np.isfinite(points), axis=1)
+        points = points[finite]
+        if len(points) < 3:
+            return False, "invalid_path", {}
+        height, width = image_shape[:2]
+        maximum_y = float(np.max(points[:, 1]))
+        near_band = max(18.0, 0.05 * float(height))
+        near_points = points[points[:, 1] >= maximum_y - near_band]
+        near_x = float(np.median(near_points[:, 0]))
+        visual_center = float(width) * self.config.visual_center_x
+        near_offset_640 = (
+            (near_x - visual_center) * 640.0 / float(max(1, width)))
+        reaches_vehicle = bool(
+            maximum_y >=
+            float(height) * self.config.line_anchor_y_ratio)
+        inside_anchor_gate = bool(
+            abs(near_offset_640) <=
+            self.config.line_anchor_max_offset_px_640)
+        metrics = {
+            "maximum_y": maximum_y,
+            "maximum_y_ratio": maximum_y / float(max(1, height)),
+            "near_x": near_x,
+            "near_offset_640": near_offset_640,
+            "reaches_vehicle": reaches_vehicle,
+            "inside_anchor_gate": inside_anchor_gate,
+        }
+        if not reaches_vehicle:
+            return False, "short_near_support", metrics
+        if not inside_anchor_gate:
+            return False, "detached_near_anchor", metrics
+        return True, "connected", metrics
+
+    def _build_command(
+            self, selected, route_reason, result, image_shape, now,
+            ocr_response=None, line_loss_reason=None):
         lookahead_y = image_shape[0] * self.config.lookahead_y_ratio
         ocr_route_locked = (
             self.branch_lock_source == "ocr"
@@ -933,7 +1054,10 @@ class VisionControlPlanner:
             and self.last_valid_ocr_ts > 0.0
             and float(now) - self.last_valid_ocr_ts <
                 self.config.ocr_lock_lifetime_s)
-        if ocr_route_locked and selected is None:
+        if (
+            ocr_route_locked and selected is None
+            and line_loss_reason is None
+        ):
             if isinstance(ocr_response, dict):
                 ocr_response["control_phase"] = "ocr_wait_route"
             return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
@@ -959,7 +1083,7 @@ class VisionControlPlanner:
         if selected is None:
             age = now - self.last_valid_ts if self.last_valid_ts else 1e9
             held_target = self._held_path_target(now)
-            if self.last_valid_ts and age <= self.config.recover_hold_s:
+            if self.last_valid_ts and age < self.config.no_path_stop_s:
                 error = self.last_error
                 return self._command(
                     error, self.config.recover_speed_mps,
@@ -972,24 +1096,19 @@ class VisionControlPlanner:
                             None if held_target is None else held_target[1]),
                         "path_target_held": held_target is not None,
                         "track_error_640": error,
-                        "reason": "recover_hold",
+                        "reason": line_loss_reason or "line_unavailable",
                         "task_reason": task_reason,
+                        "line_loss_hold": True,
+                        "line_loss_age_s": float(age),
                     }
-            state = (
-                STATE_LINE_LOSS_SAFE_STOP
-                if age >= self.config.no_path_stop_s
-                else STATE_RECOVER_LINE)
-            speed = (
-                0.0 if state == STATE_LINE_LOSS_SAFE_STOP
-                else self.config.recover_speed_mps)
-            flags = (
-                0 if state == STATE_LINE_LOSS_SAFE_STOP
-                else CONTROL_FLAG_USE_TARGET_SPEED)
-            return self._command(0.0, speed, state, flags=flags), {
+            return self._command(
+                0.0, 0.0, STATE_LINE_LOSS_SAFE_STOP, flags=0), {
                 "target_x": None,
                 "track_error_640": 0.0,
-                "reason": route_reason,
+                "reason": line_loss_reason or route_reason,
                 "task_reason": task_reason,
+                "line_loss_hold": False,
+                "line_loss_age_s": float(age),
             }
         if path_target is None:
             return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
@@ -1009,9 +1128,26 @@ class VisionControlPlanner:
             float(max(0, image_shape[1] - 1)),
         )
         task_offset_x = float(target_x) - float(path_target_x)
-        raw_error = (
+        path_raw_error = (
             float(target_x) / float(max(1, image_shape[1]))
             - self.config.visual_center_x) * 640.0
+        heading_feedforward = 0.0
+        curve_feedforward = 0.0
+        if (task_reason == "track" and target_override_x is None and
+                not path_target_adaptive):
+            heading_feedforward = self._path_heading_feedforward_error(
+                selected, path_target_y, image_shape)
+            curve_feedforward = self._curve_feedforward_error(
+                selected, path_target_y, image_shape)
+        total_feedforward = (
+            float(heading_feedforward) + float(curve_feedforward))
+        raw_error = float(path_raw_error) + total_feedforward
+        control_target_x = _clamp(
+            float(target_x) + total_feedforward *
+            float(max(1, image_shape[1])) / 640.0,
+            0.0,
+            float(max(0, image_shape[1] - 1)),
+        )
         if task_reason in {
             "turnsign_trim_forward", "turnsign_trim_reverse"
         }:
@@ -1019,8 +1155,10 @@ class VisionControlPlanner:
                 raw_error,
                 -self.config.max_track_error_640,
                 self.config.max_track_error_640)
+            self._reset_track_error_response("turnsign_trim")
         else:
-            error = self._limit_error(raw_error)
+            error = self._limit_error(
+                raw_error, adaptive=(task_reason == "track"))
         self.last_error = error
         self.last_valid_ts = now
         self.last_path_target_x = float(path_target_x)
@@ -1028,7 +1166,8 @@ class VisionControlPlanner:
         self.last_path_target_slot = int(selected["slot"])
         self.last_path_target_ts = float(now)
         return self._command(error, speed, task_state), {
-            "target_x": float(target_x),
+            "target_x": float(control_target_x),
+            "base_target_x": float(target_x),
             "path_target_x": float(path_target_x),
             "path_target_y": float(path_target_y),
             "path_target_held": False,
@@ -1040,6 +1179,13 @@ class VisionControlPlanner:
             "task_target_applied": target_override_x is not None,
             "track_error_640": float(error),
             "raw_track_error_640": float(raw_error),
+            "path_raw_track_error_640": float(path_raw_error),
+            "path_heading_feedforward_640": float(
+                heading_feedforward),
+            "curve_feedforward_640": float(curve_feedforward),
+            "total_feedforward_640": float(total_feedforward),
+            "track_error_response": self.track_error_response,
+            "track_error_trend_frames": int(self.track_error_trend_frames),
             "reason": route_reason,
             "task_reason": task_reason,
         }
@@ -1065,6 +1211,70 @@ class VisionControlPlanner:
         # coordinate from the nearest supported endpoint when the curve is
         # temporarily too short to cross that row.
         return float(points[nearest, 0]), float(preferred_y), True
+
+    def _path_heading_feedforward_error(
+            self, selected, lookahead_y, image_shape):
+        """Convert the fitted-path tangent into an anticipatory steer error."""
+        points = np.asarray(
+            (selected or {}).get("points_xy", ()), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 4:
+            return 0.0
+        height, width = image_shape[:2]
+        span = min(72.0, max(32.0, 0.15 * float(height)))
+        far_y = float(lookahead_y) - span
+        near_y = float(lookahead_y) + span
+        if (
+            far_y < float(np.min(points[:, 1]))
+            or near_y > float(np.max(points[:, 1]))
+        ):
+            return 0.0
+        far_x = _interp_path_x(points, far_y)
+        near_x = _interp_path_x(points, near_y)
+        if (
+            far_x is None or near_x is None
+            or not math.isfinite(float(far_x))
+            or not math.isfinite(float(near_x))
+        ):
+            return 0.0
+        heading_delta_640 = (
+            (float(far_x) - float(near_x)) * 640.0 /
+            float(max(1, width)))
+        if (
+            abs(heading_delta_640) <=
+            self.config.path_heading_deadband_px_640
+        ):
+            return 0.0
+        feedforward = (
+            heading_delta_640 *
+            float(self.config.path_heading_feedforward_gain))
+        maximum = float(
+            self.config.path_heading_feedforward_max_px_640)
+        return _clamp(feedforward, -maximum, maximum)
+
+    def _curve_feedforward_error(self, selected, lookahead_y, image_shape):
+        """Return a small anticipatory error from the fitted curve bend."""
+        points = np.asarray(
+            (selected or {}).get("points_xy", ()), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 4:
+            return 0.0
+        height, width = image_shape[:2]
+        span = min(72.0, max(32.0, 0.15 * float(height)))
+        rows = (
+            float(lookahead_y) - span,
+            float(lookahead_y),
+            float(lookahead_y) + span)
+        if rows[0] < float(np.min(points[:, 1])) or rows[-1] > float(np.max(points[:, 1])):
+            return 0.0
+        samples = [_interp_path_x(points, row) for row in rows]
+        if any(value is None or not math.isfinite(float(value)) for value in samples):
+            return 0.0
+        curvature_640 = (
+            float(samples[0] - 2.0 * samples[1] + samples[2]) *
+            640.0 / float(max(1, width)))
+        feedforward = (
+            curvature_640 * float(self.config.curve_feedforward_gain))
+        maximum = float(self.config.curve_feedforward_max_px_640)
+        return _clamp(feedforward, -maximum, maximum)
 
     def _held_path_target(self, now):
         if (self.last_path_target_x is None or
@@ -1139,6 +1349,32 @@ class VisionControlPlanner:
             path_x):
         response = ocr_response if isinstance(ocr_response, dict) else {}
         phase = str(response.get("control_phase") or "")
+        if not self.config.turnsign_trim_enabled:
+            # Keep the sign safety phases, but do not let OCR parking control
+            # change longitudinal motion or replace the selected path target.
+            if phase in {
+                "turnsign_edge_over_line", "turnsign_ocr_wait",
+                "turnsign_position_ready", "turnsign_missing_stop",
+            }:
+                return STATE_SAFE_STOP, 0.0, phase, None
+            if phase in {
+                "turnsign_edge_left", "turnsign_edge_right",
+                "turnsign_approach", "turnsign_missing_hold",
+                "turnsign_class_continuation",
+                "turnsign_trim_forward", "turnsign_trim_reverse",
+                "turnsign_trim_settle", "turnsign_trim_verify",
+                "turnsign_trim_ready",
+            }:
+                return (
+                    STATE_TRACK,
+                    self.config.turnsign_slow_speed_mps,
+                    "turnsign_trim_disabled",
+                    None,
+                )
+            if phase:
+                return None
+            return self._legacy_turnsign_action(
+                detections, image_shape, response, now)
         session_active = bool(response.get("session_active"))
         session_id = response.get("session_id")
         new_session = bool(
@@ -1172,7 +1408,7 @@ class VisionControlPlanner:
         if self.turnsign_trim_pulse_until > 0.0:
             if float(now) < self.turnsign_trim_pulse_until:
                 return self._active_turnsign_trim_action(
-                    response, image_shape)
+                    response, image_shape, path_x)
             self.turnsign_trim_pulse_until = 0.0
             self.turnsign_trim_direction = 0
             self.turnsign_trim_settle_until = (
@@ -1212,7 +1448,7 @@ class VisionControlPlanner:
                 self._start_turnsign_trim_pulse(
                     now, trim_direction)
                 return self._active_turnsign_trim_action(
-                    response, image_shape)
+                    response, image_shape, path_x)
             if trim_direction == 0 and not self.turnsign_trim_stop_ready:
                 response["control_phase"] = "turnsign_trim_verify"
                 self._publish_turnsign_trim_info(response)
@@ -1327,42 +1563,37 @@ class VisionControlPlanner:
         self.turnsign_trim_pulse_until = (
             float(now) + self.config.turnsign_reverse_duration_s)
 
-    def _active_turnsign_trim_action(self, response, image_shape):
+    def _active_turnsign_trim_action(
+            self, response, image_shape, path_x):
         direction = self._sign(self.turnsign_trim_direction)
         reason = (
             "turnsign_trim_forward" if direction > 0
             else "turnsign_trim_reverse")
         response["control_phase"] = reason
         target_x = self._turnsign_trim_target_x(
-            image_shape, direction)
+            image_shape, direction, path_x)
         self._publish_turnsign_trim_info(response)
         speed = abs(float(self.config.turnsign_reverse_speed_mps)) * direction
         return STATE_TRACK, speed, reason, target_x
 
-    def _turnsign_trim_target_x(self, image_shape, direction):
+    def _turnsign_trim_target_x(self, image_shape, direction, path_x):
         delta_640 = _finite_float(self.turnsign_trim_position_delta_640)
         width = float(max(1, image_shape[1]))
-        visual_center = width * self.config.visual_center_x
+        if not self.turnsign_trim_current_fresh:
+            # Do not keep steering toward a stale sign position after the
+            # detector loses the sign. The longitudinal OCR pulse can continue
+            # while lateral control remains on the selected path.
+            return _clamp(
+                float(path_x), 0.0, float(max(0, image_shape[1] - 1)))
         if (
             delta_640 is None
             or abs(delta_640) <=
                 self.config.turnsign_trim_steer_deadband_px_640
         ):
-            return float(visual_center)
-        if self.turnsign_trim_current_fresh:
-            steer_gain = self.config.turnsign_trim_steer_gain
-            max_steer = self.config.turnsign_trim_max_steer_px_640
-        elif (
-            self.turnsign_trim_missing_frames >=
-            self.config.turnsign_trim_severe_missing_frames
-        ):
-            steer_gain = self.config.turnsign_trim_severe_steer_gain
-            max_steer = (
-                self.config.turnsign_trim_severe_max_steer_px_640)
-        else:
-            steer_gain = self.config.turnsign_trim_missing_steer_gain
-            max_steer = (
-                self.config.turnsign_trim_missing_max_steer_px_640)
+            return _clamp(
+                float(path_x), 0.0, float(max(0, image_shape[1] - 1)))
+        steer_gain = self.config.turnsign_trim_steer_gain
+        max_steer = self.config.turnsign_trim_max_steer_px_640
         correction_640 = (
             float(direction) * float(steer_gain)
             * float(delta_640))
@@ -1375,7 +1606,7 @@ class VisionControlPlanner:
         correction_640 = _clamp(
             correction_640, -float(max_steer), float(max_steer))
         return _clamp(
-            float(visual_center) + correction_640 * width / 640.0,
+            float(path_x) + correction_640 * width / 640.0,
             0.0, float(max(0, image_shape[1] - 1)))
 
     def _remember_turnsign_position(self, response, phase, image_shape):
@@ -1404,7 +1635,6 @@ class VisionControlPlanner:
                 max(
                     self.turnsign_trim_fresh_frames + 1,
                     confirmed_frames))
-            self.turnsign_trim_missing_frames = 0
         elif (
             self.turnsign_detection_was_fresh
             and self.turnsign_last_seen_delta_640 is not None
@@ -1420,7 +1650,6 @@ class VisionControlPlanner:
                 self.turnsign_last_seen_delta_640)
         if not is_fresh:
             self.turnsign_trim_fresh_frames = 0
-            self.turnsign_trim_missing_frames += 1
         self.turnsign_detection_was_fresh = is_fresh
         self.turnsign_trim_current_fresh = is_fresh
         self.turnsign_trim_current_centered = bool(
@@ -1447,8 +1676,6 @@ class VisionControlPlanner:
             self.turnsign_trim_position_delta_640)
         response["turnsign_trim_fresh_frames"] = int(
             self.turnsign_trim_fresh_frames)
-        response["turnsign_trim_missing_frames"] = int(
-            self.turnsign_trim_missing_frames)
         response["turnsign_trim_current_centered"] = bool(
             self.turnsign_trim_current_centered)
         response["turnsign_trim_stop_ready"] = bool(
@@ -1477,7 +1704,6 @@ class VisionControlPlanner:
         self.turnsign_trim_current_fresh = False
         self.turnsign_trim_current_centered = False
         self.turnsign_trim_stop_ready = False
-        self.turnsign_trim_missing_frames = 0
         self.turnsign_trim_line_split_frames = 0
         self.turnsign_trim_line_collapse_frames = 0
         self.turnsign_trim_line_ever_split = False
@@ -1573,7 +1799,6 @@ class VisionControlPlanner:
             desired_magnitude_640 = abs(desired_offset) * scale
             self.car_avoid_offset_px_640 = max(
                 self.car_avoid_offset_px_640,
-                self.config.car_avoid_offset_px_640,
                 desired_magnitude_640,
             )
             self.car_avoid_hold_until = (
@@ -1589,7 +1814,10 @@ class VisionControlPlanner:
             self._clear_car_avoidance_state()
             return None
 
-        avoid_target_x = self._latched_car_target_x(path_x, image_shape)
+        avoid_target_x = self._latched_car_target_x(
+            path_x, image_shape, now,
+            full_hold=bool(
+                car is not None or self.car_human_active or pass_holding))
         human = self._best_car_context_human(
             detections, image_shape)
 
@@ -1750,11 +1978,19 @@ class VisionControlPlanner:
                 best_rank = rank
         return best
 
-    def _latched_car_target_x(self, path_x, image_shape):
+    def _latched_car_target_x(
+            self, path_x, image_shape, now, full_hold=False):
         scale = float(max(1, image_shape[1])) / 640.0
+        hold_scale = 1.0
+        if not full_hold and self.config.car_avoid_hold_s > 0.0:
+            hold_scale = _clamp(
+                (float(self.car_avoid_hold_until) - float(now)) /
+                float(self.config.car_avoid_hold_s),
+                0.0, 1.0)
         offset = (
             float(self.car_avoid_side)
             * float(self.car_avoid_offset_px_640)
+            * float(hold_scale)
             * scale)
         return _clamp(
             float(path_x) + offset,
@@ -1964,7 +2200,14 @@ class VisionControlPlanner:
             if label == "human"
             else self.config.car_avoid_offset_px_640
         )
-        offset = max(float(base_offset) * scale, float(geom["box_w"]) * self.config.avoid_box_width_gain)
+        offset = max(
+            float(base_offset) * scale,
+            float(geom["box_w"]) * self.config.avoid_box_width_gain)
+        if label == "car":
+            offset *= float(self.config.car_avoid_steer_gain)
+            offset = min(
+                offset,
+                float(self.config.car_avoid_max_offset_px_640) * scale)
         side = 1.0 if geom["cx"] <= path_x else -1.0
         return _clamp(float(path_x) + side * offset, 0.0, float(max(0, image_shape[1] - 1)))
 
@@ -2026,11 +2269,88 @@ class VisionControlPlanner:
         return 0
 
     def _is_turnsign_detection(self, det):
-        return self._normalized_label(det) in {"turnsign", "roadsign", "sign"}
+        return self._normalized_label(det) == "turnsign"
 
-    def _limit_error(self, error):
-        error = _clamp(error, -self.config.max_track_error_640, self.config.max_track_error_640)
-        delta = _clamp(error - self.last_error, -self.config.max_error_step_640, self.config.max_error_step_640)
+    def _reset_track_error_response(self, reason="fixed_step"):
+        self.track_error_trend_sign = 0
+        self.track_error_trend_frames = 0
+        self.track_error_response = str(reason)
+
+    def _shape_track_error(self, error):
+        """Suppress tiny straight-line noise without weakening large bends."""
+        limit = float(self.config.max_track_error_640)
+        error = _clamp(float(error), -limit, limit)
+        magnitude = abs(error)
+        deadband = float(self.config.track_deadband_px_640)
+        small_limit = max(
+            deadband + 1.0, float(self.config.track_small_error_px_640))
+        fast_limit = max(small_limit + 1.0,
+                         float(self.config.track_fast_error_px_640))
+        if magnitude <= deadband:
+            return 0.0
+        # Ramp the gain from the straight-line noise gain to unity.  This
+        # keeps a 5-15 px straight-line fluctuation small while retaining
+        # nearly all of a substantial curve error.
+        normalized = _clamp(
+            (magnitude - deadband) / (fast_limit - deadband), 0.0, 1.0)
+        gain = (
+            float(self.config.track_small_error_gain) * (1.0 - normalized)
+            + normalized)
+        shaped_magnitude = min(limit, (magnitude - deadband) * gain)
+        return float(math.copysign(shaped_magnitude, error))
+
+    def _limit_error(self, error, adaptive=False):
+        """Apply a stable straight response and a fast coherent bend response."""
+        clamped = _clamp(
+            float(error), -self.config.max_track_error_640,
+            self.config.max_track_error_640)
+        if not adaptive:
+            self._reset_track_error_response()
+            delta = _clamp(
+                clamped - self.last_error,
+                -self.config.max_error_step_640,
+                self.config.max_error_step_640)
+            return float(self.last_error + delta)
+
+        shaped = self._shape_track_error(clamped)
+        sign = self._sign(shaped)
+        previous_sign = int(self.track_error_trend_sign)
+        same_direction = sign != 0 and sign == previous_sign
+        if same_direction:
+            self.track_error_trend_frames += 1
+        else:
+            self.track_error_trend_frames = 1 if sign else 0
+        self.track_error_trend_sign = sign
+        base_step = float(self.config.max_error_step_640)
+        magnitude = abs(shaped)
+        last_magnitude = abs(float(self.last_error))
+        is_reversal = (
+            sign != 0 and self._sign(self.last_error) != 0 and
+            sign != self._sign(self.last_error))
+        is_unwinding = (
+            magnitude < last_magnitude and
+            self._sign(self.last_error) in {0, sign})
+        if is_unwinding and last_magnitude > self.config.track_small_error_px_640:
+            step = base_step * 1.5
+            mode = "fast_unwind"
+        elif (same_direction and self.track_error_trend_frames >= 2 and
+              magnitude >= self.config.track_fast_error_px_640):
+            step = base_step * self.config.track_fast_step_scale
+            mode = "fast_curve"
+        elif is_reversal:
+            step = base_step * self.config.track_reverse_step_scale
+            mode = "reverse_guard"
+        elif magnitude <= self.config.track_small_error_px_640:
+            step = base_step * 0.35
+            mode = "straight_damping"
+        else:
+            step = base_step
+            mode = "normal_track"
+        self.track_error_response = mode
+        # A sign change after one noisy frame is deliberately restrained.  A
+        # persistent opposite-side error gets its normal response on the
+        # following frame through the trend counter.
+        delta = _clamp(shaped - self.last_error, -step, step)
         return float(self.last_error + delta)
 
     @staticmethod
@@ -2270,10 +2590,25 @@ def render_vision_control_debug(frame, result):
     cv2.putText(frame, text, (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
     detected_count = int(debug.get(
         "detected_path_count", 1))
+    line_loss_reason = str(
+        debug.get("line_loss_reason")
+        or debug.get("line_connection_reason")
+        or "")
+    line_status = {
+        "no_candidate": "NO_LINE",
+        "short_near_support": "SHORT",
+        "detached_near_anchor": "DETACHED",
+        "invalid_path": "INVALID",
+        "no_selected_route": "NO_ROUTE",
+    }.get(line_loss_reason, "OK")
+    line_color = (
+        (0, 0, 255) if debug.get("line_loss_active")
+        else (30, 230, 255))
     cv2.putText(
-        frame, "PATH COUNT: {}".format(detected_count),
+        frame, "PATH COUNT: {}  LINE: {}".format(
+            detected_count, line_status),
         (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
-        (30, 230, 255), 2, cv2.LINE_AA)
+        line_color, 2, cv2.LINE_AA)
     return frame
 
 
@@ -2514,10 +2849,17 @@ def _fit_smooth_majority_curve(
 
 
 class _FittedControlPathTracker:
-    """Low-latency per-slot tracker for fitted control/preview curves."""
+    """Adaptive per-slot tracker for fitted control/preview curves.
 
-    def __init__(self, jump_threshold_px_640=24.0,
-                 confirm_tolerance_px_640=12.0,
+    Small frame-to-frame changes are blended to suppress straight-line model
+    noise.  A coherent same-direction change is blended aggressively so the
+    tracker does not add a visible delay at a curve entrance.  Very large
+    discontinuities still require a second-frame confirmation to protect
+    against a slot switch or an isolated bad fit.
+    """
+
+    def __init__(self, jump_threshold_px_640=48.0,
+                 confirm_tolerance_px_640=16.0,
                  hold_frames=0, timeout_s=0.5, hold_decay=0.72):
         self.jump_threshold_px_640 = max(
             0.0, float(jump_threshold_px_640))
@@ -2548,6 +2890,41 @@ class _FittedControlPathTracker:
         first_x = np.interp(
             y[overlap], first[:, 1], first[:, 0]).astype(np.float32)
         return float(np.median(np.abs(second[overlap, 0] - first_x)))
+
+    @staticmethod
+    def _median_signed_curve_displacement(first, second):
+        first = np.asarray(first, dtype=np.float32)
+        second = np.asarray(second, dtype=np.float32)
+        if len(first) < 2 or len(second) < 2:
+            return None
+        y = second[:, 1]
+        overlap = (
+            (y >= float(first[0, 1])) &
+            (y <= float(first[-1, 1])))
+        if int(np.count_nonzero(overlap)) < 2:
+            return None
+        first_x = np.interp(
+            y[overlap], first[:, 1], first[:, 0]).astype(np.float32)
+        return float(np.median(second[overlap, 0] - first_x))
+
+    @staticmethod
+    def _blend_with_previous(previous_points, current_points, alpha):
+        previous_points = np.asarray(previous_points, dtype=np.float32)
+        current_points = np.asarray(current_points, dtype=np.float32).copy()
+        if len(previous_points) < 2 or len(current_points) == 0:
+            return current_points
+        y = current_points[:, 1]
+        overlap = (
+            (y >= float(previous_points[0, 1])) &
+            (y <= float(previous_points[-1, 1])))
+        if not np.any(overlap):
+            return current_points
+        previous_x = np.interp(
+            y[overlap], previous_points[:, 1], previous_points[:, 0])
+        current_points[overlap, 0] = (
+            previous_x + float(alpha) *
+            (current_points[overlap, 0] - previous_x))
+        return current_points
 
     def update(self, slot, points, probabilities, image_shape, now=None):
         slot = int(slot)
@@ -2583,6 +2960,7 @@ class _FittedControlPathTracker:
         tracked_points = points[order].copy()
         tracked_probabilities = np.clip(
             probabilities[order], 0.0, 1.0).astype(np.float32)
+        confirmed_jump = False
         if previous is not None:
             width_scale = float(max(1, shape[1])) / 640.0
             displacement = self._median_curve_distance(
@@ -2606,6 +2984,44 @@ class _FittedControlPathTracker:
                     }
                     return (previous["points"].copy(),
                             previous["probabilities"].copy())
+                confirmed_jump = True
+
+            signed_displacement = self._median_signed_curve_displacement(
+                previous["points"], tracked_points)
+            if signed_displacement is not None and not confirmed_jump:
+                noise_floor = 3.0 * width_scale
+                if abs(signed_displacement) <= noise_floor:
+                    previous["motion_sign"] = 0
+                    previous["motion_frames"] = 0
+                else:
+                    motion_sign = 1 if signed_displacement > 0.0 else -1
+                    if motion_sign == int(previous.get("motion_sign", 0)):
+                        previous["motion_frames"] = (
+                            int(previous.get("motion_frames", 0)) + 1)
+                    else:
+                        previous["motion_sign"] = motion_sign
+                        previous["motion_frames"] = 1
+                motion_frames = int(previous.get("motion_frames", 0))
+                absolute_displacement = abs(float(signed_displacement))
+                if (
+                    absolute_displacement <= 10.0 * width_scale
+                    and motion_frames < 2
+                ):
+                    alpha = 0.20
+                elif motion_frames >= 2:
+                    # Like the OCR parking correction, a direction must first
+                    # be observed consistently. Once confirmed, even a small
+                    # per-frame movement is treated as a real curve entrance
+                    # instead of permanent straight-line jitter.
+                    alpha = 0.82
+                else:
+                    alpha = 0.55
+                # The pending branch above handles only discontinuities large
+                # enough to look like a route/slot switch.  Normal fitted
+                # movement is blended here and therefore keeps the target
+                # responsive without passing pixel noise straight through.
+                tracked_points = self._blend_with_previous(
+                    previous["points"], tracked_points, alpha)
 
         self._slots[slot] = {
             "points": tracked_points.copy(),
@@ -2614,6 +3030,12 @@ class _FittedControlPathTracker:
             "seen_at": now,
             "misses": 0,
             "pending": None,
+            "motion_sign": (
+                int(previous.get("motion_sign", 0))
+                if previous is not None else 0),
+            "motion_frames": (
+                int(previous.get("motion_frames", 0))
+                if previous is not None else 0),
         }
         return tracked_points, tracked_probabilities
 

@@ -3,7 +3,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from .ar_receiver import acquire_instance_lock, activate_existing_preview
+import numpy as np
+
+from .ar_receiver import (
+    acquire_instance_lock,
+    activate_existing_preview,
+    add_camera_fault_overlay,
+    camera_frame_is_blank,
+)
 
 
 class ArReceiverSingletonTest(unittest.TestCase):
@@ -45,6 +52,18 @@ class ArReceiverSingletonTest(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "http://127.0.0.1:9105/api/preview")
         self.assertEqual(request.data, b'{"enabled": true}')
+
+    def test_uniform_camera_failure_is_detected_and_labelled(self):
+        white = np.full((480, 640, 3), 255, dtype=np.uint8)
+        black = np.zeros((480, 640, 3), dtype=np.uint8)
+        normal = white.copy()
+        normal[:, :320] = 80
+
+        self.assertTrue(camera_frame_is_blank(white))
+        self.assertTrue(camera_frame_is_blank(black))
+        self.assertFalse(camera_frame_is_blank(normal))
+        rendered = add_camera_fault_overlay(white.copy())
+        self.assertTrue(np.any(rendered != white))
 
 
 if __name__ == "__main__":

@@ -136,6 +136,33 @@ class CurveConstructionTest(unittest.TestCase):
         self.assertAlmostEqual(220.0, float(np.mean(pending[:, 0])))
         self.assertAlmostEqual(500.0, float(np.mean(confirmed[:, 0])))
 
+    def test_tracker_damps_small_jitter(self):
+        tracker = _FittedControlPathTracker()
+        ys = np.asarray([200, 300, 400], dtype=np.float32)
+        probabilities = np.ones(3, dtype=np.float32)
+        base = np.stack((np.full_like(ys, 320), ys), axis=1)
+        jitter = np.stack((np.full_like(ys, 328), ys), axis=1)
+        tracker.update(0, base, probabilities, (480, 640, 3), now=1.0)
+        filtered, _ = tracker.update(
+            0, jitter, probabilities, (480, 640, 3), now=1.04)
+        self.assertGreater(float(np.mean(filtered[:, 0])), 320.0)
+        self.assertLess(float(np.mean(filtered[:, 0])), 328.0)
+
+    def test_tracker_accelerates_coherent_curve_motion(self):
+        tracker = _FittedControlPathTracker()
+        ys = np.asarray([200, 300, 400], dtype=np.float32)
+        probabilities = np.ones(3, dtype=np.float32)
+        base = np.stack((np.full_like(ys, 320), ys), axis=1)
+        first_curve = np.stack((np.full_like(ys, 338), ys), axis=1)
+        second_curve = np.stack((np.full_like(ys, 350), ys), axis=1)
+        tracker.update(0, base, probabilities, (480, 640, 3), now=1.0)
+        first, _ = tracker.update(
+            0, first_curve, probabilities, (480, 640, 3), now=1.04)
+        second, _ = tracker.update(
+            0, second_curve, probabilities, (480, 640, 3), now=1.08)
+        self.assertLess(float(np.mean(first[:, 0])), 338.0)
+        self.assertGreater(float(np.mean(second[:, 0])), 345.0)
+
     def test_semantic_road_mask_removes_outside_points(self):
         road = np.zeros((120, 160), dtype=np.uint8)
         road[:, 40:100] = 1
@@ -152,6 +179,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.hazard_bottom_ratio, 0.58)
         self.assertEqual(config.car_avoid_offset_px_640, 55.0)
         self.assertEqual(config.car_avoid_hold_s, 2.0)
+        self.assertEqual(config.normal_speed_mps, 0.10)
+        self.assertEqual(config.recover_speed_mps, 0.08)
+        self.assertEqual(config.collect_speed_mps, 0.08)
         self.assertEqual(config.human_pass_speed_mps, 0.30)
         self.assertEqual(config.human_speed_hold_s, 0.5)
 
@@ -187,6 +217,39 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(result["paths"], [])
         self.assertEqual(command["state_cmd"], STATE_LINE_LOSS_SAFE_STOP)
 
+    def test_short_line_loss_holds_last_steering_until_safe_stop(self):
+        planner = VisionControlPlanner(config=_config())
+        first_command, _debug = planner.update(
+            _raw_result_at(260.0, 400.0), now=1.0)
+        missing = _raw_result_at(slots=())
+        held_command, held = planner.update(missing, now=1.6)
+        stopped_command, _stopped = planner.update(
+            _raw_result_at(slots=()), now=1.81)
+        self.assertEqual(held_command["state_cmd"], STATE_RECOVER_LINE)
+        self.assertAlmostEqual(
+            held_command["track_error"], first_command["track_error"])
+        self.assertTrue(held["control_target"]["line_loss_hold"])
+        self.assertEqual(
+            stopped_command["state_cmd"], STATE_LINE_LOSS_SAFE_STOP)
+        self.assertEqual(stopped_command["target_speed"], 0.0)
+
+    def test_detached_near_path_is_treated_as_line_loss(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.update(_raw_result_at(260.0, 400.0), now=1.0)
+        previous_command, _pending = planner.update(
+            _raw_result_at(20.0, 400.0), now=1.04)
+        command, detached = planner.update(
+            _raw_result_at(20.0, 400.0), now=1.08)
+        self.assertTrue(detached["line_loss_active"])
+        self.assertEqual(
+            detached["line_connection_reason"],
+            "detached_near_anchor")
+        self.assertIsNone(detached["selected_slot"])
+        self.assertEqual(detached["raw_selected_slot"], 0)
+        self.assertEqual(command["state_cmd"], STATE_RECOVER_LINE)
+        self.assertAlmostEqual(
+            command["track_error"], previous_command["track_error"])
+
     def test_fitted_control_large_jump_requires_confirmation(self):
         planner = VisionControlPlanner(config=_config())
         planner.update(_raw_result_at(220.0, 420.0), now=1.0)
@@ -200,7 +263,58 @@ class VisionControlPlannerTest(unittest.TestCase):
             confirmed["control_target"]["path_target_x"], 500.0, delta=1.0)
         self.assertEqual(
             confirmed_result["temporal"]["mode"],
-            "large_jump_confirmation")
+            "adaptive_curve_tracking")
+
+    def test_track_error_damps_small_noise_and_fast_tracks_curve(self):
+        planner = VisionControlPlanner(config=VisionControlConfig())
+        planner.last_error = 0.0
+        first = planner._limit_error(8.0, adaptive=True)
+        planner.last_error = first
+        second = planner._limit_error(-8.0, adaptive=True)
+        self.assertLess(abs(first), 4.0)
+        self.assertLess(abs(second), 4.0)
+
+        planner.last_error = 0.0
+        errors = []
+        for _ in range(3):
+            value = planner._limit_error(100.0, adaptive=True)
+            planner.last_error = value
+            errors.append(value)
+        self.assertEqual(planner.track_error_response, "fast_curve")
+        self.assertGreater(errors[1], 48.0)
+        self.assertGreater(errors[2], errors[1])
+
+    def test_light_curve_feedforward_anticipates_bend(self):
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        xs = 320.0 + 0.0015 * (ys - 300.0) ** 2
+        result = _raw_result_at(320.0, 430.0)
+        result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
+        result["centerline"]["raw_curve_paths"][0] = result[
+            "raw_curve_paths"][0]
+        _command, debug = VisionControlPlanner(config=_config()).update(
+            result, now=1.0)
+        target = debug["control_target"]
+        self.assertGreater(target["curve_feedforward_640"], 0.0)
+        self.assertLessEqual(abs(target["curve_feedforward_640"]), 24.0)
+
+    def test_path_heading_prevents_left_target_from_commanding_late_left(self):
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        centered_y = ys - 300.0
+        xs = 260.0 + 0.00520833 * centered_y ** 2 - (
+            0.45833333 * centered_y)
+        result = _raw_result_at(260.0, 430.0)
+        result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
+        result["centerline"]["raw_curve_paths"][0] = result[
+            "raw_curve_paths"][0]
+        _command, debug = VisionControlPlanner(config=_config()).update(
+            result, now=1.0)
+        target = debug["control_target"]
+        self.assertLess(target["path_raw_track_error_640"], -40.0)
+        self.assertGreater(target["path_heading_feedforward_640"], 0.0)
+        self.assertGreater(target["total_feedforward_640"], 30.0)
+        self.assertGreater(
+            target["raw_track_error_640"],
+            target["path_raw_track_error_640"] + 30.0)
 
     def test_curve_defaults_to_blue_slot(self):
         command, debug = VisionControlPlanner(config=_config()).update(
@@ -208,6 +322,45 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(debug["selected_slot"], 0)
         self.assertEqual(debug["branch_lock"], "left")
         self.assertLess(command["track_error"], 0.0)
+
+    def test_generic_road_sign_does_not_enter_turnsign_fallback(self):
+        planner = VisionControlPlanner(config=_config())
+        self.assertTrue(planner._is_turnsign_detection({"label": "TurnSign"}))
+        self.assertFalse(planner._is_turnsign_detection({"label": "RoadSign"}))
+        self.assertFalse(planner._is_turnsign_detection({"label": "Sign"}))
+
+    def test_stale_ocr_trim_keeps_selected_path_target(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.turnsign_trim_current_fresh = False
+        planner.turnsign_trim_position_delta_640 = -160.0
+        target = planner._turnsign_trim_target_x(
+            (480, 640, 3), -1, 320.0)
+        self.assertAlmostEqual(target, 320.0)
+
+    def test_ocr_parking_trim_is_disabled_but_route_tracking_remains(self):
+        planner = VisionControlPlanner(config=_config())
+        response = {
+            "active": True,
+            "session_active": True,
+            "session_id": 41,
+            "control_phase": "turnsign_approach",
+            "bbox_center_x": 200.0,
+            "current_detection_fresh": True,
+            "instruction_current": True,
+            "instruction": {"direction": "right"},
+        }
+        command, debug = planner.update(
+            _trim_result(20.0), response, now=1.0)
+        self.assertEqual(debug["branch_lock"], "right")
+        self.assertEqual(debug["selected_slot"], 1)
+        self.assertEqual(
+            debug["control_target"]["task_reason"],
+            "track")
+        self.assertEqual(command["state_cmd"], STATE_TRACK)
+        self.assertGreater(command["target_speed"], 0.0)
+        self.assertAlmostEqual(
+            debug["control_target"]["target_x"],
+            debug["control_target"]["path_target_x"])
 
     def test_current_ocr_right_selects_green_slot(self):
         response = {
@@ -239,7 +392,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertNotIn("rear_path_target_x", debug["control_target"])
         self.assertNotIn("error_trend_mode", debug["control_target"])
 
-    def test_car_in_path_uses_e7_offset_and_normal_speed(self):
+    def test_car_in_path_uses_bounded_offset_and_normal_speed(self):
         car = [{
             "label": "Car", "score": 0.90,
             "bbox": [282.0, 260.0, 358.0, 420.0],
@@ -247,12 +400,32 @@ class VisionControlPlannerTest(unittest.TestCase):
         command, debug = VisionControlPlanner(config=_config()).update(
             _raw_result_at(320.0, 430.0, detections=car), now=1.0)
         self.assertEqual(command["state_cmd"], STATE_AVOID_CAR)
-        self.assertAlmostEqual(command["target_speed"], 0.15)
+        self.assertAlmostEqual(command["target_speed"], 0.10)
         self.assertEqual(
             debug["control_target"]["task_reason"], "car_in_path_bias")
         self.assertAlmostEqual(
-            abs(debug["control_target"]["task_offset_x"]), 55.0,
+            abs(debug["control_target"]["task_offset_x"]), 38.5,
             delta=1.0)
+
+    def test_car_avoidance_offset_decays_during_detection_hold(self):
+        planner = VisionControlPlanner(config=_config())
+        car = [{
+            "label": "Car", "score": 0.90,
+            "bbox": [282.0, 260.0, 358.0, 420.0],
+        }]
+        _command, active = planner.update(
+            _raw_result_at(320.0, 430.0, detections=car), now=1.0)
+        _command, held = planner.update(
+            _raw_result_at(320.0, 430.0), now=2.0)
+        _command, released = planner.update(
+            _raw_result_at(320.0, 430.0), now=3.1)
+        active_offset = abs(active["control_target"]["task_offset_x"])
+        held_offset = abs(held["control_target"]["task_offset_x"])
+        self.assertEqual(
+            held["control_target"]["task_reason"], "car_avoid_hold")
+        self.assertGreater(active_offset, held_offset)
+        self.assertAlmostEqual(held_offset, active_offset * 0.5, delta=1.0)
+        self.assertEqual(released["control_target"]["task_reason"], "track")
 
     def test_human_reaching_e7_stop_line_stops(self):
         human = [{
@@ -287,7 +460,8 @@ class VisionControlPlannerTest(unittest.TestCase):
             debug["control_target"]["task_reason"], "human_cross_pass")
 
     def test_new_turnsign_session_starts_adaptive_forward_trim(self):
-        planner = VisionControlPlanner(config=_config())
+        planner = VisionControlPlanner(config=_config(
+            turnsign_trim_enabled=True))
         response = {
             "active": True,
             "session_active": True,
@@ -307,6 +481,7 @@ class VisionControlPlannerTest(unittest.TestCase):
 
     def test_turnsign_split_then_collapse_requests_reverse_trim(self):
         planner = VisionControlPlanner(config=_config(
+            turnsign_trim_enabled=True,
             turnsign_trim_split_frames=1,
             turnsign_trim_collapse_frames=1,
             turnsign_reverse_duration_s=0.1,
@@ -332,6 +507,7 @@ class VisionControlPlannerTest(unittest.TestCase):
 
     def test_ocr_route_is_deferred_until_two_curves_are_clear(self):
         planner = VisionControlPlanner(config=_config(
+            turnsign_trim_enabled=True,
             turnsign_trim_split_px_640=36.0,
             turnsign_trim_split_frames=2,
             turnsign_reverse_duration_s=0.05,
