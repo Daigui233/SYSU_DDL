@@ -93,17 +93,22 @@ class VisionControlConfig:
     lookahead_y_ratio: float = 0.625
     max_track_error_640: float = 160.0
     max_error_step_640: float = 24.0
-    track_deadband_px_640: float = 4.0
-    track_small_error_px_640: float = 18.0
-    track_small_error_gain: float = 0.35
-    track_fast_error_px_640: float = 36.0
+    track_deadband_px_640: float = 8.0
+    track_small_error_px_640: float = 32.0
+    track_small_error_gain: float = 0.20
+    track_fast_error_px_640: float = 64.0
     track_fast_step_scale: float = 2.0
     track_reverse_step_scale: float = 0.50
+    curve_track_deadband_px_640: float = 4.0
+    curve_state_enter_curvature_640: float = 8.0
+    curve_state_exit_curvature_640: float = 4.0
+    curve_state_enter_frames: int = 2
+    curve_state_exit_frames: int = 5
     path_heading_feedforward_gain: float = 0.35
     path_heading_feedforward_max_px_640: float = 80.0
     path_heading_deadband_px_640: float = 6.0
-    curve_feedforward_gain: float = 0.60
-    curve_feedforward_max_px_640: float = 24.0
+    curve_feedforward_gain: float = 0.85
+    curve_feedforward_max_px_640: float = 36.0
     normal_speed_mps: float = 0.10
     recover_speed_mps: float = 0.08
     human_pass_speed_mps: float = 0.30
@@ -181,18 +186,33 @@ class VisionControlConfig:
             max_track_error_640=max(1.0, _env_float("VISION_CONTROL_MAX_ERROR_640", 160.0)),
             max_error_step_640=max(1.0, _env_float("VISION_CONTROL_MAX_STEP_640", 24.0)),
             track_deadband_px_640=max(
-                0.0, _env_float("VISION_CONTROL_TRACK_DEADBAND_640", 4.0)),
+                0.0, _env_float("VISION_CONTROL_TRACK_DEADBAND_640", 8.0)),
             track_small_error_px_640=max(
-                1.0, _env_float("VISION_CONTROL_TRACK_SMALL_ERROR_640", 18.0)),
+                1.0, _env_float("VISION_CONTROL_TRACK_SMALL_ERROR_640", 32.0)),
             track_small_error_gain=_clamp(
-                _env_float("VISION_CONTROL_TRACK_SMALL_GAIN", 0.35), 0.0, 1.0),
+                _env_float("VISION_CONTROL_TRACK_SMALL_GAIN", 0.20), 0.0, 1.0),
             track_fast_error_px_640=max(
-                1.0, _env_float("VISION_CONTROL_TRACK_FAST_ERROR_640", 36.0)),
+                1.0, _env_float("VISION_CONTROL_TRACK_FAST_ERROR_640", 64.0)),
             track_fast_step_scale=max(
                 1.0, _env_float("VISION_CONTROL_TRACK_FAST_STEP_SCALE", 2.0)),
             track_reverse_step_scale=_clamp(
                 _env_float("VISION_CONTROL_TRACK_REVERSE_STEP_SCALE", 0.50),
                 0.1, 1.0),
+            curve_track_deadband_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CURVE_TRACK_DEADBAND_640", 4.0)),
+            curve_state_enter_curvature_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CURVE_STATE_ENTER_640", 8.0)),
+            curve_state_exit_curvature_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CURVE_STATE_EXIT_640", 4.0)),
+            curve_state_enter_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CURVE_STATE_ENTER_FRAMES", 2)),
+            curve_state_exit_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CURVE_STATE_EXIT_FRAMES", 5)),
             path_heading_feedforward_gain=max(
                 0.0, _env_float(
                     "VISION_CONTROL_PATH_HEADING_FF_GAIN", 0.35)),
@@ -203,10 +223,10 @@ class VisionControlConfig:
                 0.0, _env_float(
                     "VISION_CONTROL_PATH_HEADING_DEADBAND_640", 6.0)),
             curve_feedforward_gain=_clamp(
-                _env_float("VISION_CONTROL_CURVE_FF_GAIN", 0.60),
+                _env_float("VISION_CONTROL_CURVE_FF_GAIN", 0.85),
                 0.0, 1.0),
             curve_feedforward_max_px_640=max(
-                0.0, _env_float("VISION_CONTROL_CURVE_FF_MAX_640", 24.0)),
+                0.0, _env_float("VISION_CONTROL_CURVE_FF_MAX_640", 36.0)),
             normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.10)),
             recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.08)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
@@ -336,6 +356,12 @@ class VisionControlPlanner:
         self.track_error_trend_sign = 0
         self.track_error_trend_frames = 0
         self.track_error_response = "initial"
+        self.road_shape_state = "straight"
+        self.road_shape_valid = False
+        self.road_heading_delta_640 = 0.0
+        self.road_curvature_640 = 0.0
+        self.road_curve_enter_frames = 0
+        self.road_curve_exit_frames = 0
         self.route_state = ROUTE_NONE
         self.route_reason = "initial"
         self.route_initialized = False
@@ -501,6 +527,15 @@ class VisionControlPlanner:
             "line_connected": bool(line_connected),
             "line_connection_reason": line_connection_reason,
             "line_connection_metrics": line_connection_metrics,
+            "road_shape_state": self.road_shape_state,
+            "road_shape_valid": bool(self.road_shape_valid),
+            "road_heading_delta_640": float(
+                self.road_heading_delta_640),
+            "road_curvature_640": float(self.road_curvature_640),
+            "road_curve_enter_frames": int(
+                self.road_curve_enter_frames),
+            "road_curve_exit_frames": int(
+                self.road_curve_exit_frames),
             "raw_selected_slot": (
                 None if raw_selected is None
                 else int(raw_selected.get("slot", -1))),
@@ -1048,6 +1083,9 @@ class VisionControlPlanner:
             self, selected, route_reason, result, image_shape, now,
             ocr_response=None, line_loss_reason=None):
         lookahead_y = image_shape[0] * self.config.lookahead_y_ratio
+        path_geometry = self._path_geometry_metrics(
+            selected, lookahead_y, image_shape)
+        self._update_road_shape_state(path_geometry)
         ocr_route_locked = (
             self.branch_lock_source == "ocr"
             and self.branch_lock in {"left", "right"}
@@ -1134,11 +1172,25 @@ class VisionControlPlanner:
         heading_feedforward = 0.0
         curve_feedforward = 0.0
         if (task_reason == "track" and target_override_x is None and
-                not path_target_adaptive):
-            heading_feedforward = self._path_heading_feedforward_error(
-                selected, path_target_y, image_shape)
-            curve_feedforward = self._curve_feedforward_error(
-                selected, path_target_y, image_shape)
+                not path_target_adaptive and path_geometry["valid"]):
+            heading_delta_640 = float(
+                path_geometry["heading_delta_640"])
+            if (
+                abs(heading_delta_640) >
+                self.config.path_heading_deadband_px_640
+            ):
+                heading_feedforward = _clamp(
+                    heading_delta_640 * float(
+                        self.config.path_heading_feedforward_gain),
+                    -float(self.config.path_heading_feedforward_max_px_640),
+                    float(self.config.path_heading_feedforward_max_px_640),
+                )
+            curve_feedforward = _clamp(
+                float(path_geometry["curvature_640"]) * float(
+                    self.config.curve_feedforward_gain),
+                -float(self.config.curve_feedforward_max_px_640),
+                float(self.config.curve_feedforward_max_px_640),
+            )
         total_feedforward = (
             float(heading_feedforward) + float(curve_feedforward))
         raw_error = float(path_raw_error) + total_feedforward
@@ -1158,7 +1210,12 @@ class VisionControlPlanner:
             self._reset_track_error_response("turnsign_trim")
         else:
             error = self._limit_error(
-                raw_error, adaptive=(task_reason == "track"))
+                raw_error,
+                adaptive=(task_reason == "track"),
+                curve_mode=(
+                    task_reason == "track"
+                    and self.road_shape_state == "curve"),
+            )
         self.last_error = error
         self.last_valid_ts = now
         self.last_path_target_x = float(path_target_x)
@@ -1184,6 +1241,12 @@ class VisionControlPlanner:
                 heading_feedforward),
             "curve_feedforward_640": float(curve_feedforward),
             "total_feedforward_640": float(total_feedforward),
+            "road_shape_state": self.road_shape_state,
+            "road_shape_valid": bool(path_geometry["valid"]),
+            "road_heading_delta_640": float(
+                path_geometry["heading_delta_640"]),
+            "road_curvature_640": float(
+                path_geometry["curvature_640"]),
             "track_error_response": self.track_error_response,
             "track_error_trend_frames": int(self.track_error_trend_frames),
             "reason": route_reason,
@@ -1212,69 +1275,93 @@ class VisionControlPlanner:
         # temporarily too short to cross that row.
         return float(points[nearest, 0]), float(preferred_y), True
 
-    def _path_heading_feedforward_error(
-            self, selected, lookahead_y, image_shape):
-        """Convert the fitted-path tangent into an anticipatory steer error."""
+    def _path_geometry_metrics(self, selected, lookahead_y, image_shape):
+        """Measure tangent and bend once for feedforward and road shape."""
+        empty = {
+            "valid": False,
+            "heading_delta_640": 0.0,
+            "curvature_640": 0.0,
+        }
         points = np.asarray(
             (selected or {}).get("points_xy", ()), dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 2 or len(points) < 4:
-            return 0.0
-        height, width = image_shape[:2]
-        span = min(72.0, max(32.0, 0.15 * float(height)))
-        far_y = float(lookahead_y) - span
-        near_y = float(lookahead_y) + span
-        if (
-            far_y < float(np.min(points[:, 1]))
-            or near_y > float(np.max(points[:, 1]))
-        ):
-            return 0.0
-        far_x = _interp_path_x(points, far_y)
-        near_x = _interp_path_x(points, near_y)
-        if (
-            far_x is None or near_x is None
-            or not math.isfinite(float(far_x))
-            or not math.isfinite(float(near_x))
-        ):
-            return 0.0
-        heading_delta_640 = (
-            (float(far_x) - float(near_x)) * 640.0 /
-            float(max(1, width)))
-        if (
-            abs(heading_delta_640) <=
-            self.config.path_heading_deadband_px_640
-        ):
-            return 0.0
-        feedforward = (
-            heading_delta_640 *
-            float(self.config.path_heading_feedforward_gain))
-        maximum = float(
-            self.config.path_heading_feedforward_max_px_640)
-        return _clamp(feedforward, -maximum, maximum)
-
-    def _curve_feedforward_error(self, selected, lookahead_y, image_shape):
-        """Return a small anticipatory error from the fitted curve bend."""
-        points = np.asarray(
-            (selected or {}).get("points_xy", ()), dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 4:
-            return 0.0
+            return empty
         height, width = image_shape[:2]
         span = min(72.0, max(32.0, 0.15 * float(height)))
         rows = (
             float(lookahead_y) - span,
             float(lookahead_y),
-            float(lookahead_y) + span)
-        if rows[0] < float(np.min(points[:, 1])) or rows[-1] > float(np.max(points[:, 1])):
-            return 0.0
+            float(lookahead_y) + span,
+        )
+        if (
+            rows[0] < float(np.min(points[:, 1]))
+            or rows[-1] > float(np.max(points[:, 1]))
+        ):
+            return empty
         samples = [_interp_path_x(points, row) for row in rows]
-        if any(value is None or not math.isfinite(float(value)) for value in samples):
-            return 0.0
+        if any(
+            value is None or not math.isfinite(float(value))
+            for value in samples
+        ):
+            return empty
+        scale = 640.0 / float(max(1, width))
+        heading_delta_640 = (
+            float(samples[0] - samples[2]) * scale)
         curvature_640 = (
-            float(samples[0] - 2.0 * samples[1] + samples[2]) *
-            640.0 / float(max(1, width)))
-        feedforward = (
-            curvature_640 * float(self.config.curve_feedforward_gain))
-        maximum = float(self.config.curve_feedforward_max_px_640)
-        return _clamp(feedforward, -maximum, maximum)
+            float(samples[0] - 2.0 * samples[1] + samples[2]) * scale)
+        return {
+            "valid": True,
+            "heading_delta_640": float(heading_delta_640),
+            "curvature_640": float(curvature_640),
+        }
+
+    def _update_road_shape_state(self, geometry):
+        """Latch a real bend from path curvature without reacting to slope."""
+        valid = bool((geometry or {}).get("valid"))
+        self.road_shape_valid = valid
+        if not valid:
+            self.road_curve_enter_frames = 0
+            self.road_curve_exit_frames = 0
+            return
+
+        self.road_heading_delta_640 = float(
+            geometry.get("heading_delta_640", 0.0))
+        self.road_curvature_640 = float(
+            geometry.get("curvature_640", 0.0))
+        magnitude = abs(self.road_curvature_640)
+        enter_threshold = max(
+            float(self.config.curve_state_enter_curvature_640),
+            float(self.config.curve_state_exit_curvature_640),
+        )
+        exit_threshold = min(
+            enter_threshold,
+            float(self.config.curve_state_exit_curvature_640),
+        )
+
+        if self.road_shape_state == "straight":
+            self.road_curve_exit_frames = 0
+            if magnitude >= enter_threshold:
+                self.road_curve_enter_frames += 1
+            else:
+                self.road_curve_enter_frames = 0
+            if (
+                self.road_curve_enter_frames >=
+                self.config.curve_state_enter_frames
+            ):
+                self.road_shape_state = "curve"
+                self.road_curve_enter_frames = 0
+        else:
+            self.road_curve_enter_frames = 0
+            if magnitude <= exit_threshold:
+                self.road_curve_exit_frames += 1
+            else:
+                self.road_curve_exit_frames = 0
+            if (
+                self.road_curve_exit_frames >=
+                self.config.curve_state_exit_frames
+            ):
+                self.road_shape_state = "straight"
+                self.road_curve_exit_frames = 0
 
     def _held_path_target(self, now):
         if (self.last_path_target_x is None or
@@ -2276,11 +2363,18 @@ class VisionControlPlanner:
         self.track_error_trend_frames = 0
         self.track_error_response = str(reason)
 
-    def _shape_track_error(self, error):
-        """Suppress tiny straight-line noise without weakening large bends."""
+    def _shape_track_error(self, error, curve_mode=False):
+        """Use quiet straight response and full confirmed-curve response."""
         limit = float(self.config.max_track_error_640)
         error = _clamp(float(error), -limit, limit)
         magnitude = abs(error)
+        if curve_mode:
+            deadband = float(self.config.curve_track_deadband_px_640)
+            if magnitude <= deadband:
+                return 0.0
+            return float(math.copysign(
+                min(limit, magnitude - deadband), error))
+
         deadband = float(self.config.track_deadband_px_640)
         small_limit = max(
             deadband + 1.0, float(self.config.track_small_error_px_640))
@@ -2299,7 +2393,7 @@ class VisionControlPlanner:
         shaped_magnitude = min(limit, (magnitude - deadband) * gain)
         return float(math.copysign(shaped_magnitude, error))
 
-    def _limit_error(self, error, adaptive=False):
+    def _limit_error(self, error, adaptive=False, curve_mode=False):
         """Apply a stable straight response and a fast coherent bend response."""
         clamped = _clamp(
             float(error), -self.config.max_track_error_640,
@@ -2312,7 +2406,8 @@ class VisionControlPlanner:
                 self.config.max_error_step_640)
             return float(self.last_error + delta)
 
-        shaped = self._shape_track_error(clamped)
+        shaped = self._shape_track_error(
+            clamped, curve_mode=bool(curve_mode))
         sign = self._sign(shaped)
         previous_sign = int(self.track_error_trend_sign)
         same_direction = sign != 0 and sign == previous_sign
@@ -2333,13 +2428,16 @@ class VisionControlPlanner:
         if is_unwinding and last_magnitude > self.config.track_small_error_px_640:
             step = base_step * 1.5
             mode = "fast_unwind"
+        elif is_reversal:
+            step = base_step * self.config.track_reverse_step_scale
+            mode = "reverse_guard"
+        elif curve_mode:
+            step = base_step * self.config.track_fast_step_scale
+            mode = "curve_track"
         elif (same_direction and self.track_error_trend_frames >= 2 and
               magnitude >= self.config.track_fast_error_px_640):
             step = base_step * self.config.track_fast_step_scale
             mode = "fast_curve"
-        elif is_reversal:
-            step = base_step * self.config.track_reverse_step_scale
-            mode = "reverse_guard"
         elif magnitude <= self.config.track_small_error_px_640:
             step = base_step * 0.35
             mode = "straight_damping"
@@ -2604,9 +2702,11 @@ def render_vision_control_debug(frame, result):
     line_color = (
         (0, 0, 255) if debug.get("line_loss_active")
         else (30, 230, 255))
+    road_shape = str(
+        debug.get("road_shape_state") or "straight").upper()
     cv2.putText(
-        frame, "PATH COUNT: {}  LINE: {}".format(
-            detected_count, line_status),
+        frame, "PATH: {}  LINE: {}  ROAD: {}".format(
+            detected_count, line_status, road_shape),
         (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
         line_color, 2, cv2.LINE_AA)
     return frame

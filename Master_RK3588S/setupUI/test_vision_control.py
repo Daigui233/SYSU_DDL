@@ -182,6 +182,10 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.normal_speed_mps, 0.10)
         self.assertEqual(config.recover_speed_mps, 0.08)
         self.assertEqual(config.collect_speed_mps, 0.08)
+        self.assertEqual(config.track_deadband_px_640, 8.0)
+        self.assertEqual(config.track_small_error_gain, 0.20)
+        self.assertEqual(config.curve_state_enter_frames, 2)
+        self.assertEqual(config.curve_state_exit_frames, 5)
         self.assertEqual(config.human_pass_speed_mps, 0.30)
         self.assertEqual(config.human_speed_hold_s, 0.5)
 
@@ -284,6 +288,82 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertGreater(errors[1], 48.0)
         self.assertGreater(errors[2], errors[1])
 
+    def test_road_shape_uses_curvature_not_straight_slope(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        diagonal = _raw_path(0, 320.0 + 0.25 * (ys - 300.0), ys)
+        diagonal_geometry = planner._path_geometry_metrics(
+            diagonal, 300.0, (480, 640, 3))
+        self.assertTrue(diagonal_geometry["valid"])
+        self.assertAlmostEqual(
+            diagonal_geometry["curvature_640"], 0.0, delta=0.1)
+
+        curved = _raw_path(
+            0, 320.0 + 0.0015 * (ys - 300.0) ** 2, ys)
+        curve_geometry = planner._path_geometry_metrics(
+            curved, 300.0, (480, 640, 3))
+        self.assertTrue(curve_geometry["valid"])
+        self.assertGreater(
+            abs(curve_geometry["curvature_640"]), 8.0)
+
+    def test_road_shape_state_has_entry_and_exit_hysteresis(self):
+        planner = VisionControlPlanner(config=_config(
+            curve_state_enter_frames=2,
+            curve_state_exit_frames=3,
+        ))
+        curve = {
+            "valid": True,
+            "heading_delta_640": 30.0,
+            "curvature_640": 12.0,
+        }
+        straight = {
+            "valid": True,
+            "heading_delta_640": 30.0,
+            "curvature_640": 0.0,
+        }
+        planner._update_road_shape_state(curve)
+        self.assertEqual(planner.road_shape_state, "straight")
+        planner._update_road_shape_state(curve)
+        self.assertEqual(planner.road_shape_state, "curve")
+        planner._update_road_shape_state(straight)
+        planner._update_road_shape_state(straight)
+        self.assertEqual(planner.road_shape_state, "curve")
+        planner._update_road_shape_state(straight)
+        self.assertEqual(planner.road_shape_state, "straight")
+
+    def test_repeated_fitted_bend_enters_curve_control_mode(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        xs = 320.0 + 0.0015 * (ys - 300.0) ** 2
+
+        def curved_result():
+            result = _raw_result_at(320.0, 430.0)
+            result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
+            result["centerline"]["raw_curve_paths"][0] = result[
+                "raw_curve_paths"][0]
+            return result
+
+        _command, first = planner.update(curved_result(), now=1.0)
+        _command, second = planner.update(curved_result(), now=1.04)
+        self.assertEqual(first["road_shape_state"], "straight")
+        self.assertEqual(second["road_shape_state"], "curve")
+        self.assertEqual(
+            second["control_target"]["track_error_response"],
+            "curve_track")
+        self.assertGreater(
+            abs(second["control_target"]["road_curvature_640"]), 8.0)
+
+    def test_confirmed_curve_keeps_more_medium_error_than_straight(self):
+        planner = VisionControlPlanner(config=VisionControlConfig())
+        straight = planner._shape_track_error(30.0, curve_mode=False)
+        curve = planner._shape_track_error(30.0, curve_mode=True)
+        self.assertLess(straight, 12.0)
+        self.assertGreater(curve, 24.0)
+        self.assertAlmostEqual(
+            planner._shape_track_error(100.0, curve_mode=False),
+            planner._shape_track_error(100.0, curve_mode=True),
+            delta=5.0)
+
     def test_light_curve_feedforward_anticipates_bend(self):
         ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
         xs = 320.0 + 0.0015 * (ys - 300.0) ** 2
@@ -295,7 +375,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             result, now=1.0)
         target = debug["control_target"]
         self.assertGreater(target["curve_feedforward_640"], 0.0)
-        self.assertLessEqual(abs(target["curve_feedforward_640"]), 24.0)
+        self.assertLessEqual(abs(target["curve_feedforward_640"]), 36.0)
 
     def test_path_heading_prevents_left_target_from_commanding_late_left(self):
         ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)

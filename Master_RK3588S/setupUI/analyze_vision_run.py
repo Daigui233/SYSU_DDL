@@ -48,6 +48,15 @@ def _summary(path):
     heading_feedforward = _values(
         records,
         lambda item: item["path"]["path_heading_feedforward_640"])
+    curvatures = _values(
+        records, lambda item: item["path"]["road_curvature_640"])
+    road_shapes = [
+        str(item.get("path", {}).get("road_shape_state") or "unknown")
+        for item in records
+    ]
+    road_shape_transitions = sum(
+        1 for previous, current in zip(road_shapes, road_shapes[1:])
+        if previous != current)
     task_records = [
         item for item in records
         if item.get("control", {}).get("task_reason") == "track"
@@ -85,6 +94,13 @@ def _summary(path):
             [abs(value) for value in feedforward], 0.95),
         "heading_feedforward_abs_p95_px": _percentile(
             [abs(value) for value in heading_feedforward], 0.95),
+        "road_curvature_abs_p95_px": _percentile(
+            [abs(value) for value in curvatures], 0.95),
+        "straight_frames": sum(
+            1 for value in road_shapes if value == "straight"),
+        "curve_frames": sum(
+            1 for value in road_shapes if value == "curve"),
+        "road_shape_transitions": road_shape_transitions,
         "line_loss_frames": sum(
             1 for item in records
             if item.get("selection", {}).get("line_loss_active")),

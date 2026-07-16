@@ -18,7 +18,7 @@
 #define SERVO_FULL_STEER_ERROR_PX      (160.0f)
 #define SERVO_LINEAR_OUTPUT_LIMIT      ((float)(SERVO_DUTY_MID - SERVO_DUTY_MIN))
 #define SERVO_LINEAR_KP                (SERVO_LINEAR_OUTPUT_LIMIT / SERVO_FULL_STEER_ERROR_PX)
-#define SERVO_LINEAR_KD                (0.08f)
+#define SERVO_LINEAR_KD                (0.04f)
 
 /* ===== State control parameters: tune here first during vehicle testing. ===== */
 #define TRACK_DEFAULT_SPEED_MPS        (0.05f)

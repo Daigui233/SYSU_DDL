@@ -134,6 +134,15 @@ class VisionTelemetryLogger:
                     target.get("curve_feedforward_640"), 0.0),
                 "total_feedforward_640": _number(
                     target.get("total_feedforward_640"), 0.0),
+                "road_shape_state": target.get(
+                    "road_shape_state", debug.get("road_shape_state")),
+                "road_shape_valid": bool(target.get(
+                    "road_shape_valid", debug.get("road_shape_valid", False))),
+                "road_heading_delta_640": _number(target.get(
+                    "road_heading_delta_640",
+                    debug.get("road_heading_delta_640"))),
+                "road_curvature_640": _number(target.get(
+                    "road_curvature_640", debug.get("road_curvature_640"))),
                 "paths": self._path_summary(
                     result.get("paths") or (result.get("centerline") or {}).get("paths"),
                     _number(target.get("lookahead_y"), 300.0)),

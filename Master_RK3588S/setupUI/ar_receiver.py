@@ -244,6 +244,14 @@ class RuntimeState:
                 "selected_slot_lock": vision_control.get(
                     "selected_slot_lock"),
                 "selected_slot": vision_control.get("selected_slot"),
+                "road_shape_state": vision_control.get(
+                    "road_shape_state"),
+                "road_shape_valid": bool(vision_control.get(
+                    "road_shape_valid", False)),
+                "road_heading_delta_640": vision_control.get(
+                    "road_heading_delta_640"),
+                "road_curvature_640": vision_control.get(
+                    "road_curvature_640"),
                 "ocr_lock_expired": bool(vision_control.get(
                     "ocr_lock_expired", False)),
                 "ocr_lock_remaining_s": vision_control.get(
