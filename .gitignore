@@ -44,6 +44,7 @@ __pycache__/
 Master_RK3588S/setupUI/*.log
 Master_RK3588S/setupUI/ar_pose_status.json
 Master_RK3588S/setupUI/xverse_control_live.json
+Master_RK3588S/setupUI/steering_calibration_data/
 
 # Local capture/debug data
 Master_RK3588S/setupUI/capture_sessions/

@@ -1,0 +1,1042 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SYSU_DDL 转向标定台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --line: #d7dde3;
+      --text: #17212b;
+      --muted: #65717d;
+      --green: #16784a;
+      --green-soft: #e6f4ed;
+      --blue: #1769aa;
+      --red: #bd3d3a;
+      --amber: #a96300;
+      --shadow: 0 3px 14px rgba(18, 34, 50, 0.07);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    button, input, select { font: inherit; letter-spacing: 0; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    .topbar {
+      background: #15232e;
+      color: #fff;
+      border-bottom: 3px solid #28a36a;
+    }
+    .topbar-inner {
+      width: min(1500px, calc(100% - 32px));
+      min-height: 68px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 24px;
+    }
+    .brand { min-width: 230px; }
+    .brand h1 { margin: 0; font-size: 20px; font-weight: 700; }
+    .brand p { margin: 2px 0 0; color: #b9c7d1; font-size: 12px; }
+    .connection {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: auto;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .connection select, .connection input {
+      height: 34px;
+      border: 1px solid #52616d;
+      background: #223440;
+      color: #fff;
+      border-radius: 5px;
+      padding: 0 10px;
+    }
+    .connection select { min-width: 210px; }
+    .connection input[type="number"] { width: 94px; }
+    .icon-btn, .button {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 13px;
+      font-weight: 600;
+    }
+    .icon-btn { width: 36px; padding: 0; font-size: 18px; }
+    .button.primary { border-color: #168052; background: #168052; color: #fff; }
+    .button.danger { border-color: #7f3030; background: #7f3030; color: #fff; }
+    .button.subtle { background: #f7f9fa; }
+    .connection .button { border-color: #5d6a74; background: #2d424f; color: #fff; }
+    .connection .button.primary { border-color: #2aac71; background: #168052; }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #85929b;
+      box-shadow: 0 0 0 3px rgba(255,255,255,.08);
+    }
+    .status-dot.online { background: #36d58a; }
+    .status-dot.error { background: #ff6860; }
+    main {
+      width: min(1500px, calc(100% - 32px));
+      margin: 18px auto 32px;
+    }
+    .safety {
+      margin-bottom: 14px;
+      border-left: 4px solid var(--amber);
+      background: #fff7e9;
+      color: #704400;
+      padding: 10px 13px;
+      font-weight: 600;
+    }
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(360px, 0.8fr) minmax(460px, 1.2fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .panel-header {
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-header h2 { margin: 0; font-size: 15px; }
+    .panel-header .spacer { flex: 1; }
+    .panel-body { padding: 16px; }
+    .control-value {
+      display: grid;
+      grid-template-columns: 1fr 135px;
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 12px;
+    }
+    .error-readout {
+      font-size: 48px;
+      line-height: 1;
+      font-weight: 750;
+      font-variant-numeric: tabular-nums;
+      color: #122a39;
+    }
+    .label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+    input[type="number"], input[type="text"] {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid #bfc8d0;
+      border-radius: 5px;
+      background: #fff;
+      color: var(--text);
+      padding: 7px 9px;
+    }
+    input:focus, select:focus {
+      outline: 2px solid rgba(23, 105, 170, .22);
+      border-color: var(--blue);
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--green);
+    }
+    .range-labels {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    .step-row {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 7px;
+      margin-top: 12px;
+    }
+    .step-row button { min-height: 36px; }
+    .output-row {
+      margin: 18px -16px 0;
+      padding: 14px 16px 0;
+      border-top: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .switch {
+      position: relative;
+      width: 48px;
+      height: 26px;
+      flex: 0 0 auto;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch span {
+      position: absolute;
+      inset: 0;
+      border-radius: 13px;
+      background: #9ba5ad;
+      transition: .16s;
+    }
+    .switch span::before {
+      content: "";
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      left: 3px;
+      top: 3px;
+      border-radius: 50%;
+      background: #fff;
+      transition: .16s;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25);
+    }
+    .switch input:checked + span { background: var(--green); }
+    .switch input:checked + span::before { transform: translateX(22px); }
+    .output-copy strong { display: block; }
+    .output-copy small { color: var(--muted); }
+    .telemetry {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      border-top: 1px solid var(--line);
+      margin-top: 16px;
+    }
+    .telemetry-item {
+      padding: 12px 10px;
+      border-right: 1px solid var(--line);
+      min-width: 0;
+    }
+    .telemetry-item:last-child { border-right: 0; }
+    .telemetry-item span { color: var(--muted); font-size: 11px; display: block; }
+    .telemetry-item strong {
+      display: block;
+      margin-top: 3px;
+      font-size: 15px;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+    .measure-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .measure-grid .wide { grid-column: 1 / -1; }
+    .record-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .record-row .button.primary { flex: 1; }
+    .derived {
+      margin-top: 12px;
+      min-height: 38px;
+      padding: 9px 10px;
+      background: #f3f7f9;
+      border: 1px solid #dce5ea;
+      border-radius: 5px;
+      color: #3f5360;
+      font-variant-numeric: tabular-nums;
+    }
+    .plot-panel { grid-column: 1 / -1; }
+    #plot {
+      display: block;
+      width: 100%;
+      height: 300px;
+      background: #fff;
+    }
+    .legend { display: flex; gap: 18px; color: var(--muted); font-size: 12px; }
+    .legend i {
+      display: inline-block;
+      width: 18px;
+      height: 3px;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+    .fit-panel { grid-column: 1 / -1; }
+    .fit-layout {
+      display: grid;
+      grid-template-columns: minmax(280px, .72fr) minmax(440px, 1.28fr);
+      gap: 16px;
+    }
+    .inverse-tool {
+      padding-right: 16px;
+      border-right: 1px solid var(--line);
+    }
+    .inverse-result {
+      margin: 8px 0 12px;
+      font-size: 32px;
+      line-height: 1.1;
+      font-weight: 750;
+      font-variant-numeric: tabular-nums;
+      color: #173b2c;
+    }
+    .inverse-actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .fit-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 9px;
+    }
+    .fit-item {
+      min-width: 0;
+      border-left: 3px solid #7b8a94;
+      background: #f5f7f8;
+      padding: 9px 10px;
+    }
+    .fit-item.primary-fit { border-left-color: var(--green); background: #eff8f3; }
+    .fit-item strong { display: block; font-size: 12px; margin-bottom: 4px; }
+    .fit-equation {
+      display: block;
+      color: #324651;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+    .fit-metric { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
+    .table-panel { grid-column: 1 / -1; }
+    .table-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+    .table-wrap { overflow: auto; max-height: 430px; }
+    table { width: 100%; border-collapse: collapse; min-width: 1000px; }
+    th, td {
+      border-bottom: 1px solid #e1e6ea;
+      padding: 9px 10px;
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #eef2f4;
+      color: #4b5963;
+      font-size: 11px;
+      text-transform: none;
+    }
+    th:nth-child(2), td:nth-child(2), th:nth-child(10), td:nth-child(10) { text-align: left; }
+    tbody tr:hover { background: #f5faf7; }
+    .delete-btn {
+      border: 0;
+      background: transparent;
+      color: var(--red);
+      font-size: 18px;
+      line-height: 1;
+      padding: 4px 8px;
+    }
+    .empty { text-align: center !important; color: var(--muted); padding: 34px !important; }
+    .config-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 9px;
+      align-items: end;
+    }
+    .path-line {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      max-width: min(430px, calc(100% - 40px));
+      padding: 11px 14px;
+      border-radius: 5px;
+      background: #163a2b;
+      color: #fff;
+      box-shadow: 0 6px 24px rgba(0,0,0,.22);
+      transform: translateY(80px);
+      opacity: 0;
+      transition: .2s;
+      pointer-events: none;
+      z-index: 20;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.error { background: #7a2929; }
+    @media (max-width: 900px) {
+      .topbar-inner { padding: 12px 0; align-items: flex-start; flex-direction: column; }
+      .connection { margin-left: 0; justify-content: flex-start; width: 100%; }
+      .connection select { flex: 1; min-width: 180px; }
+      .workspace { grid-template-columns: 1fr; }
+      .plot-panel, .fit-panel, .table-panel { grid-column: auto; }
+      .fit-layout { grid-template-columns: 1fr; }
+      .inverse-tool { padding-right: 0; padding-bottom: 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+    @media (max-width: 560px) {
+      main, .topbar-inner { width: min(100% - 20px, 1500px); }
+      .connection input { width: 88px; }
+      .control-value { grid-template-columns: 1fr; }
+      .error-readout { font-size: 40px; }
+      .telemetry { grid-template-columns: 1fr 1fr; }
+      .telemetry-item:nth-child(2) { border-right: 0; }
+      .telemetry-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .measure-grid, .config-grid { grid-template-columns: 1fr; }
+      .fit-grid { grid-template-columns: 1fr; }
+      .measure-grid .wide { grid-column: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <h1>SYSU_DDL 转向标定台</h1>
+        <p>error / 左右轮实测角 / 等效中心转角</p>
+      </div>
+      <div class="connection">
+        <span id="statusDot" class="status-dot"></span>
+        <select id="serialPort" aria-label="串口"></select>
+        <button id="refreshPorts" class="icon-btn" title="刷新串口" aria-label="刷新串口">↻</button>
+        <input id="baudrate" type="number" value="460800" min="1" aria-label="波特率">
+        <button id="connectBtn" class="button primary">连接</button>
+        <button id="disconnectBtn" class="button">断开</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="safety">标定前请架空驱动轮，并停止其他占用同一串口的控车程序。</div>
+
+    <section class="workspace">
+      <article class="panel">
+        <div class="panel-header">
+          <h2>实时转向命令</h2>
+          <span class="spacer"></span>
+          <span id="txState">输出已关闭</span>
+        </div>
+        <div class="panel-body">
+          <div class="control-value">
+            <div>
+              <span class="label">当前 error</span>
+              <div id="errorReadout" class="error-readout">+0.0</div>
+            </div>
+            <label>
+              <span class="label">精确输入</span>
+              <input id="errorNumber" type="number" min="-160" max="160" step="0.5" value="0">
+            </label>
+          </div>
+          <input id="errorSlider" type="range" min="-160" max="160" step="0.5" value="0">
+          <div class="range-labels"><span>-160</span><span>0</span><span>+160</span></div>
+          <div class="step-row">
+            <button class="button subtle" data-step="-10">-10</button>
+            <button class="button subtle" data-step="-1">-1</button>
+            <button id="centerBtn" class="button">回中</button>
+            <button class="button subtle" data-step="1">+1</button>
+            <button class="button subtle" data-step="10">+10</button>
+          </div>
+          <div class="output-row">
+            <label class="switch" title="启用舵机输出">
+              <input id="outputToggle" type="checkbox">
+              <span></span>
+            </label>
+            <div class="output-copy">
+              <strong>启用舵机输出</strong>
+              <small>20 Hz 持续下发，目标速度固定为 0 m/s</small>
+            </div>
+          </div>
+        </div>
+        <div class="telemetry">
+          <div class="telemetry-item"><span>串口写入</span><strong id="sendConfirm">--</strong></div>
+          <div class="telemetry-item"><span>反馈 error</span><strong id="feedbackError">--</strong></div>
+          <div class="telemetry-item"><span>舵机 duty</span><strong id="servoDuty">--</strong></div>
+          <div class="telemetry-item"><span>输入帧龄</span><strong id="inputAge">--</strong></div>
+          <div class="telemetry-item"><span>安全标志</span><strong id="safetyFlags">--</strong></div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h2>记录实测轮角</h2>
+          <span class="spacer"></span>
+          <span id="sampleCount">0 条</span>
+        </div>
+        <div class="panel-body">
+          <div class="measure-grid">
+            <label>
+              <span class="label">左前轮角度 (°)</span>
+              <input id="leftAngle" type="number" min="-89.9" max="89.9" step="0.1" placeholder="右转为正，左转为负">
+            </label>
+            <label>
+              <span class="label">右前轮角度 (°)</span>
+              <input id="rightAngle" type="number" min="-89.9" max="89.9" step="0.1" placeholder="右转为正，左转为负">
+            </label>
+            <label class="wide">
+              <span class="label">备注</span>
+              <input id="note" type="text" maxlength="120" placeholder="可选">
+            </label>
+          </div>
+          <div id="derivedPreview" class="derived">输入左右轮角度后显示等效中心转角。</div>
+          <div class="record-row">
+            <button id="recordBtn" class="button primary">保存当前测量</button>
+            <button id="clearMeasureBtn" class="button subtle">清空输入</button>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel plot-panel">
+        <div class="panel-header">
+          <h2>标定关系</h2>
+          <span class="spacer"></span>
+          <div class="legend">
+            <span><i style="background:#bd3d3a"></i>左轮</span>
+            <span><i style="background:#1769aa"></i>右轮</span>
+            <span><i style="background:#16784a"></i>中心</span>
+          </div>
+        </div>
+        <canvas id="plot"></canvas>
+      </article>
+
+      <article class="panel fit-panel">
+        <div class="panel-header">
+          <h2>拟合与控车反查</h2>
+          <span class="spacer"></span>
+          <span id="fitPointCount">0 个有效 error 点</span>
+        </div>
+        <div class="panel-body fit-layout">
+          <div class="inverse-tool">
+            <label>
+              <span class="label">期望中心转角 (°，右正左负)</span>
+              <input id="desiredCenterAngle" type="number" min="-89.9" max="89.9" step="0.1" value="0">
+            </label>
+            <span class="label" style="margin-top:12px">分段线性反查 error</span>
+            <div id="inverseError" class="inverse-result">--</div>
+            <div class="inverse-actions">
+              <button id="applyInverseBtn" class="button primary">应用到实时 error</button>
+              <button class="button subtle" data-download="/download/fit">导出拟合报告</button>
+            </div>
+          </div>
+          <div id="fitGrid" class="fit-grid"></div>
+        </div>
+      </article>
+
+      <article class="panel table-panel">
+        <div class="panel-header">
+          <h2>标定数据</h2>
+          <span class="spacer"></span>
+          <div class="table-actions">
+            <button id="saveBtn" class="button subtle">保存到磁盘</button>
+            <button class="button subtle" data-download="/download/csv">导出 CSV</button>
+            <button class="button subtle" data-download="/download/json">导出 JSON</button>
+            <button class="button subtle" data-download="/download/fit">拟合 JSON</button>
+            <button class="button subtle" data-download="/download/header">导出 C 查表</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>时间</th><th>error</th><th>duty</th>
+                <th>左轮 °</th><th>右轮 °</th><th>中心 °</th>
+                <th>曲率 1/m</th><th>半径差 mm</th><th>备注</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="sampleBody"></tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel table-panel">
+        <div class="panel-header"><h2>车辆几何参数</h2></div>
+        <div class="panel-body">
+          <div class="config-grid">
+            <label>
+              <span class="label">轴距 (mm)</span>
+              <input id="wheelbase" type="number" min="1" step="0.1">
+            </label>
+            <label>
+              <span class="label">前轮轮距 (mm)</span>
+              <input id="trackWidth" type="number" min="1" step="0.1">
+            </label>
+            <button id="saveConfigBtn" class="button">应用并重算</button>
+          </div>
+          <div id="savePath" class="path-line"></div>
+        </div>
+      </article>
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { samples: [], config: {}, serial: {}, pollBusy: false, controlTimer: null };
+
+    function fmt(value, digits = 2, signed = false) {
+      if (value === null || value === undefined || !Number.isFinite(Number(value))) return "--";
+      const number = Number(value);
+      return `${signed && number >= 0 ? "+" : ""}${number.toFixed(digits)}`;
+    }
+
+    function toast(message, isError = false) {
+      const node = $("toast");
+      node.textContent = message;
+      node.className = `toast show${isError ? " error" : ""}`;
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => node.className = "toast", 2600);
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      return payload;
+    }
+
+    function setError(value, send = true) {
+      const clamped = Math.max(-160, Math.min(160, Number(value) || 0));
+      $("errorSlider").value = clamped;
+      $("errorNumber").value = clamped;
+      $("errorReadout").textContent = fmt(clamped, 1, true);
+      if (send) scheduleControl();
+    }
+
+    function scheduleControl() {
+      clearTimeout(state.controlTimer);
+      state.controlTimer = setTimeout(sendControl, 35);
+    }
+
+    async function sendControl() {
+      try {
+        const payload = await api("/api/control", {
+          method: "POST",
+          body: JSON.stringify({
+            error: Number($("errorNumber").value),
+            output_enabled: $("outputToggle").checked
+          })
+        });
+        if (!payload.output_enabled && $("outputToggle").checked) {
+          $("outputToggle").checked = false;
+          toast("请先创建串口连接", true);
+        }
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    async function refreshPorts() {
+      try {
+        const current = $("serialPort").value || state.serial.port || "/dev/ttyUSB0";
+        const result = await api("/api/ports");
+        const ports = result.ports || [];
+        const values = new Set(ports.map((item) => item.device));
+        values.add(current);
+        $("serialPort").innerHTML = [...values].map((device) => {
+          const item = ports.find((port) => port.device === device);
+          const label = item && item.description ? `${device} — ${item.description}` : device;
+          return `<option value="${escapeHtml(device)}">${escapeHtml(label)}</option>`;
+        }).join("");
+        $("serialPort").value = current;
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    async function connect() {
+      try {
+        $("connectBtn").disabled = true;
+        await api("/api/connect", {
+          method: "POST",
+          body: JSON.stringify({
+            port: $("serialPort").value,
+            baudrate: Number($("baudrate").value)
+          })
+        });
+        toast("串口连接已创建，正在等待 TC264D 反馈");
+        await pollState();
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        $("connectBtn").disabled = false;
+      }
+    }
+
+    async function disconnect() {
+      try {
+        $("outputToggle").checked = false;
+        await api("/api/disconnect", { method: "POST", body: "{}" });
+        toast("已重复下发安全停车并断开串口");
+        await pollState();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;").replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function renderSerial(serialState) {
+      state.serial = serialState;
+      const feedback = serialState.feedback || {};
+      const online = Boolean(feedback.online);
+      const hasError = Boolean(feedback.error);
+      $("statusDot").className = `status-dot${online ? " online" : hasError ? " error" : ""}`;
+      $("txState").textContent = serialState.output_enabled
+        ? (serialState.command_written ? "已写入串口，持续发送" : serialState.last_send_ok === false ? "发送失败，重试中" : "等待首次写入")
+        : "输出已关闭";
+      $("sendConfirm").textContent = serialState.command_written
+        ? `成功 ${serialState.send_success_count}` : serialState.output_enabled ? "写入中" : "--";
+      $("feedbackError").textContent = fmt(feedback.input_track_error, 2, true);
+      $("servoDuty").textContent = feedback.servo_output ?? "--";
+      $("inputAge").textContent = feedback.input_age_ms === null || feedback.input_age_ms === undefined
+        ? "--" : `${feedback.input_age_ms} ms`;
+      $("safetyFlags").textContent = feedback.safety_flags === null || feedback.safety_flags === undefined
+        ? "--" : `0x${Number(feedback.safety_flags).toString(16).padStart(4, "0")}`;
+      $("disconnectBtn").disabled = !serialState.controller_created;
+      $("recordBtn").disabled = !serialState.command_written;
+      if (document.activeElement !== $("serialPort") && serialState.port) {
+        const exists = [...$("serialPort").options].some((option) => option.value === serialState.port);
+        if (!exists) $("serialPort").add(new Option(serialState.port, serialState.port));
+        $("serialPort").value = serialState.port;
+      }
+      $("baudrate").value = serialState.baudrate || 460800;
+    }
+
+    function renderSamples(samples) {
+      state.samples = samples || [];
+      $("sampleCount").textContent = `${state.samples.length} 条`;
+      const rows = [...state.samples].sort((a, b) => b.id - a.id);
+      $("sampleBody").innerHTML = rows.length ? rows.map((row) => `
+        <tr>
+          <td>${row.id}</td>
+          <td>${escapeHtml(String(row.timestamp || "").replace("T", " ").slice(0, 19))}</td>
+          <td>${fmt(row.error, 2, true)}</td>
+          <td>${row.servo_duty ?? "--"}</td>
+          <td>${fmt(row.left_angle_deg, 2, true)}</td>
+          <td>${fmt(row.right_angle_deg, 2, true)}</td>
+          <td>${fmt(row.center_angle_deg, 2, true)}</td>
+          <td>${fmt(row.curvature_per_m, 4, true)}</td>
+          <td>${fmt(row.radius_mismatch_mm, 1, true)}</td>
+          <td>${escapeHtml(row.note || "")}</td>
+          <td><button class="delete-btn" data-delete="${row.id}" title="删除记录" aria-label="删除记录">×</button></td>
+        </tr>`).join("") : `<tr><td colspan="11" class="empty">尚未保存测量记录</td></tr>`;
+      drawPlot();
+    }
+
+    function renderConfig(config, paths) {
+      state.config = config || {};
+      if (document.activeElement !== $("wheelbase")) $("wheelbase").value = config.wheelbase_mm ?? "";
+      if (document.activeElement !== $("trackWidth")) $("trackWidth").value = config.track_width_mm ?? "";
+      $("savePath").textContent = paths ? `自动保存：${paths.csv}` : "";
+      previewDerived();
+    }
+
+    function fitCard(title, model, primary = false) {
+      if (!model || !model.available) {
+        return `<div class="fit-item${primary ? " primary-fit" : ""}">
+          <strong>${escapeHtml(title)}</strong>
+          <span class="fit-equation">${escapeHtml(model?.reason || "至少需要两个不同输入点")}</span>
+        </div>`;
+      }
+      return `<div class="fit-item${primary ? " primary-fit" : ""}">
+        <strong>${escapeHtml(title)} · ${model.degree} 次</strong>
+        <span class="fit-equation">${escapeHtml(model.equation)}</span>
+        <span class="fit-metric">RMSE ${fmt(model.rmse, 4)} · R² ${fmt(model.r_squared, 4)}</span>
+      </div>`;
+    }
+
+    function renderFit(fit) {
+      const models = fit?.models || {};
+      $("fitPointCount").textContent = `${fit?.unique_error_count || 0} 个有效 error 点`;
+      $("fitGrid").innerHTML = [
+        fitCard("中心转角 → error", models.error_from_center_angle, true),
+        fitCard("error → 中心转角", models.center_angle_from_error),
+        fitCard("error → 左轮角", models.left_angle_from_error),
+        fitCard("error → 右轮角", models.right_angle_from_error)
+      ].join("");
+      previewInverse();
+    }
+
+    async function pollState() {
+      if (state.pollBusy) return;
+      state.pollBusy = true;
+      try {
+        const payload = await api("/api/state");
+        renderSerial(payload.serial);
+        renderSamples(payload.samples);
+        renderConfig(payload.config, payload.paths);
+        renderFit(payload.fit);
+      } catch (error) {
+        $("statusDot").className = "status-dot error";
+      } finally {
+        state.pollBusy = false;
+      }
+    }
+
+    function previewDerived() {
+      if ($("leftAngle").value === "" || $("rightAngle").value === "") {
+        $("derivedPreview").textContent = "输入左右轮角度后显示等效中心转角。";
+        return;
+      }
+      const left = Number($("leftAngle").value);
+      const right = Number($("rightAngle").value);
+      const wheelbase = Number($("wheelbase").value);
+      const track = Number($("trackWidth").value);
+      if (![left, right, wheelbase, track].every(Number.isFinite) || wheelbase <= 0 || track <= 0) {
+        $("derivedPreview").textContent = "输入左右轮角度后显示等效中心转角。";
+        return;
+      }
+      const radii = [];
+      if (Math.abs(left) >= 90 || Math.abs(right) >= 90) {
+        $("derivedPreview").textContent = "轮角必须是 (-90°, 90°) 内的锐角。";
+        return;
+      }
+      if (Math.abs(left) > 1e-6) radii.push(track / 2 + wheelbase / Math.tan(-left * Math.PI / 180));
+      if (Math.abs(right) > 1e-6) radii.push(-track / 2 + wheelbase / Math.tan(-right * Math.PI / 180));
+      if (!radii.length) {
+        $("derivedPreview").textContent = "等效中心转角 +0.00° · 曲率 +0.0000 1/m";
+        return;
+      }
+      const mathRadius = radii.reduce((sum, value) => sum + value, 0) / radii.length;
+      const center = -Math.atan(wheelbase / mathRadius) * 180 / Math.PI;
+      const curvature = -1000 / mathRadius;
+      const mismatch = radii.length === 2 ? radii[1] - radii[0] : null;
+      $("derivedPreview").textContent =
+        `等效中心转角 ${fmt(center, 2, true)}° · 曲率 ${fmt(curvature, 4, true)} 1/m` +
+        (mismatch === null ? "" : ` · 左右推算半径差 ${fmt(mismatch, 1, true)} mm`);
+    }
+
+    function inversePoints() {
+      const groups = new Map();
+      for (const row of state.samples) {
+        const angle = Number(row.center_angle_deg);
+        const error = Number(row.error);
+        if (!Number.isFinite(angle) || !Number.isFinite(error)) continue;
+        const key = angle.toFixed(6);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(error);
+      }
+      return [...groups.entries()].map(([angle, errors]) => ({
+        angle: Number(angle),
+        error: errors.reduce((sum, value) => sum + value, 0) / errors.length
+      })).sort((a, b) => a.angle - b.angle);
+    }
+
+    function predictedErrorForAngle(angle) {
+      const points = inversePoints();
+      if (!points.length) return null;
+      if (points.length === 1 || angle <= points[0].angle) return points[0].error;
+      if (angle >= points[points.length - 1].angle) return points[points.length - 1].error;
+      for (let i = 1; i < points.length; i++) {
+        if (angle <= points[i].angle) {
+          const low = points[i - 1], high = points[i];
+          const ratio = (angle - low.angle) / (high.angle - low.angle);
+          return low.error + ratio * (high.error - low.error);
+        }
+      }
+      return null;
+    }
+
+    function previewInverse() {
+      const angle = Number($("desiredCenterAngle").value);
+      if (!Number.isFinite(angle) || Math.abs(angle) >= 90) {
+        $("inverseError").textContent = "--";
+        $("applyInverseBtn").disabled = true;
+        return;
+      }
+      const error = predictedErrorForAngle(angle);
+      $("inverseError").textContent = error === null ? "--" : fmt(error, 2, true);
+      $("applyInverseBtn").disabled = error === null;
+    }
+
+    async function recordSample() {
+      if ($("leftAngle").value === "" || $("rightAngle").value === "") {
+        toast("请填写左右轮实测角度", true);
+        return;
+      }
+      try {
+        await api("/api/samples", {
+          method: "POST",
+          body: JSON.stringify({
+            left_angle_deg: Number($("leftAngle").value),
+            right_angle_deg: Number($("rightAngle").value),
+            note: $("note").value
+          })
+        });
+        toast("当前 error 与轮角已保存");
+        clearMeasure();
+        await pollState();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    function clearMeasure() {
+      $("leftAngle").value = "";
+      $("rightAngle").value = "";
+      $("note").value = "";
+      previewDerived();
+      $("leftAngle").focus();
+    }
+
+    async function saveConfig() {
+      try {
+        await api("/api/config", {
+          method: "POST",
+          body: JSON.stringify({
+            wheelbase_mm: Number($("wheelbase").value),
+            track_width_mm: Number($("trackWidth").value)
+          })
+        });
+        toast("车辆几何参数已保存，派生数据已重算");
+        await pollState();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    async function deleteSample(id) {
+      if (!confirm(`删除第 ${id} 条标定记录？`)) return;
+      try {
+        await api(`/api/samples/${id}`, { method: "DELETE" });
+        toast("记录已删除");
+        await pollState();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    function drawPlot() {
+      const canvas = $("plot");
+      const rect = canvas.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(rect.width * ratio));
+      canvas.height = Math.max(1, Math.round(rect.height * ratio));
+      const ctx = canvas.getContext("2d");
+      ctx.scale(ratio, ratio);
+      const width = rect.width;
+      const height = rect.height;
+      const pad = { left: 54, right: 20, top: 20, bottom: 38 };
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      ctx.clearRect(0, 0, width, height);
+      ctx.font = "11px system-ui";
+      ctx.fillStyle = "#65717d";
+      ctx.strokeStyle = "#e2e7ea";
+      ctx.lineWidth = 1;
+      const angleValues = state.samples.flatMap((row) =>
+        [row.left_angle_deg, row.right_angle_deg, row.center_angle_deg].map(Number)
+      ).filter(Number.isFinite);
+      const maxAngle = Math.max(10, ...angleValues.map(Math.abs));
+      const yLimit = Math.ceil(maxAngle / 5) * 5;
+      const xMin = -160, xMax = 160;
+      for (let i = 0; i <= 4; i++) {
+        const x = pad.left + plotW * i / 4;
+        const value = xMin + (xMax - xMin) * i / 4;
+        ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH); ctx.stroke();
+        ctx.textAlign = "center"; ctx.fillText(String(value), x, height - 14);
+      }
+      for (let i = 0; i <= 4; i++) {
+        const y = pad.top + plotH * i / 4;
+        const value = yLimit - 2 * yLimit * i / 4;
+        ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+        ctx.textAlign = "right"; ctx.fillText(value.toFixed(0), pad.left - 8, y + 4);
+      }
+      ctx.fillStyle = "#65717d";
+      ctx.textAlign = "center";
+      ctx.fillText("error", pad.left + plotW / 2, height - 1);
+      ctx.save();
+      ctx.translate(12, pad.top + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText("转角 (°)", 0, 0);
+      ctx.restore();
+      if (!state.samples.length) {
+        ctx.fillStyle = "#8a969f";
+        ctx.textAlign = "center";
+        ctx.font = "13px system-ui";
+        ctx.fillText("保存测量后显示标定曲线", pad.left + plotW / 2, pad.top + plotH / 2);
+        return;
+      }
+      const xMap = (value) => pad.left + (value - xMin) / (xMax - xMin) * plotW;
+      const yMap = (value) => pad.top + (yLimit - value) / (2 * yLimit) * plotH;
+      const series = [
+        ["left_angle_deg", "#bd3d3a"],
+        ["right_angle_deg", "#1769aa"],
+        ["center_angle_deg", "#16784a"]
+      ];
+      for (const [key, color] of series) {
+        const rows = [...state.samples].sort((a, b) => a.error - b.error);
+        ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+        ctx.beginPath();
+        rows.forEach((row, index) => {
+          const x = xMap(Number(row.error)), y = yMap(Number(row[key]));
+          if (index) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+        });
+        ctx.stroke();
+        rows.forEach((row) => {
+          ctx.beginPath();
+          ctx.arc(xMap(Number(row.error)), yMap(Number(row[key])), 3, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+    }
+
+    $("errorSlider").addEventListener("input", (event) => setError(event.target.value));
+    $("errorNumber").addEventListener("input", (event) => setError(event.target.value));
+    $("outputToggle").addEventListener("change", sendControl);
+    $("centerBtn").addEventListener("click", () => setError(0));
+    document.querySelectorAll("[data-step]").forEach((button) =>
+      button.addEventListener("click", () => setError(Number($("errorNumber").value) + Number(button.dataset.step)))
+    );
+    $("refreshPorts").addEventListener("click", refreshPorts);
+    $("connectBtn").addEventListener("click", connect);
+    $("disconnectBtn").addEventListener("click", disconnect);
+    $("recordBtn").addEventListener("click", recordSample);
+    $("clearMeasureBtn").addEventListener("click", clearMeasure);
+    $("saveConfigBtn").addEventListener("click", saveConfig);
+    $("desiredCenterAngle").addEventListener("input", previewInverse);
+    $("applyInverseBtn").addEventListener("click", () => {
+      const error = predictedErrorForAngle(Number($("desiredCenterAngle").value));
+      if (error !== null) {
+        setError(error);
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    });
+    $("leftAngle").addEventListener("input", previewDerived);
+    $("rightAngle").addEventListener("input", previewDerived);
+    $("wheelbase").addEventListener("input", previewDerived);
+    $("trackWidth").addEventListener("input", previewDerived);
+    $("saveBtn").addEventListener("click", async () => {
+      try {
+        await api("/api/save", { method: "POST", body: "{}" });
+        toast("JSON、CSV 和 C 查表文件已写入磁盘");
+      } catch (error) { toast(error.message, true); }
+    });
+    document.querySelectorAll("[data-download]").forEach((button) =>
+      button.addEventListener("click", () => window.location.href = button.dataset.download)
+    );
+    $("sampleBody").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-delete]");
+      if (button) deleteSample(Number(button.dataset.delete));
+    });
+    window.addEventListener("resize", drawPlot);
+    window.addEventListener("beforeunload", () => {
+      navigator.sendBeacon("/api/control", new Blob(
+        [JSON.stringify({ error: 0, output_enabled: false })],
+        { type: "application/json" }
+      ));
+    });
+
+    setError(0, false);
+    refreshPorts().then(pollState);
+    setInterval(pollState, 400);
+  </script>
+</body>
+</html>

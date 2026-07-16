@@ -74,6 +74,8 @@ class VisionTelemetryLogger:
                 "slot": int(path.get("slot", -1)),
                 "role": str(path.get("role") or ""),
                 "point_count": int(len(points_array)),
+                "min_y": _number(np.min(points_array[:, 1])),
+                "max_y": _number(np.max(points_array[:, 1])),
                 "x_y220": _path_x_at(points_array, 220.0),
                 "x_lookahead": _path_x_at(points_array, lookahead_y),
                 "x_y380": _path_x_at(points_array, 380.0),
@@ -138,6 +140,12 @@ class VisionTelemetryLogger:
                     "road_shape_state", debug.get("road_shape_state")),
                 "road_shape_valid": bool(target.get(
                     "road_shape_valid", debug.get("road_shape_valid", False))),
+                "road_geometry_reason": target.get(
+                    "road_geometry_reason"),
+                "road_geometry_sample_rows_y": target.get(
+                    "road_geometry_sample_rows_y") or [],
+                "road_geometry_support_y": target.get(
+                    "road_geometry_support_y") or [],
                 "road_heading_delta_640": _number(target.get(
                     "road_heading_delta_640",
                     debug.get("road_heading_delta_640"))),

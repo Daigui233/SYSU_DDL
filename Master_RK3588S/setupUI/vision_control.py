@@ -93,13 +93,13 @@ class VisionControlConfig:
     lookahead_y_ratio: float = 0.625
     max_track_error_640: float = 160.0
     max_error_step_640: float = 24.0
-    track_deadband_px_640: float = 8.0
+    track_deadband_px_640: float = 0.0
     track_small_error_px_640: float = 32.0
     track_small_error_gain: float = 0.20
     track_fast_error_px_640: float = 64.0
     track_fast_step_scale: float = 2.0
     track_reverse_step_scale: float = 0.50
-    curve_track_deadband_px_640: float = 4.0
+    curve_track_step_scale: float = 1.50
     curve_state_enter_curvature_640: float = 8.0
     curve_state_exit_curvature_640: float = 4.0
     curve_state_enter_frames: int = 2
@@ -109,10 +109,10 @@ class VisionControlConfig:
     path_heading_deadband_px_640: float = 6.0
     curve_feedforward_gain: float = 0.85
     curve_feedforward_max_px_640: float = 36.0
-    normal_speed_mps: float = 0.10
-    recover_speed_mps: float = 0.08
+    normal_speed_mps: float = 0.06
+    recover_speed_mps: float = 0.06
     human_pass_speed_mps: float = 0.30
-    collect_speed_mps: float = 0.08
+    collect_speed_mps: float = 0.06
     turnsign_slow_speed_mps: float = 0.08
     route_confirm_frames: int = 6
     branch_separation_px_640: float = 70.0
@@ -163,7 +163,10 @@ class VisionControlConfig:
     human_preline_missing_px_480: float = 20.0
     human_pass_offset_px_640: float = 38.0
     human_speed_hold_s: float = 0.5
+    human_path_return_guard_s: float = 0.4
     human_absence_confirm_s: float = 1.5
+    human_stop_reverse_speed_mps: float = -0.05
+    human_stop_reverse_duration_s: float = 0.3
     car_avoid_offset_px_640: float = 55.0
     car_avoid_steer_gain: float = 0.70
     car_avoid_max_offset_px_640: float = 44.0
@@ -186,7 +189,7 @@ class VisionControlConfig:
             max_track_error_640=max(1.0, _env_float("VISION_CONTROL_MAX_ERROR_640", 160.0)),
             max_error_step_640=max(1.0, _env_float("VISION_CONTROL_MAX_STEP_640", 24.0)),
             track_deadband_px_640=max(
-                0.0, _env_float("VISION_CONTROL_TRACK_DEADBAND_640", 8.0)),
+                0.0, _env_float("VISION_CONTROL_TRACK_DEADBAND_640", 0.0)),
             track_small_error_px_640=max(
                 1.0, _env_float("VISION_CONTROL_TRACK_SMALL_ERROR_640", 32.0)),
             track_small_error_gain=_clamp(
@@ -198,9 +201,9 @@ class VisionControlConfig:
             track_reverse_step_scale=_clamp(
                 _env_float("VISION_CONTROL_TRACK_REVERSE_STEP_SCALE", 0.50),
                 0.1, 1.0),
-            curve_track_deadband_px_640=max(
-                0.0, _env_float(
-                    "VISION_CONTROL_CURVE_TRACK_DEADBAND_640", 4.0)),
+            curve_track_step_scale=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CURVE_TRACK_STEP_SCALE", 1.50)),
             curve_state_enter_curvature_640=max(
                 0.0, _env_float(
                     "VISION_CONTROL_CURVE_STATE_ENTER_640", 8.0)),
@@ -227,10 +230,10 @@ class VisionControlConfig:
                 0.0, 1.0),
             curve_feedforward_max_px_640=max(
                 0.0, _env_float("VISION_CONTROL_CURVE_FF_MAX_640", 36.0)),
-            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.10)),
-            recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.08)),
+            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.06)),
+            recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.06)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
-            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.08)),
+            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.06)),
             turnsign_slow_speed_mps=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_SLOW_SPEED", 0.08)),
             route_confirm_frames=max(1, _env_int("VISION_CONTROL_ROUTE_CONFIRM_FRAMES", 6)),
             branch_separation_px_640=max(1.0, _env_float("VISION_CONTROL_BRANCH_SEP_640", 70.0)),
@@ -320,7 +323,13 @@ class VisionControlConfig:
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
+            human_path_return_guard_s=max(0.0, _env_float(
+                "VISION_CONTROL_HUMAN_PATH_RETURN_GUARD_S", 0.4)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
+            human_stop_reverse_speed_mps=-abs(_env_float(
+                "VISION_CONTROL_HUMAN_STOP_REVERSE_SPEED", -0.05)),
+            human_stop_reverse_duration_s=max(0.0, _env_float(
+                "VISION_CONTROL_HUMAN_STOP_REVERSE_DURATION_S", 0.3)),
             car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 55.0)),
             car_avoid_steer_gain=_clamp(
                 _env_float("VISION_CONTROL_CAR_AVOID_STEER_GAIN", 0.70),
@@ -385,10 +394,16 @@ class VisionControlPlanner:
         self.human_pass_active = False
         self.human_pass_offset_x = 0.0
         self.human_speed_hold_until = 0.0
+        self.human_path_return_guard_until = 0.0
+        self.human_path_return_guard_start_x = None
+        self.human_path_return_pending = False
+        self.human_last_avoid_target_x = None
         self.human_detected_latched = False
         self.human_last_seen_ts = 0.0
         self.human_preline_last_gap_px_480 = None
         self.human_preline_wait_until = 0.0
+        self.human_stop_reverse_until = 0.0
+        self.human_stop_reverse_started = False
         self.car_avoid_side = 0
         self.car_avoid_offset_px_640 = 0.0
         self.car_avoid_hold_until = 0.0
@@ -798,21 +813,30 @@ class VisionControlPlanner:
         blue = by_slot.get(0)
         green = by_slot.get(1)
         if blue is None or green is None:
-            # Do not turn an ordinary missing-blue frame into an implicit
-            # green fallback.  An already-active merge takeover stays latched
-            # until blue has genuinely recovered for several frames.
+            # A merge takeover is valid only while both candidates exist.
+            # If green disappears during takeover, immediately return slot
+            # ownership to blue instead of steering from stale green state.
             if not self.curve_merge_override:
                 self.curve_merge_bad_evidence = max(
                     0, self.curve_merge_bad_evidence - 1)
             self.curve_merge_blue_stable_frames = 0
             self.curve_merge_reason = "waiting_for_both_paths"
             if self.curve_merge_override:
-                self.selected_slot_lock = 1
+                self.curve_merge_override = False
+                self.curve_merge_bad_evidence = 0
+                self.selected_slot_lock = 0
+                self.curve_merge_reason = "green_missing"
             return
 
         blue_points = np.asarray(blue.get("points_xy"), dtype=np.float32)
         green_points = np.asarray(green.get("points_xy"), dtype=np.float32)
         if not len(blue_points) or not len(green_points):
+            if self.curve_merge_override:
+                self.curve_merge_override = False
+                self.curve_merge_bad_evidence = 0
+                self.curve_merge_blue_stable_frames = 0
+                self.selected_slot_lock = 0
+                self.curve_merge_reason = "merge_path_empty"
             return
         height, width = image_shape[:2]
         lookahead_y = float(height) * self.config.lookahead_y_ratio
@@ -823,6 +847,10 @@ class VisionControlPlanner:
             blue_points, lookahead_y)
         green_covers_lookahead = self._path_covers_y(
             green_points, lookahead_y)
+        blue_covers_control_geometry = self._path_covers_control_geometry(
+            blue_points, lookahead_y, height)
+        green_covers_control_geometry = self._path_covers_control_geometry(
+            green_points, lookahead_y, height)
         blue_covers_near = self._path_covers_y(blue_points, near_y)
         green_covers_near = self._path_covers_y(green_points, near_y)
         blue_near_x = _interp_path_x(blue_points, near_y)
@@ -835,14 +863,14 @@ class VisionControlPlanner:
         shared_near = (
             blue_covers_near and green_covers_near and
             near_distance_640 <= self.config.curve_merge_near_px_640)
-        green_good = green_covers_lookahead and green_span > 0.0
+        green_good = green_covers_control_geometry and green_span > 0.0
         blue_bad = (
-            not blue_covers_lookahead or
+            not blue_covers_control_geometry or
             blue_span < (
                 green_span * self.config.curve_merge_support_ratio))
         bad_merge_frame = shared_near and green_good and blue_bad
         blue_recovered = (
-            blue_covers_lookahead and
+            blue_covers_control_geometry and
             blue_span >= green_span * max(
                 0.85, self.config.curve_merge_support_ratio))
         self.curve_merge_metrics = {
@@ -852,10 +880,21 @@ class VisionControlPlanner:
             "green_span": green_span,
             "blue_covers_lookahead": bool(blue_covers_lookahead),
             "green_covers_lookahead": bool(green_covers_lookahead),
+            "blue_covers_control_geometry": bool(
+                blue_covers_control_geometry),
+            "green_covers_control_geometry": bool(
+                green_covers_control_geometry),
             "blue_bad": bool(blue_bad),
         }
 
         if self.curve_merge_override:
+            if not green_good:
+                self.curve_merge_override = False
+                self.curve_merge_bad_evidence = 0
+                self.curve_merge_blue_stable_frames = 0
+                self.selected_slot_lock = 0
+                self.curve_merge_reason = "green_support_lost"
+                return
             if blue_recovered:
                 self.curve_merge_blue_stable_frames += 1
             else:
@@ -1079,6 +1118,29 @@ class VisionControlPlanner:
             return False, "detached_near_anchor", metrics
         return True, "connected", metrics
 
+    @staticmethod
+    def _is_human_stop_reason(task_reason):
+        return str(task_reason or "") in {
+            "human_half_lookahead_stop",
+            "human_wait_cross",
+            "human_absence_check",
+            "human_preline_absence_check",
+            "car_human_same_side_wait",
+            "car_human_absence_check",
+            "car_human_preline_absence_check",
+        }
+
+    def _update_human_stop_reverse(self, task_reason, now):
+        if not self._is_human_stop_reason(task_reason):
+            self.human_stop_reverse_until = 0.0
+            self.human_stop_reverse_started = False
+            return False
+        if not self.human_stop_reverse_started:
+            self.human_stop_reverse_started = True
+            self.human_stop_reverse_until = (
+                float(now) + self.config.human_stop_reverse_duration_s)
+        return float(now) < self.human_stop_reverse_until
+
     def _build_command(
             self, selected, route_reason, result, image_shape, now,
             ocr_response=None, line_loss_reason=None):
@@ -1112,12 +1174,64 @@ class VisionControlPlanner:
         path_target = (
             self._path_target_on_selected(selected, lookahead_y)
             if selected is not None else None)
+        path_target_held = False
+        adaptive_path_without_hold = False
+        if path_target is not None and path_target[2]:
+            held_target = self._held_path_target(now)
+            if held_target is not None:
+                path_target = (
+                    float(held_target[0]), float(held_target[1]), True)
+                path_target_held = True
+            else:
+                # A nearest endpoint is only a preview fallback. Never use it
+                # as a fresh steering target when the control row is absent.
+                adaptive_path_without_hold = True
+                path_target = None
         task_path_target_x = None if path_target is None else path_target[0]
         task_state, speed, task_reason, target_override_x = (
             self._task_from_detections(
                 result, selected, image_shape, lookahead_y, now,
                 ocr_response=ocr_response,
                 path_target_x=task_path_target_x))
+        human_reverse_active = self._update_human_stop_reverse(
+            task_reason, now)
+        if adaptive_path_without_hold:
+            if self._is_human_stop_reason(task_reason):
+                reverse_state = (
+                    STATE_AVOID_HUMAN if human_reverse_active
+                    else STATE_SAFE_STOP)
+                reverse_speed = (
+                    self.config.human_stop_reverse_speed_mps
+                    if human_reverse_active else 0.0)
+                return self._command(
+                    self.last_error, reverse_speed, reverse_state,
+                    flags=(
+                        CONTROL_FLAG_USE_TARGET_SPEED
+                        if human_reverse_active else 0)), {
+                        "target_x": None,
+                        "path_target_x": None,
+                        "path_target_y": float(lookahead_y),
+                        "path_target_adaptive_y": True,
+                        "path_target_held": False,
+                        "track_error_640": float(self.last_error),
+                        "reason": "adaptive_path_human_stop",
+                        "task_reason": task_reason,
+                        "human_stop_reverse_active": bool(
+                            human_reverse_active),
+                    }
+            return self._command(
+                self.last_error, self.config.recover_speed_mps,
+                STATE_RECOVER_LINE), {
+                    "target_x": None,
+                    "path_target_x": None,
+                    "path_target_y": float(lookahead_y),
+                    "path_target_adaptive_y": True,
+                    "path_target_held": False,
+                    "track_error_640": float(self.last_error),
+                    "reason": "adaptive_path_no_previous_target",
+                    "task_reason": task_reason,
+                    "human_stop_reverse_active": False,
+                }
         if selected is None:
             age = now - self.last_valid_ts if self.last_valid_ts else 1e9
             held_target = self._held_path_target(now)
@@ -1214,20 +1328,26 @@ class VisionControlPlanner:
                 adaptive=(task_reason == "track"),
                 curve_mode=(
                     task_reason == "track"
+                    and path_geometry["valid"]
                     and self.road_shape_state == "curve"),
             )
         self.last_error = error
-        self.last_valid_ts = now
-        self.last_path_target_x = float(path_target_x)
-        self.last_path_target_y = float(path_target_y)
-        self.last_path_target_slot = int(selected["slot"])
-        self.last_path_target_ts = float(now)
-        return self._command(error, speed, task_state), {
+        if not path_target_held:
+            self.last_valid_ts = now
+            self.last_path_target_x = float(path_target_x)
+            self.last_path_target_y = float(path_target_y)
+            self.last_path_target_slot = int(selected["slot"])
+            self.last_path_target_ts = float(now)
+        output_speed = (
+            self.config.human_stop_reverse_speed_mps
+            if human_reverse_active else speed)
+        output_state = STATE_AVOID_HUMAN if human_reverse_active else task_state
+        return self._command(error, output_speed, output_state), {
             "target_x": float(control_target_x),
             "base_target_x": float(target_x),
             "path_target_x": float(path_target_x),
             "path_target_y": float(path_target_y),
-            "path_target_held": False,
+            "path_target_held": bool(path_target_held),
             "path_target_adaptive_y": bool(path_target_adaptive),
             "lookahead_y": float(path_target_y),
             "human_stop_line_y": self._human_stop_line_y(
@@ -1243,6 +1363,11 @@ class VisionControlPlanner:
             "total_feedforward_640": float(total_feedforward),
             "road_shape_state": self.road_shape_state,
             "road_shape_valid": bool(path_geometry["valid"]),
+            "road_geometry_reason": path_geometry.get("reason"),
+            "road_geometry_sample_rows_y": list(
+                path_geometry.get("sample_rows_y") or ()),
+            "road_geometry_support_y": list(
+                path_geometry.get("support_y") or ()),
             "road_heading_delta_640": float(
                 path_geometry["heading_delta_640"]),
             "road_curvature_640": float(
@@ -1251,6 +1376,7 @@ class VisionControlPlanner:
             "track_error_trend_frames": int(self.track_error_trend_frames),
             "reason": route_reason,
             "task_reason": task_reason,
+            "human_stop_reverse_active": bool(human_reverse_active),
         }
 
     @staticmethod
@@ -1270,49 +1396,90 @@ class VisionControlPlanner:
                 minimum_y <= float(preferred_y) <= maximum_y):
             return float(target_x), float(preferred_y), False
         nearest = int(np.argmin(np.abs(points[:, 1] - float(preferred_y))))
-        # Keep the displayed/control lookahead row fixed. Only borrow the x
-        # coordinate from the nearest supported endpoint when the curve is
-        # temporarily too short to cross that row.
+        # Keep the displayed lookahead row fixed and tag the nearest endpoint
+        # as adaptive. The caller may use it for preview or a recent-target
+        # hold, but never as a fresh normal steering target.
         return float(points[nearest, 0]), float(preferred_y), True
+
+    @staticmethod
+    def _road_geometry_sample_rows(lookahead_y, image_height):
+        span = min(72.0, max(32.0, 0.15 * float(image_height)))
+        sample_step = 0.5 * span
+        return (
+            float(lookahead_y),
+            float(lookahead_y) + sample_step,
+            float(lookahead_y) + span,
+        )
+
+    @classmethod
+    def _path_covers_control_geometry(cls, points, lookahead_y, image_height):
+        rows = cls._road_geometry_sample_rows(lookahead_y, image_height)
+        return all(cls._path_covers_y(points, row) for row in rows)
 
     def _path_geometry_metrics(self, selected, lookahead_y, image_shape):
         """Measure tangent and bend once for feedforward and road shape."""
         empty = {
             "valid": False,
+            "reason": "insufficient_points",
             "heading_delta_640": 0.0,
             "curvature_640": 0.0,
+            "sample_rows_y": (),
+            "support_y": (),
         }
         points = np.asarray(
             (selected or {}).get("points_xy", ()), dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 2 or len(points) < 4:
             return empty
         height, width = image_shape[:2]
-        span = min(72.0, max(32.0, 0.15 * float(height)))
-        rows = (
-            float(lookahead_y) - span,
-            float(lookahead_y),
-            float(lookahead_y) + span,
+        # The fitted control curve is guaranteed to reach the lookahead row,
+        # not a row farther toward the top of the image.  Sample from the
+        # lookahead toward the vehicle so normal fitted curves can provide
+        # geometry without extrapolation.
+        rows = self._road_geometry_sample_rows(lookahead_y, height)
+        span = float(rows[-1] - rows[0])
+        sample_step = float(rows[1] - rows[0])
+        support_y = (
+            float(np.min(points[:, 1])),
+            float(np.max(points[:, 1])),
         )
+        base = {
+            "valid": False,
+            "reason": "insufficient_vertical_support",
+            "heading_delta_640": 0.0,
+            "curvature_640": 0.0,
+            "sample_rows_y": rows,
+            "support_y": support_y,
+        }
         if (
-            rows[0] < float(np.min(points[:, 1]))
-            or rows[-1] > float(np.max(points[:, 1]))
+            rows[0] < support_y[0]
+            or rows[-1] > support_y[1]
         ):
-            return empty
+            return base
         samples = [_interp_path_x(points, row) for row in rows]
         if any(
             value is None or not math.isfinite(float(value))
             for value in samples
         ):
-            return empty
-        scale = 640.0 / float(max(1, width))
+            base["reason"] = "invalid_interpolation"
+            return base
+        width_scale = 640.0 / float(max(1, width))
+        # Preserve the former 72 px adjacent-row scale.  The new one-sided
+        # samples are 36 px apart at 480p, so slope and second difference are
+        # normalized to keep existing thresholds/gains comparable.
+        heading_scale = (2.0 * span) / max(1.0, rows[2] - rows[0])
+        curvature_scale = (span / max(1.0, sample_step)) ** 2
         heading_delta_640 = (
-            float(samples[0] - samples[2]) * scale)
+            float(samples[0] - samples[2]) * width_scale * heading_scale)
         curvature_640 = (
-            float(samples[0] - 2.0 * samples[1] + samples[2]) * scale)
+            float(samples[0] - 2.0 * samples[1] + samples[2]) *
+            width_scale * curvature_scale)
         return {
             "valid": True,
+            "reason": "valid",
             "heading_delta_640": float(heading_delta_640),
             "curvature_640": float(curvature_640),
+            "sample_rows_y": rows,
+            "support_y": support_y,
         }
 
     def _update_road_shape_state(self, geometry):
@@ -1320,8 +1487,19 @@ class VisionControlPlanner:
         valid = bool((geometry or {}).get("valid"))
         self.road_shape_valid = valid
         if not valid:
+            self.road_heading_delta_640 = 0.0
+            self.road_curvature_640 = 0.0
             self.road_curve_enter_frames = 0
-            self.road_curve_exit_frames = 0
+            if self.road_shape_state == "curve":
+                self.road_curve_exit_frames += 1
+                if (
+                    self.road_curve_exit_frames >=
+                    self.config.curve_state_exit_frames
+                ):
+                    self.road_shape_state = "straight"
+                    self.road_curve_exit_frames = 0
+            else:
+                self.road_curve_exit_frames = 0
             return
 
         self.road_heading_delta_640 = float(
@@ -1398,6 +1576,15 @@ class VisionControlPlanner:
         car_action = self._car_avoidance_action(
             detections, image_shape, lookahead_y, lookahead_path_x, now)
         if car_action is not None:
+            if str(car_action[2]) in {
+                "car_human_same_side_pass",
+                "car_human_same_side_pass_hold",
+            }:
+                self.human_path_return_guard_until = 0.0
+                self.human_path_return_guard_start_x = None
+                self.human_path_return_pending = True
+                self.human_last_avoid_target_x = _finite_float(
+                    car_action[3])
             return car_action
         human_action = self._human_action(
             detections, selected, image_shape, lookahead_y,
@@ -1413,13 +1600,60 @@ class VisionControlPlanner:
                 0.0,
                 float(max(0, image_shape[1] - 1)),
             )
+            self.human_path_return_pending = True
+            self.human_last_avoid_target_x = float(held_target_x)
             return (
                 STATE_AVOID_HUMAN,
                 self.config.human_pass_speed_mps,
                 "human_speed_hold",
                 held_target_x,
             )
+        if self.human_path_return_pending:
+            # Keep the last physical pass target as the start of a short
+            # return ramp.  The newly selected path may be noisy or sit at
+            # the image edge immediately after the person leaves.
+            return_start_x = _finite_float(
+                self.human_last_avoid_target_x)
+            if return_start_x is None:
+                return_start_x = (
+                    float(target_path_x) + float(self.human_pass_offset_x))
+            self.human_path_return_guard_start_x = _clamp(
+                float(return_start_x),
+                0.0,
+                float(max(0, image_shape[1] - 1)),
+            )
+            self.human_path_return_guard_until = (
+                float(now) + self.config.human_path_return_guard_s)
+            self.human_path_return_pending = False
         self.human_pass_offset_x = 0.0
+        guard_duration = float(self.config.human_path_return_guard_s)
+        if (
+            self.human_path_return_guard_start_x is not None
+            and float(now) < self.human_path_return_guard_until
+            and guard_duration > 0.0
+        ):
+            remaining = _clamp(
+                (self.human_path_return_guard_until - float(now)) /
+                guard_duration,
+                0.0, 1.0)
+            return_target_x = (
+                float(target_path_x)
+                + (float(self.human_path_return_guard_start_x)
+                   - float(target_path_x)) * remaining
+            )
+            return (
+                STATE_TRACK,
+                self.config.normal_speed_mps,
+                "human_path_return_guard",
+                _clamp(
+                    return_target_x,
+                    0.0,
+                    float(max(0, image_shape[1] - 1)),
+                ),
+            )
+        self.human_path_return_guard_until = 0.0
+        self.human_path_return_guard_start_x = None
+        self.human_last_avoid_target_x = None
         coin = self._best_coin(detections, image_shape, target_path_x)
         if coin is not None:
             return (
@@ -2190,6 +2424,8 @@ class VisionControlPlanner:
         return None
 
     def _human_pass_command(self, path_x, image_shape, human_side):
+        self.human_path_return_guard_until = 0.0
+        self.human_path_return_guard_start_x = None
         scale = float(max(1, image_shape[1])) / 640.0
         offset = self.config.human_pass_offset_px_640 * scale
         target_x = _clamp(
@@ -2198,6 +2434,8 @@ class VisionControlPlanner:
             float(max(0, image_shape[1] - 1)),
         )
         self.human_pass_offset_x = float(target_x) - float(path_x)
+        self.human_path_return_pending = True
+        self.human_last_avoid_target_x = float(target_x)
         return STATE_AVOID_HUMAN, self.config.human_pass_speed_mps, "human_cross_pass", target_x
 
     def _human_on_stop_line(self, geom, image_shape, lookahead_y):
@@ -2369,11 +2607,7 @@ class VisionControlPlanner:
         error = _clamp(float(error), -limit, limit)
         magnitude = abs(error)
         if curve_mode:
-            deadband = float(self.config.curve_track_deadband_px_640)
-            if magnitude <= deadband:
-                return 0.0
-            return float(math.copysign(
-                min(limit, magnitude - deadband), error))
+            return float(error)
 
         deadband = float(self.config.track_deadband_px_640)
         small_limit = max(
@@ -2432,7 +2666,7 @@ class VisionControlPlanner:
             step = base_step * self.config.track_reverse_step_scale
             mode = "reverse_guard"
         elif curve_mode:
-            step = base_step * self.config.track_fast_step_scale
+            step = base_step * self.config.curve_track_step_scale
             mode = "curve_track"
         elif (same_direction and self.track_error_trend_frames >= 2 and
               magnitude >= self.config.track_fast_error_px_640):
