@@ -30,12 +30,15 @@ class InferWrap:
                 "MULTITASK_NPU_MODE must be parallel or all_cores")
         use_all_cores = self.npu_mode == "all_cores"
         self.TPEs = 1 if use_all_cores else max(1, min(int(TPEs), 3))
-        default_depth = min(2, self.TPEs)
+        # Keep every NPU worker busy. Depth 1 serializes put/get and drops the
+        # three-core setup to single-inference throughput; matching the queue
+        # depth to the worker count restores the intended real-time FPS.
+        default_depth = self.TPEs
         try:
             requested_depth = int(os.environ.get(
                 "MULTITASK_PIPELINE_DEPTH", str(default_depth)))
         except ValueError:
-            requested_depth = self.TPEs
+            requested_depth = default_depth
         self.pipeline_depth = max(1, min(requested_depth, self.TPEs))
         self.rknn_pool = rknnPoolExecutor(
             rknnModel=self.model_path,
@@ -78,7 +81,6 @@ class InferWrap:
             "int8": "multitask_ppyoloe_int8.rknn",
             "fp16": "multitask_ppyoloe_fp16.rknn",
             "curve_best": "multitask_ppyoloe_curve_best_int8.rknn",
-            "heatmap_best": "multitask_ppyoloe_heatmap_best_int8.rknn",
             "multitask_best": "multitask_ppyoloe_multitask_best_int8.rknn",
         }
         if variant not in variant_files:

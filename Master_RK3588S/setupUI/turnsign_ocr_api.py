@@ -694,7 +694,7 @@ class TurnSignOcrApiProcessor:
         candidates.sort(key=lambda item: item[0], reverse=True)
         return candidates[0][1]
 
-    def process(self, frame, detections, timestamp=None, context=None):
+    def process(self, frame, detections, timestamp=None):
         ts = float(timestamp if timestamp is not None else now_seconds())
         if _near_door_turnsign_conflict(
                 detections,
@@ -1180,7 +1180,6 @@ class AsyncTurnSignOcrApiProcessor:
         self.confirm_bbox = None
         self.session_active = False
         self.session_resolved = False
-        self.turnsign_suppressed = False
         self.session_id = 0
         self.latest_result = fixed_unknown_result("", "not_started")
         self.latest_response = {
@@ -1639,44 +1638,6 @@ class AsyncTurnSignOcrApiProcessor:
         self.session_last_turnsign_seen_ts = 0.0
         self.session_ocr_started_ts = 0.0
 
-    def _right_merge_suppressed_response(self, timestamp):
-        """Drop all TurnSign state while the car completes a right merge."""
-        first_suppressed_frame = not self.turnsign_suppressed
-        if first_suppressed_frame:
-            # Reject a late worker reply and discard the completed sign that
-            # initiated this right turn. A door-shaped false positive must not
-            # inherit either the old confirmation count or route result.
-            self._invalidate_stable_result()
-            self.last_turnsign_seen_ts = 0.0
-            self.last_turnsign_bbox = None
-            self.last_position_detection = None
-            self.tracking_misses = 0
-        self.turnsign_suppressed = True
-        result = fixed_unknown_result("", "right_merge_suppressed")
-        response = {
-            "active": False,
-            "status": "turnsign_suppressed_right_merge",
-            "control_phase": "turnsign_suppressed_right_merge",
-            "instruction": result,
-            "latest_instruction": result,
-            "instruction_current": False,
-            "worker_ready": self.worker_ready,
-            "error": self.worker_error or None,
-            "clear_result": bool(first_suppressed_frame),
-            "confirm_count": 0,
-            "confirm_frames": self.confirm_frames,
-            "session_id": None,
-            "session_active": False,
-            "turnsign_resolved": False,
-            "candidate_status": "turnsign_suppressed_right_merge",
-            "current_detection_fresh": False,
-            "stop_size_reached": False,
-            "position_ready": False,
-            "snapshot_captured": False,
-        }
-        self.latest_response = dict(response)
-        self.latest_response_ts = float(timestamp)
-        return response
 
     def _door_conflict_response(self, timestamp):
         """Reject a nearby high-confidence Door/TurnSign duplicate."""
@@ -1839,20 +1800,12 @@ class AsyncTurnSignOcrApiProcessor:
 
     def process(self, frame, detections, timestamp=None, context=None):
         ts = float(timestamp if timestamp is not None else now_seconds())
-        context = context if isinstance(context, dict) else {}
-        if bool(context.get("suppress_turnsign_right_merge")):
-            return self._right_merge_suppressed_response(ts)
         if _near_door_turnsign_conflict(
                 detections,
                 self.door_conflict_score,
                 self.door_conflict_distance_px_640,
                 frame):
             return self._door_conflict_response(ts)
-        if self.turnsign_suppressed:
-            # Re-enable with a clean confirmation window. The next road sign
-            # must independently satisfy the normal consecutive-frame gate.
-            self.turnsign_suppressed = False
-            self._reset_confirmation()
         clear_result = bool(self.clear_result_pending)
         self.clear_result_pending = False
         result_received = self._drain_results()

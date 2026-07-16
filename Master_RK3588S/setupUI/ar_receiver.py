@@ -225,44 +225,6 @@ class RuntimeState:
                 "selected_slot_lock": vision_control.get(
                     "selected_slot_lock"),
                 "selected_slot": vision_control.get("selected_slot"),
-                "ocr_right_merge_phase": vision_control.get(
-                    "ocr_right_merge_phase"),
-                "ocr_right_green_lock_elapsed_s": vision_control.get(
-                    "ocr_right_green_lock_elapsed_s"),
-                "ocr_right_green_lock_remaining_s": vision_control.get(
-                    "ocr_right_green_lock_remaining_s"),
-                "ocr_right_hold_error_640": vision_control.get(
-                    "ocr_right_hold_error_640"),
-                "ocr_right_blue_vertical_frames": vision_control.get(
-                    "ocr_right_blue_vertical_frames"),
-                "ocr_right_blue_heading_deg": vision_control.get(
-                    "ocr_right_blue_heading_deg"),
-                "ocr_right_blue_local_max_angle_deg": vision_control.get(
-                    "ocr_right_blue_local_max_angle_deg"),
-                "ocr_right_blue_vertical_ready": bool(
-                    vision_control.get(
-                        "ocr_right_blue_vertical_ready", False)),
-                "ocr_right_green_recovery_frames": vision_control.get(
-                    "ocr_right_green_recovery_frames"),
-                "ocr_right_green_reliable": bool(
-                    vision_control.get(
-                        "ocr_right_green_reliable", False)),
-                "ocr_right_green_effective_lookahead_y": vision_control.get(
-                    "ocr_right_green_effective_lookahead_y"),
-                "ocr_right_green_search_down_px_480": vision_control.get(
-                    "ocr_right_green_search_down_px_480"),
-                "ocr_right_blue_effective_lookahead_y": vision_control.get(
-                    "ocr_right_blue_effective_lookahead_y"),
-                "ocr_right_blue_search_down_px_480": vision_control.get(
-                    "ocr_right_blue_search_down_px_480"),
-                "ocr_right_blue_motion_span_px_640": vision_control.get(
-                    "ocr_right_blue_motion_span_px_640"),
-                "ocr_right_blue_motion_unstable": bool(
-                    vision_control.get(
-                        "ocr_right_blue_motion_unstable", False)),
-                "turnsign_suppressed_right_merge": bool(
-                    vision_control.get(
-                        "turnsign_suppressed_right_merge", False)),
                 "ocr_lock_expired": bool(vision_control.get(
                     "ocr_lock_expired", False)),
                 "ocr_lock_remaining_s": vision_control.get(
@@ -769,7 +731,7 @@ def create_vision_control_planner():
     try:
         from vision_control import VisionControlPlanner, render_vision_control_debug
 
-        planner = VisionControlPlanner(log_func=lambda message: print(f"[VISION CONTROL] {message}"))
+        planner = VisionControlPlanner()
         mode = "send" if env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT) else "debug-only"
         print(f"[VISION CONTROL] enabled ({mode})")
         return planner, render_vision_control_debug
@@ -800,16 +762,11 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
         "turnsign_door_conflict": "IGNORE_NEAR_DOOR",
         "turnsign_bad_bbox": "BAD_BOX",
         "turnsign_confirming": "CONFIRM",
-        "turnsign_lock_reverse": "LOCK_REVERSE_0.08_0.5S",
         "turnsign_trim_forward": "TRIM_FORWARD_0.08_0.5S",
         "turnsign_trim_reverse": "TRIM_REVERSE_0.08_0.5S",
         "turnsign_trim_settle": "TRIM_OBSERVE_0.8S",
         "turnsign_trim_verify": "TRIM_VERIFY_SIGN",
         "turnsign_trim_ready": "TRIM_READY_TWO_LINES",
-        "ocr_right_merge_hold": "RIGHT_MERGE_HOLD_0.10",
-        "ocr_right_wait_blue_vertical": "WAIT_BLUE_VERTICAL",
-        "ocr_right_wait_green_reliable": "WAIT_GREEN_RELIABLE",
-        "ocr_right_blue_blend": "BLEND_TO_BLUE",
         "turnsign_approach": "APPROACH",
         "turnsign_edge_left": "EDGE_LEFT",
         "turnsign_edge_right": "EDGE_RIGHT",
@@ -818,7 +775,6 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
         "turnsign_missing_stop": "MISS_STOP",
         "turnsign_ocr_wait": "STOP_WAIT_OCR",
         "turnsign_consumed": "RESULT_LATCHED",
-        "turnsign_suppressed_right_merge": "IGNORE_SIGN_RIGHT_MERGE",
         "turnsign_exit_no_sign": "EXIT_NO_SIGN_3S",
         "turnsign_exit_ocr_timeout": "EXIT_TIMEOUT_10S",
         "ocr_wait_route": "WAIT_ROUTE",
@@ -1028,19 +984,10 @@ def main():
 
                 if ocr_processor is not None:
                     try:
-                        suppress_turnsign_right_merge = bool(
-                            vision_control_planner is not None
-                            and vision_control_planner
-                            .should_suppress_turnsign_detection()
-                        )
                         latest_ocr_response = ocr_processor.process(
                             ocr_source_frame,
                             detections,
                             timestamp=time.time(),
-                            context={
-                                "suppress_turnsign_right_merge":
-                                suppress_turnsign_right_merge,
-                            },
                         )
                         state.update_ocr(latest_ocr_response)
                         instruction = (

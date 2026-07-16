@@ -5,7 +5,7 @@ Place the trained six-output RKNN model here as one of:
 - `multitask_ppyoloe_int8.rknn` (default)
 - `multitask_ppyoloe_fp16.rknn`
 
-Select it with `MULTITASK_RKNN_VARIANT=int8|fp16|curve_best|heatmap_best|multitask_best`,
+Select it with `MULTITASK_RKNN_VARIANT=int8|fp16|curve_best|multitask_best`,
 or set an absolute path with `MULTITASK_RKNN_MODEL`. The included
 `curve_best` variant is the Stage3 row-classifier curve checkpoint.
 
@@ -35,10 +35,11 @@ Path slots have conditional roles:
 - count 1: slot 0 is `single`.
 - count 2: slot 0 is `left`, slot 1 is `right`.
 
-The default active path is `row_path_logits`: the ordered row-classifier curve
-is exposed as `paths` and `curve_paths`. It is decoded without B-spline fitting
-or extrapolation. Raw heatmaps remain available for preview. The old
-heatmap-ridge extraction is retained as an optional comparison mode.
+`row_path_logits` is the only path source. Post-processing first exposes all
+32 anchors for both slots as `raw_curve_paths`, without threshold filtering or
+fitting. `vision_control.py` then removes unsupported points with the semantic
+road mask and local association checks, compensates sparse lower points, fits
+the smooth majority curve, and publishes the final control curves as `paths`.
 
 ## Runtime tuning
 
@@ -46,7 +47,7 @@ heatmap-ridge extraction is retained as an optional comparison mode.
 export MULTITASK_RKNN_VARIANT=curve_best
 export MULTITASK_NPU_MODE=parallel
 export MULTITASK_RKNN_TPES=3
-export MULTITASK_PIPELINE_DEPTH=2
+export MULTITASK_PIPELINE_DEPTH=3
 export MULTITASK_OPENCV_THREADS=2
 export MULTITASK_RKNN_WARMUP=1
 export MULTITASK_DET_THRESHOLD=0.50
@@ -70,43 +71,20 @@ export MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO=0.70
 export MULTITASK_RENDER_MAX_BOX_AREA_RATIO=0.30
 export MULTITASK_RENDER_PATH_MIN_SCORE=0.35
 export MULTITASK_RENDER_PATH_MIN_COUNT_CONFIDENCE=0.40
-export MULTITASK_ROW_GREEN_PATH_MIN_SCORE=0.03
-export MULTITASK_ROW_GREEN_NO_PATH_THRESHOLD=0.93
-export MULTITASK_ROW_GREEN_MAX_MISSING_ANCHORS=6
-export MULTITASK_PATH_SOURCE=curve  # curve (default) or heatmap
-export VISION_CONTROL_PATH_SOURCE=curve
-export VISION_CONTROL_LOOKAHEAD_Y_RATIO=0.60
-export VISION_CONTROL_CURVE_GREEN_MAX_STEP_640=20
-export VISION_CONTROL_CURVE_GREEN_EMA_ALPHA=0.30
-export VISION_CONTROL_CURVE_GREEN_HOLD_FRAMES=3
+export VISION_CONTROL_LOOKAHEAD_Y_RATIO=0.625
 export VISION_CONTROL_POINT_LOWER_CONFIDENCE_BOOST=0.35
 export VISION_CONTROL_POINT_UPPER_CONFIDENCE_DECAY=0.55
-export VISION_CONTROL_DEFAULT_LEFT_ERROR_GAIN=0.75
-export VISION_CONTROL_DEFAULT_LEFT_MAX_ERROR_640=210
-export VISION_CONTROL_DEFAULT_LEFT_MAX_STEP_640=32
-export VISION_CONTROL_DEFAULT_RIGHT_ERROR_GAIN=0.87
-export VISION_CONTROL_DEFAULT_RIGHT_MAX_ERROR_640=210
-export VISION_CONTROL_DEFAULT_RIGHT_MAX_STEP_640=36
-export VISION_CONTROL_OCR_RIGHT_GREEN_LOCK_S=5.0
-export VISION_CONTROL_OCR_RIGHT_SEARCH_DOWN_PX_480=120
-export VISION_CONTROL_OCR_RIGHT_MIN_PATH_SPAN_PX_480=60
-export VISION_CONTROL_ERROR_TREND_WINDOW=5
-export VISION_CONTROL_ERROR_TREND_MIN_FRAMES=3
-export VISION_CONTROL_ERROR_TREND_KD=0.15
-export VISION_CONTROL_ERROR_TREND_DEADBAND_640=5
-export VISION_CONTROL_ERROR_TREND_MAX_ADJUST_640=20
-export VISION_CONTROL_HUMAN_SPEED=0.40
-export VISION_CONTROL_HUMAN_PASS_SPEED=0.42
-export VISION_CONTROL_HUMAN_SPEED_HOLD_S=1.0
-export VISION_CONTROL_CAR_HUMAN_PASS_SPEED=0.42
-export VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S=1.0
-export VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO=0.8888889
+export VISION_CONTROL_MAX_STEP_640=24
+export VISION_CONTROL_HUMAN_PASS_SPEED=0.30
+export VISION_CONTROL_HUMAN_SPEED_HOLD_S=0.5
+export VISION_CONTROL_CAR_HUMAN_PASS_SPEED=0.30
+export VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S=2.0
+export VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO=0.78
 export VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480=20
-export VISION_CONTROL_HUMAN_BRAKE_REVERSE_SPEED=-0.05
-export VISION_CONTROL_HUMAN_BRAKE_REVERSE_DURATION_S=0.2
-export VISION_CONTROL_HUMAN_CROSS_RELEASE_640=5
-export VISION_CONTROL_HAZARD_BOTTOM_RATIO=0.5208333
-export VISION_CONTROL_CAR_AVOID_OFFSET_640=60
+export VISION_CONTROL_CAR_AVOID_OFFSET_640=55
+export VISION_CONTROL_CAR_AVOID_HOLD_S=2.0
+export VISION_CONTROL_HAZARD_BOTTOM_RATIO=0.58
+export VISION_CONTROL_CAR_AVOID_OFFSET_640=57
 export VISION_CONTROL_CAR_AVOID_SPEED=0.10
 export VISION_CONTROL_CAR_AVOID_RAMP_S=1.5
 export VISION_CONTROL_CAR_AVOID_HOLD_S=1.0
@@ -160,10 +138,14 @@ export VISION_CONTROL_RECOVERY_MIN_PROBABILITY=0.35
 export VISION_CONTROL_RECOVERY_MIN_CONTINUATION_ROWS=8
 export VISION_CONTROL_RECOVERY_AMBIGUITY_MARGIN=0.08
 export VISION_CONTROL_CURVE_FIT_BLEND=0.25
+export VISION_CONTROL_HISTORY_WEIGHT=0.035
 export VISION_CONTROL_PATH_EMA_ALPHA=0.45
 export VISION_CONTROL_PATH_SMOOTH_WINDOW=5
 export VISION_CONTROL_PATH_MAX_STEP_640=40
 export VISION_CONTROL_PATH_HOLD_FRAMES=8
+export VISION_CONTROL_CURVE_GREEN_MAX_STEP_640=20
+export VISION_CONTROL_CURVE_GREEN_EMA_ALPHA=0.30
+export VISION_CONTROL_CURVE_GREEN_HOLD_FRAMES=3
 export VISION_CONTROL_ROUTE_CONFIRM_FRAMES=6
 export VISION_CONTROL_BRANCH_RELEASE_FRAMES=20
 export VISION_CONTROL_CURVE_MERGE_FAST_SPAN_RATIO=0.55
@@ -175,9 +157,14 @@ export VISION_CONTROL_CURVE_BLUE_INSTABILITY_EVIDENCE=3
 export VISION_CONTROL_CURVE_GREEN_MISSING_RELEASE_FRAMES=3
 ```
 
-Path filtering is causal and adds no buffered-frame latency. Each path is
-spatially smoothed, aligned to the previous path from the same model slot, and
-then filtered with an EMA. Raw heatmaps remain unchanged.
+Fitted centerlines retain a lightweight temporal guard: a lateral jump over
+24 px/640 must be seen again within 12 px before it replaces the previous
+fitted curve. Candidate paths also keep the established slot EMA, per-frame
+step limit, short missing-path hold, green-curve guard, and route confirmation.
+Ordinary line following uses the historical left/right error slew limits and
+trend feedback; trend slopes with an absolute value below 10 px/frame are
+ignored. Pedestrian/car avoidance remains outside that restored feedback.
+Safety/task action timing remains independent of path filtering.
 
 `MULTITASK_COIN_MIN_SHORT_SIDE=10` mirrors the training dataset rule: Coin
 detections whose short side is below 10 pixels in the fixed 640x480 model input
@@ -221,24 +208,17 @@ Debug rendering is performed by the drop-frame preview thread, not by an NPU
 worker. Select it with:
 
 ```bash
-export MULTITASK_RENDER_MODE=drive  # off, heatmap, drive, debug, or full
+export MULTITASK_RENDER_MODE=drive  # off, drive, debug, or full
 export MULTITASK_ROAD_OVERLAY_ALPHA=0.28
-export MULTITASK_PATH_HEATMAP_ALPHA=0.45
-export MULTITASK_PATH_HEATMAP_THRESHOLD=0.25
 ```
 
 - `off`: no perception drawing.
 - `drive`: realtime default. Draw compact detections and the active control
-  paths without calculating or overlaying path heatmaps.
-- `heatmap`: offline diagnostic mode. Draw every post-NMS detection as a full
-  box and overlay heatmaps only when they were explicitly decoded.
-  The default active source is the row-classifier curve; use the heatmap source
-  switch only for comparison. Frame-spanning boxes are hidden from rendering only and
-  remain available to OCR/control.
-- `drive`: low-clutter mode. No road fill or labels; paths are thin, Coin uses
-  a dot, and other detections use corner marks.
+  paths. No road fill or labels; paths are thin, Coin uses a dot, and other
+  detections use corner marks. Frame-spanning boxes are hidden from rendering
+  only and remain available to OCR/control.
 - `debug`: drive mode plus the binary road overlay.
-- `full`: road, heatmaps, up to 20 detections, all 32 path points, roles, and
+- `full`: road, up to 20 detections, final path points, roles, and
   confidence text.
 
 Drive rendering is separate from perception output. OCR and control still
@@ -246,25 +226,9 @@ receive every post-NMS detection even though preview drawing defaults to at
 most six detections, two per class. Legacy `path` and `road` mode names map to
 `drive` and `debug`.
 
-`MULTITASK_PATH_SOURCE=curve` is the default. It decodes each query at the 32
-fixed row anchors, keeps only rows predicted as present, and never fits a
-B-spline through unsupported regions. All rendered heatmap pixels and curve
-points are clipped to the cleaned road segmentation mask. Set
-`MULTITASK_PATH_SOURCE=heatmap` to restore the prior heatmap-ridge comparison
-mode. `VISION_CONTROL_PATH_SOURCE` defaults to the same value and can be
-overridden independently for comparison.
-
-The visual controller derives the one/two-path decision from horizontal peaks
-inside the middle 45%-55% image band. Peaks are checked from strongest to
-weakest; low-confidence peaks and components smaller than 20 heatmap pixels
-are skipped. Accepted peaks seed a greedy hysteresis trace. Values below 0.05
-are blank. A trace is valid if it reaches the bottom 10% of the image, or a
-left/right edge margin inside the lower third. One short interruption can be
-bridged using a robust quadratic prediction, but only when the lower segment
-is strong, continuous, reaches a valid exit, and is unambiguous. Observed
-points receive only a small fitted correction; blank bridge points use the
-fitted curve. `AR Preview` outlines the scan band and displays the resulting
-path count.
+There is no runtime path-source switch. The preview consumes the same final
+`paths` objects used by steering, so it does not repeat curve fitting or retain
+a second control-line implementation.
 
 Route classification changes only after six consecutive confirming frames.
 The selected path slot is held across eight missing frames, and an OCR-locked
@@ -282,20 +246,12 @@ The result exposes both the unified top-level fields and the existing nested
 - `detections`: class id/name, score, and original-image `box_xyxy`.
 - `road_probability`: `[120,160]` float32.
 - `road_mask`: `[120,160]` uint8.
-- `path_heatmaps`: raw sigmoid probabilities with shape `[2,120,160]`.
-- `path_count` and `path_count_scores`.
-- `paths`: the active source, row-classifier paths by default.
-- `curve_paths`: paths decoded from `[2,32,161]` row logits; each contains
-  only visible row anchors and road-constrained display segments.
-- `heatmap_ridge_paths`: only populated when `MULTITASK_PATH_SOURCE=heatmap`.
+- `model_path_count` and `path_count_scores`: raw count-head diagnostics.
+- `raw_curve_paths`: both slots and all 32 row-classifier anchors.
+- `paths`: final road-supported, compensated, fitted control curves, added by
+  `VisionControlPlanner.update`.
 - `timings_ms`: preprocess, RKNN inference, FIFO wait, postprocess, and total
   latency visible to the perception consumer.
-
-In `heatmap` mode the old centerline scanner works unchanged: it scans each raw
-path heatmap from bottom to top, links spatially near row peaks across small
-gaps, and keeps only the track with the greatest row coverage and accumulated
-confidence. Its resulting points are then projected into the cleaned road mask;
-the raw heatmap values themselves are not changed.
 
 The old `rknn_lt.rknn` and old four-output models are incompatible and fail
 fast instead of producing incorrect paths.
