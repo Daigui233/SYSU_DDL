@@ -473,6 +473,26 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertGreater(
             abs(second["control_target"]["road_curvature_640"]), 8.0)
 
+    def test_right_circle_uses_track_feedforward_with_small_trim(self):
+        planner = VisionControlPlanner(config=_config(
+            right_circle_feedforward_640=66.5,
+            right_circle_trim_max_640=10.0,
+        ))
+        planner.road_shape_state = "curve"
+        planner.road_shape_valid = True
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        xs = 320.0 + 0.0015 * (ys - 300.0) ** 2
+        result = _raw_result_at(320.0, 430.0)
+        result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
+        result["centerline"]["raw_curve_paths"][0] = result[
+            "raw_curve_paths"][0]
+        _command, debug = planner.update(result, now=1.0)
+        target = debug["control_target"]
+        self.assertAlmostEqual(
+            target["right_circle_feedforward_640"], 66.5)
+        self.assertLessEqual(abs(target["right_circle_trim_640"]), 10.0)
+        self.assertGreater(target["track_error_640"], 50.0)
+
     def test_confirmed_curve_keeps_more_medium_error_than_straight(self):
         planner = VisionControlPlanner(config=VisionControlConfig())
         self.assertGreater(
@@ -879,19 +899,25 @@ class VisionControlPlannerTest(unittest.TestCase):
             },
         }
 
-        source_quad = _birdseye_debug_source_quad_from_road(
-            result, (480, 640, 3))
+        with mock.patch.dict(os.environ, {
+                "AR_BIRDSEYE_FOLLOW_ROAD_MASK": "1",
+        }):
+            source_quad = _birdseye_debug_source_quad_from_road(
+                result, (480, 640, 3))
 
         self.assertIsNotNone(source_quad)
-        self.assertAlmostEqual(float(source_quad[0, 0]), 0.434, delta=0.03)
-        self.assertAlmostEqual(float(source_quad[1, 0]), 0.572, delta=0.03)
+        self.assertAlmostEqual(float(source_quad[0, 0]), 0.428, delta=0.03)
+        self.assertAlmostEqual(float(source_quad[1, 0]), 0.578, delta=0.03)
         self.assertAlmostEqual(float(source_quad[3, 0]), 0.214, delta=0.04)
         self.assertAlmostEqual(float(source_quad[2, 0]), 0.792, delta=0.04)
 
-        renderer = VisionControlBirdseyeRenderer()
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        rendered = renderer(frame, result)
-        renderer.draw_source_roi(frame)
+        with mock.patch.dict(os.environ, {
+                "AR_BIRDSEYE_FOLLOW_ROAD_MASK": "1",
+        }):
+            renderer = VisionControlBirdseyeRenderer()
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            rendered = renderer(frame, result)
+            renderer.draw_source_roi(frame)
         self.assertEqual(renderer.source_status, "ROAD MASK")
         self.assertGreater(int(rendered.sum()), 0)
         self.assertGreater(int(frame.sum()), 0)

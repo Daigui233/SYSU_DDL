@@ -109,6 +109,9 @@ class VisionControlConfig:
     path_heading_deadband_px_640: float = 6.0
     curve_feedforward_gain: float = 0.85
     curve_feedforward_max_px_640: float = 36.0
+    # Track-specific steering feedforward: straight or right 3 m circle.
+    right_circle_feedforward_640: float = 66.5
+    right_circle_trim_max_640: float = 10.0
     normal_speed_mps: float = 0.06
     recover_speed_mps: float = 0.06
     human_pass_speed_mps: float = 0.30
@@ -230,6 +233,11 @@ class VisionControlConfig:
                 0.0, 1.0),
             curve_feedforward_max_px_640=max(
                 0.0, _env_float("VISION_CONTROL_CURVE_FF_MAX_640", 36.0)),
+            right_circle_feedforward_640=_clamp(
+                _env_float("VISION_CONTROL_RIGHT_CIRCLE_FF_640", 66.5),
+                -160.0, 160.0),
+            right_circle_trim_max_640=max(
+                0.0, _env_float("VISION_CONTROL_RIGHT_CIRCLE_TRIM_MAX_640", 10.0)),
             normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.06)),
             recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.06)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
@@ -1285,6 +1293,8 @@ class VisionControlPlanner:
             - self.config.visual_center_x) * 640.0
         heading_feedforward = 0.0
         curve_feedforward = 0.0
+        right_circle_feedforward = 0.0
+        right_circle_trim = 0.0
         if (task_reason == "track" and target_override_x is None and
                 not path_target_adaptive and path_geometry["valid"]):
             heading_delta_640 = float(
@@ -1305,9 +1315,31 @@ class VisionControlPlanner:
                 -float(self.config.curve_feedforward_max_px_640),
                 float(self.config.curve_feedforward_max_px_640),
             )
+            # The course has only a straight and a right-turn 3 m circle.
+            # Once the curve state is latched, hold the measured steering
+            # baseline and permit only a small visual trim around it.
+            if (
+                self.road_shape_state == "curve"
+                and float(path_geometry["curvature_640"]) > 0.0
+            ):
+                right_circle_feedforward = float(
+                    self.config.right_circle_feedforward_640)
+                right_circle_trim = _clamp(
+                    float(path_raw_error),
+                    -float(self.config.right_circle_trim_max_640),
+                    float(self.config.right_circle_trim_max_640),
+                )
         total_feedforward = (
             float(heading_feedforward) + float(curve_feedforward))
-        raw_error = float(path_raw_error) + total_feedforward
+        applied_steering_feedforward = total_feedforward
+        if right_circle_feedforward != 0.0:
+            # The measured +66.5 baseline replaces the generic curvature
+            # feedforward. Only a bounded visual trim is allowed around it.
+            raw_error = right_circle_feedforward + right_circle_trim
+            applied_steering_feedforward = (
+                right_circle_feedforward + right_circle_trim)
+        else:
+            raw_error = float(path_raw_error) + total_feedforward
         control_target_x = _clamp(
             float(target_x) + total_feedforward *
             float(max(1, image_shape[1])) / 640.0,
@@ -1360,7 +1392,12 @@ class VisionControlPlanner:
             "path_heading_feedforward_640": float(
                 heading_feedforward),
             "curve_feedforward_640": float(curve_feedforward),
+            "right_circle_feedforward_640": float(
+                right_circle_feedforward),
+            "right_circle_trim_640": float(right_circle_trim),
             "total_feedforward_640": float(total_feedforward),
+            "applied_steering_feedforward_640": float(
+                applied_steering_feedforward),
             "road_shape_state": self.road_shape_state,
             "road_shape_valid": bool(path_geometry["valid"]),
             "road_geometry_reason": path_geometry.get("reason"),
@@ -2983,7 +3020,8 @@ def _draw_identity_probability_curve(
 
 def _birdseye_debug_default_source_quad():
     top_y = _clamp(
-        _env_float("AR_BIRDSEYE_SRC_TOP_Y", 0.52), 0.05, 0.85)
+        _env_float("AR_BIRDSEYE_SRC_TOP_Y", 0.52),
+        0.05, 0.85)
     bottom_y = _clamp(
         _env_float("AR_BIRDSEYE_SRC_BOTTOM_Y", 0.95),
         top_y + 0.05, 1.0)
@@ -3117,8 +3155,44 @@ def _birdseye_debug_mask_run(
     return None
 
 
+def _birdseye_debug_mask_vertical_span(road_mask):
+    """Return the stable occupied-row span of the current road component."""
+    road_mask = (np.asarray(road_mask) != 0).astype(np.uint8)
+    if road_mask.ndim != 2 or not road_mask.size:
+        return None
+    height, width = road_mask.shape
+    row_counts = np.count_nonzero(road_mask, axis=1)
+    minimum_count = max(2, int(round(width * 0.02)))
+    valid = row_counts >= minimum_count
+    if not np.any(valid):
+        return None
+    # Bridge one- or two-row segmentation holes before selecting a span.
+    valid = np.convolve(valid.astype(np.int8), [1, 1, 1], mode="same") >= 2
+    padded = np.pad(valid.astype(np.int8), (1, 1))
+    transitions = np.diff(padded)
+    starts = np.flatnonzero(transitions == 1)
+    ends = np.flatnonzero(transitions == -1) - 1
+    spans = [
+        (int(start), int(end))
+        for start, end in zip(starts, ends)
+        if end - start + 1 >= 4
+    ]
+    if not spans:
+        return None
+    # Prefer the longest coherent component; ties go to the lower span,
+    # which is the incoming road rather than a small far-field speck.
+    start, end = max(spans, key=lambda item: (
+        item[1] - item[0] + 1, item[1]))
+    if end - start < max(8, int(round(height * 0.12))):
+        return None
+    return (
+        float(start) / float(max(1, height - 1)),
+        float(end) / float(max(1, height - 1)),
+    )
+
+
 def _birdseye_debug_source_quad_from_road(result, image_shape):
-    """Fit the display ROI to the selected semantic-road component."""
+    """Fit the display ROI to the current semantic-road geometry."""
     if not _env_bool("AR_BIRDSEYE_FOLLOW_ROAD_MASK", True):
         return None
     road_mask = _birdseye_debug_result_road_mask(result)
@@ -3126,9 +3200,10 @@ def _birdseye_debug_source_quad_from_road(result, image_shape):
         return None
     image_height, image_width = image_shape[:2]
     mask_height, mask_width = road_mask.shape
-    fixed_quad = _birdseye_debug_default_source_quad()
-    top_y = float(fixed_quad[0, 1])
-    bottom_y = float(fixed_quad[2, 1])
+    vertical_span = _birdseye_debug_mask_vertical_span(road_mask)
+    if vertical_span is None:
+        return None
+    top_y, bottom_y = vertical_span
     band_rows = max(0, _env_int("AR_BIRDSEYE_MASK_BAND_ROWS", 2))
     search_rows = max(0, _env_int("AR_BIRDSEYE_MASK_SEARCH_ROWS", 8))
 
@@ -3169,7 +3244,10 @@ def _birdseye_debug_source_quad_from_road(result, image_shape):
         return None
     if not (0.08 <= bottom_width <= 0.98):
         return None
-    if bottom_width < top_width * 1.12:
+    # Camera height changes can make the visible road nearly parallel.  Do
+    # not reject that valid geometry merely because the bottom is not 12%
+    # wider than the top; temporal gating below handles noisy candidates.
+    if bottom_width < top_width:
         return None
     return np.asarray([
         [top_left, top_y],
@@ -3269,54 +3347,45 @@ def _draw_birdseye_debug_road(
         return
     mask_to_birdseye = (
         np.asarray(homography, dtype=np.float64) @ mask_to_source)
-    road_color = (55, 55, 220)
-
-    contours, _hierarchy = cv2.findContours(
-        ground_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for contour in contours:
-        if len(contour) < 2:
-            continue
-        projected = cv2.perspectiveTransform(
-            contour.astype(np.float32), mask_to_birdseye)
-        cv2.polylines(
-            frame, [np.rint(projected).astype(np.int32)], True,
-            road_color, 2, cv2.LINE_AA)
-
-    # Sparse dots communicate the segmented area without a second full-size
-    # warp/blend, which keeps this display-only overlay cheap on the RK3588.
-    stride = max(4, _env_int("AR_BIRDSEYE_ROAD_SAMPLE_STRIDE", 8))
-    sampled_y, sampled_x = np.nonzero(ground_mask[::stride, ::stride])
-    if len(sampled_x) == 0:
+    # The previous implementation transformed every contour and then drew
+    # thousands of individual road dots.  On the RK3588 that made the writer
+    # thread fall behind the camera.  One nearest-neighbour mask warp keeps
+    # the same display-only information while remaining bounded and cheap.
+    warped_mask = cv2.warpPerspective(
+        (ground_mask.astype(np.uint8) * 255), mask_to_birdseye,
+        (frame.shape[1], frame.shape[0]), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    visible = warped_mask != 0
+    if not np.any(visible):
         return
-    sampled = np.stack(
-        (sampled_x * stride, sampled_y * stride), axis=1
-    ).astype(np.float32)
-    projected = cv2.perspectiveTransform(
-        sampled.reshape(-1, 1, 2), mask_to_birdseye).reshape(-1, 2)
-    height, width = frame.shape[:2]
-    visible = (
-        np.isfinite(projected).all(axis=1)
-        & (projected[:, 0] >= 0.0)
-        & (projected[:, 0] < width)
-        & (projected[:, 1] >= 0.0)
-        & (projected[:, 1] < height)
-    )
-    for point in np.rint(projected[visible]).astype(np.int32):
-        cv2.circle(frame, tuple(point), 1, road_color, -1, cv2.LINE_8)
+    road_color = np.asarray((55, 55, 220), dtype=np.float32)
+    alpha = _clamp(
+        _env_float("AR_BIRDSEYE_ROAD_ALPHA", 0.60), 0.05, 1.0)
+    frame_pixels = frame[visible].astype(np.float32)
+    frame[visible] = np.clip(
+        frame_pixels * (1.0 - alpha) + road_color * alpha,
+        0.0, 255.0).astype(np.uint8)
 
 
 def render_vision_control_birdseye(
-        frame, result, source_quad_normalized=None):
+        frame, result, source_quad_normalized=None, homography_bundle=None):
     """Render an IPM debug panel without feeding anything back to control."""
     if frame is None or frame.size == 0:
         return frame
     if source_quad_normalized is None:
-        source_quad_normalized = _birdseye_debug_source_quad_from_road(
-            result, frame.shape)
+        source_quad_normalized = _birdseye_debug_default_source_quad()
+        if _env_bool("AR_BIRDSEYE_FOLLOW_ROAD_MASK", True):
+            candidate = _birdseye_debug_source_quad_from_road(
+                result, frame.shape)
+            if candidate is not None:
+                source_quad_normalized = candidate
     height, width = frame.shape[:2]
-    homography, source_quad, destination_quad = (
-        _birdseye_debug_homography(
-            frame.shape, source_quad_normalized=source_quad_normalized))
+    if homography_bundle is None:
+        homography, source_quad, destination_quad = (
+            _birdseye_debug_homography(
+                frame.shape, source_quad_normalized=source_quad_normalized))
+    else:
+        homography, source_quad, destination_quad = homography_bundle
     panel = cv2.warpPerspective(
         frame, homography, (width, height),
         flags=cv2.INTER_LINEAR,
@@ -3452,58 +3521,133 @@ def render_vision_control_birdseye(
 
 
 class VisionControlBirdseyeRenderer:
-    """Stateful, smoothed display renderer for the local preview only."""
+    """Low-latency, stable display renderer for the local preview only.
+
+    The source trapezoid follows the current semantic-road component.  A
+    conservative fallback is used only while the mask is unavailable.
+    """
 
     def __init__(self):
         self.source_quad_normalized = None
-        self.source_status = "FIXED FALLBACK"
+        self.source_status = "MASK FALLBACK"
         self.missing_mask_frames = 0
+        self._pending_quad = None
+        self._pending_frames = 0
+        self._homography_bundle = None
+        self._homography_shape = None
+        self._homography_source_key = None
 
     def _update_source_quad(self, result, image_shape):
         fixed = _birdseye_debug_default_source_quad()
+        if not _env_bool("AR_BIRDSEYE_FOLLOW_ROAD_MASK", True):
+            self.source_quad_normalized = fixed
+            self.source_status = "MASK FALLBACK"
+            self.missing_mask_frames = 0
+            self._pending_quad = None
+            self._pending_frames = 0
+            return self.source_quad_normalized
+
         candidate = _birdseye_debug_source_quad_from_road(
             result, image_shape)
         hold_frames = max(
-            0, _env_int("AR_BIRDSEYE_MASK_HOLD_FRAMES", 8))
+            0, _env_int("AR_BIRDSEYE_MASK_HOLD_FRAMES", 4))
         if candidate is None:
             self.missing_mask_frames += 1
             if (self.source_quad_normalized is None
                     or self.missing_mask_frames > hold_frames):
                 self.source_quad_normalized = fixed
-                self.source_status = "FIXED FALLBACK"
+                self.source_status = "MASK FALLBACK"
             else:
                 self.source_status = "ROAD MASK HOLD"
             return self.source_quad_normalized
 
         self.missing_mask_frames = 0
         if self.source_quad_normalized is None:
-            self.source_quad_normalized = candidate
+            self.source_quad_normalized = candidate.copy()
+            self.source_status = "ROAD MASK"
         else:
+            jump_threshold = _clamp(
+                _env_float("AR_BIRDSEYE_MASK_JUMP_THRESHOLD_X", 0.12),
+                0.02, 0.50)
+            jump_threshold_y = _clamp(
+                _env_float("AR_BIRDSEYE_MASK_JUMP_THRESHOLD_Y", 0.14),
+                0.02, 0.40)
+            candidate_delta = float(np.max(np.abs(
+                candidate[:, 0] - self.source_quad_normalized[:, 0])))
+            candidate_delta_y = float(np.max(np.abs(
+                candidate[:, 1] - self.source_quad_normalized[:, 1])))
+            if (candidate_delta > jump_threshold
+                    or candidate_delta_y > jump_threshold_y):
+                confirm_frames = max(
+                    1, _env_int("AR_BIRDSEYE_MASK_CONFIRM_FRAMES", 3))
+                if (self._pending_quad is None
+                        or float(np.max(np.abs(
+                            candidate[:, 0] - self._pending_quad[:, 0])))
+                        > jump_threshold * 0.5
+                        or float(np.max(np.abs(
+                            candidate[:, 1] - self._pending_quad[:, 1])))
+                        > jump_threshold_y * 0.5):
+                    self._pending_quad = candidate.copy()
+                    self._pending_frames = 1
+                else:
+                    self._pending_frames += 1
+                if self._pending_frames < confirm_frames:
+                    self.source_status = "ROAD MASK HOLD"
+                    return self.source_quad_normalized
+                candidate = self._pending_quad
+                self._pending_quad = None
+                self._pending_frames = 0
+            else:
+                self._pending_quad = None
+                self._pending_frames = 0
             alpha = _clamp(
-                _env_float("AR_BIRDSEYE_MASK_SMOOTH_ALPHA", 0.30),
+                _env_float("AR_BIRDSEYE_MASK_SMOOTH_ALPHA", 0.45),
                 0.02, 1.0)
             max_step = _clamp(
-                _env_float("AR_BIRDSEYE_MASK_MAX_STEP_X", 0.035),
+                _env_float("AR_BIRDSEYE_MASK_MAX_STEP_X", 0.06),
+                0.002, 0.20)
+            max_step_y = _clamp(
+                _env_float("AR_BIRDSEYE_MASK_MAX_STEP_Y", 0.045),
                 0.002, 0.20)
             delta = alpha * (
-                candidate[:, 0] - self.source_quad_normalized[:, 0])
-            self.source_quad_normalized[:, 0] += np.clip(
-                delta, -max_step, max_step)
-            self.source_quad_normalized[:, 1] = candidate[:, 1]
+                candidate - self.source_quad_normalized)
+            self.source_quad_normalized += np.clip(
+                delta,
+                np.asarray([-max_step, -max_step_y], dtype=np.float32),
+                np.asarray([max_step, max_step_y], dtype=np.float32))
         self.source_status = "ROAD MASK"
         return self.source_quad_normalized
 
+    def _homography_for(self, frame_shape, source_quad):
+        source_key = tuple(np.round(
+            np.asarray(source_quad, dtype=np.float32).reshape(-1), 5))
+        shape_key = tuple(frame_shape[:2])
+        if (self._homography_bundle is None
+                or self._homography_shape != shape_key
+                or self._homography_source_key != source_key):
+            self._homography_bundle = _birdseye_debug_homography(
+                frame_shape, source_quad_normalized=source_quad)
+            self._homography_shape = shape_key
+            self._homography_source_key = source_key
+        return self._homography_bundle
+
     def __call__(self, frame, result):
         source_quad = self._update_source_quad(result, frame.shape)
+        homography_bundle = self._homography_for(frame.shape, source_quad)
         return render_vision_control_birdseye(
-            frame, result, source_quad_normalized=source_quad)
+            frame, result, source_quad_normalized=source_quad,
+            homography_bundle=homography_bundle)
 
     def draw_source_roi(self, frame):
         if (frame is None or frame.size == 0
                 or not _env_bool("AR_BIRDSEYE_SHOW_SOURCE_ROI", True)):
             return frame
-        _homography, source, _destination = _birdseye_debug_homography(
-            frame.shape, source_quad_normalized=self.source_quad_normalized)
+        source_quad = (
+            self.source_quad_normalized
+            if self.source_quad_normalized is not None
+            else _birdseye_debug_default_source_quad())
+        _homography, source, _destination = self._homography_for(
+            frame.shape, source_quad)
         source_pixels = np.rint(source).astype(np.int32)
         cv2.polylines(
             frame, [source_pixels], True, (0, 0, 255), 2, cv2.LINE_AA)

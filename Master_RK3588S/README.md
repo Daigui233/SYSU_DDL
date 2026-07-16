@@ -50,6 +50,12 @@ python3 ar_receiver.py
 
 `standalone_control_bridge.py` 只在不运行 `ar_receiver.py` 时使用，二者不能同时启动。后续多任务视觉控制通过 `ControlRuntime.update_vision_command()` 接入，不再创建第二条串口链路。
 
+当前赛道只有直道和右转 3 m 圆，`VisionControlPlanner` 默认使用右圆前馈
+`VISION_CONTROL_RIGHT_CIRCLE_FF_640=66.5`，并限制视觉微调为
+`VISION_CONTROL_RIGHT_CIRCLE_TRIM_MAX_640=10`。直道不加固定前馈；右圆模式下
+实际下发关系为 `error=66.5+clamp(visual_trim,-10,+10)`。重新实测右圆后可通过
+环境变量调整这两个参数。
+
 ## 转向标定
 
 标定时先停止 `ar_receiver.py`、`standalone_control_bridge.py` 等占用 TC264D 串口的程序，并架空驱动轮：

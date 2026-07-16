@@ -306,6 +306,8 @@
     .fit-metric { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
     .table-panel { grid-column: 1 / -1; }
     .table-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+    .delete-control { display: flex; gap: 5px; }
+    .delete-control input[type="number"] { width: 78px; min-height: 34px; }
     .table-wrap { overflow: auto; max-height: 430px; }
     table { width: 100%; border-collapse: collapse; min-width: 1000px; }
     th, td {
@@ -526,6 +528,10 @@
           <h2>标定数据</h2>
           <span class="spacer"></span>
           <div class="table-actions">
+            <div class="delete-control">
+              <input id="deleteSampleId" type="number" min="1" step="1" placeholder="记录 ID" aria-label="要删除的记录 ID">
+              <button id="deleteByIdBtn" class="button danger">删除 ID</button>
+            </div>
             <button id="saveBtn" class="button subtle">保存到磁盘</button>
             <button class="button subtle" data-download="/download/csv">导出 CSV</button>
             <button class="button subtle" data-download="/download/json">导出 JSON</button>
@@ -902,11 +908,16 @@
       }
     }
 
-    async function deleteSample(id) {
-      if (!confirm(`删除第 ${id} 条标定记录？`)) return;
+    async function deleteSample(id, askConfirmation = true) {
+      if (!Number.isInteger(id) || id < 1) {
+        toast("请输入有效的记录 ID", true);
+        return;
+      }
+      if (askConfirmation && !confirm(`删除第 ${id} 条标定记录？`)) return;
       try {
         await api(`/api/samples/${id}`, { method: "DELETE" });
         toast("记录已删除");
+        $("deleteSampleId").value = "";
         await pollState();
       } catch (error) {
         toast(error.message, true);
@@ -1001,6 +1012,12 @@
     $("recordBtn").addEventListener("click", recordSample);
     $("clearMeasureBtn").addEventListener("click", clearMeasure);
     $("saveConfigBtn").addEventListener("click", saveConfig);
+    $("deleteByIdBtn").addEventListener("click", () =>
+      deleteSample(Number($("deleteSampleId").value), false)
+    );
+    $("deleteSampleId").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") deleteSample(Number(event.target.value), false);
+    });
     $("desiredCenterAngle").addEventListener("input", previewInverse);
     $("applyInverseBtn").addEventListener("click", () => {
       const error = predictedErrorForAngle(Number($("desiredCenterAngle").value));

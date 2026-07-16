@@ -844,6 +844,8 @@ class CalibrationHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        if args and str(args[0]).startswith("GET /api/state "):
+            return
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
 
     def do_GET(self) -> None:

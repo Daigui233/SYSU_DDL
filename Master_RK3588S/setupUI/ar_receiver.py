@@ -572,6 +572,21 @@ class FfplayPreview:
                     continue
                 if frame is None:
                     break
+                # If capture/inference produced another frame while the
+                # writer was waking up, render the newest item immediately.
+                # This prevents a slow diagnostic renderer from displaying a
+                # stale queued frame before it catches up.
+                while True:
+                    try:
+                        newer = frames.get_nowait()
+                    except queue.Empty:
+                        break
+                    if newer is None:
+                        frame = None
+                        break
+                    frame = newer
+                if frame is None:
+                    break
                 renderer = None
                 expected_size = None
                 if isinstance(frame, tuple):
