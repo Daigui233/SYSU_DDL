@@ -12,7 +12,6 @@ from vision_control import (  # noqa: E402
     STATE_AVOID_CAR,
     STATE_AVOID_HUMAN,
     STATE_COLLECT_GOLD,
-    STATE_LINE_LOSS_SAFE_STOP,
     STATE_RECOVER_LINE,
     STATE_SAFE_STOP,
     STATE_TRACK,
@@ -89,6 +88,23 @@ def _trim_result(far_gap_640, lookahead_gap_640=None):
         "image_shape": (480, 640, 3),
         "detections": [],
     }
+
+
+def _road_mask_following_path(x_values, y_values, half_width_px=110.0):
+    """Build a low-resolution road mask whose center follows a test path."""
+    y_values = np.asarray(y_values, dtype=np.float32)
+    x_values = np.asarray(x_values, dtype=np.float32)
+    order = np.argsort(y_values)
+    y_values = y_values[order]
+    x_values = x_values[order]
+    mask = np.zeros((120, 160), dtype=np.uint8)
+    for mask_y in range(mask.shape[0]):
+        image_y = float(mask_y) * 479.0 / float(mask.shape[0] - 1)
+        center_x = float(np.interp(image_y, y_values, x_values))
+        left = int(round((center_x - half_width_px) * 159.0 / 639.0))
+        right = int(round((center_x + half_width_px) * 159.0 / 639.0))
+        mask[mask_y, max(0, left):min(mask.shape[1], right + 1)] = 1
+    return mask
 
 
 class CurveConstructionTest(unittest.TestCase):
@@ -192,6 +208,8 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.curve_track_step_scale, 1.50)
         self.assertEqual(config.curve_state_enter_frames, 2)
         self.assertEqual(config.curve_state_exit_frames, 5)
+        self.assertEqual(config.right_circle_capture_range_640, 24.0)
+        self.assertEqual(config.right_circle_compensation_gain, 0.30)
         self.assertEqual(config.human_pass_speed_mps, 0.30)
         self.assertEqual(config.human_path_return_guard_s, 0.40)
         self.assertEqual(config.human_stop_reverse_speed_mps, -0.05)
@@ -228,23 +246,29 @@ class VisionControlPlannerTest(unittest.TestCase):
             _raw_path(0, 100.0), _raw_path(1, 540.0)]
         command, _debug = planner.update(result, now=1.0)
         self.assertEqual(result["paths"], [])
-        self.assertEqual(command["state_cmd"], STATE_LINE_LOSS_SAFE_STOP)
+        self.assertEqual(command["state_cmd"], STATE_RECOVER_LINE)
+        self.assertGreater(command["target_speed"], 0.0)
 
-    def test_short_line_loss_holds_last_steering_until_safe_stop(self):
+    def test_line_loss_holds_last_control_without_eventual_stop(self):
         planner = VisionControlPlanner(config=_config())
         first_command, _debug = planner.update(
             _raw_result_at(260.0, 400.0), now=1.0)
         missing = _raw_result_at(slots=())
         held_command, held = planner.update(missing, now=1.6)
-        stopped_command, _stopped = planner.update(
-            _raw_result_at(slots=()), now=1.81)
+        long_held_command, long_held = planner.update(
+            _raw_result_at(slots=()), now=10.0)
         self.assertEqual(held_command["state_cmd"], STATE_RECOVER_LINE)
         self.assertAlmostEqual(
             held_command["track_error"], first_command["track_error"])
         self.assertTrue(held["control_target"]["line_loss_hold"])
-        self.assertEqual(
-            stopped_command["state_cmd"], STATE_LINE_LOSS_SAFE_STOP)
-        self.assertEqual(stopped_command["target_speed"], 0.0)
+        self.assertEqual(long_held_command["state_cmd"], STATE_RECOVER_LINE)
+        self.assertAlmostEqual(
+            long_held_command["track_error"], first_command["track_error"])
+        self.assertAlmostEqual(
+            long_held_command["target_speed"],
+            first_command["target_speed"])
+        self.assertTrue(
+            long_held["control_target"]["line_loss_indefinite"])
 
     def test_detached_near_path_is_treated_as_line_loss(self):
         planner = VisionControlPlanner(config=_config())
@@ -461,22 +485,27 @@ class VisionControlPlannerTest(unittest.TestCase):
             result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
             result["centerline"]["raw_curve_paths"][0] = result[
                 "raw_curve_paths"][0]
+            result["road"]["mask"] = _road_mask_following_path(xs, ys)
             return result
 
         _command, first = planner.update(curved_result(), now=1.0)
         _command, second = planner.update(curved_result(), now=1.04)
+        _command, third = planner.update(curved_result(), now=1.08)
         self.assertEqual(first["road_shape_state"], "straight")
-        self.assertEqual(second["road_shape_state"], "curve")
+        self.assertEqual(second["road_shape_state"], "straight")
+        self.assertEqual(third["road_shape_state"], "curve")
         self.assertEqual(
-            second["control_target"]["track_error_response"],
+            third["control_target"]["track_error_response"],
             "curve_track")
         self.assertGreater(
-            abs(second["control_target"]["road_curvature_640"]), 8.0)
+            abs(third["control_target"]["road_curvature_640"]), 8.0)
 
-    def test_right_circle_uses_track_feedforward_with_small_trim(self):
+    def test_right_circle_far_from_feedforward_stays_line_based(self):
         planner = VisionControlPlanner(config=_config(
             right_circle_feedforward_640=66.5,
             right_circle_trim_max_640=10.0,
+            right_circle_capture_range_640=24.0,
+            right_circle_compensation_gain=0.30,
         ))
         planner.road_shape_state = "curve"
         planner.road_shape_valid = True
@@ -486,12 +515,50 @@ class VisionControlPlannerTest(unittest.TestCase):
         result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
         result["centerline"]["raw_curve_paths"][0] = result[
             "raw_curve_paths"][0]
+        result["road"]["mask"] = _road_mask_following_path(xs, ys)
         _command, debug = planner.update(result, now=1.0)
+        _command, debug = planner.update(result, now=1.04)
         target = debug["control_target"]
         self.assertAlmostEqual(
             target["right_circle_feedforward_640"], 66.5)
-        self.assertLessEqual(abs(target["right_circle_trim_640"]), 10.0)
-        self.assertGreater(target["track_error_640"], 50.0)
+        self.assertFalse(target["right_circle_feedforward_active"])
+        self.assertAlmostEqual(target["right_circle_compensation_640"], 0.0)
+        self.assertAlmostEqual(
+            target["raw_track_error_640"],
+            target["line_based_track_error_640"])
+        self.assertLess(abs(target["track_error_640"]), 30.0)
+
+    def test_right_circle_near_feedforward_uses_bounded_compensation(self):
+        planner = VisionControlPlanner(config=_config(
+            right_circle_feedforward_640=66.5,
+            right_circle_trim_max_640=10.0,
+            right_circle_capture_range_640=24.0,
+            right_circle_compensation_gain=0.30,
+        ))
+        planner.road_shape_state = "curve"
+        planner.road_shape_valid = True
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        xs = 400.0 + 0.0015 * (ys - 300.0) ** 2
+        result = _raw_result_at(400.0, 430.0)
+        result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
+        result["centerline"]["raw_curve_paths"][0] = result[
+            "raw_curve_paths"][0]
+        result["road"]["mask"] = _road_mask_following_path(xs, ys)
+        planner.update(result, now=1.0)
+        command, debug = planner.update(result, now=1.04)
+        target = debug["control_target"]
+        self.assertTrue(target["right_circle_feedforward_active"])
+        self.assertAlmostEqual(target["right_circle_trim_640"], 10.0)
+        self.assertLess(target["right_circle_compensation_640"], 0.0)
+        self.assertGreater(target["right_circle_compensation_640"], -3.01)
+        self.assertLess(
+            target["raw_track_error_640"],
+            target["line_based_track_error_640"])
+        self.assertGreater(
+            target["raw_track_error_640"],
+            target["line_based_track_error_640"] - 3.01)
+        self.assertAlmostEqual(
+            command["track_error"], target["raw_track_error_640"])
 
     def test_confirmed_curve_keeps_more_medium_error_than_straight(self):
         planner = VisionControlPlanner(config=VisionControlConfig())
@@ -523,8 +590,10 @@ class VisionControlPlannerTest(unittest.TestCase):
         result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
         result["centerline"]["raw_curve_paths"][0] = result[
             "raw_curve_paths"][0]
-        _command, debug = VisionControlPlanner(config=_config()).update(
-            result, now=1.0)
+        result["road"]["mask"] = _road_mask_following_path(xs, ys)
+        planner = VisionControlPlanner(config=_config())
+        _command, debug = planner.update(result, now=1.0)
+        _command, debug = planner.update(result, now=1.04)
         target = debug["control_target"]
         self.assertGreater(target["curve_feedforward_640"], 0.0)
         self.assertLessEqual(abs(target["curve_feedforward_640"]), 36.0)
@@ -543,10 +612,10 @@ class VisionControlPlannerTest(unittest.TestCase):
         target = debug["control_target"]
         self.assertLess(target["path_raw_track_error_640"], -40.0)
         self.assertGreater(target["path_heading_feedforward_640"], 0.0)
-        self.assertGreater(target["total_feedforward_640"], 30.0)
+        self.assertGreater(target["total_feedforward_640"], 0.0)
         self.assertGreater(
             target["raw_track_error_640"],
-            target["path_raw_track_error_640"] + 30.0)
+            target["path_raw_track_error_640"])
 
     def test_curve_defaults_to_blue_slot(self):
         command, debug = VisionControlPlanner(config=_config()).update(

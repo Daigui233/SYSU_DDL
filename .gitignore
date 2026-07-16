@@ -49,6 +49,7 @@ Master_RK3588S/setupUI/steering_calibration_data/
 # Local capture/debug data
 Master_RK3588S/setupUI/capture_sessions/
 Master_RK3588S/setupUI/dist/match_record_*.json
+Master_RK3588S/setupUI/dist/vision_runs/
 ArucoCalib-master/ArucoCalib-master/dist/runs/
 ArucoCalib-master/ArucoCalib-master/runs/
 

@@ -104,6 +104,8 @@ class VisionControlConfig:
     curve_state_exit_curvature_640: float = 4.0
     curve_state_enter_frames: int = 2
     curve_state_exit_frames: int = 5
+    curve_evidence_stable_frames: int = 2
+    curve_evidence_max_delta_640: float = 20.0
     path_heading_feedforward_gain: float = 0.35
     path_heading_feedforward_max_px_640: float = 80.0
     path_heading_deadband_px_640: float = 6.0
@@ -112,6 +114,8 @@ class VisionControlConfig:
     # Track-specific steering feedforward: straight or right 3 m circle.
     right_circle_feedforward_640: float = 66.5
     right_circle_trim_max_640: float = 10.0
+    right_circle_capture_range_640: float = 24.0
+    right_circle_compensation_gain: float = 0.30
     normal_speed_mps: float = 0.06
     recover_speed_mps: float = 0.06
     human_pass_speed_mps: float = 0.30
@@ -127,7 +131,6 @@ class VisionControlConfig:
     curve_merge_near_px_640: float = 36.0
     curve_merge_enter_evidence: int = 4
     curve_merge_release_frames: int = 30
-    no_path_stop_s: float = 0.8
     recover_hold_s: float = 0.5
     line_anchor_y_ratio: float = 0.78
     line_anchor_max_offset_px_640: float = 200.0
@@ -219,6 +222,12 @@ class VisionControlConfig:
             curve_state_exit_frames=max(
                 1, _env_int(
                     "VISION_CONTROL_CURVE_STATE_EXIT_FRAMES", 5)),
+            curve_evidence_stable_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CURVE_EVIDENCE_STABLE_FRAMES", 2)),
+            curve_evidence_max_delta_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CURVE_EVIDENCE_MAX_DELTA_640", 20.0)),
             path_heading_feedforward_gain=max(
                 0.0, _env_float(
                     "VISION_CONTROL_PATH_HEADING_FF_GAIN", 0.35)),
@@ -238,6 +247,13 @@ class VisionControlConfig:
                 -160.0, 160.0),
             right_circle_trim_max_640=max(
                 0.0, _env_float("VISION_CONTROL_RIGHT_CIRCLE_TRIM_MAX_640", 10.0)),
+            right_circle_capture_range_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_RIGHT_CIRCLE_CAPTURE_RANGE_640", 24.0)),
+            right_circle_compensation_gain=_clamp(
+                _env_float(
+                    "VISION_CONTROL_RIGHT_CIRCLE_COMPENSATION_GAIN", 0.30),
+                0.0, 1.0),
             normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.06)),
             recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.06)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
@@ -262,7 +278,6 @@ class VisionControlConfig:
             curve_merge_release_frames=max(
                 1, _env_int(
                     "VISION_CONTROL_CURVE_MERGE_RELEASE_FRAMES", 30)),
-            no_path_stop_s=max(0.1, _env_float("VISION_CONTROL_NO_PATH_STOP_S", 0.8)),
             recover_hold_s=max(0.0, _env_float("VISION_CONTROL_RECOVER_HOLD_S", 0.5)),
             line_anchor_y_ratio=_clamp(
                 _env_float("VISION_CONTROL_LINE_ANCHOR_Y_RATIO", 0.78),
@@ -370,6 +385,7 @@ class VisionControlPlanner:
         self.last_path_target_ts = 0.0
         self.last_valid_ts = 0.0
         self.last_error = 0.0
+        self.last_forward_speed_mps = float(self.config.normal_speed_mps)
         self.track_error_trend_sign = 0
         self.track_error_trend_frames = 0
         self.track_error_response = "initial"
@@ -379,6 +395,8 @@ class VisionControlPlanner:
         self.road_curvature_640 = 0.0
         self.road_curve_enter_frames = 0
         self.road_curve_exit_frames = 0
+        self.road_curve_path_states = {}
+        self.road_shape_metrics = {}
         self.route_state = ROUTE_NONE
         self.route_reason = "initial"
         self.route_initialized = False
@@ -559,6 +577,7 @@ class VisionControlPlanner:
                 self.road_curve_enter_frames),
             "road_curve_exit_frames": int(
                 self.road_curve_exit_frames),
+            "road_curve_evidence": dict(self.road_shape_metrics),
             "raw_selected_slot": (
                 None if raw_selected is None
                 else int(raw_selected.get("slot", -1))),
@@ -1155,7 +1174,9 @@ class VisionControlPlanner:
         lookahead_y = image_shape[0] * self.config.lookahead_y_ratio
         path_geometry = self._path_geometry_metrics(
             selected, lookahead_y, image_shape)
-        self._update_road_shape_state(path_geometry)
+        road_shape_geometry = self._road_shape_consensus_geometry(
+            result, selected, lookahead_y, image_shape)
+        self._update_road_shape_state(road_shape_geometry)
         ocr_route_locked = (
             self.branch_lock_source == "ocr"
             and self.branch_lock in {"left", "right"}
@@ -1168,14 +1189,9 @@ class VisionControlPlanner:
         ):
             if isinstance(ocr_response, dict):
                 ocr_response["control_phase"] = "ocr_wait_route"
-            return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
-                "target_x": None,
-                "path_target_x": None,
-                "path_target_y": float(lookahead_y),
-                "track_error_640": 0.0,
-                "reason": "ocr_selected_route_unavailable",
-                "task_reason": "ocr_wait_route",
-            }
+            return self._line_loss_hold_command(
+                "ocr_selected_route_unavailable", "ocr_wait_route",
+                now, lookahead_y)
         if ocr_route_locked and isinstance(ocr_response, dict):
             ocr_response["control_phase"] = "ocr_route_ready"
 
@@ -1227,58 +1243,22 @@ class VisionControlPlanner:
                         "human_stop_reverse_active": bool(
                             human_reverse_active),
                     }
-            return self._command(
-                self.last_error, self.config.recover_speed_mps,
-                STATE_RECOVER_LINE), {
-                    "target_x": None,
-                    "path_target_x": None,
-                    "path_target_y": float(lookahead_y),
-                    "path_target_adaptive_y": True,
-                    "path_target_held": False,
-                    "track_error_640": float(self.last_error),
-                    "reason": "adaptive_path_no_previous_target",
-                    "task_reason": task_reason,
-                    "human_stop_reverse_active": False,
-                }
+            command, target = self._line_loss_hold_command(
+                "adaptive_path_no_previous_target", task_reason,
+                now, lookahead_y)
+            target.update({
+                "path_target_adaptive_y": True,
+                "path_target_held": False,
+                "human_stop_reverse_active": False,
+            })
+            return command, target
         if selected is None:
-            age = now - self.last_valid_ts if self.last_valid_ts else 1e9
-            held_target = self._held_path_target(now)
-            if self.last_valid_ts and age < self.config.no_path_stop_s:
-                error = self.last_error
-                return self._command(
-                    error, self.config.recover_speed_mps,
-                    STATE_RECOVER_LINE), {
-                        "target_x": (
-                            None if held_target is None else held_target[0]),
-                        "path_target_x": (
-                            None if held_target is None else held_target[0]),
-                        "path_target_y": (
-                            None if held_target is None else held_target[1]),
-                        "path_target_held": held_target is not None,
-                        "track_error_640": error,
-                        "reason": line_loss_reason or "line_unavailable",
-                        "task_reason": task_reason,
-                        "line_loss_hold": True,
-                        "line_loss_age_s": float(age),
-                    }
-            return self._command(
-                0.0, 0.0, STATE_LINE_LOSS_SAFE_STOP, flags=0), {
-                "target_x": None,
-                "track_error_640": 0.0,
-                "reason": line_loss_reason or route_reason,
-                "task_reason": task_reason,
-                "line_loss_hold": False,
-                "line_loss_age_s": float(age),
-            }
+            return self._line_loss_hold_command(
+                line_loss_reason or route_reason or "line_unavailable",
+                task_reason, now, lookahead_y)
         if path_target is None:
-            return self._command(0.0, 0.0, STATE_SAFE_STOP, flags=0), {
-                "target_x": None,
-                "path_target_x": None,
-                "path_target_y": None,
-                "track_error_640": 0.0,
-                "reason": "missing_target_x",
-                "task_reason": task_reason,
-            }
+            return self._line_loss_hold_command(
+                "missing_target_x", task_reason, now, lookahead_y)
 
         path_target_x, path_target_y, path_target_adaptive = path_target
         target_x = _clamp(
@@ -1295,6 +1275,9 @@ class VisionControlPlanner:
         curve_feedforward = 0.0
         right_circle_feedforward = 0.0
         right_circle_trim = 0.0
+        right_circle_compensation = 0.0
+        right_circle_feedforward_active = False
+        right_circle_anchor_weight = 0.0
         if (task_reason == "track" and target_override_x is None and
                 not path_target_adaptive and path_geometry["valid"]):
             heading_delta_640 = float(
@@ -1310,7 +1293,7 @@ class VisionControlPlanner:
                     float(self.config.path_heading_feedforward_max_px_640),
                 )
             curve_feedforward = _clamp(
-                float(path_geometry["curvature_640"]) * float(
+                float(road_shape_geometry["curvature_640"]) * float(
                     self.config.curve_feedforward_gain),
                 -float(self.config.curve_feedforward_max_px_640),
                 float(self.config.curve_feedforward_max_px_640),
@@ -1320,28 +1303,50 @@ class VisionControlPlanner:
             # baseline and permit only a small visual trim around it.
             if (
                 self.road_shape_state == "curve"
-                and float(path_geometry["curvature_640"]) > 0.0
+                and road_shape_geometry["valid"]
+                and float(road_shape_geometry["curvature_640"]) > 0.0
             ):
                 right_circle_feedforward = float(
                     self.config.right_circle_feedforward_640)
+        total_feedforward = (
+            float(heading_feedforward) + float(curve_feedforward))
+        line_based_error = float(path_raw_error) + total_feedforward
+        raw_error = line_based_error
+        if right_circle_feedforward != 0.0:
+            feedforward_delta = (
+                line_based_error - right_circle_feedforward)
+            capture_range = float(
+                self.config.right_circle_capture_range_640)
+            if capture_range > 0.0 and abs(feedforward_delta) < capture_range:
+                # Keep the selected blue/green line as the steering source.
+                # The measured circle value is only a soft nearby anchor.
+                # Its bounded correction fades continuously to zero at the
+                # capture boundary, so the line-derived command never jumps
+                # or gets replaced by a hard-coded steering value.
+                right_circle_feedforward_active = True
+                right_circle_anchor_weight = _clamp(
+                    1.0 - abs(feedforward_delta) / capture_range,
+                    0.0,
+                    1.0,
+                )
                 right_circle_trim = _clamp(
-                    float(path_raw_error),
+                    feedforward_delta,
                     -float(self.config.right_circle_trim_max_640),
                     float(self.config.right_circle_trim_max_640),
                 )
-        total_feedforward = (
-            float(heading_feedforward) + float(curve_feedforward))
-        applied_steering_feedforward = total_feedforward
-        if right_circle_feedforward != 0.0:
-            # The measured +66.5 baseline replaces the generic curvature
-            # feedforward. Only a bounded visual trim is allowed around it.
-            raw_error = right_circle_feedforward + right_circle_trim
-            applied_steering_feedforward = (
-                right_circle_feedforward + right_circle_trim)
-        else:
-            raw_error = float(path_raw_error) + total_feedforward
+                right_circle_compensation = (
+                    _clamp(
+                        -feedforward_delta,
+                        -float(self.config.right_circle_trim_max_640),
+                        float(self.config.right_circle_trim_max_640),
+                    ) * right_circle_anchor_weight * float(
+                        self.config.right_circle_compensation_gain))
+                raw_error = (
+                    line_based_error + right_circle_compensation)
+        applied_steering_feedforward = (
+            float(raw_error) - float(path_raw_error))
         control_target_x = _clamp(
-            float(target_x) + total_feedforward *
+            float(target_x) + applied_steering_feedforward *
             float(max(1, image_shape[1])) / 640.0,
             0.0,
             float(max(0, image_shape[1] - 1)),
@@ -1360,7 +1365,7 @@ class VisionControlPlanner:
                 adaptive=(task_reason == "track"),
                 curve_mode=(
                     task_reason == "track"
-                    and path_geometry["valid"]
+                    and road_shape_geometry["valid"]
                     and self.road_shape_state == "curve"),
             )
         self.last_error = error
@@ -1374,6 +1379,8 @@ class VisionControlPlanner:
             self.config.human_stop_reverse_speed_mps
             if human_reverse_active else speed)
         output_state = STATE_AVOID_HUMAN if human_reverse_active else task_state
+        if float(output_speed) > 0.0:
+            self.last_forward_speed_mps = float(output_speed)
         return self._command(error, output_speed, output_state), {
             "target_x": float(control_target_x),
             "base_target_x": float(target_x),
@@ -1395,25 +1402,71 @@ class VisionControlPlanner:
             "right_circle_feedforward_640": float(
                 right_circle_feedforward),
             "right_circle_trim_640": float(right_circle_trim),
+            "right_circle_feedforward_active": bool(
+                right_circle_feedforward_active),
+            "right_circle_compensation_640": float(
+                right_circle_compensation),
+            "right_circle_anchor_weight": float(
+                right_circle_anchor_weight),
+            "right_circle_compensation_gain": float(
+                self.config.right_circle_compensation_gain),
+            "right_circle_output_offset_640": float(
+                raw_error - right_circle_feedforward
+                if right_circle_feedforward != 0.0 else 0.0),
+            "line_based_track_error_640": float(line_based_error),
             "total_feedforward_640": float(total_feedforward),
             "applied_steering_feedforward_640": float(
                 applied_steering_feedforward),
             "road_shape_state": self.road_shape_state,
-            "road_shape_valid": bool(path_geometry["valid"]),
-            "road_geometry_reason": path_geometry.get("reason"),
+            "road_shape_valid": bool(road_shape_geometry["valid"]),
+            "road_geometry_reason": road_shape_geometry.get("reason"),
             "road_geometry_sample_rows_y": list(
-                path_geometry.get("sample_rows_y") or ()),
+                road_shape_geometry.get("sample_rows_y") or ()),
             "road_geometry_support_y": list(
-                path_geometry.get("support_y") or ()),
+                road_shape_geometry.get("support_y") or ()),
             "road_heading_delta_640": float(
-                path_geometry["heading_delta_640"]),
+                road_shape_geometry["heading_delta_640"]),
             "road_curvature_640": float(
+                road_shape_geometry["curvature_640"]),
+            "road_curve_evidence": dict(self.road_shape_metrics),
+            "selected_path_curvature_640": float(
                 path_geometry["curvature_640"]),
             "track_error_response": self.track_error_response,
             "track_error_trend_frames": int(self.track_error_trend_frames),
             "reason": route_reason,
             "task_reason": task_reason,
             "human_stop_reverse_active": bool(human_reverse_active),
+        }
+
+    def _line_loss_hold_command(
+            self, reason, task_reason, now, lookahead_y):
+        """Keep the latest forward command indefinitely while the path is lost."""
+        age = now - self.last_valid_ts if self.last_valid_ts else 1e9
+        held_target = self._held_path_target(now)
+        error = float(self.last_error)
+        speed = float(self.last_forward_speed_mps)
+        if speed <= 0.0:
+            speed = max(
+                0.01,
+                float(self.config.normal_speed_mps),
+                float(self.config.recover_speed_mps),
+            )
+        return self._command(error, speed, STATE_RECOVER_LINE), {
+            "target_x": (
+                None if held_target is None else held_target[0]),
+            "path_target_x": (
+                None if held_target is None else held_target[0]),
+            "path_target_y": (
+                float(lookahead_y)
+                if held_target is None else held_target[1]),
+            "path_target_held": held_target is not None,
+            "track_error_640": error,
+            "reason": str(reason or "line_unavailable"),
+            "task_reason": str(task_reason or "no_path"),
+            "line_loss_hold": True,
+            "line_loss_indefinite": True,
+            "line_loss_age_s": float(age),
+            "line_loss_held_speed_mps": float(speed),
         }
 
     @staticmethod
@@ -1517,6 +1570,331 @@ class VisionControlPlanner:
             "curvature_640": float(curvature_640),
             "sample_rows_y": rows,
             "support_y": support_y,
+        }
+
+    @staticmethod
+    def _curvature_from_samples(samples, rows, image_width):
+        span = float(rows[-1] - rows[0])
+        sample_step = float(rows[1] - rows[0])
+        width_scale = 640.0 / float(max(1, image_width))
+        heading_scale = (2.0 * span) / max(1.0, rows[2] - rows[0])
+        curvature_scale = (span / max(1.0, sample_step)) ** 2
+        heading_delta_640 = (
+            float(samples[0] - samples[2]) *
+            width_scale * heading_scale)
+        curvature_640 = (
+            float(samples[0] - 2.0 * samples[1] + samples[2]) *
+            width_scale * curvature_scale)
+        return float(heading_delta_640), float(curvature_640)
+
+    @staticmethod
+    def _road_mask_run(road_mask, row, reference_x):
+        height, width = road_mask.shape
+        offsets = (0, -1, 1, -2, 2)
+        for offset in offsets:
+            center_row = int(np.clip(int(row) + offset, 0, height - 1))
+            row_start = max(0, center_row - 1)
+            row_end = min(height, center_row + 2)
+            occupied = np.any(
+                road_mask[row_start:row_end] != 0, axis=0)
+            padded = np.pad(occupied.astype(np.int8), (1, 1))
+            transitions = np.diff(padded)
+            starts = np.flatnonzero(transitions == 1)
+            ends = np.flatnonzero(transitions == -1) - 1
+            runs = [
+                (int(start), int(end))
+                for start, end in zip(starts, ends)
+                if end - start + 1 >= 3
+            ]
+            if not runs:
+                continue
+
+            def distance(run):
+                start, end = run
+                if start <= reference_x <= end:
+                    return 0.0
+                return min(
+                    abs(float(reference_x) - start),
+                    abs(float(reference_x) - end),
+                )
+
+            return min(
+                runs,
+                key=lambda run: (
+                    distance(run),
+                    abs(0.5 * (run[0] + run[1]) - reference_x),
+                    -(run[1] - run[0]),
+                ),
+            )
+        return None
+
+    def _stable_curve_path_geometry(
+            self, candidates, selected, lookahead_y, image_shape):
+        selected_slot = (
+            None if selected is None
+            else int(selected.get("slot", -1)))
+        next_states = {}
+        evaluated = []
+        for candidate in list(candidates or ())[:2]:
+            slot = int(candidate.get("slot", -1))
+            connected, _reason, _metrics = self._path_connection_status(
+                candidate, image_shape)
+            geometry = self._path_geometry_metrics(
+                candidate, lookahead_y, image_shape)
+            if not connected or not geometry["valid"]:
+                continue
+            curvature = float(geometry["curvature_640"])
+            previous = self.road_curve_path_states.get(slot)
+            consistent = bool(
+                previous is not None
+                and abs(curvature - float(previous["curvature_640"]))
+                <= float(self.config.curve_evidence_max_delta_640)
+            )
+            stable_frames = (
+                min(1000, int(previous["stable_frames"]) + 1)
+                if consistent else 1)
+            next_states[slot] = {
+                "curvature_640": curvature,
+                "stable_frames": stable_frames,
+            }
+            confidences = np.asarray(
+                candidate.get("point_confidences", ()),
+                dtype=np.float32)
+            mean_confidence = (
+                float(np.mean(confidences))
+                if len(confidences) else float(candidate.get("score", 0.0)))
+            support_span = float(
+                geometry["support_y"][1] - geometry["support_y"][0])
+            quality = (
+                stable_frames,
+                int(candidate.get("row_support", 0)),
+                mean_confidence,
+                support_span,
+                1 if slot == selected_slot else 0,
+            )
+            evaluated.append(
+                (quality, candidate, geometry, mean_confidence))
+        self.road_curve_path_states = next_states
+        if not evaluated:
+            return None, None, {
+                "stable_path_slot": None,
+                "stable_path_frames": 0,
+                "stable_path_ready": False,
+            }
+        _quality, candidate, geometry, confidence = max(
+            evaluated, key=lambda item: item[0])
+        slot = int(candidate.get("slot", -1))
+        stable_frames = int(next_states[slot]["stable_frames"])
+        return candidate, geometry, {
+            "stable_path_slot": slot,
+            "stable_path_frames": stable_frames,
+            "stable_path_ready": bool(
+                stable_frames >=
+                self.config.curve_evidence_stable_frames),
+            "stable_path_row_support": int(
+                candidate.get("row_support", 0)),
+            "stable_path_confidence": float(confidence),
+            "stable_path_curvature_640": float(
+                geometry["curvature_640"]),
+        }
+
+    def _segmentation_edge_geometry(
+            self, result, reference_path, path_geometry, image_shape):
+        road = (result.get("road") or {}).get("mask")
+        if road is None:
+            road = result.get("road_mask")
+        road_mask = np.asarray(
+            road) if road is not None else np.empty((0, 0))
+        if road_mask.ndim != 2 or not road_mask.size or not np.any(road_mask):
+            return None, {"segmentation_reason": "missing_road_mask"}
+        points = np.asarray(
+            (reference_path or {}).get("points_xy", ()),
+            dtype=np.float32)
+        rows = tuple(path_geometry.get("sample_rows_y") or ())
+        if len(rows) != 3 or len(points) < 2:
+            return None, {"segmentation_reason": "missing_reference_path"}
+        image_height, image_width = image_shape[:2]
+        mask_height, mask_width = road_mask.shape
+        edge_rows = np.linspace(
+            float(rows[0]), float(rows[-1]), 7, dtype=np.float32)
+        left_samples = []
+        right_samples = []
+        widths_640 = []
+        for image_y in edge_rows:
+            reference_image_x = _interp_path_x(points, image_y)
+            if reference_image_x is None:
+                return None, {
+                    "segmentation_reason": "reference_interpolation_failed"}
+            mask_x = (
+                float(reference_image_x) *
+                float(max(1, mask_width - 1)) /
+                float(max(1, image_width - 1)))
+            mask_y = int(round(
+                float(image_y) * float(max(1, mask_height - 1)) /
+                float(max(1, image_height - 1))))
+            run = self._road_mask_run(road_mask, mask_y, mask_x)
+            if run is None:
+                return None, {
+                    "segmentation_reason": "road_edge_missing"}
+            image_scale = (
+                float(max(1, image_width - 1)) /
+                float(max(1, mask_width - 1)))
+            left_x = float(run[0]) * image_scale
+            right_x = float(run[1]) * image_scale
+            left_samples.append(left_x)
+            right_samples.append(right_x)
+            widths_640.append(
+                (right_x - left_x) * 640.0 /
+                float(max(1, image_width)))
+        if min(widths_640) < 12.0:
+            return None, {"segmentation_reason": "road_component_too_narrow"}
+        center_samples = [
+            0.5 * (left + right)
+            for left, right in zip(left_samples, right_samples)
+        ]
+        def smoothed_curvature(samples):
+            try:
+                coefficients = np.polyfit(
+                    edge_rows.astype(np.float64),
+                    np.asarray(samples, dtype=np.float64),
+                    2,
+                )
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                return 0.0, 0.0
+            fitted = np.polyval(
+                coefficients, np.asarray(rows, dtype=np.float64))
+            return self._curvature_from_samples(
+                fitted, rows, image_width)
+
+        left_heading, left_curvature = smoothed_curvature(left_samples)
+        right_heading, right_curvature = smoothed_curvature(right_samples)
+        center_heading, center_curvature = smoothed_curvature(center_samples)
+        return {
+            "valid": True,
+            "heading_delta_640": float(center_heading),
+            "curvature_640": float(center_curvature),
+            "left_curvature_640": float(left_curvature),
+            "right_curvature_640": float(right_curvature),
+            "sample_rows_y": rows,
+            "support_y": tuple(path_geometry.get("support_y") or ()),
+        }, {
+            "segmentation_reason": "valid",
+            "segmentation_center_curvature_640": float(center_curvature),
+            "segmentation_left_curvature_640": float(left_curvature),
+            "segmentation_right_curvature_640": float(right_curvature),
+            "segmentation_widths_640": [
+                float(value) for value in widths_640],
+        }
+
+    def _road_shape_consensus_geometry(
+            self, result, selected, lookahead_y, image_shape):
+        candidates = result.get("paths")
+        if candidates is None:
+            candidates = (result.get("centerline") or {}).get("paths") or []
+        candidates = list(candidates or ())
+        if selected is not None:
+            selected_slot = int(selected.get("slot", -1))
+            if not any(
+                int(candidate.get("slot", -1)) == selected_slot
+                for candidate in candidates
+            ):
+                candidates.append(selected)
+        stable_path, path_geometry, metrics = (
+            self._stable_curve_path_geometry(
+                candidates, selected, lookahead_y, image_shape))
+        empty = {
+            "valid": False,
+            "reason": "no_stable_path",
+            "heading_delta_640": 0.0,
+            "curvature_640": 0.0,
+            "sample_rows_y": (),
+            "support_y": (),
+        }
+        if stable_path is None or path_geometry is None:
+            self.road_shape_metrics = metrics
+            return empty
+        if not metrics["stable_path_ready"]:
+            pending = dict(empty)
+            pending.update({
+                "reason": "stable_path_pending",
+                "sample_rows_y": path_geometry.get("sample_rows_y", ()),
+                "support_y": path_geometry.get("support_y", ()),
+            })
+            self.road_shape_metrics = metrics
+            return pending
+        segmentation, segmentation_metrics = (
+            self._segmentation_edge_geometry(
+                result, stable_path, path_geometry, image_shape))
+        metrics.update(segmentation_metrics)
+        if segmentation is None:
+            missing = dict(empty)
+            missing.update({
+                "reason": segmentation_metrics["segmentation_reason"],
+                "sample_rows_y": path_geometry.get("sample_rows_y", ()),
+                "support_y": path_geometry.get("support_y", ()),
+            })
+            self.road_shape_metrics = metrics
+            return missing
+
+        path_curvature = float(path_geometry["curvature_640"])
+        center_curvature = float(segmentation["curvature_640"])
+        edge_curvatures = (
+            float(segmentation["left_curvature_640"]),
+            float(segmentation["right_curvature_640"]),
+        )
+        exit_threshold = max(
+            0.0, float(self.config.curve_state_exit_curvature_640))
+        path_sign = self._sign(path_curvature)
+        center_sign = self._sign(center_curvature)
+        agreeing_edges = [
+            value for value in edge_curvatures
+            if self._sign(value) == path_sign
+            and abs(value) >= exit_threshold
+        ]
+        straight_consensus = bool(
+            abs(path_curvature) <= exit_threshold
+            and abs(center_curvature) <= exit_threshold
+        )
+        curve_consensus = bool(
+            path_sign != 0
+            and path_sign == center_sign
+            and agreeing_edges
+        )
+        metrics.update({
+            "curve_consensus": curve_consensus,
+            "straight_consensus": straight_consensus,
+            "agreeing_segmentation_edges": len(agreeing_edges),
+        })
+        if straight_consensus:
+            consensus_curvature = 0.0
+            reason = "straight_consensus"
+        elif curve_consensus:
+            edge_curvature = min(
+                agreeing_edges,
+                key=lambda value: abs(
+                    abs(value) - abs(path_curvature)))
+            consensus_magnitude = min(
+                abs(path_curvature),
+                abs(center_curvature),
+                abs(edge_curvature),
+            )
+            consensus_curvature = (
+                float(path_sign) * consensus_magnitude)
+            metrics["selected_segmentation_edge_curvature_640"] = float(
+                edge_curvature)
+            reason = "curve_consensus"
+        else:
+            consensus_curvature = 0.0
+            reason = "curve_evidence_disagrees"
+        self.road_shape_metrics = metrics
+        return {
+            "valid": True,
+            "reason": reason,
+            "heading_delta_640": float(
+                segmentation["heading_delta_640"]),
+            "curvature_640": float(consensus_curvature),
+            "sample_rows_y": path_geometry.get("sample_rows_y", ()),
+            "support_y": path_geometry.get("support_y", ()),
         }
 
     def _update_road_shape_state(self, geometry):

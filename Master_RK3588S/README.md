@@ -52,9 +52,22 @@ python3 ar_receiver.py
 
 当前赛道只有直道和右转 3 m 圆，`VisionControlPlanner` 默认使用右圆前馈
 `VISION_CONTROL_RIGHT_CIRCLE_FF_640=66.5`，并限制视觉微调为
-`VISION_CONTROL_RIGHT_CIRCLE_TRIM_MAX_640=10`。直道不加固定前馈；右圆模式下
-实际下发关系为 `error=66.5+clamp(visual_trim,-10,+10)`。重新实测右圆后可通过
-环境变量调整这两个参数。
+`VISION_CONTROL_RIGHT_CIRCLE_TRIM_MAX_640=10`。巡迹始终先按蓝线或绿线计算
+`line_error`；仅当 `line_error` 距离 `66.5` 不超过
+`VISION_CONTROL_RIGHT_CIRCLE_CAPTURE_RANGE_640=24` 时，才叠加软补偿：
+`weight=1-|line_error-66.5|/24`，
+`compensation=clamp(66.5-line_error,-10,+10)*weight*0.30`，
+最终 `error=line_error+compensation`。补偿在捕获区边缘连续衰减为 0，
+且默认最多只修正约 `±3`。蓝线/绿线巡迹始终拥有最高优先级，不会把转向
+强制写死到前馈值。补偿增益可通过
+`VISION_CONTROL_RIGHT_CIRCLE_COMPENSATION_GAIN` 调整。
+
+视觉控制运行数据默认记录到 `setupUI/dist/vision_runs/vision_run_*.jsonl`。
+如需临时关闭，可设置 `AR_VISION_TELEMETRY=0`；可通过
+`AR_VISION_TELEMETRY_DIR` 修改记录目录。
+
+路径暂时丢失、与车体断开或所选分支短暂不可用时，不再触发丢线停车。
+控制器会持续保持最近一次有效转向和正向速度，直到重新识别到有效路径。
 
 ## 转向标定
 

@@ -795,18 +795,14 @@ def create_vision_control_planner():
         return None, None, None
     try:
         from vision_control import (
-            VisionControlBirdseyeRenderer,
             VisionControlPlanner,
             render_vision_control_debug,
         )
 
         planner = VisionControlPlanner()
-        birdseye_renderer = VisionControlBirdseyeRenderer()
         mode = "send" if env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT) else "debug-only"
         print(f"[VISION CONTROL] enabled ({mode})")
-        return (
-            planner, render_vision_control_debug,
-            birdseye_renderer)
+        return planner, render_vision_control_debug, None
     except Exception as exc:
         print(f"[VISION CONTROL] unavailable: {exc}")
         return None, None, None
@@ -975,10 +971,7 @@ def main():
     control_runtime = create_control_runtime(state)
     (vision_control_planner,
      render_vision_control,
-     render_vision_birdseye) = create_vision_control_planner()
-    birdseye_preview = env_flag("AR_BIRDSEYE_PREVIEW", True)
-    if birdseye_preview and render_vision_birdseye is not None:
-        print("[PREVIEW] side-by-side bird's-eye debug enabled (display only)")
+     _) = create_vision_control_planner()
     vision_control_send = env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT)
     camera_invalid_hold_s = max(
         0.0, env_float(
@@ -988,7 +981,7 @@ def main():
         0.02, env_float(
             "AR_CAMERA_STALE_SECONDS", CAMERA_STALE_SECONDS))
     telemetry_logger = None
-    if env_flag("AR_VISION_TELEMETRY", False):
+    if env_flag("AR_VISION_TELEMETRY", True):
         try:
             from vision_telemetry import VisionTelemetryLogger
 
@@ -1246,34 +1239,17 @@ def main():
                             process_fps=current_fps,
                             inference_fps=current_inference_fps,
                             ocr_response=latest_ocr_response):
-                        birdseye = None
-                        if (birdseye_preview
-                                and render_vision_birdseye is not None):
-                            birdseye = render_vision_birdseye(target, result)
                         if result is not None and render_perception is not None:
                             render_perception(target, result, mode=render_mode)
                         if result is not None and render_vision_control is not None:
                             render_vision_control(target, result)
                         target = add_runtime_overlay(
                             target, process_fps, inference_fps, ocr_response)
-                        if birdseye is not None:
-                            draw_source_roi = getattr(
-                                render_vision_birdseye,
-                                "draw_source_roi", None)
-                            if draw_source_roi is not None:
-                                draw_source_roi(target)
-                            return np.hstack((target, birdseye))
                         return target
 
-                    output_size = None
-                    if (birdseye_preview
-                            and render_vision_birdseye is not None):
-                        output_size = (
-                            int(display_frame.shape[1]) * 2,
-                            int(display_frame.shape[0]))
                     preview.show(
                         display_frame, renderer=render_preview,
-                        output_size=output_size)
+                        output_size=None)
     except KeyboardInterrupt:
         print("\n[AR_RECEIVER] stopped by user")
     finally:

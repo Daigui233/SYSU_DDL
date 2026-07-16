@@ -57,7 +57,7 @@ class VisionTelemetryLogger:
 
     @classmethod
     def from_env(cls):
-        if not _env_flag("AR_VISION_TELEMETRY", False):
+        if not _env_flag("AR_VISION_TELEMETRY", True):
             return None
         return cls(os.environ.get("AR_VISION_TELEMETRY_DIR"))
 
@@ -134,6 +134,22 @@ class VisionTelemetryLogger:
                     target.get("path_heading_feedforward_640"), 0.0),
                 "curve_feedforward_640": _number(
                     target.get("curve_feedforward_640"), 0.0),
+                "right_circle_feedforward_640": _number(
+                    target.get("right_circle_feedforward_640"), 0.0),
+                "right_circle_feedforward_active": bool(
+                    target.get("right_circle_feedforward_active", False)),
+                "right_circle_trim_640": _number(
+                    target.get("right_circle_trim_640"), 0.0),
+                "right_circle_compensation_640": _number(
+                    target.get("right_circle_compensation_640"), 0.0),
+                "right_circle_anchor_weight": _number(
+                    target.get("right_circle_anchor_weight"), 0.0),
+                "right_circle_compensation_gain": _number(
+                    target.get("right_circle_compensation_gain"), 0.0),
+                "right_circle_output_offset_640": _number(
+                    target.get("right_circle_output_offset_640"), 0.0),
+                "line_based_track_error_640": _number(
+                    target.get("line_based_track_error_640")),
                 "total_feedforward_640": _number(
                     target.get("total_feedforward_640"), 0.0),
                 "road_shape_state": target.get(
@@ -151,6 +167,12 @@ class VisionTelemetryLogger:
                     debug.get("road_heading_delta_640"))),
                 "road_curvature_640": _number(target.get(
                     "road_curvature_640", debug.get("road_curvature_640"))),
+                "selected_path_curvature_640": _number(
+                    target.get("selected_path_curvature_640")),
+                "road_curve_evidence": (
+                    target.get("road_curve_evidence")
+                    or debug.get("road_curve_evidence")
+                    or {}),
                 "paths": self._path_summary(
                     result.get("paths") or (result.get("centerline") or {}).get("paths"),
                     _number(target.get("lookahead_y"), 300.0)),
@@ -166,6 +188,12 @@ class VisionTelemetryLogger:
                 "response": target.get("track_error_response"),
                 "trend_frames": target.get("track_error_trend_frames"),
                 "task_offset_x": _number(target.get("task_offset_x")),
+                "line_loss_hold": bool(
+                    target.get("line_loss_hold", False)),
+                "line_loss_indefinite": bool(
+                    target.get("line_loss_indefinite", False)),
+                "line_loss_held_speed_mps": _number(
+                    target.get("line_loss_held_speed_mps")),
             },
             "selection": {
                 "selected_slot": debug.get("selected_slot"),
