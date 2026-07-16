@@ -130,6 +130,19 @@ class VisionTelemetryLogger:
                 "path_raw_error_640": _number(
                     target.get("path_raw_track_error_640")),
                 "raw_error_640": _number(target.get("raw_track_error_640")),
+                "uncapped_raw_error_640": _number(
+                    target.get("uncapped_raw_track_error_640")),
+                "straight_error_limit_640": _number(
+                    target.get("straight_error_limit_640")),
+                "straight_error_limited": bool(
+                    target.get("straight_error_limited", False)),
+                "high_confidence_straight": bool(
+                    target.get("high_confidence_straight", False)),
+                "straight_hard_limit_enabled": bool(
+                    target.get("straight_hard_limit_enabled", False)),
+                "straight_limit_suppressed_by_task": bool(
+                    target.get(
+                        "straight_limit_suppressed_by_task", False)),
                 "path_heading_feedforward_640": _number(
                     target.get("path_heading_feedforward_640"), 0.0),
                 "curve_feedforward_640": _number(
@@ -188,6 +201,16 @@ class VisionTelemetryLogger:
                 "response": target.get("track_error_response"),
                 "trend_frames": target.get("track_error_trend_frames"),
                 "task_offset_x": _number(target.get("task_offset_x")),
+                "requested_task_adjustment_640": _number(
+                    target.get("requested_task_adjustment_640")),
+                "applied_task_adjustment_640": _number(
+                    target.get("applied_task_adjustment_640")),
+                "curve_task_adjust_limit_640": _number(
+                    target.get("curve_task_adjust_limit_640")),
+                "curve_task_adjust_soft_margin_640": _number(
+                    target.get("curve_task_adjust_soft_margin_640")),
+                "curve_task_adjustment_limited": bool(
+                    target.get("curve_task_adjustment_limited", False)),
                 "line_loss_hold": bool(
                     target.get("line_loss_hold", False)),
                 "line_loss_indefinite": bool(

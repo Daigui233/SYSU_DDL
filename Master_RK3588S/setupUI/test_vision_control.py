@@ -210,6 +210,10 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.curve_state_exit_frames, 5)
         self.assertEqual(config.right_circle_capture_range_640, 24.0)
         self.assertEqual(config.right_circle_compensation_gain, 0.30)
+        self.assertEqual(config.straight_error_limit_ratio, 0.50)
+        self.assertEqual(config.curve_task_adjust_limit_ratio, 0.50)
+        self.assertEqual(config.curve_task_adjust_soft_margin_ratio, 0.25)
+        self.assertEqual(config.straight_min_span_ratio, 0.50)
         self.assertEqual(config.human_pass_speed_mps, 0.30)
         self.assertEqual(config.human_path_return_guard_s, 0.40)
         self.assertEqual(config.human_stop_reverse_speed_mps, -0.05)
@@ -692,6 +696,121 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(command["track_error"], -24.0)
         self.assertNotIn("rear_path_target_x", debug["control_target"])
         self.assertNotIn("error_trend_mode", debug["control_target"])
+
+    def test_only_long_end_to_end_straight_uses_hard_error_limit(self):
+        planner = VisionControlPlanner(config=_config(
+            right_circle_feedforward_640=66.5,
+            straight_error_limit_ratio=0.50,
+        ))
+        result = _raw_result_at(500.0, 430.0)
+        planner.update(result, now=1.0)
+        command, debug = planner.update(result, now=1.04)
+        target = debug["control_target"]
+        self.assertTrue(target["high_confidence_straight"])
+        self.assertTrue(target["straight_error_limited"])
+        self.assertAlmostEqual(target["straight_error_limit_640"], 33.25)
+        self.assertAlmostEqual(target["raw_track_error_640"], 33.25)
+        self.assertLessEqual(abs(command["track_error"]), 33.25)
+        self.assertEqual(
+            target["road_curve_evidence"]["long_straight_reason"],
+            "whole_segment_straight")
+
+    def test_short_local_straight_does_not_use_hard_error_limit(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(300.0, 380.0, 20, dtype=np.float32)
+        selected = _raw_path(0, 500.0, ys)
+        result = {
+            "detections": [],
+            "paths": [selected],
+            "road": {"mask": np.ones((120, 160), dtype=np.uint8)},
+        }
+        planner._build_command(
+            selected, "test", result, (480, 640, 3), now=1.0)
+        _command, target = planner._build_command(
+            selected, "test", result, (480, 640, 3), now=1.04)
+        self.assertFalse(target["high_confidence_straight"])
+        self.assertFalse(target["straight_error_limited"])
+        self.assertGreater(abs(target["raw_track_error_640"]), 33.25)
+        self.assertEqual(
+            target["road_curve_evidence"]["long_straight_reason"],
+            "path_too_short")
+
+    def test_partly_curved_path_is_not_high_confidence_straight(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(460.0, 60.0, 64, dtype=np.float32)
+        far_bend = np.maximum(250.0 - ys, 0.0)
+        xs = 500.0 + 0.003 * far_bend ** 2
+        selected = _raw_path(0, xs, ys)
+        result = {
+            "detections": [],
+            "paths": [selected],
+            "road": {
+                "mask": _road_mask_following_path(xs, ys),
+            },
+        }
+        planner._build_command(
+            selected, "test", result, (480, 640, 3), now=1.0)
+        _command, target = planner._build_command(
+            selected, "test", result, (480, 640, 3), now=1.04)
+        self.assertFalse(target["high_confidence_straight"])
+        self.assertFalse(target["straight_error_limited"])
+        self.assertEqual(
+            target["road_curve_evidence"]["long_straight_reason"],
+            "path_not_straight_end_to_end")
+
+    def test_curve_object_offsets_use_soft_limit_for_car_human_and_coin(self):
+        for state, reason in (
+            (STATE_AVOID_CAR, "car_in_path_bias"),
+            (STATE_AVOID_HUMAN, "human_cross_pass"),
+            (STATE_COLLECT_GOLD, "coin_bias"),
+        ):
+            with self.subTest(reason=reason):
+                planner = VisionControlPlanner(config=_config())
+                planner.road_shape_state = "curve"
+                planner._road_shape_consensus_geometry = lambda *_args: {
+                    "valid": True,
+                    "reason": "curve_consensus",
+                    "heading_delta_640": 0.0,
+                    "curvature_640": 10.0,
+                    "sample_rows_y": (300.0, 336.0, 372.0),
+                    "support_y": (60.0, 460.0),
+                }
+                planner._task_from_detections = (
+                    lambda *_args, _state=state, _reason=reason, **_kwargs:
+                    (_state, 0.06, _reason, 420.0))
+                selected = _raw_path(0, 320.0)
+                command, target = planner._build_command(
+                    selected, "test", {
+                        "detections": [],
+                        "paths": [selected],
+                    }, (480, 640, 3), now=1.0)
+                self.assertEqual(command["state_cmd"], state)
+                self.assertAlmostEqual(
+                    target["requested_task_adjustment_640"], 100.0)
+                self.assertGreater(
+                    target["applied_task_adjustment_640"], 33.25)
+                self.assertLess(
+                    target["applied_task_adjustment_640"], 41.57)
+                self.assertTrue(
+                    target["curve_task_adjustment_limited"])
+                self.assertFalse(target["straight_error_limited"])
+
+    def test_straight_avoidance_task_bypasses_hard_limit(self):
+        planner = VisionControlPlanner(config=_config())
+        result = _raw_result_at(320.0, 430.0)
+        planner.update(result, now=1.0)
+        planner.update(result, now=1.04)
+        planner._task_from_detections = (
+            lambda *_args, **_kwargs:
+            (STATE_AVOID_CAR, 0.06, "car_in_path_bias", 420.0))
+        command, debug = planner.update(result, now=1.08)
+        target = debug["control_target"]
+        self.assertTrue(target["high_confidence_straight"])
+        self.assertTrue(target["straight_limit_suppressed_by_task"])
+        self.assertFalse(target["straight_hard_limit_enabled"])
+        self.assertFalse(target["straight_error_limited"])
+        self.assertGreater(target["raw_track_error_640"], 33.25)
+        self.assertEqual(command["state_cmd"], STATE_AVOID_CAR)
 
     def test_car_in_path_uses_bounded_offset_and_normal_speed(self):
         car = [{

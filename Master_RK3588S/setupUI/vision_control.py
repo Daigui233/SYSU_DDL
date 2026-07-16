@@ -57,6 +57,22 @@ def _clamp(value, low, high):
     return max(float(low), min(float(high), float(value)))
 
 
+def _soft_limit(value, limit, margin):
+    """Preserve small values and smoothly compress only the excess."""
+    value = float(value)
+    limit = max(0.0, float(limit))
+    margin = max(0.0, float(margin))
+    magnitude = abs(value)
+    if magnitude <= limit:
+        return value
+    if margin <= 1e-6:
+        return math.copysign(limit, value)
+    compressed = (
+        limit + margin *
+        (1.0 - math.exp(-(magnitude - limit) / margin)))
+    return float(math.copysign(compressed, value))
+
+
 def _interp_path_x(points, target_y):
     if points is None or len(points) == 0:
         return None
@@ -116,6 +132,12 @@ class VisionControlConfig:
     right_circle_trim_max_640: float = 10.0
     right_circle_capture_range_640: float = 24.0
     right_circle_compensation_gain: float = 0.30
+    straight_error_limit_ratio: float = 0.50
+    curve_task_adjust_limit_ratio: float = 0.50
+    curve_task_adjust_soft_margin_ratio: float = 0.25
+    straight_min_span_ratio: float = 0.50
+    straight_path_max_residual_640: float = 6.0
+    straight_edge_max_residual_640: float = 10.0
     normal_speed_mps: float = 0.06
     recover_speed_mps: float = 0.06
     human_pass_speed_mps: float = 0.30
@@ -254,6 +276,29 @@ class VisionControlConfig:
                 _env_float(
                     "VISION_CONTROL_RIGHT_CIRCLE_COMPENSATION_GAIN", 0.30),
                 0.0, 1.0),
+            straight_error_limit_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_STRAIGHT_ERROR_LIMIT_RATIO", 0.50),
+                0.0, 1.0),
+            curve_task_adjust_limit_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CURVE_TASK_ADJUST_LIMIT_RATIO", 0.50),
+                0.0, 1.0),
+            curve_task_adjust_soft_margin_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CURVE_TASK_ADJUST_SOFT_MARGIN_RATIO",
+                    0.25),
+                0.0, 1.0),
+            straight_min_span_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_STRAIGHT_MIN_SPAN_RATIO", 0.50),
+                0.10, 0.95),
+            straight_path_max_residual_640=max(
+                0.5, _env_float(
+                    "VISION_CONTROL_STRAIGHT_PATH_MAX_RESIDUAL_640", 6.0)),
+            straight_edge_max_residual_640=max(
+                0.5, _env_float(
+                    "VISION_CONTROL_STRAIGHT_EDGE_MAX_RESIDUAL_640", 10.0)),
             normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.06)),
             recover_speed_mps=max(0.0, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.06)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
@@ -1261,15 +1306,52 @@ class VisionControlPlanner:
                 "missing_target_x", task_reason, now, lookahead_y)
 
         path_target_x, path_target_y, path_target_adaptive = path_target
-        target_x = _clamp(
+        requested_target_x = _clamp(
             float(target_override_x) if target_override_x is not None
             else float(path_target_x),
             0.0,
             float(max(0, image_shape[1] - 1)),
         )
+        width = float(max(1, image_shape[1]))
+        requested_task_adjustment_640 = (
+            (float(requested_target_x) - float(path_target_x))
+            * 640.0 / width)
+        curve_task_adjust_limit_640 = (
+            abs(float(self.config.right_circle_feedforward_640))
+            * float(self.config.curve_task_adjust_limit_ratio))
+        offset_task = bool(
+            target_override_x is not None
+            and int(task_state) in {
+                STATE_AVOID_CAR,
+                STATE_AVOID_HUMAN,
+                STATE_COLLECT_GOLD,
+            }
+        )
+        curve_offset_task = bool(
+            offset_task
+            and self.road_shape_state == "curve"
+            and road_shape_geometry["valid"]
+        )
+        applied_task_adjustment_640 = float(
+            requested_task_adjustment_640)
+        curve_task_adjust_soft_margin_640 = (
+            curve_task_adjust_limit_640
+            * float(self.config.curve_task_adjust_soft_margin_ratio))
+        if curve_offset_task:
+            applied_task_adjustment_640 = _soft_limit(
+                requested_task_adjustment_640,
+                curve_task_adjust_limit_640,
+                curve_task_adjust_soft_margin_640,
+            )
+        target_x = _clamp(
+            float(path_target_x)
+            + applied_task_adjustment_640 * width / 640.0,
+            0.0,
+            float(max(0, image_shape[1] - 1)),
+        )
         task_offset_x = float(target_x) - float(path_target_x)
         path_raw_error = (
-            float(target_x) / float(max(1, image_shape[1]))
+            float(target_x) / width
             - self.config.visual_center_x) * 640.0
         heading_feedforward = 0.0
         curve_feedforward = 0.0
@@ -1278,7 +1360,10 @@ class VisionControlPlanner:
         right_circle_compensation = 0.0
         right_circle_feedforward_active = False
         right_circle_anchor_weight = 0.0
-        if (task_reason == "track" and target_override_x is None and
+        line_feedforward_enabled = bool(
+            (task_reason == "track" and target_override_x is None)
+            or curve_offset_task)
+        if (line_feedforward_enabled and
                 not path_target_adaptive and path_geometry["valid"]):
             heading_delta_640 = float(
                 path_geometry["heading_delta_640"])
@@ -1343,6 +1428,27 @@ class VisionControlPlanner:
                         self.config.right_circle_compensation_gain))
                 raw_error = (
                     line_based_error + right_circle_compensation)
+        uncapped_raw_error = float(raw_error)
+        straight_error_limit_640 = (
+            abs(float(self.config.right_circle_feedforward_640))
+            * float(self.config.straight_error_limit_ratio))
+        high_confidence_straight = bool(
+            road_shape_geometry["valid"]
+            and road_shape_geometry.get("reason") == "straight_consensus"
+            and self.road_shape_metrics.get("stable_path_ready", False)
+            and self.road_shape_metrics.get("segmentation_reason") == "valid"
+        )
+        straight_hard_limit_enabled = bool(
+            high_confidence_straight and not offset_task)
+        straight_error_limited = bool(
+            straight_hard_limit_enabled
+            and abs(raw_error) > straight_error_limit_640)
+        if straight_hard_limit_enabled:
+            raw_error = _clamp(
+                raw_error,
+                -straight_error_limit_640,
+                straight_error_limit_640,
+            )
         applied_steering_feedforward = (
             float(raw_error) - float(path_raw_error))
         control_target_x = _clamp(
@@ -1393,8 +1499,29 @@ class VisionControlPlanner:
                 image_shape, path_target_y),
             "task_offset_x": float(task_offset_x),
             "task_target_applied": target_override_x is not None,
+            "requested_task_adjustment_640": float(
+                requested_task_adjustment_640),
+            "applied_task_adjustment_640": float(
+                applied_task_adjustment_640),
+            "curve_task_adjust_limit_640": float(
+                curve_task_adjust_limit_640),
+            "curve_task_adjust_soft_margin_640": float(
+                curve_task_adjust_soft_margin_640),
+            "curve_task_adjustment_limited": bool(
+                curve_offset_task
+                and abs(applied_task_adjustment_640
+                        - requested_task_adjustment_640) > 1e-6),
             "track_error_640": float(error),
             "raw_track_error_640": float(raw_error),
+            "uncapped_raw_track_error_640": float(uncapped_raw_error),
+            "straight_error_limit_640": float(straight_error_limit_640),
+            "straight_error_limited": bool(straight_error_limited),
+            "high_confidence_straight": bool(
+                high_confidence_straight),
+            "straight_hard_limit_enabled": bool(
+                straight_hard_limit_enabled),
+            "straight_limit_suppressed_by_task": bool(
+                high_confidence_straight and offset_task),
             "path_raw_track_error_640": float(path_raw_error),
             "path_heading_feedforward_640": float(
                 heading_feedforward),
@@ -1786,6 +1913,135 @@ class VisionControlPlanner:
                 float(value) for value in widths_640],
         }
 
+    @staticmethod
+    def _line_fit_max_residual_640(y_values, x_values, image_width):
+        y_values = np.asarray(y_values, dtype=np.float64)
+        x_values = np.asarray(x_values, dtype=np.float64)
+        if len(y_values) < 3 or len(x_values) != len(y_values):
+            return 1e9
+        try:
+            coefficients = np.polyfit(y_values, x_values, 1)
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            return 1e9
+        predicted = np.polyval(coefficients, y_values)
+        return float(
+            np.max(np.abs(x_values - predicted))
+            * 640.0 / float(max(1, image_width)))
+
+    def _long_straight_evidence(
+            self, result, reference_path, image_shape):
+        points = np.asarray(
+            (reference_path or {}).get("points_xy", ()),
+            dtype=np.float32)
+        finite = (
+            np.all(np.isfinite(points), axis=1)
+            if points.ndim == 2 and points.shape[1:] == (2,)
+            else np.zeros(0, dtype=bool))
+        points = points[finite] if len(finite) else np.empty((0, 2))
+        image_height, image_width = image_shape[:2]
+        minimum_span = (
+            float(image_height) * float(
+                self.config.straight_min_span_ratio))
+        if len(points) < 4:
+            return {
+                "long_straight_ready": False,
+                "long_straight_reason": "insufficient_path_points",
+                "long_path_span_640": 0.0,
+            }
+        order = np.argsort(points[:, 1], kind="stable")
+        points = points[order]
+        minimum_y = float(points[0, 1])
+        maximum_y = float(points[-1, 1])
+        path_span = maximum_y - minimum_y
+        path_residual = self._line_fit_max_residual_640(
+            points[:, 1], points[:, 0], image_width)
+        metrics = {
+            "long_path_span_px": float(path_span),
+            "long_path_min_span_px": float(minimum_span),
+            "long_path_residual_640": float(path_residual),
+        }
+        if path_span < minimum_span:
+            metrics.update({
+                "long_straight_ready": False,
+                "long_straight_reason": "path_too_short",
+            })
+            return metrics
+        if path_residual > self.config.straight_path_max_residual_640:
+            metrics.update({
+                "long_straight_ready": False,
+                "long_straight_reason": "path_not_straight_end_to_end",
+            })
+            return metrics
+
+        road = (result.get("road") or {}).get("mask")
+        if road is None:
+            road = result.get("road_mask")
+        road_mask = np.asarray(
+            road) if road is not None else np.empty((0, 0))
+        if road_mask.ndim != 2 or not road_mask.size or not np.any(road_mask):
+            metrics.update({
+                "long_straight_ready": False,
+                "long_straight_reason": "missing_long_road_edges",
+            })
+            return metrics
+        mask_height, mask_width = road_mask.shape
+        sample_rows = np.linspace(
+            minimum_y, maximum_y, 11, dtype=np.float32)
+        left_samples = []
+        right_samples = []
+        for image_y in sample_rows:
+            reference_x = _interp_path_x(points, float(image_y))
+            if reference_x is None:
+                metrics.update({
+                    "long_straight_ready": False,
+                    "long_straight_reason": "long_reference_failed",
+                })
+                return metrics
+            mask_x = (
+                float(reference_x) * float(max(1, mask_width - 1))
+                / float(max(1, image_width - 1)))
+            mask_y = int(round(
+                float(image_y) * float(max(1, mask_height - 1))
+                / float(max(1, image_height - 1))))
+            run = self._road_mask_run(road_mask, mask_y, mask_x)
+            if run is None:
+                metrics.update({
+                    "long_straight_ready": False,
+                    "long_straight_reason": "long_road_edge_missing",
+                })
+                return metrics
+            image_scale = (
+                float(max(1, image_width - 1))
+                / float(max(1, mask_width - 1)))
+            left_samples.append(float(run[0]) * image_scale)
+            right_samples.append(float(run[1]) * image_scale)
+        center_samples = [
+            0.5 * (left + right)
+            for left, right in zip(left_samples, right_samples)
+        ]
+        left_residual = self._line_fit_max_residual_640(
+            sample_rows, left_samples, image_width)
+        right_residual = self._line_fit_max_residual_640(
+            sample_rows, right_samples, image_width)
+        center_residual = self._line_fit_max_residual_640(
+            sample_rows, center_samples, image_width)
+        maximum_edge_residual = max(
+            left_residual, right_residual, center_residual)
+        metrics.update({
+            "long_left_edge_residual_640": float(left_residual),
+            "long_right_edge_residual_640": float(right_residual),
+            "long_center_residual_640": float(center_residual),
+            "long_straight_ready": bool(
+                maximum_edge_residual <=
+                self.config.straight_edge_max_residual_640),
+            "long_straight_reason": (
+                "whole_segment_straight"
+                if maximum_edge_residual <=
+                    self.config.straight_edge_max_residual_640
+                else "road_edges_not_straight_end_to_end"),
+        })
+        return metrics
+
     def _road_shape_consensus_geometry(
             self, result, selected, lookahead_y, image_shape):
         candidates = result.get("paths")
@@ -1835,6 +2091,9 @@ class VisionControlPlanner:
             })
             self.road_shape_metrics = metrics
             return missing
+        long_straight_metrics = self._long_straight_evidence(
+            result, stable_path, image_shape)
+        metrics.update(long_straight_metrics)
 
         path_curvature = float(path_geometry["curvature_640"])
         center_curvature = float(segmentation["curvature_640"])
@@ -1854,6 +2113,11 @@ class VisionControlPlanner:
         straight_consensus = bool(
             abs(path_curvature) <= exit_threshold
             and abs(center_curvature) <= exit_threshold
+            and all(
+                abs(value) <= exit_threshold
+                for value in edge_curvatures
+            )
+            and metrics.get("long_straight_ready", False)
         )
         curve_consensus = bool(
             path_sign != 0
