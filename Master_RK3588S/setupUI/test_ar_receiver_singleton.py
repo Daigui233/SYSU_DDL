@@ -1,4 +1,5 @@
 import os
+import queue
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +11,7 @@ from .ar_receiver import (
     activate_existing_preview,
     add_camera_fault_overlay,
     camera_frame_is_blank,
+    FfplayPreview,
 )
 
 
@@ -64,6 +66,24 @@ class ArReceiverSingletonTest(unittest.TestCase):
         self.assertFalse(camera_frame_is_blank(normal))
         rendered = add_camera_fault_overlay(white.copy())
         self.assertTrue(np.any(rendered != white))
+
+    def test_preview_tracks_input_and_side_by_side_output_sizes(self):
+        state = mock.MagicMock()
+        preview = FfplayPreview(state, fps=30.0)
+        preview.process = mock.MagicMock()
+        preview.process.poll.return_value = None
+        preview.frame_size = (1280, 480)
+        preview.input_size = (640, 480)
+        preview.frames = queue.Queue(maxsize=1)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        preview.show(frame, output_size=(1280, 480))
+
+        queued_frame, queued_renderer, queued_size = (
+            preview.frames.get_nowait())
+        self.assertIs(queued_frame, frame)
+        self.assertIsNone(queued_renderer)
+        self.assertEqual(queued_size, (1280, 480))
 
 
 if __name__ == "__main__":

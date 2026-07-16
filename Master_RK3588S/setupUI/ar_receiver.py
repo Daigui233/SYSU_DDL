@@ -494,11 +494,12 @@ class FfplayPreview:
         self.frames = None
         self.stop_event = None
         self.frame_size = None
+        self.input_size = None
         self.next_frame_ts = 0.0
         self._lock = threading.Lock()
         self._intentional_stop = False
 
-    def _start(self, width, height):
+    def _start(self, width, height, input_size=None):
         if not self.ffplay:
             self.state.set_preview_runtime(False, "ffplay not found")
             return False
@@ -545,6 +546,7 @@ class FfplayPreview:
             self.frames = queue.Queue(maxsize=1)
             self.stop_event = threading.Event()
             self.frame_size = (width, height)
+            self.input_size = input_size or (width, height)
             self.next_frame_ts = 0.0
             self._intentional_stop = False
             self.writer = threading.Thread(
@@ -571,10 +573,20 @@ class FfplayPreview:
                 if frame is None:
                     break
                 renderer = None
+                expected_size = None
                 if isinstance(frame, tuple):
-                    frame, renderer = frame
+                    if len(frame) == 3:
+                        frame, renderer, expected_size = frame
+                    else:
+                        frame, renderer = frame
                 if renderer is not None:
                     frame = renderer(frame)
+                if expected_size is not None:
+                    expected_width, expected_height = expected_size
+                    if frame.shape[:2] != (expected_height, expected_width):
+                        frame = cv2.resize(
+                            frame, (expected_width, expected_height),
+                            interpolation=cv2.INTER_LINEAR)
                 payload = memoryview(np.ascontiguousarray(frame)).cast("B")
                 while payload and not stop_event.is_set():
                     written = os.write(process.stdin.fileno(), payload)
@@ -591,15 +603,25 @@ class FfplayPreview:
                 self.state.set_preview_enabled(False)
             self.state.set_preview_runtime(False, "" if intentional else error)
 
-    def show(self, frame, renderer=None):
+    def show(self, frame, renderer=None, output_size=None):
         if frame is None or frame.size == 0:
             return
         height, width = frame.shape[:2]
+        input_size = (width, height)
+        if output_size is None:
+            output_size = input_size
+        output_width = max(1, int(output_size[0]))
+        output_height = max(1, int(output_size[1]))
+        output_size = (output_width, output_height)
         with self._lock:
             process = self.process
             frame_size = self.frame_size
-        if process is None or process.poll() is not None or frame_size != (width, height):
-            if not self._start(width, height):
+            current_input_size = self.input_size
+        if (process is None or process.poll() is not None
+                or frame_size != output_size
+                or current_input_size != input_size):
+            if not self._start(
+                    output_width, output_height, input_size=input_size):
                 return
         now = time.monotonic()
         with self._lock:
@@ -610,14 +632,14 @@ class FfplayPreview:
         if frames is None:
             return
         try:
-            frames.put_nowait((frame, renderer))
+            frames.put_nowait((frame, renderer, output_size))
         except queue.Full:
             try:
                 frames.get_nowait()
             except queue.Empty:
                 pass
             try:
-                frames.put_nowait((frame, renderer))
+                frames.put_nowait((frame, renderer, output_size))
             except queue.Full:
                 pass
 
@@ -635,6 +657,7 @@ class FfplayPreview:
             self.frames = None
             self.stop_event = None
             self.frame_size = None
+            self.input_size = None
             self.next_frame_ts = 0.0
         if stop_event is not None:
             stop_event.set()
@@ -754,17 +777,24 @@ def create_vision_control_planner():
         or env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT)
     ):
         print("[VISION CONTROL] disabled by AR_VISION_CONTROL_DEBUG=0 and AR_VISION_CONTROL_SEND=0")
-        return None, None
+        return None, None, None
     try:
-        from vision_control import VisionControlPlanner, render_vision_control_debug
+        from vision_control import (
+            VisionControlBirdseyeRenderer,
+            VisionControlPlanner,
+            render_vision_control_debug,
+        )
 
         planner = VisionControlPlanner()
+        birdseye_renderer = VisionControlBirdseyeRenderer()
         mode = "send" if env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT) else "debug-only"
         print(f"[VISION CONTROL] enabled ({mode})")
-        return planner, render_vision_control_debug
+        return (
+            planner, render_vision_control_debug,
+            birdseye_renderer)
     except Exception as exc:
         print(f"[VISION CONTROL] unavailable: {exc}")
-        return None, None
+        return None, None, None
 
 
 def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
@@ -928,7 +958,12 @@ def main():
     web.start()
     ocr_processor = create_ocr_processor()
     control_runtime = create_control_runtime(state)
-    vision_control_planner, render_vision_control = create_vision_control_planner()
+    (vision_control_planner,
+     render_vision_control,
+     render_vision_birdseye) = create_vision_control_planner()
+    birdseye_preview = env_flag("AR_BIRDSEYE_PREVIEW", True)
+    if birdseye_preview and render_vision_birdseye is not None:
+        print("[PREVIEW] side-by-side bird's-eye debug enabled (display only)")
     vision_control_send = env_flag("AR_VISION_CONTROL_SEND", VISION_CONTROL_SEND_DEFAULT)
     camera_invalid_hold_s = max(
         0.0, env_float(
@@ -1196,14 +1231,34 @@ def main():
                             process_fps=current_fps,
                             inference_fps=current_inference_fps,
                             ocr_response=latest_ocr_response):
+                        birdseye = None
+                        if (birdseye_preview
+                                and render_vision_birdseye is not None):
+                            birdseye = render_vision_birdseye(target, result)
                         if result is not None and render_perception is not None:
                             render_perception(target, result, mode=render_mode)
                         if result is not None and render_vision_control is not None:
                             render_vision_control(target, result)
-                        return add_runtime_overlay(
+                        target = add_runtime_overlay(
                             target, process_fps, inference_fps, ocr_response)
+                        if birdseye is not None:
+                            draw_source_roi = getattr(
+                                render_vision_birdseye,
+                                "draw_source_roi", None)
+                            if draw_source_roi is not None:
+                                draw_source_roi(target)
+                            return np.hstack((target, birdseye))
+                        return target
 
-                    preview.show(display_frame, renderer=render_preview)
+                    output_size = None
+                    if (birdseye_preview
+                            and render_vision_birdseye is not None):
+                        output_size = (
+                            int(display_frame.shape[1]) * 2,
+                            int(display_frame.shape[0]))
+                    preview.show(
+                        display_frame, renderer=render_preview,
+                        output_size=output_size)
     except KeyboardInterrupt:
         print("\n[AR_RECEIVER] stopped by user")
     finally:

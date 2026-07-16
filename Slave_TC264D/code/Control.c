@@ -25,14 +25,21 @@
 #define TRACK_MOTOR_KP                 (100.0f)
 #define TRACK_MOTOR_KI                 (8.0f)
 #define TRACK_MOTOR_KD                 (0.0f)
-#define TRACK_SERVO_KP                 SERVO_LINEAR_KP
+/*
+ * The fitted path and its curvature feedforward are both intentionally kept.
+ * Reduce only the ordinary line-tracking steering response to suppress the
+ * overshoot seen on both straights and bends.  Avoidance states keep the full
+ * steering ratio so that obstacle-pass corrections are not weakened.
+ */
+#define TRACK_SERVO_RESPONSE_SCALE     (0.80f)
+#define TRACK_SERVO_KP                 (SERVO_LINEAR_KP * TRACK_SERVO_RESPONSE_SCALE)
 #define TRACK_SERVO_KD                 SERVO_LINEAR_KD
 
 #define AVOID_STONE_DEFAULT_SPEED_MPS  TRACK_DEFAULT_SPEED_MPS
 #define AVOID_STONE_MOTOR_KP           TRACK_MOTOR_KP
 #define AVOID_STONE_MOTOR_KI           TRACK_MOTOR_KI
 #define AVOID_STONE_MOTOR_KD           TRACK_MOTOR_KD
-#define AVOID_STONE_SERVO_KP           TRACK_SERVO_KP
+#define AVOID_STONE_SERVO_KP           SERVO_LINEAR_KP
 #define AVOID_STONE_SERVO_KD           TRACK_SERVO_KD
 
 #define AVOID_CAR_DEFAULT_SPEED_MPS    (0.05f)

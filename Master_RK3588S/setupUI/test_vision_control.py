@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -15,15 +16,18 @@ from vision_control import (  # noqa: E402
     STATE_RECOVER_LINE,
     STATE_SAFE_STOP,
     STATE_TRACK,
+    VisionControlBirdseyeRenderer,
     VisionControlConfig,
     VisionControlPlanner,
     _FittedControlPathTracker,
     _associated_point_mask,
+    _birdseye_debug_source_quad_from_road,
     _densify_associated_lower_points,
     _extract_curve_preview_lines,
     _fit_smooth_majority_curve,
     _identity_probability_color,
     _semantic_road_point_mask,
+    render_vision_control_birdseye,
     render_vision_control_debug,
 )
 
@@ -823,6 +827,74 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertGreater(int(rendered.sum()), 0)
         self.assertEqual(_identity_probability_color(0, 1.0), (255, 0, 0))
         self.assertEqual(_identity_probability_color(1, 1.0), (0, 255, 0))
+
+    def test_birdseye_preview_projects_actual_path_and_target(self):
+        planner = VisionControlPlanner(config=_config())
+        result = _raw_result_at()
+        planner.update(result, now=1.0)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        rendered = render_vision_control_birdseye(frame, result)
+
+        self.assertEqual(rendered.shape, frame.shape)
+        self.assertGreater(int(rendered.sum()), 0)
+        magenta = (
+            (rendered[:, :, 0] > 200)
+            & (rendered[:, :, 1] < 80)
+            & (rendered[:, :, 2] > 200))
+        self.assertGreater(int(np.count_nonzero(magenta)), 0)
+
+    def test_birdseye_preview_overlays_existing_semantic_road_mask(self):
+        result = _raw_result_at()
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        with mock.patch.dict(os.environ, {
+                "AR_BIRDSEYE_ROAD_OVERLAY": "1",
+        }):
+            rendered = render_vision_control_birdseye(frame, result)
+
+        road_tint = (
+            (rendered[:, :, 2] > 120)
+            & (rendered[:, :, 2] > rendered[:, :, 1] * 1.5)
+            & (rendered[:, :, 2] > rendered[:, :, 0] * 1.5))
+        self.assertGreater(int(np.count_nonzero(road_tint)), 200)
+        self.assertEqual(int(frame.sum()), 0)
+
+    def test_birdseye_roi_follows_selected_semantic_road_component(self):
+        road = np.zeros((120, 160), dtype=np.uint8)
+        for row in range(60, 116):
+            blend = float(row - 60) / 55.0
+            left = int(round(70.0 + blend * (35.0 - 70.0)))
+            right = int(round(90.0 + blend * (125.0 - 90.0)))
+            road[row, left:right + 1] = 1
+        selected_path = [[320.0, 455.0], [320.0, 249.0]]
+        result = {
+            "road": {"mask": road},
+            "road_mask": road,
+            "vision_control": {
+                "selected_path": selected_path,
+                "control_target": {
+                    "path_target_x": 320.0,
+                    "path_target_y": 300.0,
+                },
+            },
+        }
+
+        source_quad = _birdseye_debug_source_quad_from_road(
+            result, (480, 640, 3))
+
+        self.assertIsNotNone(source_quad)
+        self.assertAlmostEqual(float(source_quad[0, 0]), 0.434, delta=0.03)
+        self.assertAlmostEqual(float(source_quad[1, 0]), 0.572, delta=0.03)
+        self.assertAlmostEqual(float(source_quad[3, 0]), 0.214, delta=0.04)
+        self.assertAlmostEqual(float(source_quad[2, 0]), 0.792, delta=0.04)
+
+        renderer = VisionControlBirdseyeRenderer()
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        rendered = renderer(frame, result)
+        renderer.draw_source_roi(frame)
+        self.assertEqual(renderer.source_status, "ROAD MASK")
+        self.assertGreater(int(rendered.sum()), 0)
+        self.assertGreater(int(frame.sum()), 0)
 
 
 if __name__ == "__main__":
