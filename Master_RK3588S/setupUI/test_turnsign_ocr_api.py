@@ -99,6 +99,8 @@ class TurnSignOcrApiProcessorTest(unittest.TestCase):
         self.assertAlmostEqual(185.0 / 480.0, processor.detection_line_ratio)
         self.assertAlmostEqual(3.0, processor.session_absence_timeout_s)
         self.assertAlmostEqual(10.0, processor.ocr_response_timeout_s)
+        self.assertAlmostEqual(10.0, processor.route_lock_lifetime_s)
+        self.assertEqual(3, processor.return_confirm_frames)
         self.assertAlmostEqual(0.40, sync_processor.min_det_score)
         self.assertAlmostEqual(0.40, sync_processor.min_ocr_confidence)
 
@@ -567,9 +569,139 @@ class TurnSignOcrApiProcessorTest(unittest.TestCase):
         self.assertEqual("api_done", current["status"])
         self.assertTrue(current["instruction_current"])
         self.assertTrue(current["turnsign_resolved"])
-        self.assertEqual("api_done_held", held["status"])
+        self.assertEqual("first_route_turnsign_shielded", held["status"])
         self.assertFalse(held["instruction_current"])
         self.assertTrue(held["turnsign_resolved"])
+        self.assertEqual("right", held["first_api_direction"])
+        self.assertEqual(0, held["return_confirm_count"])
+
+    def test_only_valid_api_direction_establishes_first_route(self):
+        processor = AsyncTurnSignOcrApiProcessor()
+        processor.result_queue = queue.Queue(maxsize=3)
+        processor.pending = True
+        processor.pending_request_id = 1
+        processor.session_id = 1
+        processor.result_queue.put_nowait({
+            "type": "result",
+            "request_id": 1,
+            "session_id": 1,
+            "response": {
+                "active": True,
+                "status": "api_done",
+                "instruction_current": True,
+                "instruction": {"direction": "unknown"},
+            },
+        })
+
+        self.assertTrue(processor._drain_results(timestamp=5.0))
+        self.assertIsNone(processor.first_api_direction)
+        self.assertEqual(0.0, processor.first_api_result_ts)
+
+        processor.pending = True
+        processor.pending_request_id = 2
+        processor.result_queue.put_nowait({
+            "type": "result",
+            "request_id": 2,
+            "session_id": 1,
+            "response": {
+                "active": True,
+                "status": "low_ocr_confidence",
+                "instruction_current": False,
+                "instruction": {"direction": "left"},
+            },
+        })
+
+        self.assertTrue(processor._drain_results(timestamp=6.0))
+        self.assertIsNone(processor.first_api_direction)
+        self.assertEqual(0.0, processor.first_api_result_ts)
+
+    def test_return_pass_uses_opposite_without_second_ocr_or_stop(self):
+        processor = AsyncTurnSignOcrApiProcessor(
+            confirm_frames=1,
+            min_area_ratio=0.031,
+            ocr_interval=0.0,
+            route_lock_lifetime_s=10.0,
+            return_confirm_frames=3,
+            confirm_iou=0.30,
+        )
+        worker_starts = []
+
+        def start_worker():
+            worker_starts.append(True)
+            processor.process_handle = FakeAliveProcess()
+            processor.request_queue = queue.Queue(maxsize=1)
+            processor.result_queue = queue.Queue(maxsize=3)
+            processor.worker_ready = True
+            return True
+
+        processor._start_worker = start_worker
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        sign = {
+            "label": "TurnSign", "score": 0.90,
+            "area_ratio": 0.03145,
+            "bbox": [285, 200, 425, 269],
+        }
+
+        first_submit = processor.process(frame, [sign], timestamp=1.0)
+        first_payload = processor.request_queue.get_nowait()
+        first_request_id = processor.pending_request_id
+        processor.result_queue.put_nowait({
+            "type": "result",
+            "request_id": first_request_id,
+            "session_id": processor.session_id,
+            "response": {
+                "active": True,
+                "status": "api_done",
+                "instruction_current": True,
+                "instruction": {
+                    "valid": True,
+                    "direction": "right",
+                    "preferred_branch": "right",
+                    "source_text": "test",
+                },
+            },
+        })
+        first_result = processor.process(frame, [sign], timestamp=1.1)
+
+        shield_early = processor.process(frame, [sign], timestamp=1.2)
+        shield_late = processor.process(frame, [sign], timestamp=11.09)
+        return_one = processor.process(frame, [sign], timestamp=11.11)
+        return_two = processor.process(frame, [sign], timestamp=11.12)
+        return_ready = processor.process(frame, [sign], timestamp=11.13)
+        return_held = processor.process(frame, [sign], timestamp=11.14)
+
+        self.assertEqual("ocr_submitted", first_submit["status"])
+        self.assertEqual(1, first_payload["request_id"])
+        self.assertEqual("right", first_result["instruction"]["direction"])
+        self.assertTrue(first_result["instruction_current"])
+        self.assertEqual("right", processor.first_api_direction)
+
+        self.assertEqual(
+            "first_route_turnsign_shielded", shield_early["status"])
+        self.assertEqual(
+            "first_route_turnsign_shielded", shield_late["status"])
+        self.assertEqual(0, shield_early["return_confirm_count"])
+        self.assertEqual(0, shield_late["return_confirm_count"])
+        self.assertFalse(shield_late["instruction_current"])
+
+        self.assertEqual("return_turnsign_confirming", return_one["status"])
+        self.assertEqual(1, return_one["return_confirm_count"])
+        self.assertEqual("return_turnsign_confirming", return_two["status"])
+        self.assertEqual(2, return_two["return_confirm_count"])
+        self.assertEqual("return_route_opposite_ready", return_ready["status"])
+        self.assertEqual("turnsign_consumed", return_ready["control_phase"])
+        self.assertTrue(return_ready["instruction_current"])
+        self.assertTrue(return_ready["api_bypassed"])
+        self.assertEqual("left", return_ready["instruction"]["direction"])
+        self.assertEqual(
+            "return_pass_opposite_of_first_api",
+            return_ready["instruction"]["reason"],
+        )
+        self.assertEqual("return_route_held", return_held["status"])
+        self.assertFalse(return_held["instruction_current"])
+        self.assertEqual(1, len(worker_starts))
+        self.assertEqual(first_request_id, processor.request_id)
+        self.assertTrue(processor.request_queue.empty())
 
     def test_async_failed_read_refreshes_correctly_positioned_snapshot(self):
         processor = AsyncTurnSignOcrApiProcessor(

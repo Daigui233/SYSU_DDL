@@ -1141,6 +1141,8 @@ class AsyncTurnSignOcrApiProcessor:
         confirmed_max_misses=3,
         session_absence_timeout_s=3.0,
         ocr_response_timeout_s=10.0,
+        route_lock_lifetime_s=10.0,
+        return_confirm_frames=3,
         **processor_kwargs,
     ):
         self.log_func = log_func or (lambda _message: None)
@@ -1175,12 +1177,29 @@ class AsyncTurnSignOcrApiProcessor:
             0.0, float(session_absence_timeout_s))
         self.ocr_response_timeout_s = max(
             0.0, float(ocr_response_timeout_s))
+        # The first valid API decision owns the route for exactly the same
+        # lifetime as the vision-control branch lock.  During that interval,
+        # every TurnSign detection is treated as a residual view of the first
+        # sign.  Only a stable detection after the lock expires can represent
+        # the second pass through the intersection.
+        self.route_lock_lifetime_s = max(
+            0.1, float(route_lock_lifetime_s))
+        self.return_confirm_frames = max(1, int(return_confirm_frames))
         self.confirm_count = 0
         self.confirm_misses = 0
         self.confirm_bbox = None
         self.session_active = False
         self.session_resolved = False
         self.session_id = 0
+        self.first_api_direction = None
+        self.first_api_instruction = None
+        self.first_api_result_ts = 0.0
+        self.return_tracking_started = False
+        self.return_confirm_count = 0
+        self.return_confirm_bbox = None
+        self.return_decision_emitted = False
+        self.return_decision_instruction = None
+        self.return_decision_ts = 0.0
         self.latest_result = fixed_unknown_result("", "not_started")
         self.latest_response = {
             "active": False,
@@ -1557,6 +1576,156 @@ class AsyncTurnSignOcrApiProcessor:
             or ""
         )
 
+    def _reset_return_confirmation(self):
+        self.return_confirm_count = 0
+        self.return_confirm_bbox = None
+
+    def _retire_first_turnsign_session(self):
+        """Retire OCR session state without clearing the first API memory."""
+        if self.return_tracking_started:
+            return
+        self.return_tracking_started = True
+        self.min_result_request_id = max(
+            self.min_result_request_id, self.request_id + 1)
+        self.pending = False
+        self.pending_since_ts = 0.0
+        self.pending_request_id = 0
+        self.session_active = False
+        self.session_resolved = False
+        self._reset_confirmation()
+        self.bbox_mismatch_candidate = None
+        self.bbox_mismatch_count = 0
+        self.last_position_detection = None
+        self.tracking_misses = 0
+        self.turnsign_snapshot_crop = None
+        self.turnsign_snapshot_detection = None
+        self.turnsign_snapshot_ts = 0.0
+        self.session_last_turnsign_seen_ts = 0.0
+        self.session_ocr_started_ts = 0.0
+
+    def _return_pass_response(
+            self, det, status, control_phase, timestamp,
+            instruction=None, instruction_current=False,
+            candidate_status=None, shield_remaining=0.0):
+        instruction = dict(
+            instruction or self.return_decision_instruction
+            or self.first_api_instruction or self.latest_result)
+        response = {
+            "active": False,
+            "status": str(status),
+            "control_phase": str(control_phase),
+            "detection": det,
+            "instruction": instruction,
+            "latest_instruction": self.latest_result,
+            "instruction_current": bool(instruction_current),
+            "worker_ready": self.worker_ready,
+            "error": self.worker_error or None,
+            "clear_result": False,
+            "session_id": None,
+            "session_active": False,
+            # The first API route remains a resolved/latched decision while
+            # residual signs are shielded and the return pass is confirmed.
+            "turnsign_resolved": True,
+            "candidate_status": str(candidate_status or status),
+            "current_detection_fresh": det is not None,
+            "first_api_direction": self.first_api_direction,
+            "first_api_result_valid": True,
+            "route_lock_lifetime_s": self.route_lock_lifetime_s,
+            "route_shield_remaining_s": max(
+                0.0, float(shield_remaining)),
+            "return_confirm_count": self.return_confirm_count,
+            "return_confirm_frames": self.return_confirm_frames,
+            "return_decision_emitted": self.return_decision_emitted,
+            "api_bypassed": bool(self.return_decision_emitted),
+        }
+        self.latest_response = dict(response)
+        self.latest_response_ts = float(timestamp)
+        return response
+
+    def _process_return_pass(self, det, candidate_status, timestamp):
+        """Ignore the first sign, then resolve the return pass oppositely."""
+        self._retire_first_turnsign_session()
+
+        if self.return_decision_emitted:
+            self._reset_return_confirmation()
+            return self._return_pass_response(
+                det,
+                "return_route_held",
+                "turnsign_consumed",
+                timestamp,
+                instruction=self.return_decision_instruction,
+                candidate_status=candidate_status,
+            )
+
+        elapsed = max(0.0, float(timestamp) - self.first_api_result_ts)
+        remaining = max(0.0, self.route_lock_lifetime_s - elapsed)
+        if remaining > 0.0:
+            # Do not allow residual detections of the first physical sign to
+            # contribute even one frame toward the return-pass confirmation.
+            self._reset_return_confirmation()
+            return self._return_pass_response(
+                det,
+                "first_route_turnsign_shielded",
+                "turnsign_first_route_shielded",
+                timestamp,
+                candidate_status=candidate_status,
+                shield_remaining=remaining,
+            )
+
+        if det is None:
+            self._reset_return_confirmation()
+            return self._return_pass_response(
+                None,
+                "return_route_armed",
+                "turnsign_return_armed",
+                timestamp,
+                candidate_status=candidate_status,
+            )
+
+        bbox = (det or {}).get("bbox")
+        overlap = self._bbox_iou(self.return_confirm_bbox, bbox)
+        if self.return_confirm_bbox is None or overlap >= self.confirm_iou:
+            self.return_confirm_count += 1
+        else:
+            self.return_confirm_count = 1
+        self.return_confirm_bbox = (
+            list(bbox) if bbox is not None else None)
+
+        if self.return_confirm_count < self.return_confirm_frames:
+            return self._return_pass_response(
+                det,
+                "return_turnsign_confirming",
+                "turnsign_return_confirming",
+                timestamp,
+                candidate_status=candidate_status,
+            )
+
+        opposite = (
+            "right" if self.first_api_direction == "left" else "left")
+        source_text = str(
+            (self.first_api_instruction or {}).get("source_text") or "")
+        instruction = normalize_instruction(
+            {"direction": opposite}, source_text=source_text)
+        instruction.update({
+            "reason": "return_pass_opposite_of_first_api",
+            "derived_from_first_api": True,
+            "first_api_direction": self.first_api_direction,
+        })
+        self.latest_result = dict(instruction)
+        self.return_decision_emitted = True
+        self.return_decision_instruction = dict(instruction)
+        self.return_decision_ts = float(timestamp)
+        self._reset_return_confirmation()
+        return self._return_pass_response(
+            det,
+            "return_route_opposite_ready",
+            "turnsign_consumed",
+            timestamp,
+            instruction=instruction,
+            instruction_current=True,
+            candidate_status=candidate_status,
+        )
+
     @staticmethod
     def _bbox_iou(first, second):
         try:
@@ -1642,6 +1811,7 @@ class AsyncTurnSignOcrApiProcessor:
     def _door_conflict_response(self, timestamp):
         """Reject a nearby high-confidence Door/TurnSign duplicate."""
         self._invalidate_stable_result()
+        self._reset_return_confirmation()
         self.last_turnsign_seen_ts = 0.0
         self.last_turnsign_bbox = None
         self.last_position_detection = None
@@ -1732,7 +1902,9 @@ class AsyncTurnSignOcrApiProcessor:
     def close(self):
         self._stop_worker(terminate=True, graceful_timeout=10.0)
 
-    def _drain_results(self):
+    def _drain_results(self, timestamp=None):
+        result_ts = float(
+            timestamp if timestamp is not None else now_seconds())
         result_received = False
         while True:
             try:
@@ -1786,12 +1958,25 @@ class AsyncTurnSignOcrApiProcessor:
                     self.latest_result = dict(instruction)
                     if self._response_direction(response) in {"left", "right"}:
                         self.last_valid_response = dict(response)
-                        self.last_valid_response_ts = now_seconds()
+                        self.last_valid_response_ts = result_ts
                         self.session_resolved = True
+                        # A detection, OCR text or API attempt is not enough to
+                        # establish lap one.  Latch only the first valid
+                        # left/right result returned by the worker/API path.
+                        if self.first_api_direction not in {"left", "right"}:
+                            self.first_api_direction = self._response_direction(
+                                response)
+                            self.first_api_instruction = dict(instruction)
+                            self.first_api_result_ts = result_ts
+                            self.return_tracking_started = False
+                            self.return_decision_emitted = False
+                            self.return_decision_instruction = None
+                            self.return_decision_ts = 0.0
+                            self._reset_return_confirmation()
                 else:
                     response.setdefault("latest_instruction", self.latest_result)
                 self.latest_response = response
-                self.latest_response_ts = now_seconds()
+                self.latest_response_ts = result_ts
                 self.pending = False
                 self.pending_since_ts = 0.0
                 self.pending_request_id = 0
@@ -1808,9 +1993,14 @@ class AsyncTurnSignOcrApiProcessor:
             return self._door_conflict_response(ts)
         clear_result = bool(self.clear_result_pending)
         self.clear_result_pending = False
-        result_received = self._drain_results()
+        result_received = self._drain_results(timestamp=ts)
         det, candidate_status = self._select_turnsign_with_status(
             detections, frame)
+        if (
+            self.first_api_direction in {"left", "right"}
+            and not result_received
+        ):
+            return self._process_return_pass(det, candidate_status, ts)
         fresh_turnsign_detected = det is not None
         continuation = False
         if (

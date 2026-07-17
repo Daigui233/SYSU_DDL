@@ -740,6 +740,10 @@ def create_ocr_processor():
                 "AR_TURNSIGN_SESSION_ABSENCE_TIMEOUT_S", 3.0),
             ocr_response_timeout_s=env_float(
                 "AR_TURNSIGN_RESPONSE_TIMEOUT_S", 10.0),
+            route_lock_lifetime_s=env_float(
+                "VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0),
+            return_confirm_frames=max(
+                1, int(env_float("AR_TURNSIGN_RETURN_CONFIRM_FRAMES", 3))),
             min_ocr_confidence=env_float("AR_TURNSIGN_MIN_OCR_CONFIDENCE", 0.40),
             stable_frames=max(1, int(env_float("AR_TURNSIGN_STABLE_FRAMES", 2))),
             stable_duration_s=env_float("AR_TURNSIGN_STABLE_DURATION_S", 0.50),
@@ -755,7 +759,8 @@ def create_ocr_processor():
             "[OCR] TurnSign OCR/API enabled "
             "(1 complete box; det/OCR confidence>=0.40; "
             "snapshot area>=2% in center 80%; "
-            "exit after 3s no TurnSign or 10s no OCR response)")
+            "exit after 3s no TurnSign or 10s no OCR response; "
+            "return pass uses opposite first API route after lock expiry)")
         return processor
     except Exception as exc:
         print(f"[OCR] unavailable: {exc}")
@@ -843,6 +848,9 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
         "turnsign_missing_stop": "MISS_STOP",
         "turnsign_ocr_wait": "STOP_WAIT_OCR",
         "turnsign_consumed": "RESULT_LATCHED",
+        "turnsign_first_route_shielded": "FIRST_ROUTE_SHIELD",
+        "turnsign_return_armed": "RETURN_ROUTE_ARMED",
+        "turnsign_return_confirming": "RETURN_ROUTE_CONFIRM",
         "turnsign_exit_no_sign": "EXIT_NO_SIGN_3S",
         "turnsign_exit_ocr_timeout": "EXIT_TIMEOUT_10S",
         "ocr_wait_route": "WAIT_ROUTE",
@@ -850,10 +858,16 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     }
     status = phase_labels.get(
         phase, str(ocr_response.get("status") or "-"))
-    if phase == "turnsign_confirming":
+    if phase in {"turnsign_confirming", "turnsign_return_confirming"}:
+        count_key = (
+            "return_confirm_count"
+            if phase == "turnsign_return_confirming" else "confirm_count")
+        frames_key = (
+            "return_confirm_frames"
+            if phase == "turnsign_return_confirming" else "confirm_frames")
         status = (
-            f"{status} {int(ocr_response.get('confirm_count') or 0)}/"
-            f"{int(ocr_response.get('confirm_frames') or 1)}")
+            f"{status} {int(ocr_response.get(count_key) or 0)}/"
+            f"{int(ocr_response.get(frames_key) or 1)}")
     instruction = ocr_response.get("instruction") or {}
     latest_instruction = ocr_response.get("latest_instruction") or {}
     choice = instruction_direction(instruction) or instruction_direction(latest_instruction) or "-"
