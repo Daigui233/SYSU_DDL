@@ -65,28 +65,6 @@ ROAD_MIN_COMPONENT_AREA_RATIO = max(
 ROAD_MAX_COMPONENTS = max(1, _env_int("MULTITASK_ROAD_MAX_COMPONENTS", 3))
 ROAD_OVERLAY_ALPHA = float(np.clip(
     _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28), 0.0, 1.0))
-RENDER_DET_THRESHOLD = float(np.clip(
-    _env_float("MULTITASK_RENDER_DET_THRESHOLD", 0.45), 0.0, 1.0))
-CONTROL_HUMAN_SCORE_THRESHOLD = float(np.clip(
-    _env_float("VISION_CONTROL_HUMAN_MIN_SCORE", 0.35), 0.0, 1.0))
-CONTROL_CAR_SCORE_THRESHOLD = float(np.clip(
-    _env_float("VISION_CONTROL_CAR_MIN_SCORE", 0.35), 0.0, 1.0))
-CONTROL_COIN_SCORE_THRESHOLD = float(np.clip(
-    _env_float("VISION_CONTROL_COIN_MIN_SCORE", 0.35), 0.0, 1.0))
-CONTROL_TURNSIGN_SCORE_THRESHOLD = float(np.clip(
-    _env_float("VISION_CONTROL_SIGN_SLOW_MIN_SCORE", 0.20), 0.0, 1.0))
-RENDER_MAX_DETECTIONS = max(
-    0, _env_int("MULTITASK_RENDER_MAX_DETECTIONS", 6))
-RENDER_MAX_PER_CLASS = max(
-    0, _env_int("MULTITASK_RENDER_MAX_PER_CLASS", 2))
-RENDER_FULL_MAX_DETECTIONS = max(
-    0, _env_int("MULTITASK_RENDER_FULL_MAX_DETECTIONS", 20))
-RENDER_MAX_BOX_WIDTH_RATIO = float(np.clip(
-    _env_float("MULTITASK_RENDER_MAX_BOX_WIDTH_RATIO", 0.70), 0.0, 1.0))
-RENDER_MAX_BOX_HEIGHT_RATIO = float(np.clip(
-    _env_float("MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO", 0.70), 0.0, 1.0))
-RENDER_MAX_BOX_AREA_RATIO = float(np.clip(
-    _env_float("MULTITASK_RENDER_MAX_BOX_AREA_RATIO", 0.30), 0.0, 1.0))
 RENDER_PATH_MIN_SCORE = float(np.clip(
     _env_float("MULTITASK_RENDER_PATH_MIN_SCORE", 0.35), 0.0, 1.0))
 RENDER_PATH_MIN_COUNT_CONFIDENCE = float(np.clip(
@@ -104,18 +82,6 @@ PATH_COLORS = {
     "left": (255, 0, 0),
     "right": (0, 255, 0),
 }
-
-DETECTION_COLORS = {
-    "Door": (80, 200, 255),
-    "TurnSign": (0, 255, 120),
-    "BeginSign": (0, 220, 255),
-    "EndSign": (0, 150, 255),
-    "Coin": (0, 220, 255),
-    "Human": (60, 60, 255),
-    "Car": (255, 160, 60),
-    "SpeedSign": (255, 80, 220),
-}
-
 
 def _load_classes():
     names_path = Path(__file__).resolve().parent / "model" / "coco.names"
@@ -553,72 +519,12 @@ def _overlay_binary_mask(image, mask, color, alpha):
     cv2.copyTo(tinted, resized, image)
 
 
-def _render_detection_threshold(label, mode):
-    normalized = str(label or "").strip().lower().replace(
-        "_", "").replace("-", "").replace(" ", "")
-    if normalized in {"door", "beginsign", "endsign"}:
-        return None
-    controlled_thresholds = {
-        "turnsign": max(
-            DET_TURNSIGN_SCORE_THRESHOLD,
-            CONTROL_TURNSIGN_SCORE_THRESHOLD),
-        "human": max(
-            DET_HUMAN_SCORE_THRESHOLD,
-            CONTROL_HUMAN_SCORE_THRESHOLD),
-        "car": max(
-            DET_CAR_SCORE_THRESHOLD,
-            CONTROL_CAR_SCORE_THRESHOLD),
-        "coin": max(
-            DET_SCORE_THRESHOLD,
-            CONTROL_COIN_SCORE_THRESHOLD),
-    }
-    if normalized in controlled_thresholds:
-        return float(controlled_thresholds[normalized])
-    return float(
-        DET_SCORE_THRESHOLD if mode == "full" else RENDER_DET_THRESHOLD)
-
-
 def _select_detections_for_render(detections, mode):
-    total_limit = (
-        RENDER_FULL_MAX_DETECTIONS if mode == "full"
-        else RENDER_MAX_DETECTIONS)
-    if total_limit <= 0:
-        return []
-    per_class_limit = (
-        total_limit if mode == "full" else RENDER_MAX_PER_CLASS)
-    counts = {}
-    selected = []
-    for detection in sorted(
-            detections or [], key=lambda item: item.get("score", 0.0),
-            reverse=True):
-        label = str(detection.get("label") or "")
-        threshold = _render_detection_threshold(label, mode)
-        if threshold is None:
-            continue
-        if float(detection.get("score", 0.0)) < threshold:
-            continue
-        if counts.get(label, 0) >= per_class_limit:
-            continue
-        selected.append(detection)
-        counts[label] = counts.get(label, 0) + 1
-        if len(selected) >= total_limit:
-            break
-    return selected
-
-
-def _is_oversized_render_box(detection, image_shape):
-    """Hide frame-spanning preview boxes without changing perception data."""
-    height, width = image_shape[:2]
-    if width <= 0 or height <= 0:
-        return False
-    left, top, right, bottom = detection.get("bbox", (0, 0, 0, 0))
-    width_ratio = max(0.0, float(right) - float(left)) / float(width)
-    height_ratio = max(0.0, float(bottom) - float(top)) / float(height)
-    area_ratio = width_ratio * height_ratio
-    return (
-        width_ratio >= RENDER_MAX_BOX_WIDTH_RATIO or
-        height_ratio >= RENDER_MAX_BOX_HEIGHT_RATIO or
-        area_ratio >= RENDER_MAX_BOX_AREA_RATIO)
+    """Return every post-NMS detection, ordered for stable rendering."""
+    del mode
+    return sorted(
+        detections or [], key=lambda item: item.get("score", 0.0),
+        reverse=True)
 
 
 def _clip_render_bbox(image, bbox):
@@ -681,8 +587,6 @@ def render_result(image, result, mode=None):
     drawn_detections = _select_detections_for_render(
         result.get("detections"), mode)
     for detection in drawn_detections:
-        if _is_oversized_render_box(detection, image.shape):
-            continue
         _draw_detection_annotation(image, detection)
 
     display_paths = result.get("paths") or []

@@ -9,7 +9,6 @@ from .func import (
     DET_SCORE_THRESHOLD,
     DET_TURNSIGN_SCORE_THRESHOLD,
     RENDER_MODE,
-    _is_oversized_render_box,
     _select_detections_for_render,
     clean_road_mask,
     decode_outputs,
@@ -161,7 +160,7 @@ class MultiTaskPostprocessTest(unittest.TestCase):
             pre_nms_top_k=1000, max_detections=2)
         self.assertEqual([item[0] for item in results], [7, 0])
 
-    def test_drive_render_limits_detection_clutter(self):
+    def test_drive_render_keeps_every_post_nms_detection(self):
         detections = [{
             "label": "Coin", "score": 0.95 - index * 0.01,
             "bbox": [10 + index * 5, 10, 20 + index * 5, 20],
@@ -172,19 +171,20 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         })
         selected = _select_detections_for_render(detections, "drive")
         labels = [item["label"] for item in selected]
-        self.assertLessEqual(len(selected), 6)
-        self.assertEqual(labels.count("Coin"), 2)
+        self.assertEqual(len(selected), len(detections))
+        self.assertEqual(labels.count("Coin"), 8)
         self.assertEqual(labels.count("TurnSign"), 1)
 
-    def test_render_car_threshold_matches_effective_control_threshold(self):
+    def test_render_selection_does_not_apply_a_second_car_threshold(self):
         selected = _select_detections_for_render([
             {"label": "Car", "score": 0.39, "bbox": [0, 0, 20, 20]},
             {"label": "Car", "score": 0.40, "bbox": [30, 0, 50, 20]},
         ], "drive")
-        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(selected), 2)
         self.assertAlmostEqual(selected[0]["score"], 0.40)
+        self.assertAlmostEqual(selected[1]["score"], 0.39)
 
-    def test_render_hides_door_begin_and_end_signs(self):
+    def test_render_keeps_door_begin_and_end_signs(self):
         selected = _select_detections_for_render([
             {"label": "Door", "score": 0.99, "bbox": [0, 0, 20, 20]},
             {"label": "BeginSign", "score": 0.99,
@@ -194,7 +194,9 @@ class MultiTaskPostprocessTest(unittest.TestCase):
             {"label": "Car", "score": 0.90,
              "bbox": [90, 0, 110, 20]},
         ], "drive")
-        self.assertEqual([item["label"] for item in selected], ["Car"])
+        self.assertEqual(
+            [item["label"] for item in selected],
+            ["Door", "BeginSign", "EndSign", "Car"])
 
     def test_drive_render_draws_complete_thick_box_and_label(self):
         image = np.zeros((120, 180, 3), dtype=np.uint8)
@@ -226,11 +228,12 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         }
         self.assertGreater(int(render_result(image, result).sum()), 0)
 
-    def test_frame_spanning_detection_box_is_hidden(self):
-        self.assertTrue(_is_oversized_render_box(
-            {"bbox": [5, 40, 635, 180]}, (480, 640, 3)))
-        self.assertFalse(_is_oversized_render_box(
-            {"bbox": [100, 100, 220, 240]}, (480, 640, 3)))
+    def test_frame_spanning_detection_box_is_kept(self):
+        selected = _select_detections_for_render([
+            {"label": "Car", "score": 0.90,
+             "bbox": [5, 40, 635, 180]},
+        ], "drive")
+        self.assertEqual(len(selected), 1)
 
     def test_default_render_mode_is_drive(self):
         self.assertEqual(RENDER_MODE, "drive")
