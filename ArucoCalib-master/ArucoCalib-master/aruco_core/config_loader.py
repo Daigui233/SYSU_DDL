@@ -114,6 +114,49 @@ class Config:
             int(rectification.get("max_dimension", 1600)),
         )
 
+        exposure_compensation = config_data.get(
+            "vehicle_exposure_compensation", {}) or {}
+        self.VEHICLE_EXPOSURE_COMPENSATION_ENABLED = bool(
+            exposure_compensation.get("enabled", True))
+        self.VEHICLE_EXPOSURE_CLAHE_CLIP_LIMIT = max(
+            0.1,
+            float(exposure_compensation.get("clahe_clip_limit", 3.0)),
+        )
+        self.VEHICLE_EXPOSURE_CLAHE_TILE_GRID_SIZE = max(
+            2,
+            int(exposure_compensation.get("clahe_tile_grid_size", 8)),
+        )
+        self.VEHICLE_EXPOSURE_BRIGHT_MEAN_THRESHOLD = max(
+            0.0,
+            min(255.0, float(exposure_compensation.get(
+                "bright_mean_threshold", 180.0))),
+        )
+        self.VEHICLE_EXPOSURE_DARK_MEAN_THRESHOLD = max(
+            0.0,
+            min(255.0, float(exposure_compensation.get(
+                "dark_mean_threshold", 75.0))),
+        )
+        self.VEHICLE_EXPOSURE_BRIGHT_GAMMA = max(
+            1.0,
+            float(exposure_compensation.get("bright_gamma", 2.2)),
+        )
+        self.VEHICLE_EXPOSURE_DARK_GAMMA = min(
+            1.0,
+            max(0.1, float(exposure_compensation.get("dark_gamma", 0.65))),
+        )
+        self.VEHICLE_EXPOSURE_TRACKING_ROI_SIZE = max(
+            96,
+            int(exposure_compensation.get("tracking_roi_size", 420)),
+        )
+        self.VEHICLE_EXPOSURE_FULL_FRAME_AFTER_MISSES = max(
+            0,
+            int(exposure_compensation.get("full_frame_after_misses", 3)),
+        )
+        self.VEHICLE_EXPOSURE_FULL_FRAME_INTERVAL = max(
+            1,
+            int(exposure_compensation.get("full_frame_interval", 4)),
+        )
+
     @staticmethod
     def _resolve_config_path(config_file: str) -> Path:
         """

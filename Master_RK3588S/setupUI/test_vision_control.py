@@ -932,6 +932,88 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(
             debug["control_target"]["task_reason"], "human_cross_pass")
 
+    def test_human_only_waits_for_left_to_right_and_keeps_left_pass(self):
+        planner = VisionControlPlanner(config=_config())
+        selected = {
+            "points_xy": np.asarray(
+                [[320.0, 60.0], [320.0, 460.0]], dtype=np.float32),
+        }
+        left = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [250.0, 330.0, 310.0, 450.0],
+        }]
+        right = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [360.0, 330.0, 420.0, 450.0],
+        }]
+
+        stop_right = planner._human_action(
+            right, selected, (480, 640, 3), 300.0, 320.0, 1.0)
+        wait_after_right_to_left = planner._human_action(
+            left, selected, (480, 640, 3), 300.0, 320.0, 1.1)
+        pass_after_left_to_right = planner._human_action(
+            right, selected, (480, 640, 3), 300.0, 320.0, 1.2)
+        pass_after_human_returns = planner._human_action(
+            left, selected, (480, 640, 3), 300.0, 320.0, 1.3)
+
+        self.assertEqual(stop_right[0], STATE_SAFE_STOP)
+        self.assertEqual(wait_after_right_to_left[0], STATE_SAFE_STOP)
+        self.assertEqual(pass_after_left_to_right[0], STATE_AVOID_HUMAN)
+        self.assertEqual(pass_after_left_to_right[2], "human_cross_pass")
+        self.assertLess(pass_after_left_to_right[3], 320.0)
+        self.assertEqual(pass_after_human_returns[0], STATE_AVOID_HUMAN)
+        self.assertAlmostEqual(
+            pass_after_human_returns[3], pass_after_left_to_right[3])
+
+    def test_human_left_offset_stays_default_while_inside_road_mask(self):
+        planner = VisionControlPlanner(config=_config())
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        mask_row = int(round(300.0 * 119.0 / 479.0))
+        mask[mask_row, 65:91] = 1
+
+        constraint = planner._road_mask_target_constraint(
+            {"road": {"mask": mask}}, (480, 640, 3),
+            300.0, 320.0, 282.0)
+
+        self.assertTrue(constraint["available"])
+        self.assertFalse(constraint["applied"])
+        self.assertEqual(constraint["constrained_x"], 282.0)
+        self.assertEqual(constraint["mask_row"], mask_row)
+
+    def test_human_left_offset_and_final_steering_stop_at_mask_edge(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.road_shape_state = "curve"
+        planner._road_shape_consensus_geometry = lambda *_args: {
+            "valid": True,
+            "reason": "curve_consensus",
+            "heading_delta_640": 0.0,
+            # This feedforward points farther left than the mask edge. The
+            # final command must still remain on the nearest valid mask point.
+            "curvature_640": -10.0,
+            "sample_rows_y": (300.0, 336.0, 372.0),
+            "support_y": (60.0, 460.0),
+        }
+        planner._task_from_detections = lambda *_args, **_kwargs: (
+            STATE_AVOID_HUMAN, 0.30, "human_cross_pass", 282.0)
+        selected = _raw_path(0, 320.0)
+        mask = np.zeros((120, 160), dtype=np.uint8)
+        mask[:, 75:91] = 1
+
+        command, target = planner._build_command(
+            selected, "test", {
+                "detections": [],
+                "road": {"mask": mask},
+            }, (480, 640, 3), now=1.0)
+
+        self.assertEqual(command["state_cmd"], STATE_AVOID_HUMAN)
+        self.assertTrue(target["human_mask_constraint_available"])
+        self.assertTrue(target["human_mask_constraint_applied"])
+        self.assertEqual(target["human_mask_requested_target_x"], 282.0)
+        self.assertAlmostEqual(
+            target["base_target_x"], target["human_mask_left_x"])
+        self.assertAlmostEqual(
+            target["target_x"], target["human_mask_left_x"])
+
     def test_human_pass_returns_to_path_without_target_jump(self):
         planner = VisionControlPlanner(config=_config())
         left = [{

@@ -22,12 +22,72 @@ class ArUcoDetector:
             self.aruco_dict.maxCorrectionBits = int(max_correction_bits)
         self.aruco_params = cv2.aruco.DetectorParameters()
         self._apply_detector_params_overrides(getattr(cfg, "ARUCO_PARAMS", {}) or {})
+        self.exposure_compensation_enabled = bool(getattr(
+            cfg, "VEHICLE_EXPOSURE_COMPENSATION_ENABLED", True))
+        clahe_grid = int(getattr(
+            cfg, "VEHICLE_EXPOSURE_CLAHE_TILE_GRID_SIZE", 8))
+        self.exposure_clahe = cv2.createCLAHE(
+            clipLimit=float(getattr(
+                cfg, "VEHICLE_EXPOSURE_CLAHE_CLIP_LIMIT", 3.0)),
+            tileGridSize=(clahe_grid, clahe_grid),
+        )
+        self.exposure_bright_mean_threshold = float(getattr(
+            cfg, "VEHICLE_EXPOSURE_BRIGHT_MEAN_THRESHOLD", 180.0))
+        self.exposure_dark_mean_threshold = float(getattr(
+            cfg, "VEHICLE_EXPOSURE_DARK_MEAN_THRESHOLD", 75.0))
+        self.exposure_bright_lut = self._gamma_lut(float(getattr(
+            cfg, "VEHICLE_EXPOSURE_BRIGHT_GAMMA", 2.2)))
+        self.exposure_dark_lut = self._gamma_lut(float(getattr(
+            cfg, "VEHICLE_EXPOSURE_DARK_GAMMA", 0.65)))
         # Try to use ArucoDetector (OpenCV 4.7+), fallback to old API
         try:
             self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
             self.use_new_api = True
         except AttributeError:
             self.use_new_api = False
+
+    @staticmethod
+    def _gamma_lut(gamma):
+        gamma = max(0.1, float(gamma))
+        values = np.arange(256, dtype=np.float32) / 255.0
+        return np.clip(
+            np.power(values, gamma) * 255.0 + 0.5,
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+
+    @staticmethod
+    def _as_gray(image):
+        if len(image.shape) == 3:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return np.asarray(image, dtype=np.uint8)
+
+    def _detect_gray(self, gray):
+        if self.use_new_api:
+            return self.detector.detectMarkers(gray)
+        return cv2.aruco.detectMarkers(
+            gray, self.aruco_dict, parameters=self.aruco_params)
+
+    def exposure_compensated_gray(self, image):
+        """Normalize a missed vehicle ROI without altering the display frame."""
+        gray = self._as_gray(image)
+        mean_value = float(np.mean(gray)) if gray.size else 0.0
+        if mean_value >= self.exposure_bright_mean_threshold:
+            # Gamma > 1 restores separation between washed-out black cells and
+            # the white paper.  Saturated white stays white.
+            gray = cv2.LUT(gray, self.exposure_bright_lut)
+        elif mean_value <= self.exposure_dark_mean_threshold:
+            gray = cv2.LUT(gray, self.exposure_dark_lut)
+        return self.exposure_clahe.apply(gray)
+
+    def detect_markers_exposure_compensated(self, image):
+        """Fallback marker pass for locally over/under-exposed vehicle tags."""
+        if self.exposure_compensation_enabled:
+            gray = self.exposure_compensated_gray(image)
+        else:
+            gray = self._as_gray(image)
+        corners, ids, _ = self._detect_gray(gray)
+        return corners, ids, image.copy()
 
     @staticmethod
     def _corner_refinement_method_from_cfg(v):
@@ -118,19 +178,8 @@ class ArUcoDetector:
                 - ids: Array of marker IDs
                 - image_with_markers: Image with detected markers drawn
         """
-        # Convert to grayscale if needed
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-        
-        # Detect markers
-        if self.use_new_api:
-            corners, ids, _ = self.detector.detectMarkers(gray)
-        else:
-            corners, ids, _ = cv2.aruco.detectMarkers(
-                gray, self.aruco_dict, parameters=self.aruco_params
-            )
+        gray = self._as_gray(image)
+        corners, ids, _ = self._detect_gray(gray)
         
         # Drawing is handled by the UI so locked fixed tags can stay stable
         # while the vehicle tag remains live.

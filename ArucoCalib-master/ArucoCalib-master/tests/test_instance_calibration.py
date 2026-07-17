@@ -35,6 +35,32 @@ class InstanceCalibrationTests(unittest.TestCase):
         self.assertEqual(detector.aruco_dict.maxCorrectionBits, 5)
         self.assertAlmostEqual(detector.aruco_params.errorCorrectionRate, 0.6)
 
+    def test_vehicle_exposure_compensation_defaults_are_enabled(self):
+        cfg = get_config()
+
+        self.assertTrue(cfg.VEHICLE_EXPOSURE_COMPENSATION_ENABLED)
+        self.assertAlmostEqual(3.0, cfg.VEHICLE_EXPOSURE_CLAHE_CLIP_LIMIT)
+        self.assertAlmostEqual(2.2, cfg.VEHICLE_EXPOSURE_BRIGHT_GAMMA)
+        self.assertEqual(420, cfg.VEHICLE_EXPOSURE_TRACKING_ROI_SIZE)
+        self.assertEqual(3, cfg.VEHICLE_EXPOSURE_FULL_FRAME_AFTER_MISSES)
+        self.assertEqual(4, cfg.VEHICLE_EXPOSURE_FULL_FRAME_INTERVAL)
+
+    def test_exposure_fallback_recovers_extremely_washed_out_id_zero(self):
+        detector = ArUcoDetector()
+        tag = cv2.aruco.generateImageMarker(detector.aruco_dict, 0, 120)
+        image = np.full((300, 300), 255, dtype=np.uint8)
+        image[90:210, 90:210] = tag
+        washed = np.where(image < 128, 242, 255).astype(np.uint8)
+        washed = cv2.GaussianBlur(washed, (3, 3), 0.8)
+
+        _raw_corners, raw_ids, _ = detector.detect_markers(washed)
+        _fixed_corners, fixed_ids, _ = (
+            detector.detect_markers_exposure_compensated(washed))
+
+        self.assertIsNone(raw_ids)
+        self.assertIsNotNone(fixed_ids)
+        self.assertIn(0, fixed_ids.flatten().tolist())
+
     def test_duplicate_ids_are_preserved_as_separate_instances(self):
         detector = ArUcoDetector.__new__(ArUcoDetector)
         items = [
@@ -151,6 +177,63 @@ class InstanceCalibrationTests(unittest.TestCase):
             any(np.linalg.norm(item["center"] - vehicle_center) < 3.0 for item in recovered)
         )
 
+    def test_rectified_vehicle_fallback_recovers_washed_out_moving_id_zero(self):
+        window = MainWindow.__new__(MainWindow)
+        window.cfg = get_config()
+        window.transformer = CoordinateTransformer()
+        window.detector = ArUcoDetector()
+        window.rectified_detection_geometry = None
+        window.vehicle_id = 0
+        window.vehicle_track_center_px = (900.0, 280.0)
+        window.vehicle_detection_misses = 0
+        window.last_detection_exposure_compensated = False
+        fixed = [
+            marker(4, (600, 120), 42),
+            marker(2, (1200, 120), 42),
+            marker(3, (250, 1050), 90),
+            marker(0, (1550, 1050), 90),
+        ]
+        self.assertTrue(window.transformer.calibrate(fixed))
+        self.assertTrue(window._prepare_rectified_detection())
+        window.locked_fixed_markers = [
+            {
+                **item,
+                "match_radius": MainWindow._fixed_marker_match_radius(
+                    item["corners"]),
+            }
+            for item in fixed
+        ]
+        image = np.full((1200, 1920, 3), 255, dtype=np.uint8)
+
+        for item in fixed:
+            side = int(round(np.linalg.norm(
+                item["corners"][1] - item["corners"][0])))
+            tag = cv2.aruco.generateImageMarker(
+                window.detector.aruco_dict, item["id"], side)
+            x = int(item["center"][0] - side // 2)
+            y = int(item["center"][1] - side // 2)
+            image[y:y + side, x:x + side] = cv2.cvtColor(
+                tag, cv2.COLOR_GRAY2BGR)
+
+        side = 24
+        washed_tag = cv2.aruco.generateImageMarker(
+            window.detector.aruco_dict, 0, side)
+        washed_tag = np.where(
+            washed_tag < 128, 242, 255).astype(np.uint8)
+        washed_tag = cv2.GaussianBlur(washed_tag, (3, 3), 0.8)
+        x = 900 - side // 2
+        y = 280 - side // 2
+        image[y:y + side, x:x + side] = cv2.cvtColor(
+            washed_tag, cv2.COLOR_GRAY2BGR)
+
+        instances = window._detect_rectified_marker_instances(image)
+        vehicle = window._select_vehicle_marker(instances)
+
+        self.assertTrue(window.last_detection_exposure_compensated)
+        self.assertIsNotNone(vehicle)
+        self.assertLess(float(np.linalg.norm(
+            vehicle["center"] - np.asarray((900.0, 280.0)))), 5.0)
+
     def test_locked_fixed_id_zero_is_not_selected_as_vehicle(self):
         window = MainWindow.__new__(MainWindow)
         window.vehicle_id = 0
@@ -167,6 +250,39 @@ class InstanceCalibrationTests(unittest.TestCase):
         self.assertIsNone(window._select_vehicle_marker([fixed_zero]))
         self.assertIs(window._select_vehicle_marker([fixed_zero, moving_zero]), moving_zero)
         self.assertIs(window._select_vehicle_marker([moving_zero]), moving_zero)
+
+    def test_exposure_fallback_deduplicates_fixed_id_zero(self):
+        fixed_primary = marker(0, (100, 100), 40)
+        fixed_fallback = marker(0, (101, 99), 41)
+        vehicle_fallback = marker(0, (300, 240), 35)
+
+        merged = MainWindow._merge_unique_marker_instances(
+            [fixed_primary], [fixed_fallback, vehicle_fallback])
+
+        self.assertEqual(2, len(merged))
+        self.assertIs(fixed_primary, merged[0])
+        self.assertIs(vehicle_fallback, merged[1])
+
+    def test_full_field_exposure_recovery_is_not_run_every_missed_frame(self):
+        window = MainWindow.__new__(MainWindow)
+        window.cfg = get_config()
+        window.vehicle_track_center_px = None
+        rectified = np.zeros((990, 1290, 3), dtype=np.uint8)
+        identity = np.eye(3, dtype=np.float64)
+
+        window.vehicle_detection_misses = 3
+        due_image, _ = window._vehicle_exposure_fallback_roi(
+            rectified, identity)
+        window.vehicle_detection_misses = 4
+        skipped_image, _ = window._vehicle_exposure_fallback_roi(
+            rectified, identity)
+        window.vehicle_detection_misses = 7
+        next_due_image, _ = window._vehicle_exposure_fallback_roi(
+            rectified, identity)
+
+        self.assertIs(rectified, due_image)
+        self.assertIsNone(skipped_image)
+        self.assertIs(rectified, next_due_image)
 
 
 if __name__ == "__main__":

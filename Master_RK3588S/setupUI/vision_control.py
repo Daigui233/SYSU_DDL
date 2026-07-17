@@ -1307,12 +1307,29 @@ class VisionControlPlanner:
                 "missing_target_x", task_reason, now, lookahead_y)
 
         path_target_x, path_target_y, path_target_adaptive = path_target
-        requested_target_x = _clamp(
+        unconstrained_requested_target_x = _clamp(
             float(target_override_x) if target_override_x is not None
             else float(path_target_x),
             0.0,
             float(max(0, image_shape[1] - 1)),
         )
+        constrain_human_target_to_road = bool(
+            target_override_x is not None
+            and (
+                int(task_state) == STATE_AVOID_HUMAN
+                or str(task_reason) == "human_path_return_guard"
+            )
+        )
+        human_mask_constraints = []
+        requested_target_x = float(unconstrained_requested_target_x)
+        if constrain_human_target_to_road:
+            task_mask_constraint = self._road_mask_target_constraint(
+                result, image_shape, path_target_y, path_target_x,
+                requested_target_x)
+            human_mask_constraints.append(task_mask_constraint)
+            if task_mask_constraint["available"]:
+                requested_target_x = float(
+                    task_mask_constraint["constrained_x"])
         width = float(max(1, image_shape[1]))
         requested_task_adjustment_640 = (
             (float(requested_target_x) - float(path_target_x))
@@ -1450,6 +1467,22 @@ class VisionControlPlanner:
                 -straight_error_limit_640,
                 straight_error_limit_640,
             )
+        if constrain_human_target_to_road:
+            raw_target_x = _clamp(
+                width * (
+                    self.config.visual_center_x
+                    + float(raw_error) / 640.0),
+                0.0,
+                float(max(0, image_shape[1] - 1)),
+            )
+            raw_mask_constraint = self._road_mask_target_constraint(
+                result, image_shape, path_target_y, path_target_x,
+                raw_target_x)
+            human_mask_constraints.append(raw_mask_constraint)
+            if raw_mask_constraint["available"]:
+                raw_error = (
+                    float(raw_mask_constraint["constrained_x"]) / width
+                    - self.config.visual_center_x) * 640.0
         applied_steering_feedforward = (
             float(raw_error) - float(path_raw_error))
         control_target_x = _clamp(
@@ -1475,6 +1508,24 @@ class VisionControlPlanner:
                     and road_shape_geometry["valid"]
                     and self.road_shape_state == "curve"),
             )
+        if constrain_human_target_to_road:
+            limited_target_x = _clamp(
+                width * (
+                    self.config.visual_center_x
+                    + float(error) / 640.0),
+                0.0,
+                float(max(0, image_shape[1] - 1)),
+            )
+            final_mask_constraint = self._road_mask_target_constraint(
+                result, image_shape, path_target_y, path_target_x,
+                limited_target_x)
+            human_mask_constraints.append(final_mask_constraint)
+            if final_mask_constraint["available"]:
+                error = (
+                    float(final_mask_constraint["constrained_x"]) / width
+                    - self.config.visual_center_x) * 640.0
+                control_target_x = float(
+                    final_mask_constraint["constrained_x"])
         self.last_error = error
         if not path_target_held:
             self.last_valid_ts = now
@@ -1500,6 +1551,26 @@ class VisionControlPlanner:
                 image_shape, path_target_y),
             "task_offset_x": float(task_offset_x),
             "task_target_applied": target_override_x is not None,
+            "human_mask_constraint_available": any(
+                item["available"] for item in human_mask_constraints),
+            "human_mask_constraint_applied": any(
+                item["applied"] for item in human_mask_constraints),
+            "human_mask_requested_target_x": float(
+                unconstrained_requested_target_x),
+            "human_mask_constrained_target_x": float(requested_target_x),
+            "human_mask_final_target_x": float(control_target_x),
+            "human_mask_left_x": next((
+                float(item["left_x"])
+                for item in reversed(human_mask_constraints)
+                if item["available"]), None),
+            "human_mask_right_x": next((
+                float(item["right_x"])
+                for item in reversed(human_mask_constraints)
+                if item["available"]), None),
+            "human_mask_row": next((
+                int(item["mask_row"])
+                for item in reversed(human_mask_constraints)
+                if item["available"]), None),
             "requested_task_adjustment_640": float(
                 requested_task_adjustment_640),
             "applied_task_adjustment_640": float(
@@ -1755,6 +1826,102 @@ class VisionControlPlanner:
                 ),
             )
         return None
+
+    @staticmethod
+    def _road_mask_target_constraint(
+            result, image_shape, target_y, reference_x, requested_x):
+        """Keep a task target in the same-row road run as its base path."""
+        unavailable = {
+            "available": False,
+            "applied": False,
+            "constrained_x": float(requested_x),
+            "left_x": None,
+            "right_x": None,
+            "mask_row": None,
+        }
+        road_value = (result.get("road") or {}).get("mask")
+        if road_value is None:
+            road_value = result.get("road_mask")
+        road_mask = np.asarray(
+            road_value) if road_value is not None else np.empty((0, 0))
+        if (
+            road_mask.ndim != 2
+            or not road_mask.size
+            or not np.any(road_mask)
+        ):
+            return unavailable
+
+        image_height, image_width = image_shape[:2]
+        mask_height, mask_width = road_mask.shape
+        mask_row = int(np.clip(
+            round(
+                float(target_y) * float(max(1, mask_height - 1))
+                / float(max(1, image_height - 1))),
+            0,
+            mask_height - 1,
+        ))
+        occupied = np.asarray(road_mask[mask_row]) != 0
+        padded = np.pad(occupied.astype(np.int8), (1, 1))
+        transitions = np.diff(padded)
+        starts = np.flatnonzero(transitions == 1)
+        ends = np.flatnonzero(transitions == -1) - 1
+        runs = [
+            (int(start), int(end))
+            for start, end in zip(starts, ends)
+        ]
+        if not runs:
+            return unavailable
+
+        reference_mask_x = (
+            float(reference_x) * float(max(1, mask_width - 1))
+            / float(max(1, image_width - 1)))
+
+        def run_distance(run):
+            start, end = run
+            if start <= reference_mask_x <= end:
+                return 0.0
+            return min(
+                abs(reference_mask_x - float(start)),
+                abs(reference_mask_x - float(end)),
+            )
+
+        run = min(
+            runs,
+            key=lambda item: (
+                run_distance(item),
+                abs(0.5 * (item[0] + item[1]) - reference_mask_x),
+                -(item[1] - item[0]),
+            ),
+        )
+        requested_mask_x = int(np.clip(
+            round(
+                float(requested_x) * float(max(1, mask_width - 1))
+                / float(max(1, image_width - 1))),
+            0,
+            mask_width - 1,
+        ))
+        if run[0] <= requested_mask_x <= run[1]:
+            constrained_x = float(requested_x)
+            applied = False
+        else:
+            nearest_mask_x = (
+                run[0] if requested_mask_x < run[0] else run[1])
+            constrained_x = (
+                float(nearest_mask_x)
+                * float(max(1, image_width - 1))
+                / float(max(1, mask_width - 1)))
+            applied = True
+        image_scale = (
+            float(max(1, image_width - 1))
+            / float(max(1, mask_width - 1)))
+        return {
+            "available": True,
+            "applied": bool(applied),
+            "constrained_x": float(constrained_x),
+            "left_x": float(run[0]) * image_scale,
+            "right_x": float(run[1]) * image_scale,
+            "mask_row": int(mask_row),
+        }
 
     def _stable_curve_path_geometry(
             self, candidates, selected, lookahead_y, image_shape):
@@ -3069,23 +3236,24 @@ class VisionControlPlanner:
             ),
         )
         geom = human["geom"]
-        side = human["side"] or self.human_last_side or 1
 
         if self.human_pass_active:
-            return self._human_pass_command(lookahead_path_x, image_shape, side)
+            # A pedestrian-only pass always stays on the left.  Car-plus-human
+            # sequences are handled earlier and keep the side chosen for the
+            # car, so they never reach this branch.
+            return self._human_pass_command(lookahead_path_x, image_shape, 1)
 
-        crossed = (
+        crossed_left_to_right = (
             self.human_waiting_cross
-            and human["side"] != 0
-            and self.human_last_side is not None
-            and human["side"] != self.human_last_side
+            and self.human_last_side == -1
+            and human["side"] == 1
         )
-        if crossed:
+        if crossed_left_to_right:
             self.human_waiting_cross = False
             self.human_pass_active = True
             self.human_detected_latched = False
             self.human_last_seen_ts = 0.0
-            return self._human_pass_command(lookahead_path_x, image_shape, side)
+            return self._human_pass_command(lookahead_path_x, image_shape, 1)
 
         if self._human_on_stop_line(geom, image_shape, lookahead_y):
             self._clear_human_preline_state()

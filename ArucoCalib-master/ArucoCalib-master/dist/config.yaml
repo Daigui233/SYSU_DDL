@@ -27,7 +27,7 @@ min_marker_count: 4
 ui:
   trace_window_ms: 500
 camera:
-  index: 0
+  index: 1
   backend: DSHOW
   width: 1920
   height: 1200
@@ -44,7 +44,7 @@ camera:
   sharpness: 0
 udp:
   enabled: true
-  target_ip: 192.168.43.196
+  target_ip: 10.188.74.220
   target_port: 9005
 gamepad_control:
   target_port: 9010
@@ -64,6 +64,17 @@ pose_filter:
   reset_gap_s: 0.35
 vehicle_detection_rectification:
   enabled: true
-  scale_px_per_mm: 0.30
+  scale_px_per_mm: 0.3
   margin_mm: 150.0
   max_dimension: 1600
+vehicle_exposure_compensation:
+  enabled: true
+  clahe_clip_limit: 3.0
+  clahe_tile_grid_size: 8
+  bright_mean_threshold: 180.0
+  dark_mean_threshold: 75.0
+  bright_gamma: 2.2
+  dark_gamma: 0.65
+  tracking_roi_size: 420
+  full_frame_after_misses: 3
+  full_frame_interval: 4

@@ -103,3 +103,17 @@ vehicle_detection_rectification:
   margin_mm: 150.0
   max_dimension: 1600
 
+# Run only when the normal rectified pass cannot select the moving vehicle ID.
+# This keeps normal frames fast while recovering washed-out/dark vehicle tags.
+vehicle_exposure_compensation:
+  enabled: true
+  clahe_clip_limit: 3.0
+  clahe_tile_grid_size: 8
+  bright_mean_threshold: 180.0
+  dark_mean_threshold: 75.0
+  bright_gamma: 2.2
+  dark_gamma: 0.65
+  tracking_roi_size: 420
+  full_frame_after_misses: 3
+  full_frame_interval: 4
+

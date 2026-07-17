@@ -277,7 +277,9 @@ class ImageLabel(QLabel):
 
     def set_image(self, image):
         """Set the image to display"""
-        self.original_image = image.copy()
+        # The caller owns a complete frame until the next set_image call.
+        # Avoid copying 6.9 MB at 60 FPS just to hand it to QImage.
+        self.original_image = image
         self._update_display()
 
     def _update_display(self):
@@ -285,31 +287,45 @@ class ImageLabel(QLabel):
         if self.original_image is None:
             return
 
-        # Convert BGR to RGB
-        rgb_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
+        source_h, source_w = self.original_image.shape[:2]
+        label_w = max(1, int(self.width()))
+        label_h = max(1, int(self.height()))
+        scale = min(label_w / float(source_w), label_h / float(source_h))
+        target_w = max(1, int(round(source_w * scale)))
+        target_h = max(1, int(round(source_h * scale)))
+        if target_w != source_w or target_h != source_h:
+            display_image = cv2.resize(
+                self.original_image,
+                (target_w, target_h),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        else:
+            display_image = self.original_image
+        h, w, ch = display_image.shape
         bytes_per_line = ch * w
 
-        # Create QImage
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        # Qt 5.14+ accepts OpenCV's BGR memory directly. Keep the RGB fallback
+        # for older runtimes, but avoid a full-frame color conversion normally.
+        bgr_format = getattr(QImage, "Format_BGR888", None)
+        if bgr_format is not None:
+            qt_image = QImage(
+                display_image.data, w, h, bytes_per_line, bgr_format)
+        else:
+            display_image = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
+            qt_image = QImage(
+                display_image.data, w, h, bytes_per_line,
+                QImage.Format_RGB888)
 
-        # Scale to fit label while maintaining aspect ratio
         pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(
-            self.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
-
-        self.setPixmap(scaled_pixmap)
+        self.setPixmap(pixmap)
 
         # Calculate scale factor and offset
-        pixmap_rect = scaled_pixmap.rect()
+        pixmap_rect = pixmap.rect()
         label_rect = self.rect()
 
         # Calculate scale factor (ratio between scaled and original)
-        self.scale_factor_x = scaled_pixmap.width() / w
-        self.scale_factor_y = scaled_pixmap.height() / h
+        self.scale_factor_x = pixmap.width() / source_w
+        self.scale_factor_y = pixmap.height() / source_h
 
         self.offset_x = (label_rect.width() - pixmap_rect.width()) // 2
         self.offset_y = (label_rect.height() - pixmap_rect.height()) // 2
@@ -415,6 +431,14 @@ class MainWindow(QMainWindow):
         self.locked_fixed_markers = []  # [{id, center, corners, match_radius}, ...]
         self.rectified_detection_geometry = None  # (image->rectified, rectified->image, size)
         self.last_detection_rectified = False
+        self.last_detection_exposure_compensated = False
+        self.vehicle_detection_misses = 0
+        self.actual_frame_fps = 0.0
+        self.vehicle_pose_fps = 0.0
+        self.last_frame_started_ts = 0.0
+        self.last_vehicle_pose_event_ts = 0.0
+        self.frame_total_ms = 0.0
+        self.detection_ms = 0.0
         self.last_udp_ok = False
         self.pose_seq = 0
         self.pose_history = []
@@ -447,6 +471,22 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _clamp_float(value: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, float(value)))
+
+    @staticmethod
+    def _ema_value(current, sample, alpha):
+        current = float(current or 0.0)
+        sample = float(sample)
+        alpha = max(0.0, min(1.0, float(alpha)))
+        return sample if current <= 0.0 else (
+            current + alpha * (sample - current))
+
+    def _reset_performance_metrics(self):
+        self.actual_frame_fps = 0.0
+        self.vehicle_pose_fps = 0.0
+        self.last_frame_started_ts = 0.0
+        self.last_vehicle_pose_event_ts = 0.0
+        self.frame_total_ms = 0.0
+        self.detection_ms = 0.0
 
     def _reset_pose_filter(self):
         self.filtered_output_pose = None
@@ -507,7 +547,11 @@ class MainWindow(QMainWindow):
 
         cx, cy = self.last_vehicle_center_px
         lines = [f"vehicle_id: {vid}", f"center_px: ({cx:.1f}, {cy:.1f})"]
-        lines.append(f"detection: {'rectified' if self.last_detection_rectified else 'direct'}")
+        detection_source = (
+            "rectified" if self.last_detection_rectified else "direct")
+        if self.last_detection_exposure_compensated:
+            detection_source += "+exposure"
+        lines.append(f"detection: {detection_source}")
 
         output_pose = self.last_output_pose if self.last_pose_live else None
         if output_pose is None:
@@ -747,6 +791,13 @@ class MainWindow(QMainWindow):
             self.last_udp_ok = False
             return
         now_s = time.monotonic()
+        if self.last_vehicle_pose_event_ts > 0.0:
+            interval_s = now_s - self.last_vehicle_pose_event_ts
+            if 0.001 <= interval_s <= 1.0:
+                instant_fps = 1.0 / interval_s
+                self.vehicle_pose_fps = self._ema_value(
+                    self.vehicle_pose_fps, instant_fps, 0.12)
+        self.last_vehicle_pose_event_ts = now_s
         pose = self._apply_pose_filter(raw_pose, now_s)
         self.last_output_pose = pose
         self.last_output_pose_ts = now_s
@@ -788,6 +839,21 @@ class MainWindow(QMainWindow):
         else:
             lines = [f"seq={self.pose_seq} sent=0", "pose: waiting"]
 
+        vehicle_fps = self.vehicle_pose_fps
+        if (
+            self.last_vehicle_pose_event_ts <= 0.0
+            or time.monotonic() - self.last_vehicle_pose_event_ts > 0.5
+        ):
+            vehicle_fps = 0.0
+        exposure_text = (
+            " exp" if self.last_detection_exposure_compensated else "")
+        lines.insert(
+            0,
+            f"FPS frame={self.actual_frame_fps:.1f} vehicle={vehicle_fps:.1f} "
+            f"total={self.frame_total_ms:.1f}ms detect={self.detection_ms:.1f}ms"
+            f"{exposure_text}",
+        )
+
         if self.pose_sender.last_error:
             lines.append(f"udp error: {self.pose_sender.last_error[:50]}")
         if hasattr(self, "gamepad_mode_chk") and self.gamepad_mode_chk.isChecked():
@@ -808,9 +874,12 @@ class MainWindow(QMainWindow):
         x1 = w - 16
         y1 = y0 + inset_h
 
-        overlay = image_bgr.copy()
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), (10, 14, 12), -1)
-        cv2.addWeighted(overlay, 0.82, image_bgr, 0.18, 0, image_bgr)
+        # Blend only the small inset, not a duplicate 1920x1200 frame.
+        inset_roi = image_bgr[y0:y1, x0:x1]
+        inset_background = np.empty_like(inset_roi)
+        inset_background[:] = (10, 14, 12)
+        cv2.addWeighted(
+            inset_background, 0.82, inset_roi, 0.18, 0, inset_roi)
         cv2.rectangle(image_bgr, (x0, y0), (x1, y1), (110, 125, 115), 1)
         cv2.putText(image_bgr, "UDP trajectory", (x0 + 10, y0 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 220, 210), 1, cv2.LINE_AA)
 
@@ -895,7 +964,16 @@ class MainWindow(QMainWindow):
         cv2.putText(image_bgr, field_label, (x0 + 10, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (170, 185, 175), 1, cv2.LINE_AA)
 
         if len(self.pose_history) >= 2:
-            pts = np.array([map_point(px, pz) for px, pz, _ in self.pose_history], dtype=np.int32).reshape(-1, 1, 2)
+            # The inset is only a few hundred pixels wide; drawing thousands
+            # of sub-pixel history samples adds CPU without visible detail.
+            history_step = max(1, int(math.ceil(len(self.pose_history) / 480.0)))
+            display_history = self.pose_history[::history_step]
+            if display_history[-1] is not self.pose_history[-1]:
+                display_history = display_history + [self.pose_history[-1]]
+            pts = np.array(
+                [map_point(px, pz) for px, pz, _ in display_history],
+                dtype=np.int32,
+            ).reshape(-1, 1, 2)
             cv2.polylines(image_bgr, [pts], False, (0, 220, 255), 2, cv2.LINE_AA)
 
         display_pose, pose_state, _age_s = self._display_pose_state()
@@ -922,16 +1000,20 @@ class MainWindow(QMainWindow):
 
     def _select_vehicle_marker(self, marker_instances):
         """Select the moving vehicle instance even when a fixed tag has the same ID."""
+        instance_state = self.__dict__
+        cfg = instance_state.get("cfg")
+        vehicle_id = int(instance_state.get(
+            "vehicle_id", getattr(cfg, "VEHICLE_ID", 0)))
         candidates = [
             marker for marker in marker_instances
-            if int(marker["id"]) == int(self.vehicle_id)
+            if int(marker["id"]) == vehicle_id
         ]
         if not candidates:
             return None
 
         locked_same_id = [
-            marker for marker in self.locked_fixed_markers
-            if int(marker["id"]) == int(self.vehicle_id)
+            marker for marker in instance_state.get("locked_fixed_markers", [])
+            if int(marker["id"]) == vehicle_id
         ]
         unmatched_indices = set(range(len(candidates)))
 
@@ -961,10 +1043,12 @@ class MainWindow(QMainWindow):
         remaining = [candidates[index] for index in sorted(unmatched_indices)]
         if not remaining:
             return None
-        if self.vehicle_track_center_px is None or len(remaining) == 1:
+        vehicle_track_center_px = instance_state.get(
+            "vehicle_track_center_px")
+        if vehicle_track_center_px is None or len(remaining) == 1:
             return remaining[0]
 
-        previous = np.asarray(self.vehicle_track_center_px, dtype=np.float32)
+        previous = np.asarray(vehicle_track_center_px, dtype=np.float32)
         return min(
             remaining,
             key=lambda marker: float(
@@ -1027,6 +1111,97 @@ class MainWindow(QMainWindow):
         )
         return True
 
+    @staticmethod
+    def _map_rectified_marker_instances(marker_instances, rectified_to_image):
+        mapped_instances = []
+        for marker in marker_instances:
+            marker_corners = cv2.perspectiveTransform(
+                np.asarray(marker["corners"], dtype=np.float32).reshape(-1, 1, 2),
+                rectified_to_image,
+            ).reshape(4, 2)
+            if not np.all(np.isfinite(marker_corners)):
+                continue
+            mapped_instances.append(
+                {
+                    "id": int(marker["id"]),
+                    "index": int(marker["index"]),
+                    "corners": marker_corners.astype(np.float32),
+                    "center": np.mean(marker_corners, axis=0).astype(np.float32),
+                }
+            )
+        return mapped_instances
+
+    @staticmethod
+    def _merge_unique_marker_instances(primary, fallback):
+        """Merge two passes without cloning one fixed ID0 into a fake car."""
+        merged = list(primary)
+        for candidate in fallback:
+            candidate_center = np.asarray(candidate["center"], dtype=np.float32)
+            candidate_corners = np.asarray(candidate["corners"], dtype=np.float32)
+            candidate_sides = np.linalg.norm(
+                candidate_corners - np.roll(candidate_corners, -1, axis=0),
+                axis=1,
+            )
+            candidate_side = float(np.mean(candidate_sides))
+            duplicate = False
+            for existing in merged:
+                if int(existing["id"]) != int(candidate["id"]):
+                    continue
+                existing_corners = np.asarray(existing["corners"], dtype=np.float32)
+                existing_sides = np.linalg.norm(
+                    existing_corners - np.roll(existing_corners, -1, axis=0),
+                    axis=1,
+                )
+                existing_side = float(np.mean(existing_sides))
+                center_distance = float(np.linalg.norm(
+                    candidate_center
+                    - np.asarray(existing["center"], dtype=np.float32)))
+                same_marker_radius = max(
+                    3.0, 0.45 * max(candidate_side, existing_side))
+                if center_distance <= same_marker_radius:
+                    duplicate = True
+                    break
+            if not duplicate:
+                merged.append(candidate)
+        return merged
+
+    def _vehicle_exposure_fallback_roi(self, rectified, image_to_rectified):
+        """Use a tracked ROI first; expand to the field after repeated misses."""
+        misses = int(getattr(self, "vehicle_detection_misses", 0))
+        full_after = int(getattr(
+            self.cfg, "VEHICLE_EXPOSURE_FULL_FRAME_AFTER_MISSES", 3))
+        full_interval = int(getattr(
+            self.cfg, "VEHICLE_EXPOSURE_FULL_FRAME_INTERVAL", 4))
+        tracked_center = getattr(self, "vehicle_track_center_px", None)
+        full_recovery_due = bool(
+            misses >= full_after
+            and (misses - full_after) % max(1, full_interval) == 0)
+        if tracked_center is None:
+            if misses < full_after or full_recovery_due:
+                return rectified, (0, 0)
+            return None, (0, 0)
+        if full_recovery_due:
+            return rectified, (0, 0)
+
+        center = cv2.perspectiveTransform(
+            np.asarray(tracked_center, dtype=np.float32).reshape(1, 1, 2),
+            image_to_rectified,
+        ).reshape(2)
+        if not np.all(np.isfinite(center)):
+            return rectified, (0, 0)
+        base_size = int(getattr(
+            self.cfg, "VEHICLE_EXPOSURE_TRACKING_ROI_SIZE", 420))
+        roi_size = int(round(base_size * (1.0 + 0.35 * min(misses, 2))))
+        half = max(48, roi_size // 2)
+        height, width = rectified.shape[:2]
+        x0 = max(0, int(round(float(center[0]))) - half)
+        y0 = max(0, int(round(float(center[1]))) - half)
+        x1 = min(width, int(round(float(center[0]))) + half)
+        y1 = min(height, int(round(float(center[1]))) + half)
+        if x1 - x0 < 64 or y1 - y0 < 64:
+            return rectified, (0, 0)
+        return rectified[y0:y1, x0:x1], (x0, y0)
+
     def _detect_rectified_marker_instances(self, image):
         """Run one synchronous detection pass on the uniform-scale field image."""
         if self.rectified_detection_geometry is None and not self._prepare_rectified_detection():
@@ -1042,23 +1217,48 @@ class MainWindow(QMainWindow):
         )
         corners, ids, _ = self.detector.detect_markers(rectified)
         rectified_instances = self.detector.get_marker_instances(corners, ids)
+        mapped_instances = self._map_rectified_marker_instances(
+            rectified_instances, rectified_to_image)
+        compensation_enabled = bool(getattr(
+            self.cfg, "VEHICLE_EXPOSURE_COMPENSATION_ENABLED", True))
+        if (
+            not compensation_enabled
+            or self._select_vehicle_marker(mapped_instances) is not None
+        ):
+            return mapped_instances
 
-        mapped_instances = []
-        for marker in rectified_instances:
-            marker_corners = cv2.perspectiveTransform(
-                np.asarray(marker["corners"], dtype=np.float32).reshape(-1, 1, 2),
-                rectified_to_image,
-            ).reshape(4, 2)
-            if not np.all(np.isfinite(marker_corners)):
+        fallback_image, (offset_x, offset_y) = (
+            self._vehicle_exposure_fallback_roi(
+                rectified, image_to_rectified))
+        if fallback_image is None:
+            return mapped_instances
+        fallback_corners, fallback_ids, _ = (
+            self.detector.detect_markers_exposure_compensated(
+                fallback_image))
+        fallback_instances = self.detector.get_marker_instances(
+            fallback_corners, fallback_ids)
+        vehicle_id = int(self.__dict__.get(
+            "vehicle_id", getattr(self.cfg, "VEHICLE_ID", 0)))
+        vehicle_fallback = []
+        offset = np.asarray((offset_x, offset_y), dtype=np.float32)
+        for marker in fallback_instances:
+            if int(marker["id"]) != vehicle_id:
                 continue
-            mapped_instances.append(
-                {
-                    "id": int(marker["id"]),
-                    "index": int(marker["index"]),
-                    "corners": marker_corners.astype(np.float32),
-                    "center": np.mean(marker_corners, axis=0).astype(np.float32),
-                }
-            )
+            shifted_corners = (
+                np.asarray(marker["corners"], dtype=np.float32) + offset)
+            vehicle_fallback.append({
+                "id": int(marker["id"]),
+                "index": int(marker["index"]),
+                "corners": shifted_corners,
+                "center": np.mean(shifted_corners, axis=0).astype(np.float32),
+            })
+
+        merged_instances = self._merge_unique_marker_instances(
+            rectified_instances, vehicle_fallback)
+        mapped_instances = self._map_rectified_marker_instances(
+            merged_instances, rectified_to_image)
+        if self._select_vehicle_marker(mapped_instances) is not None:
+            self.last_detection_exposure_compensated = True
         return mapped_instances
 
     @staticmethod
@@ -1301,6 +1501,8 @@ class MainWindow(QMainWindow):
         self.vehicle_track_center_px = None
         self.rectified_detection_geometry = None
         self.last_detection_rectified = False
+        self.last_detection_exposure_compensated = False
+        self.vehicle_detection_misses = 0
         self.last_output_pose = None
         self._reset_pose_filter()
         self.pose_seq = 0
@@ -1366,6 +1568,7 @@ class MainWindow(QMainWindow):
 
         self.radio_camera.setChecked(True)
         self._apply_capture_properties()
+        self._reset_performance_metrics()
 
         # Determine FPS for recording/video pacing.
         fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -1424,6 +1627,7 @@ class MainWindow(QMainWindow):
         if fps <= 0.0:
             fps = 30.0
         self.source_fps = fps
+        self._reset_performance_metrics()
 
         self._update_trace_max_len()
 
@@ -1532,9 +1736,16 @@ class MainWindow(QMainWindow):
 
     def update_frame(self):
         """Update frame from camera"""
+        frame_started = time.perf_counter()
         if self.cap is not None and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
+                if self.last_frame_started_ts > 0.0:
+                    interval_s = frame_started - self.last_frame_started_ts
+                    if 0.001 <= interval_s <= 1.0:
+                        self.actual_frame_fps = self._ema_value(
+                            self.actual_frame_fps, 1.0 / interval_s, 0.12)
+                self.last_frame_started_ts = frame_started
                 if self.camera_mirror_chk.isChecked():
                     frame = cv2.flip(frame, 1)
                 self.current_image = frame
@@ -1545,9 +1756,18 @@ class MainWindow(QMainWindow):
 
                 # Run inference without persisting every frame.
                 if self.is_detecting:
+                    detection_started = time.perf_counter()
                     self.detect_and_calibrate(frame)
+                    detection_elapsed_ms = (
+                        time.perf_counter() - detection_started) * 1000.0
+                    self.detection_ms = self._ema_value(
+                        self.detection_ms, detection_elapsed_ms, 0.12)
                 else:
                     self.image_label.set_image(frame)
+                frame_elapsed_ms = (
+                    time.perf_counter() - frame_started) * 1000.0
+                self.frame_total_ms = self._ema_value(
+                    self.frame_total_ms, frame_elapsed_ms, 0.12)
                 return
 
             # End of stream (video file) or read error.
@@ -1575,6 +1795,7 @@ class MainWindow(QMainWindow):
         ids = None
         image_with_markers = image.copy()
         self.last_detection_rectified = False
+        self.last_detection_exposure_compensated = False
         marker_instances = None
         if self.transformer.get_calibration_status():
             marker_instances = self._detect_rectified_marker_instances(image)
@@ -1660,6 +1881,12 @@ class MainWindow(QMainWindow):
                     self.last_vehicle_yaw_deg = self._norm_angle_deg(yaw_deg)
             except Exception:
                 vehicle_detected = False
+
+        if vehicle_detected:
+            self.vehicle_detection_misses = 0
+        else:
+            self.vehicle_detection_misses = min(
+                1000, int(getattr(self, "vehicle_detection_misses", 0)) + 1)
 
         if vehicle_detected and self.transformer.get_calibration_status():
             self._send_current_pose()
