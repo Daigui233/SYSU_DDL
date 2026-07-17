@@ -45,7 +45,8 @@ def _env_int(name, default):
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.50)
 DET_TURNSIGN_SCORE_THRESHOLD = _env_float(
     "MULTITASK_TURNSIGN_THRESHOLD", 0.40)
-DET_CAR_SCORE_THRESHOLD = _env_float("MULTITASK_CAR_THRESHOLD", 0.35)
+DET_HUMAN_SCORE_THRESHOLD = _env_float("MULTITASK_HUMAN_THRESHOLD", 0.40)
+DET_CAR_SCORE_THRESHOLD = _env_float("MULTITASK_CAR_THRESHOLD", 0.40)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.45)
 DET_PRE_NMS_TOP_K = max(1, _env_int("MULTITASK_PRE_NMS_TOP_K", 1000))
 MAX_DETECTIONS = max(1, _env_int("MULTITASK_MAX_DETECTIONS", 100))
@@ -64,20 +65,6 @@ ROAD_MIN_COMPONENT_AREA_RATIO = max(
 ROAD_MAX_COMPONENTS = max(1, _env_int("MULTITASK_ROAD_MAX_COMPONENTS", 3))
 ROAD_OVERLAY_ALPHA = float(np.clip(
     _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28), 0.0, 1.0))
-RENDER_DET_THRESHOLD = float(np.clip(
-    _env_float("MULTITASK_RENDER_DET_THRESHOLD", 0.45), 0.0, 1.0))
-RENDER_MAX_DETECTIONS = max(
-    0, _env_int("MULTITASK_RENDER_MAX_DETECTIONS", 6))
-RENDER_MAX_PER_CLASS = max(
-    0, _env_int("MULTITASK_RENDER_MAX_PER_CLASS", 2))
-RENDER_FULL_MAX_DETECTIONS = max(
-    0, _env_int("MULTITASK_RENDER_FULL_MAX_DETECTIONS", 20))
-RENDER_MAX_BOX_WIDTH_RATIO = float(np.clip(
-    _env_float("MULTITASK_RENDER_MAX_BOX_WIDTH_RATIO", 0.70), 0.0, 1.0))
-RENDER_MAX_BOX_HEIGHT_RATIO = float(np.clip(
-    _env_float("MULTITASK_RENDER_MAX_BOX_HEIGHT_RATIO", 0.70), 0.0, 1.0))
-RENDER_MAX_BOX_AREA_RATIO = float(np.clip(
-    _env_float("MULTITASK_RENDER_MAX_BOX_AREA_RATIO", 0.30), 0.0, 1.0))
 RENDER_PATH_MIN_SCORE = float(np.clip(
     _env_float("MULTITASK_RENDER_PATH_MIN_SCORE", 0.35), 0.0, 1.0))
 RENDER_PATH_MIN_COUNT_CONFIDENCE = float(np.clip(
@@ -95,18 +82,6 @@ PATH_COLORS = {
     "left": (255, 0, 0),
     "right": (0, 255, 0),
 }
-
-DETECTION_COLORS = {
-    "Door": (80, 200, 255),
-    "TurnSign": (0, 255, 120),
-    "BeginSign": (0, 220, 255),
-    "EndSign": (0, 150, 255),
-    "Coin": (0, 220, 255),
-    "Human": (60, 60, 255),
-    "Car": (255, 160, 60),
-    "SpeedSign": (255, 80, 220),
-}
-
 
 def _load_classes():
     names_path = Path(__file__).resolve().parent / "model" / "coco.names"
@@ -333,6 +308,7 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
                   max_detections=MAX_DETECTIONS,
                   coin_min_short_side=COIN_MIN_SHORT_SIDE,
                   turnsign_score_threshold=DET_TURNSIGN_SCORE_THRESHOLD,
+                  human_score_threshold=DET_HUMAN_SCORE_THRESHOLD,
                   car_score_threshold=DET_CAR_SCORE_THRESHOLD):
     """Apply main-branch argmax filtering and class-wise NMS."""
     results = []
@@ -346,11 +322,14 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
     best_scores = scores[
         np.arange(scores.shape[0], dtype=np.int32), best_classes]
     turnsign_class_id = CLASSES.index("TurnSign")
+    human_class_id = CLASSES.index("Human")
     car_class_id = CLASSES.index("Car")
     class_thresholds = np.full(
         best_classes.shape, float(score_threshold), dtype=np.float32)
     class_thresholds[best_classes == turnsign_class_id] = float(
         turnsign_score_threshold)
+    class_thresholds[best_classes == human_class_id] = float(
+        human_score_threshold)
     class_thresholds[best_classes == car_class_id] = float(
         car_score_threshold)
     eligible = valid_boxes & (best_scores >= class_thresholds)
@@ -541,66 +520,40 @@ def _overlay_binary_mask(image, mask, color, alpha):
 
 
 def _select_detections_for_render(detections, mode):
-    threshold = (
-        DET_SCORE_THRESHOLD if mode == "full" else RENDER_DET_THRESHOLD)
-    total_limit = (
-        RENDER_FULL_MAX_DETECTIONS if mode == "full"
-        else RENDER_MAX_DETECTIONS)
-    if total_limit <= 0:
-        return []
-    per_class_limit = (
-        total_limit if mode == "full" else RENDER_MAX_PER_CLASS)
-    counts = {}
-    selected = []
-    for detection in sorted(
-            detections or [], key=lambda item: item.get("score", 0.0),
-            reverse=True):
-        if float(detection.get("score", 0.0)) < threshold:
-            continue
-        label = str(detection.get("label") or "")
-        if counts.get(label, 0) >= per_class_limit:
-            continue
-        selected.append(detection)
-        counts[label] = counts.get(label, 0) + 1
-        if len(selected) >= total_limit:
-            break
-    return selected
+    """Return every post-NMS detection, ordered for stable rendering."""
+    del mode
+    return sorted(
+        detections or [], key=lambda item: item.get("score", 0.0),
+        reverse=True)
 
 
-def _is_oversized_render_box(detection, image_shape):
-    """Hide frame-spanning preview boxes without changing perception data."""
-    height, width = image_shape[:2]
-    if width <= 0 or height <= 0:
-        return False
-    left, top, right, bottom = detection.get("bbox", (0, 0, 0, 0))
-    width_ratio = max(0.0, float(right) - float(left)) / float(width)
-    height_ratio = max(0.0, float(bottom) - float(top)) / float(height)
-    area_ratio = width_ratio * height_ratio
-    return (
-        width_ratio >= RENDER_MAX_BOX_WIDTH_RATIO or
-        height_ratio >= RENDER_MAX_BOX_HEIGHT_RATIO or
-        area_ratio >= RENDER_MAX_BOX_AREA_RATIO)
-
-
-def _draw_corner_box(image, bbox, color, thickness=1):
+def _clip_render_bbox(image, bbox):
     left, top, right, bottom = [int(round(value)) for value in bbox]
     left = max(0, min(left, image.shape[1] - 1))
     right = max(0, min(right, image.shape[1] - 1))
     top = max(0, min(top, image.shape[0] - 1))
     bottom = max(0, min(bottom, image.shape[0] - 1))
-    length = max(4, min(12, (right - left) // 4, (bottom - top) // 4))
-    segments = (
-        ((left, top), (left + length, top)),
-        ((left, top), (left, top + length)),
-        ((right, top), (right - length, top)),
-        ((right, top), (right, top + length)),
-        ((left, bottom), (left + length, bottom)),
-        ((left, bottom), (left, bottom - length)),
-        ((right, bottom), (right - length, bottom)),
-        ((right, bottom), (right, bottom - length)),
+    return left, top, right, bottom
+
+
+def _draw_detection_annotation(image, detection):
+    left, top, right, bottom = _clip_render_bbox(
+        image, detection["bbox"])
+    if right <= left or bottom <= top:
+        return
+
+    cv2.rectangle(
+        image, (left, top), (right, bottom), (0, 255, 0), 2)
+    cv2.putText(
+        image,
+        "{} {:.2f}".format(
+            detection["label"], float(detection["score"])),
+        (left, max(20, top - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2,
     )
-    for start, end in segments:
-        cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
 
 
 def _draw_path_curve(image, points, color, dashed=False):
@@ -634,31 +587,7 @@ def render_result(image, result, mode=None):
     drawn_detections = _select_detections_for_render(
         result.get("detections"), mode)
     for detection in drawn_detections:
-        if _is_oversized_render_box(detection, image.shape):
-            continue
-        bbox = detection["bbox"]
-        label = detection["label"]
-        color = DETECTION_COLORS.get(label, (0, 220, 0))
-        if mode == "full":
-            left, top, right, bottom = [
-                int(round(value)) for value in bbox]
-            cv2.rectangle(
-                image, (left, top), (right, bottom), color, 2, cv2.LINE_AA)
-        elif label == "Coin":
-            left, top, right, bottom = bbox
-            center = (int(round((left + right) * 0.5)),
-                      int(round((top + bottom) * 0.5)))
-            cv2.circle(image, center, 4, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.circle(image, center, 3, color, -1, cv2.LINE_AA)
-        else:
-            _draw_corner_box(
-                image, bbox, color, thickness=1)
-        if mode == "full":
-            left, top = int(bbox[0]), int(bbox[1])
-            cv2.putText(
-                image, "{} {:.2f}".format(label, detection["score"]),
-                (left, max(18, top - 5)), cv2.FONT_HERSHEY_SIMPLEX,
-                0.48, color, 1, cv2.LINE_AA)
+        _draw_detection_annotation(image, detection)
 
     display_paths = result.get("paths") or []
     if result.get("vision_control_path_overlay"):

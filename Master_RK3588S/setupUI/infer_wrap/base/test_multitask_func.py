@@ -5,10 +5,10 @@ import numpy as np
 from .func import (
     CLASSES,
     DET_CAR_SCORE_THRESHOLD,
+    DET_HUMAN_SCORE_THRESHOLD,
     DET_SCORE_THRESHOLD,
     DET_TURNSIGN_SCORE_THRESHOLD,
     RENDER_MODE,
-    _is_oversized_render_box,
     _select_detections_for_render,
     clean_road_mask,
     decode_outputs,
@@ -121,10 +121,11 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(info["reason"], "raw-full")
         self.assertEqual(int(cleaned.sum()), 0)
 
-    def test_turnsign_and_car_use_class_specific_detection_thresholds(self):
+    def test_turnsign_human_and_car_use_class_specific_detection_thresholds(self):
         self.assertAlmostEqual(0.50, DET_SCORE_THRESHOLD)
         self.assertAlmostEqual(0.40, DET_TURNSIGN_SCORE_THRESHOLD)
-        self.assertAlmostEqual(0.35, DET_CAR_SCORE_THRESHOLD)
+        self.assertAlmostEqual(0.40, DET_HUMAN_SCORE_THRESHOLD)
+        self.assertAlmostEqual(0.40, DET_CAR_SCORE_THRESHOLD)
         boxes = np.asarray([
             [0.0, 0.0, 20.0, 20.0],
             [30.0, 0.0, 50.0, 20.0],
@@ -136,10 +137,10 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         scores = np.zeros((6, len(CLASSES)), dtype=np.float32)
         scores[0, CLASSES.index("TurnSign")] = 0.35
         scores[1, CLASSES.index("TurnSign")] = 0.45
-        scores[2, CLASSES.index("Car")] = 0.34
-        scores[3, CLASSES.index("Car")] = 0.36
-        scores[4, CLASSES.index("Human")] = 0.36
-        scores[5, CLASSES.index("Human")] = 0.55
+        scores[2, CLASSES.index("Car")] = 0.39
+        scores[3, CLASSES.index("Car")] = 0.40
+        scores[4, CLASSES.index("Human")] = 0.39
+        scores[5, CLASSES.index("Human")] = 0.40
         results = detection_nms(boxes, scores)
         self.assertEqual(3, len(results))
         self.assertEqual(
@@ -159,7 +160,7 @@ class MultiTaskPostprocessTest(unittest.TestCase):
             pre_nms_top_k=1000, max_detections=2)
         self.assertEqual([item[0] for item in results], [7, 0])
 
-    def test_drive_render_limits_detection_clutter(self):
+    def test_drive_render_keeps_every_post_nms_detection(self):
         detections = [{
             "label": "Coin", "score": 0.95 - index * 0.01,
             "bbox": [10 + index * 5, 10, 20 + index * 5, 20],
@@ -170,9 +171,23 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         })
         selected = _select_detections_for_render(detections, "drive")
         labels = [item["label"] for item in selected]
-        self.assertLessEqual(len(selected), 6)
-        self.assertEqual(labels.count("Coin"), 2)
+        self.assertEqual(len(selected), len(detections))
+        self.assertEqual(labels.count("Coin"), 8)
         self.assertEqual(labels.count("TurnSign"), 1)
+
+    def test_drive_render_draws_complete_thick_box_and_label(self):
+        image = np.zeros((120, 180, 3), dtype=np.uint8)
+        result = {"detections": [{
+            "label": "Car", "score": 0.876,
+            "bbox": [30, 40, 130, 100],
+        }]}
+        rendered = render_result(image, result, mode="drive")
+        color = np.asarray([0, 255, 0], dtype=np.uint8)
+        self.assertTrue(np.array_equal(rendered[40, 80], color))
+        self.assertTrue(np.array_equal(rendered[100, 80], color))
+        self.assertTrue(np.array_equal(rendered[70, 30], color))
+        self.assertTrue(np.array_equal(rendered[70, 130], color))
+        self.assertGreater(int(rendered[20:40, 30:130].sum()), 0)
 
     def test_render_draws_only_finalized_paths(self):
         image = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -189,12 +204,6 @@ class MultiTaskPostprocessTest(unittest.TestCase):
             }],
         }
         self.assertGreater(int(render_result(image, result).sum()), 0)
-
-    def test_frame_spanning_detection_box_is_hidden(self):
-        self.assertTrue(_is_oversized_render_box(
-            {"bbox": [5, 40, 635, 180]}, (480, 640, 3)))
-        self.assertFalse(_is_oversized_render_box(
-            {"bbox": [100, 100, 220, 240]}, (480, 640, 3)))
 
     def test_default_render_mode_is_drive(self):
         self.assertEqual(RENDER_MODE, "drive")
