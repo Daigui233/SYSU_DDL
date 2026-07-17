@@ -216,7 +216,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.straight_min_span_ratio, 0.50)
         self.assertEqual(config.human_pass_speed_mps, 0.30)
         self.assertEqual(config.human_path_return_guard_s, 0.40)
-        self.assertEqual(config.human_stop_reverse_speed_mps, -0.05)
+        self.assertEqual(config.human_stop_reverse_speed_mps, -0.10)
         self.assertEqual(config.human_stop_reverse_duration_s, 0.30)
         self.assertEqual(config.human_speed_hold_s, 0.5)
         self.assertEqual(config.human_stop_progress_ratio, 0.84)
@@ -892,7 +892,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         command, debug = planner.update(
             _raw_result_at(detections=human), now=1.0)
         self.assertEqual(command["state_cmd"], STATE_AVOID_HUMAN)
-        self.assertEqual(command["target_speed"], -0.05)
+        self.assertEqual(command["target_speed"], -0.10)
         self.assertEqual(command["flags"], 1)
         self.assertEqual(
             debug["control_target"]["task_reason"],
@@ -903,7 +903,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         command, debug = planner.update(
             _raw_result_at(detections=human), now=1.2)
         self.assertEqual(command["state_cmd"], STATE_AVOID_HUMAN)
-        self.assertEqual(command["target_speed"], -0.05)
+        self.assertEqual(command["target_speed"], -0.10)
 
         command, debug = planner.update(
             _raw_result_at(detections=human), now=1.31)

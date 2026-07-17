@@ -194,7 +194,7 @@ class VisionControlConfig:
     human_speed_hold_s: float = 0.5
     human_path_return_guard_s: float = 0.4
     human_absence_confirm_s: float = 1.5
-    human_stop_reverse_speed_mps: float = -0.05
+    human_stop_reverse_speed_mps: float = -0.10
     human_stop_reverse_duration_s: float = 0.3
     car_avoid_offset_px_640: float = 55.0
     car_avoid_steer_gain: float = 0.70
@@ -396,7 +396,7 @@ class VisionControlConfig:
                 "VISION_CONTROL_HUMAN_PATH_RETURN_GUARD_S", 0.4)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
             human_stop_reverse_speed_mps=-abs(_env_float(
-                "VISION_CONTROL_HUMAN_STOP_REVERSE_SPEED", -0.05)),
+                "VISION_CONTROL_HUMAN_STOP_REVERSE_SPEED", -0.10)),
             human_stop_reverse_duration_s=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_STOP_REVERSE_DURATION_S", 0.3)),
             car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 55.0)),
