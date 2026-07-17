@@ -205,7 +205,7 @@ class VisionControlConfig:
     human_avoid_offset_px_640: float = 75.0
     avoid_box_width_gain: float = 0.35
     gold_bias_gain: float = 0.45
-    gold_max_bias_px_640: float = 75.0
+    gold_max_bias_px_640: float = 40.0
     min_human_score: float = 0.35
     min_car_score: float = 0.35
     min_coin_score: float = 0.35
@@ -412,7 +412,7 @@ class VisionControlConfig:
             human_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_AVOID_OFFSET_640", 75.0)),
             avoid_box_width_gain=max(0.0, _env_float("VISION_CONTROL_AVOID_BOX_WIDTH_GAIN", 0.35)),
             gold_bias_gain=max(0.0, _env_float("VISION_CONTROL_GOLD_BIAS_GAIN", 0.45)),
-            gold_max_bias_px_640=max(0.0, _env_float("VISION_CONTROL_GOLD_MAX_BIAS_640", 75.0)),
+            gold_max_bias_px_640=max(0.0, _env_float("VISION_CONTROL_GOLD_MAX_BIAS_640", 40.0)),
             min_human_score=_clamp(_env_float("VISION_CONTROL_HUMAN_MIN_SCORE", 0.35), 0.0, 1.0),
             min_car_score=_clamp(_env_float("VISION_CONTROL_CAR_MIN_SCORE", 0.35), 0.0, 1.0),
             min_coin_score=_clamp(_env_float("VISION_CONTROL_COIN_MIN_SCORE", 0.35), 0.0, 1.0),
@@ -1199,6 +1199,7 @@ class VisionControlPlanner:
             "human_absence_check",
             "human_preline_absence_check",
             "car_human_same_side_wait",
+            "car_human_right_pass_blocked",
             "car_human_absence_check",
             "car_human_preline_absence_check",
         }
@@ -2334,7 +2335,8 @@ class VisionControlPlanner:
         self.human_path_return_guard_until = 0.0
         self.human_path_return_guard_start_x = None
         self.human_last_avoid_target_x = None
-        coin = self._best_coin(detections, image_shape, target_path_x)
+        coin = self._best_coin(
+            detections, image_shape, target_path_x, lookahead_y)
         if coin is not None:
             return (
                 STATE_COLLECT_GOLD,
@@ -2823,6 +2825,15 @@ class VisionControlPlanner:
             detections, image_shape)
 
         if pass_holding:
+            if self.car_avoid_side > 0:
+                self.car_human_pass_until = 0.0
+                self.car_human_waiting_cross = True
+                return (
+                    STATE_SAFE_STOP,
+                    0.0,
+                    "car_human_right_pass_blocked",
+                    None,
+                )
             return (
                 STATE_AVOID_HUMAN,
                 self.config.car_human_pass_speed_mps,
@@ -2871,6 +2882,14 @@ class VisionControlPlanner:
                 and human_side == -self.car_avoid_side
             )
             if crossed_to_other_side:
+                if self.car_avoid_side > 0:
+                    self.car_human_waiting_cross = True
+                    return (
+                        STATE_SAFE_STOP,
+                        0.0,
+                        "car_human_right_pass_blocked",
+                        None,
+                    )
                 self.car_human_pass_until = (
                     float(now) + self.config.car_human_pass_hold_s)
                 self.car_human_waiting_cross = False
@@ -3069,10 +3088,9 @@ class VisionControlPlanner:
             ),
         )
         geom = human["geom"]
-        side = human["side"] or self.human_last_side or 1
 
         if self.human_pass_active:
-            return self._human_pass_command(lookahead_path_x, image_shape, side)
+            return self._human_pass_command(lookahead_path_x, image_shape)
 
         crossed = (
             self.human_waiting_cross
@@ -3085,7 +3103,7 @@ class VisionControlPlanner:
             self.human_pass_active = True
             self.human_detected_latched = False
             self.human_last_seen_ts = 0.0
-            return self._human_pass_command(lookahead_path_x, image_shape, side)
+            return self._human_pass_command(lookahead_path_x, image_shape)
 
         if self._human_on_stop_line(geom, image_shape, lookahead_y):
             self._clear_human_preline_state()
@@ -3103,13 +3121,13 @@ class VisionControlPlanner:
         self._record_human_preline_gap(geom, image_shape, lookahead_y)
         return None
 
-    def _human_pass_command(self, path_x, image_shape, human_side):
+    def _human_pass_command(self, path_x, image_shape):
         self.human_path_return_guard_until = 0.0
         self.human_path_return_guard_start_x = None
         scale = float(max(1, image_shape[1])) / 640.0
         offset = self.config.human_pass_offset_px_640 * scale
         target_x = _clamp(
-            float(path_x) - float(human_side or 1) * offset,
+            float(path_x) - offset,
             0.0,
             float(max(0, image_shape[1] - 1)),
         )
@@ -3176,9 +3194,13 @@ class VisionControlPlanner:
         # snapshot gate so stopping and OCR submission happen on the same frame.
         return float(area_ratio) >= self.config.sign_stop_area_ratio
 
-    def _best_coin(self, detections, image_shape, path_x):
+    def _best_coin(self, detections, image_shape, path_x, lookahead_y):
         best = None
         best_rank = -1.0
+        min_bottom_y = max(
+            float(image_shape[0]) * self.config.coin_bottom_ratio,
+            self._human_stop_line_y(image_shape, lookahead_y),
+        )
         for det in detections:
             label = str(det.get("label") or det.get("category") or "").lower()
             if label != "coin":
@@ -3187,7 +3209,7 @@ class VisionControlPlanner:
             if score < self.config.min_coin_score:
                 continue
             geom = self._detection_geom(det, image_shape)
-            if geom is None or geom["bottom_ratio"] < self.config.coin_bottom_ratio:
+            if geom is None or float(geom["bottom"]) < min_bottom_y:
                 continue
             lateral = abs(geom["cx"] - path_x) / float(max(1, image_shape[1]))
             if lateral > self.config.coin_lateral_ratio:

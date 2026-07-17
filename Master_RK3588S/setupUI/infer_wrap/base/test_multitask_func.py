@@ -4,6 +4,8 @@ import numpy as np
 
 from .func import (
     CLASSES,
+    DET_CAR_SCORE_THRESHOLD,
+    DET_HUMAN_SCORE_THRESHOLD,
     DET_SCORE_THRESHOLD,
     DET_TURNSIGN_SCORE_THRESHOLD,
     RENDER_MODE,
@@ -120,20 +122,31 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(info["reason"], "raw-full")
         self.assertEqual(int(cleaned.sum()), 0)
 
-    def test_turnsign_uses_lower_detection_threshold(self):
+    def test_turnsign_human_and_car_use_class_specific_detection_thresholds(self):
         self.assertAlmostEqual(0.50, DET_SCORE_THRESHOLD)
         self.assertAlmostEqual(0.40, DET_TURNSIGN_SCORE_THRESHOLD)
+        self.assertAlmostEqual(0.40, DET_HUMAN_SCORE_THRESHOLD)
+        self.assertAlmostEqual(0.40, DET_CAR_SCORE_THRESHOLD)
         boxes = np.asarray([
             [0.0, 0.0, 20.0, 20.0],
             [30.0, 0.0, 50.0, 20.0],
             [60.0, 0.0, 80.0, 20.0],
+            [90.0, 0.0, 110.0, 20.0],
+            [120.0, 0.0, 140.0, 20.0],
+            [150.0, 0.0, 170.0, 20.0],
         ], dtype=np.float32)
-        scores = np.zeros((3, len(CLASSES)), dtype=np.float32)
+        scores = np.zeros((6, len(CLASSES)), dtype=np.float32)
         scores[0, CLASSES.index("TurnSign")] = 0.35
         scores[1, CLASSES.index("TurnSign")] = 0.45
-        scores[2, CLASSES.index("Human")] = 0.55
+        scores[2, CLASSES.index("Car")] = 0.39
+        scores[3, CLASSES.index("Car")] = 0.40
+        scores[4, CLASSES.index("Human")] = 0.39
+        scores[5, CLASSES.index("Human")] = 0.40
         results = detection_nms(boxes, scores)
-        self.assertEqual(2, len(results))
+        self.assertEqual(3, len(results))
+        self.assertEqual(
+            {"TurnSign", "Car", "Human"},
+            {CLASSES[item[0]] for item in results})
 
     def test_nms_is_classwise_then_globally_limited(self):
         boxes = np.asarray([
@@ -162,6 +175,40 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertLessEqual(len(selected), 6)
         self.assertEqual(labels.count("Coin"), 2)
         self.assertEqual(labels.count("TurnSign"), 1)
+
+    def test_render_car_threshold_matches_effective_control_threshold(self):
+        selected = _select_detections_for_render([
+            {"label": "Car", "score": 0.39, "bbox": [0, 0, 20, 20]},
+            {"label": "Car", "score": 0.40, "bbox": [30, 0, 50, 20]},
+        ], "drive")
+        self.assertEqual(len(selected), 1)
+        self.assertAlmostEqual(selected[0]["score"], 0.40)
+
+    def test_render_hides_door_begin_and_end_signs(self):
+        selected = _select_detections_for_render([
+            {"label": "Door", "score": 0.99, "bbox": [0, 0, 20, 20]},
+            {"label": "BeginSign", "score": 0.99,
+             "bbox": [30, 0, 50, 20]},
+            {"label": "EndSign", "score": 0.99,
+             "bbox": [60, 0, 80, 20]},
+            {"label": "Car", "score": 0.90,
+             "bbox": [90, 0, 110, 20]},
+        ], "drive")
+        self.assertEqual([item["label"] for item in selected], ["Car"])
+
+    def test_drive_render_draws_complete_thick_box_and_label(self):
+        image = np.zeros((120, 180, 3), dtype=np.uint8)
+        result = {"detections": [{
+            "label": "Car", "score": 0.876,
+            "bbox": [30, 40, 130, 100],
+        }]}
+        rendered = render_result(image, result, mode="drive")
+        box_color = np.asarray([0, 255, 0], dtype=np.uint8)
+        self.assertTrue(np.array_equal(rendered[40, 80], box_color))
+        self.assertTrue(np.array_equal(rendered[100, 80], box_color))
+        self.assertTrue(np.array_equal(rendered[70, 30], box_color))
+        self.assertTrue(np.array_equal(rendered[70, 130], box_color))
+        self.assertGreater(int(rendered[20:40, 30:130].sum()), 0)
 
     def test_render_draws_only_finalized_paths(self):
         image = np.zeros((240, 320, 3), dtype=np.uint8)
