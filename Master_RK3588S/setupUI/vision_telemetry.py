@@ -127,6 +127,21 @@ class VisionTelemetryLogger:
                     target.get("path_target_adaptive_y", False)),
                 "path_target_held": bool(
                     target.get("path_target_held", False)),
+                "car_avoid_side": int(target.get("car_avoid_side", 0)),
+                "car_avoid_offset_640": _number(
+                    target.get("car_avoid_offset_px_640"), 0.0),
+                "car_avoid_hold_remaining_s": _number(
+                    target.get("car_avoid_hold_remaining_s"), 0.0),
+                "car_recovery_active": bool(
+                    target.get("car_recovery_active", False)),
+                "car_line_reacquire_frames": int(
+                    target.get("car_line_reacquire_frames", 0)),
+                "car_human_priority": target.get(
+                    "car_human_priority", "none"),
+                "car_human_bottom_avg": _number(
+                    target.get("car_human_bottom_avg")),
+                "human_bottom_avg": _number(
+                    target.get("human_bottom_avg")),
                 "path_raw_error_640": _number(
                     target.get("path_raw_track_error_640")),
                 "path_position_gain": _number(

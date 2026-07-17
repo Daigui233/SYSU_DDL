@@ -42,7 +42,7 @@
 #define AVOID_STONE_SERVO_KP           SERVO_LINEAR_KP
 #define AVOID_STONE_SERVO_KD           TRACK_SERVO_KD
 
-#define AVOID_CAR_DEFAULT_SPEED_MPS    (0.05f)
+#define AVOID_CAR_DEFAULT_SPEED_MPS    (0.06f)
 #define AVOID_CAR_MOTOR_KP             (100.0f)
 #define AVOID_CAR_MOTOR_KI             (8.0f)
 #define AVOID_CAR_MOTOR_KD             (0.0f)
@@ -63,7 +63,7 @@
 #define COLLECT_GOLD_SERVO_KP          SERVO_LINEAR_KP
 #define COLLECT_GOLD_SERVO_KD          SERVO_LINEAR_KD
 
-#define RECOVER_LINE_DEFAULT_SPEED_MPS (0.03f)
+#define RECOVER_LINE_DEFAULT_SPEED_MPS (0.04f)
 #define RECOVER_LINE_MOTOR_KP          (100.0f)
 #define RECOVER_LINE_MOTOR_KI          (8.0f)
 #define RECOVER_LINE_MOTOR_KD          (0.0f)
