@@ -21,7 +21,7 @@
 #define SERVO_LINEAR_KD                (0.04f)
 
 /* ===== State control parameters: tune here first during vehicle testing. ===== */
-#define TRACK_DEFAULT_SPEED_MPS        (0.05f)
+#define TRACK_DEFAULT_SPEED_MPS        (0.10f)
 #define TRACK_MOTOR_KP                 (100.0f)
 #define TRACK_MOTOR_KI                 (8.0f)
 #define TRACK_MOTOR_KD                 (0.0f)

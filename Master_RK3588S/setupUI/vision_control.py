@@ -138,7 +138,7 @@ class VisionControlConfig:
     straight_min_span_ratio: float = 0.50
     straight_path_max_residual_640: float = 6.0
     straight_edge_max_residual_640: float = 10.0
-    normal_speed_mps: float = 0.06
+    normal_speed_mps: float = 0.10
     recover_speed_mps: float = 0.04
     human_pass_speed_mps: float = 0.35
     collect_speed_mps: float = 0.06
@@ -189,12 +189,13 @@ class VisionControlConfig:
     human_stop_line_margin_ratio: float = 0.0
     # Larger values move the human stop line upward, so braking starts sooner.
     human_stop_progress_ratio: float = 0.84
-    human_stop_line_offset_px_480: float = 15.0
+    human_stop_line_offset_px_480: float = 35.0
     human_preline_missing_px_480: float = 20.0
     human_pass_offset_px_640: float = 38.0
     human_speed_hold_s: float = 0.5
     human_path_return_guard_s: float = 0.4
     human_absence_confirm_s: float = 1.5
+    human_stop_absence_restart_s: float = 5.0
     human_stop_reverse_speed_mps: float = -0.10
     human_stop_reverse_duration_s: float = 0.3
     car_avoid_offset_px_640: float = 55.0
@@ -302,7 +303,7 @@ class VisionControlConfig:
             straight_edge_max_residual_640=max(
                 0.5, _env_float(
                     "VISION_CONTROL_STRAIGHT_EDGE_MAX_RESIDUAL_640", 10.0)),
-            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.06)),
+            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.10)),
             recover_speed_mps=max(0.031, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.04)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.35)),
             collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.06)),
@@ -392,13 +393,15 @@ class VisionControlConfig:
             human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
             human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 0.84), 0.0, 1.0),
             human_stop_line_offset_px_480=max(0.0, _env_float(
-                "VISION_CONTROL_HUMAN_STOP_LINE_OFFSET_PX_480", 15.0)),
+                "VISION_CONTROL_HUMAN_STOP_LINE_OFFSET_PX_480", 35.0)),
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
             human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
             human_path_return_guard_s=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_PATH_RETURN_GUARD_S", 0.4)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
+            human_stop_absence_restart_s=max(0.0, _env_float(
+                "VISION_CONTROL_HUMAN_STOP_ABSENCE_RESTART_S", 5.0)),
             human_stop_reverse_speed_mps=-abs(_env_float(
                 "VISION_CONTROL_HUMAN_STOP_REVERSE_SPEED", -0.10)),
             human_stop_reverse_duration_s=max(0.0, _env_float(
@@ -1716,7 +1719,9 @@ class VisionControlPlanner:
             "car_human_preline_approach",
             "car_human_same_side_pass",
             "car_human_same_side_pass_hold",
+            "car_human_absence_restart",
             "human_cross_pass",
+            "human_absence_restart",
             "human_speed_hold",
             "human_path_return_guard",
         }
@@ -3212,9 +3217,24 @@ class VisionControlPlanner:
                 )
 
         if self.car_human_active:
-            # Once a person has reached the stop line, detector loss must not
-            # release the stop. Only the observed crossing transition above can
-            # restart the car and enter the timed pass hold.
+            # Keep short detector dropouts latched, but resume the same-side
+            # pass after the configured absence interval so this combined
+            # car/human sequence cannot deadlock indefinitely.
+            if self.car_human_last_seen_ts <= 0.0:
+                self.car_human_last_seen_ts = float(now)
+            if (
+                float(now) - self.car_human_last_seen_ts >=
+                self.config.human_stop_absence_restart_s
+            ):
+                self.car_human_pass_until = (
+                    float(now) + self.config.car_human_pass_hold_s)
+                self.car_human_waiting_cross = False
+                return (
+                    STATE_AVOID_HUMAN,
+                    self.config.car_human_pass_speed_mps,
+                    "car_human_absence_restart",
+                    avoid_target_x,
+                )
             return (
                 STATE_SAFE_STOP,
                 0.0,
@@ -3351,9 +3371,23 @@ class VisionControlPlanner:
                 self._clear_human_state()
                 return None
             if self.human_detected_latched:
-                # A stop-line crossing starts one latched avoidance session.
-                # Do not time it out on detector loss; the car may restart only
-                # after the required left-to-right transition is observed.
+                # Keep the stop latched across short detector dropouts. If the
+                # person remains absent for the configured interval, resume the
+                # existing left-side pass so a lost detection cannot deadlock
+                # the vehicle indefinitely.
+                if self.human_last_seen_ts <= 0.0:
+                    self.human_last_seen_ts = float(now)
+                if (
+                    float(now) - self.human_last_seen_ts >=
+                    self.config.human_stop_absence_restart_s
+                ):
+                    self.human_waiting_cross = False
+                    self.human_pass_active = True
+                    self.human_detected_latched = False
+                    self.human_last_seen_ts = 0.0
+                    return self._human_pass_command(
+                        lookahead_path_x, image_shape, 1,
+                        reason="human_absence_restart")
                 return (
                     STATE_SAFE_STOP,
                     0.0,
@@ -3413,7 +3447,9 @@ class VisionControlPlanner:
         self._record_human_preline_gap(geom, image_shape, lookahead_y)
         return None
 
-    def _human_pass_command(self, path_x, image_shape, human_side):
+    def _human_pass_command(
+            self, path_x, image_shape, human_side,
+            reason="human_cross_pass"):
         self.human_path_return_guard_until = 0.0
         self.human_path_return_guard_start_x = None
         scale = float(max(1, image_shape[1])) / 640.0
@@ -3426,7 +3462,12 @@ class VisionControlPlanner:
         self.human_pass_offset_x = float(target_x) - float(path_x)
         self.human_path_return_pending = True
         self.human_last_avoid_target_x = float(target_x)
-        return STATE_AVOID_HUMAN, self.config.human_pass_speed_mps, "human_cross_pass", target_x
+        return (
+            STATE_AVOID_HUMAN,
+            self.config.human_pass_speed_mps,
+            str(reason),
+            target_x,
+        )
 
     def _human_on_stop_line(self, geom, image_shape, lookahead_y):
         stop_y = self._human_stop_line_y(image_shape, lookahead_y)
