@@ -203,7 +203,7 @@ class VisionControlConfig:
     car_human_pass_speed_mps: float = 0.30
     car_human_pass_hold_s: float = 2.0
     human_avoid_offset_px_640: float = 75.0
-    avoid_box_width_gain: float = 0.35
+    avoid_box_width_gain: float = 0.40
     gold_bias_gain: float = 0.45
     gold_max_bias_px_640: float = 75.0
     min_human_score: float = 0.35
@@ -410,7 +410,7 @@ class VisionControlConfig:
             car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.30)),
             car_human_pass_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S", 2.0)),
             human_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_AVOID_OFFSET_640", 75.0)),
-            avoid_box_width_gain=max(0.0, _env_float("VISION_CONTROL_AVOID_BOX_WIDTH_GAIN", 0.35)),
+            avoid_box_width_gain=max(0.0, _env_float("VISION_CONTROL_AVOID_BOX_WIDTH_GAIN", 0.40)),
             gold_bias_gain=max(0.0, _env_float("VISION_CONTROL_GOLD_BIAS_GAIN", 0.45)),
             gold_max_bias_px_640=max(0.0, _env_float("VISION_CONTROL_GOLD_MAX_BIAS_640", 75.0)),
             min_human_score=_clamp(_env_float("VISION_CONTROL_HUMAN_MIN_SCORE", 0.35), 0.0, 1.0),

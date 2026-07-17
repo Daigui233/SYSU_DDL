@@ -4,6 +4,7 @@ import numpy as np
 
 from .func import (
     CLASSES,
+    DET_CAR_SCORE_THRESHOLD,
     DET_SCORE_THRESHOLD,
     DET_TURNSIGN_SCORE_THRESHOLD,
     RENDER_MODE,
@@ -120,20 +121,30 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(info["reason"], "raw-full")
         self.assertEqual(int(cleaned.sum()), 0)
 
-    def test_turnsign_uses_lower_detection_threshold(self):
+    def test_turnsign_and_car_use_class_specific_detection_thresholds(self):
         self.assertAlmostEqual(0.50, DET_SCORE_THRESHOLD)
         self.assertAlmostEqual(0.40, DET_TURNSIGN_SCORE_THRESHOLD)
+        self.assertAlmostEqual(0.35, DET_CAR_SCORE_THRESHOLD)
         boxes = np.asarray([
             [0.0, 0.0, 20.0, 20.0],
             [30.0, 0.0, 50.0, 20.0],
             [60.0, 0.0, 80.0, 20.0],
+            [90.0, 0.0, 110.0, 20.0],
+            [120.0, 0.0, 140.0, 20.0],
+            [150.0, 0.0, 170.0, 20.0],
         ], dtype=np.float32)
-        scores = np.zeros((3, len(CLASSES)), dtype=np.float32)
+        scores = np.zeros((6, len(CLASSES)), dtype=np.float32)
         scores[0, CLASSES.index("TurnSign")] = 0.35
         scores[1, CLASSES.index("TurnSign")] = 0.45
-        scores[2, CLASSES.index("Human")] = 0.55
+        scores[2, CLASSES.index("Car")] = 0.34
+        scores[3, CLASSES.index("Car")] = 0.36
+        scores[4, CLASSES.index("Human")] = 0.36
+        scores[5, CLASSES.index("Human")] = 0.55
         results = detection_nms(boxes, scores)
-        self.assertEqual(2, len(results))
+        self.assertEqual(3, len(results))
+        self.assertEqual(
+            {"TurnSign", "Car", "Human"},
+            {CLASSES[item[0]] for item in results})
 
     def test_nms_is_classwise_then_globally_limited(self):
         boxes = np.asarray([

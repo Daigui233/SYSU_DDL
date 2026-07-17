@@ -200,6 +200,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.hazard_bottom_ratio, 0.58)
         self.assertEqual(config.car_avoid_offset_px_640, 55.0)
         self.assertEqual(config.car_avoid_hold_s, 2.0)
+        self.assertEqual(config.avoid_box_width_gain, 0.40)
         self.assertEqual(config.normal_speed_mps, 0.06)
         self.assertEqual(config.recover_speed_mps, 0.04)
         self.assertEqual(config.collect_speed_mps, 0.06)
@@ -850,6 +851,13 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(
             abs(debug["control_target"]["task_offset_x"]), 38.5,
             delta=1.0)
+
+    def test_wide_car_uses_40_percent_box_width_for_offset(self):
+        planner = VisionControlPlanner(config=_config())
+        target_x = planner._avoid_target_x(
+            "car", {"cx": 300.0, "box_w": 150.0},
+            320.0, (480, 640, 3))
+        self.assertAlmostEqual(target_x - 320.0, 42.0)
 
     def test_coin_collection_uses_collect_speed(self):
         coin = [{

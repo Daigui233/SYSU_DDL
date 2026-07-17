@@ -45,6 +45,7 @@ def _env_int(name, default):
 DET_SCORE_THRESHOLD = _env_float("MULTITASK_DET_THRESHOLD", 0.50)
 DET_TURNSIGN_SCORE_THRESHOLD = _env_float(
     "MULTITASK_TURNSIGN_THRESHOLD", 0.40)
+DET_CAR_SCORE_THRESHOLD = _env_float("MULTITASK_CAR_THRESHOLD", 0.35)
 DET_NMS_THRESHOLD = _env_float("MULTITASK_NMS_THRESHOLD", 0.45)
 DET_PRE_NMS_TOP_K = max(1, _env_int("MULTITASK_PRE_NMS_TOP_K", 1000))
 MAX_DETECTIONS = max(1, _env_int("MULTITASK_MAX_DETECTIONS", 100))
@@ -331,7 +332,8 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
                   pre_nms_top_k=DET_PRE_NMS_TOP_K,
                   max_detections=MAX_DETECTIONS,
                   coin_min_short_side=COIN_MIN_SHORT_SIDE,
-                  turnsign_score_threshold=DET_TURNSIGN_SCORE_THRESHOLD):
+                  turnsign_score_threshold=DET_TURNSIGN_SCORE_THRESHOLD,
+                  car_score_threshold=DET_CAR_SCORE_THRESHOLD):
     """Apply main-branch argmax filtering and class-wise NMS."""
     results = []
     pre_nms_top_k = max(1, int(pre_nms_top_k))
@@ -344,11 +346,13 @@ def detection_nms(boxes, scores, score_threshold=DET_SCORE_THRESHOLD,
     best_scores = scores[
         np.arange(scores.shape[0], dtype=np.int32), best_classes]
     turnsign_class_id = CLASSES.index("TurnSign")
-    class_thresholds = np.where(
-        best_classes == turnsign_class_id,
-        float(turnsign_score_threshold),
-        float(score_threshold),
-    )
+    car_class_id = CLASSES.index("Car")
+    class_thresholds = np.full(
+        best_classes.shape, float(score_threshold), dtype=np.float32)
+    class_thresholds[best_classes == turnsign_class_id] = float(
+        turnsign_score_threshold)
+    class_thresholds[best_classes == car_class_id] = float(
+        car_score_threshold)
     eligible = valid_boxes & (best_scores >= class_thresholds)
 
     for class_id in np.unique(best_classes[eligible]):

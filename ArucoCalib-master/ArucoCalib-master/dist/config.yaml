@@ -44,7 +44,7 @@ camera:
   sharpness: 0
 udp:
   enabled: true
-  target_ip: 10.188.74.220
+  target_ip: 10.131.156.220
   target_port: 9005
 gamepad_control:
   target_port: 9010
