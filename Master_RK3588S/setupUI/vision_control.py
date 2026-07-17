@@ -138,10 +138,10 @@ class VisionControlConfig:
     straight_min_span_ratio: float = 0.50
     straight_path_max_residual_640: float = 6.0
     straight_edge_max_residual_640: float = 10.0
-    normal_speed_mps: float = 0.06
+    normal_speed_mps: float = 0.10
     recover_speed_mps: float = 0.04
     human_pass_speed_mps: float = 0.30
-    collect_speed_mps: float = 0.06
+    collect_speed_mps: float = 0.10
     turnsign_slow_speed_mps: float = 0.08
     route_confirm_frames: int = 6
     branch_separation_px_640: float = 70.0
@@ -300,10 +300,10 @@ class VisionControlConfig:
             straight_edge_max_residual_640=max(
                 0.5, _env_float(
                     "VISION_CONTROL_STRAIGHT_EDGE_MAX_RESIDUAL_640", 10.0)),
-            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.06)),
+            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.10)),
             recover_speed_mps=max(0.031, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.04)),
             human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.30)),
-            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.06)),
+            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.10)),
             turnsign_slow_speed_mps=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_SLOW_SPEED", 0.08)),
             route_confirm_frames=max(1, _env_int("VISION_CONTROL_ROUTE_CONFIRM_FRAMES", 6)),
             branch_separation_px_640=max(1.0, _env_float("VISION_CONTROL_BRANCH_SEP_640", 70.0)),

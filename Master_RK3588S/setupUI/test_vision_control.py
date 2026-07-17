@@ -200,9 +200,9 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.hazard_bottom_ratio, 0.58)
         self.assertEqual(config.car_avoid_offset_px_640, 55.0)
         self.assertEqual(config.car_avoid_hold_s, 2.0)
-        self.assertEqual(config.normal_speed_mps, 0.06)
+        self.assertEqual(config.normal_speed_mps, 0.10)
         self.assertEqual(config.recover_speed_mps, 0.04)
-        self.assertEqual(config.collect_speed_mps, 0.06)
+        self.assertEqual(config.collect_speed_mps, 0.10)
         self.assertEqual(config.track_deadband_px_640, 0.0)
         self.assertEqual(config.track_small_error_gain, 0.20)
         self.assertEqual(config.curve_track_step_scale, 1.50)
@@ -295,7 +295,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             _raw_result_at(260.0, 400.0), now=10.1)
         self.assertEqual(reacquired["control_target"]["task_reason"], "track")
         self.assertEqual(reacquired_command["state_cmd"], STATE_TRACK)
-        self.assertAlmostEqual(reacquired_command["target_speed"], 0.06)
+        self.assertAlmostEqual(reacquired_command["target_speed"], 0.10)
 
     def test_detached_near_path_is_treated_as_line_loss(self):
         planner = VisionControlPlanner(config=_config())
@@ -844,7 +844,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         command, debug = VisionControlPlanner(config=_config()).update(
             _raw_result_at(320.0, 430.0, detections=car), now=1.0)
         self.assertEqual(command["state_cmd"], STATE_AVOID_CAR)
-        self.assertAlmostEqual(command["target_speed"], 0.06)
+        self.assertAlmostEqual(command["target_speed"], 0.10)
         self.assertEqual(
             debug["control_target"]["task_reason"], "car_in_path_bias")
         self.assertAlmostEqual(
@@ -859,7 +859,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         command, debug = VisionControlPlanner(config=_config()).update(
             _raw_result_at(320.0, 430.0, detections=coin), now=1.0)
         self.assertEqual(command["state_cmd"], STATE_COLLECT_GOLD)
-        self.assertAlmostEqual(command["target_speed"], 0.06)
+        self.assertAlmostEqual(command["target_speed"], 0.10)
         self.assertEqual(
             debug["control_target"]["task_reason"], "coin_bias")
 
