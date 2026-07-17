@@ -129,6 +129,16 @@ class VisionTelemetryLogger:
                     target.get("path_target_held", False)),
                 "path_raw_error_640": _number(
                     target.get("path_raw_track_error_640")),
+                "path_position_gain": _number(
+                    target.get("path_position_gain"), 1.0),
+                "path_position_weighted_error_640": _number(
+                    target.get("path_position_weighted_error_640")),
+                "straight_line_weights_active": bool(
+                    target.get("straight_line_weights_active", False)),
+                "path_heading_feedforward_gain": _number(
+                    target.get("path_heading_feedforward_gain")),
+                "curve_feedforward_gain": _number(
+                    target.get("curve_feedforward_gain")),
                 "raw_error_640": _number(target.get("raw_track_error_640")),
                 "uncapped_raw_error_640": _number(
                     target.get("uncapped_raw_track_error_640")),

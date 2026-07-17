@@ -196,6 +196,9 @@ class VisionControlPlannerTest(unittest.TestCase):
     def test_conflicting_control_defaults_match_e7(self):
         config = VisionControlConfig()
         self.assertEqual(config.lookahead_y_ratio, 0.625)
+        self.assertEqual(config.straight_position_gain, 0.70)
+        self.assertEqual(config.straight_heading_feedforward_gain, 0.60)
+        self.assertEqual(config.straight_curve_feedforward_gain, 0.0)
         self.assertEqual(config.max_error_step_640, 24.0)
         self.assertEqual(config.hazard_bottom_ratio, 0.58)
         self.assertEqual(config.car_avoid_offset_px_640, 55.0)
@@ -585,11 +588,12 @@ class VisionControlPlannerTest(unittest.TestCase):
         _command, first = planner.update(curved_result(), now=1.0)
         _command, second = planner.update(curved_result(), now=1.04)
         _command, third = planner.update(curved_result(), now=1.08)
+        _command, fourth = planner.update(curved_result(), now=1.12)
         self.assertEqual(first["road_shape_state"], "straight")
         self.assertEqual(second["road_shape_state"], "straight")
         self.assertEqual(third["road_shape_state"], "curve")
         self.assertEqual(
-            third["control_target"]["track_error_response"],
+            fourth["control_target"]["track_error_response"],
             "curve_track")
         self.assertGreater(
             abs(third["control_target"]["road_curvature_640"]), 8.0)
@@ -677,7 +681,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(error, 36.0)
         self.assertEqual(planner.track_error_response, "curve_track")
 
-    def test_light_curve_feedforward_anticipates_bend(self):
+    def test_straight_state_keeps_curve_feedforward_zero_until_curve_latched(self):
         ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
         xs = 320.0 + 0.0015 * (ys - 300.0) ** 2
         result = _raw_result_at(320.0, 430.0)
@@ -689,8 +693,46 @@ class VisionControlPlannerTest(unittest.TestCase):
         _command, debug = planner.update(result, now=1.0)
         _command, debug = planner.update(result, now=1.04)
         target = debug["control_target"]
+        self.assertEqual(debug["road_shape_state"], "straight")
+        self.assertTrue(target["straight_line_weights_active"])
+        self.assertEqual(target["curve_feedforward_gain"], 0.0)
+        self.assertEqual(target["curve_feedforward_640"], 0.0)
+        _command, debug = planner.update(result, now=1.08)
+        target = debug["control_target"]
+        self.assertEqual(debug["road_shape_state"], "curve")
+        self.assertFalse(target["straight_line_weights_active"])
         self.assertGreater(target["curve_feedforward_640"], 0.0)
         self.assertLessEqual(abs(target["curve_feedforward_640"]), 36.0)
+
+    def test_straight_nominal_position_and_heading_weights_are_applied(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        xs = 340.0 + 0.10 * (ys - 300.0)
+        selected = _raw_path(0, xs, ys)
+        result = {
+            "paths": [selected],
+            "road": {"mask": _road_mask_following_path(xs, ys)},
+            "detections": [],
+        }
+        path_geometry = planner._path_geometry_metrics(
+            selected, 300.0, (480, 640, 3))
+        _command, target = planner._build_command(
+            selected, "test", result, (480, 640, 3), now=1.0)
+        self.assertTrue(target["straight_line_weights_active"])
+        self.assertEqual(target["path_position_gain"], 0.70)
+        self.assertEqual(target["path_heading_feedforward_gain"], 0.60)
+        self.assertEqual(target["curve_feedforward_gain"], 0.0)
+        self.assertAlmostEqual(
+            target["path_position_weighted_error_640"],
+            target["path_raw_track_error_640"] * 0.70)
+        self.assertAlmostEqual(
+            target["path_heading_feedforward_640"],
+            path_geometry["heading_delta_640"] * 0.60)
+        self.assertEqual(target["curve_feedforward_640"], 0.0)
+        self.assertAlmostEqual(
+            target["line_based_track_error_640"],
+            target["path_position_weighted_error_640"]
+            + target["path_heading_feedforward_640"])
 
     def test_path_heading_prevents_left_target_from_commanding_late_left(self):
         ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)

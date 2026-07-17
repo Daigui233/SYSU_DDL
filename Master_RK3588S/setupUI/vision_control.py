@@ -106,6 +106,11 @@ def _interp_path_x_many(points, target_ys):
 @dataclass
 class VisionControlConfig:
     visual_center_x: float = 0.50
+    # Nominal straight-line blend: position 0.70, slope 0.60, curvature 0.
+    # Confirmed curves retain the independent path/curvature gains below.
+    straight_position_gain: float = 0.70
+    straight_heading_feedforward_gain: float = 0.60
+    straight_curve_feedforward_gain: float = 0.0
     lookahead_y_ratio: float = 0.625
     max_track_error_640: float = 160.0
     max_error_step_640: float = 24.0
@@ -216,6 +221,15 @@ class VisionControlConfig:
     def from_env(cls):
         return cls(
             visual_center_x=_clamp(_env_float("VISION_CONTROL_CENTER_X", 0.50), 0.2, 0.8),
+            straight_position_gain=_clamp(
+                _env_float("VISION_CONTROL_STRAIGHT_POSITION_GAIN", 0.70),
+                0.0, 1.0),
+            straight_heading_feedforward_gain=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_STRAIGHT_HEADING_FF_GAIN", 0.60)),
+            straight_curve_feedforward_gain=_clamp(
+                _env_float("VISION_CONTROL_STRAIGHT_CURVE_FF_GAIN", 0.0),
+                0.0, 1.0),
             lookahead_y_ratio=_clamp(_env_float("VISION_CONTROL_LOOKAHEAD_Y_RATIO", 0.625), 0.25, 0.95),
             max_track_error_640=max(1.0, _env_float("VISION_CONTROL_MAX_ERROR_640", 160.0)),
             max_error_step_640=max(1.0, _env_float("VISION_CONTROL_MAX_STEP_640", 24.0)),
@@ -1421,6 +1435,21 @@ class VisionControlPlanner:
         line_feedforward_enabled = bool(
             (task_reason == "track" and target_override_x is None)
             or curve_offset_task)
+        straight_line_weights_active = bool(
+            line_feedforward_enabled and self.road_shape_state == "straight")
+        position_gain = (
+            float(self.config.straight_position_gain)
+            if straight_line_weights_active else 1.0)
+        heading_gain = (
+            float(self.config.straight_heading_feedforward_gain)
+            if straight_line_weights_active
+            else float(self.config.path_heading_feedforward_gain))
+        curve_gain = (
+            float(self.config.straight_curve_feedforward_gain)
+            if straight_line_weights_active
+            else float(self.config.curve_feedforward_gain))
+        weighted_path_error = (
+            float(path_raw_error) * position_gain)
         if (line_feedforward_enabled and
                 not path_target_adaptive and path_geometry["valid"]):
             heading_delta_640 = float(
@@ -1430,14 +1459,12 @@ class VisionControlPlanner:
                 self.config.path_heading_deadband_px_640
             ):
                 heading_feedforward = _clamp(
-                    heading_delta_640 * float(
-                        self.config.path_heading_feedforward_gain),
+                    heading_delta_640 * heading_gain,
                     -float(self.config.path_heading_feedforward_max_px_640),
                     float(self.config.path_heading_feedforward_max_px_640),
                 )
             curve_feedforward = _clamp(
-                float(road_shape_geometry["curvature_640"]) * float(
-                    self.config.curve_feedforward_gain),
+                float(road_shape_geometry["curvature_640"]) * curve_gain,
                 -float(self.config.curve_feedforward_max_px_640),
                 float(self.config.curve_feedforward_max_px_640),
             )
@@ -1453,7 +1480,7 @@ class VisionControlPlanner:
                     self.config.right_circle_feedforward_640)
         total_feedforward = (
             float(heading_feedforward) + float(curve_feedforward))
-        line_based_error = float(path_raw_error) + total_feedforward
+        line_based_error = float(weighted_path_error) + total_feedforward
         raw_error = line_based_error
         if right_circle_feedforward != 0.0:
             feedforward_delta = (
@@ -1524,7 +1551,7 @@ class VisionControlPlanner:
                     float(raw_mask_constraint["constrained_x"]) / width
                     - self.config.visual_center_x) * 640.0
         applied_steering_feedforward = (
-            float(raw_error) - float(path_raw_error))
+            float(raw_error) - float(weighted_path_error))
         control_target_x = _clamp(
             float(target_x) + applied_steering_feedforward *
             float(max(1, image_shape[1])) / 640.0,
@@ -1635,6 +1662,13 @@ class VisionControlPlanner:
             "straight_limit_suppressed_by_task": bool(
                 high_confidence_straight and offset_task),
             "path_raw_track_error_640": float(path_raw_error),
+            "straight_line_weights_active": bool(
+                straight_line_weights_active),
+            "path_position_gain": float(position_gain),
+            "path_position_weighted_error_640": float(
+                weighted_path_error),
+            "path_heading_feedforward_gain": float(heading_gain),
+            "curve_feedforward_gain": float(curve_gain),
             "path_heading_feedforward_640": float(
                 heading_feedforward),
             "curve_feedforward_640": float(curve_feedforward),
