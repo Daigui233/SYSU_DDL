@@ -965,6 +965,87 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(
             pass_after_human_returns[3], pass_after_left_to_right[3])
 
+    def test_human_stop_latch_survives_long_dropout_until_restart(self):
+        planner = VisionControlPlanner(config=_config())
+        selected = {
+            "points_xy": np.asarray(
+                [[320.0, 60.0], [320.0, 460.0]], dtype=np.float32),
+        }
+        left = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [250.0, 330.0, 310.0, 450.0],
+        }]
+        right = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [360.0, 330.0, 420.0, 450.0],
+        }]
+
+        stop = planner._human_action(
+            left, selected, (480, 640, 3), 300.0, 320.0, 1.0)
+        first_reverse = planner._update_human_stop_reverse(stop[2], 1.0)
+        missing_long_after_old_timeout = planner._human_action(
+            [], selected, (480, 640, 3), 300.0, 320.0, 10.0)
+        repeated_reverse = planner._update_human_stop_reverse(
+            missing_long_after_old_timeout[2], 10.0)
+        restart = planner._human_action(
+            right, selected, (480, 640, 3), 300.0, 320.0, 10.1)
+
+        self.assertEqual(stop[0], STATE_SAFE_STOP)
+        self.assertTrue(first_reverse)
+        self.assertFalse(repeated_reverse)
+        self.assertEqual(
+            missing_long_after_old_timeout[0], STATE_SAFE_STOP)
+        self.assertEqual(
+            missing_long_after_old_timeout[2], "human_absence_check")
+        self.assertTrue(planner.human_pass_active)
+        self.assertFalse(planner.human_detected_latched)
+        self.assertEqual(restart[0], STATE_AVOID_HUMAN)
+
+    def test_human_restart_hold_ignores_same_person_redetection(self):
+        planner = VisionControlPlanner(config=_config())
+        selected = _raw_path(0, 320.0)
+        left = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [250.0, 330.0, 310.0, 450.0],
+        }]
+        right = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [360.0, 330.0, 420.0, 450.0],
+        }]
+
+        stop = planner._task_from_detections(
+            {"detections": left}, selected, (480, 640, 3),
+            300.0, 1.0, path_target_x=320.0)
+        restart = planner._task_from_detections(
+            {"detections": right}, selected, (480, 640, 3),
+            300.0, 1.1, path_target_x=320.0)
+        dropout_hold = planner._task_from_detections(
+            {"detections": []}, selected, (480, 640, 3),
+            300.0, 1.2, path_target_x=320.0)
+        redetection_hold = planner._task_from_detections(
+            {"detections": right}, selected, (480, 640, 3),
+            300.0, 1.3, path_target_x=320.0)
+
+        self.assertEqual(stop[0], STATE_SAFE_STOP)
+        self.assertEqual(restart[0], STATE_AVOID_HUMAN)
+        self.assertEqual(dropout_hold[2], "human_speed_hold")
+        self.assertEqual(redetection_hold[2], "human_speed_hold")
+        self.assertEqual(redetection_hold[0], STATE_AVOID_HUMAN)
+        self.assertTrue(planner.human_pass_active)
+
+    def test_line_loss_cannot_release_latched_human_stop(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.human_detected_latched = True
+        planner.human_waiting_cross = True
+
+        action = planner._task_from_detections(
+            {"detections": []}, None, (480, 640, 3),
+            300.0, 5.0, path_target_x=None)
+
+        self.assertEqual(action[0], STATE_SAFE_STOP)
+        self.assertEqual(action[1], 0.0)
+        self.assertEqual(action[2], "human_absence_check")
+
     def test_human_left_offset_stays_default_while_inside_road_mask(self):
         planner = VisionControlPlanner(config=_config())
         mask = np.zeros((120, 160), dtype=np.uint8)

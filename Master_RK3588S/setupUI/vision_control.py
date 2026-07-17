@@ -1299,6 +1299,28 @@ class VisionControlPlanner:
             })
             return command, target
         if selected is None:
+            if self._is_human_stop_reason(task_reason):
+                reverse_state = (
+                    STATE_AVOID_HUMAN if human_reverse_active
+                    else STATE_SAFE_STOP)
+                reverse_speed = (
+                    self.config.human_stop_reverse_speed_mps
+                    if human_reverse_active else 0.0)
+                return self._command(
+                    self.last_error, reverse_speed, reverse_state,
+                    flags=(
+                        CONTROL_FLAG_USE_TARGET_SPEED
+                        if human_reverse_active else 0)), {
+                        "target_x": None,
+                        "path_target_x": None,
+                        "path_target_y": float(lookahead_y),
+                        "path_target_held": False,
+                        "track_error_640": float(self.last_error),
+                        "reason": "line_loss_human_stop",
+                        "task_reason": task_reason,
+                        "human_stop_reverse_active": bool(
+                            human_reverse_active),
+                    }
             return self._line_loss_hold_command(
                 line_loss_reason or route_reason or "line_unavailable",
                 task_reason, now, lookahead_y)
@@ -2404,6 +2426,14 @@ class VisionControlPlanner:
             ocr_response=None, path_target_x=None):
         detections = result.get("detections") or []
         if selected is None:
+            if self.car_human_active:
+                return (
+                    STATE_SAFE_STOP, 0.0,
+                    "car_human_absence_check", None)
+            if self.human_detected_latched:
+                return (
+                    STATE_SAFE_STOP, 0.0,
+                    "human_absence_check", None)
             return (
                 STATE_RECOVER_LINE, self.config.recover_speed_mps,
                 "no_path", None)
@@ -2433,15 +2463,10 @@ class VisionControlPlanner:
                 self.human_last_avoid_target_x = _finite_float(
                     car_action[3])
             return car_action
-        human_action = self._human_action(
-            detections, selected, image_shape, lookahead_y,
-            lookahead_path_x, now)
-        if human_action is not None:
-            if int(human_action[0]) == STATE_AVOID_HUMAN:
-                self.human_speed_hold_until = (
-                    float(now) + self.config.human_speed_hold_s)
-            return human_action
         if now < self.human_speed_hold_until:
+            # Once the car has restarted, keep the committed pass command ahead
+            # of fresh Human detections. Detector flicker must not turn the same
+            # crossing into a second stop-and-reverse event.
             held_target_x = _clamp(
                 float(target_path_x) + float(self.human_pass_offset_x),
                 0.0,
@@ -2455,6 +2480,14 @@ class VisionControlPlanner:
                 "human_speed_hold",
                 held_target_x,
             )
+        human_action = self._human_action(
+            detections, selected, image_shape, lookahead_y,
+            lookahead_path_x, now)
+        if human_action is not None:
+            if int(human_action[0]) == STATE_AVOID_HUMAN:
+                self.human_speed_hold_until = (
+                    float(now) + self.config.human_speed_hold_s)
+            return human_action
         if self.human_path_return_pending:
             # Keep the last physical pass target as the start of a short
             # return ramp.  The newly selected path may be noisy or sit at
@@ -3059,26 +3092,15 @@ class VisionControlPlanner:
                 )
 
         if self.car_human_active:
-            absence_age = max(
-                0.0, float(now) - self.car_human_last_seen_ts)
-            if absence_age < self.config.human_absence_confirm_s:
-                return (
-                    STATE_SAFE_STOP,
-                    0.0,
-                    "car_human_absence_check",
-                    avoid_target_x,
-                )
-
-            # No Human has been detected for the complete confirmation window.
-            # Release only the pedestrian part of the state; a remaining car
-            # hold still owns the same avoidance side until its own 2 s expires.
-            self.car_human_active = False
-            self.car_human_waiting_cross = False
-            self.car_human_seen_avoid_side = False
-            self.car_human_last_seen_ts = 0.0
-            if car is None and not car_holding:
-                self._clear_car_avoidance_state()
-                return None
+            # Once a person has reached the stop line, detector loss must not
+            # release the stop. Only the observed crossing transition above can
+            # restart the car and enter the timed pass hold.
+            return (
+                STATE_SAFE_STOP,
+                0.0,
+                "car_human_absence_check",
+                avoid_target_x,
+            )
 
         elif self._human_preline_missing_waiting(now):
             return (
@@ -3206,18 +3228,15 @@ class VisionControlPlanner:
                 self._clear_human_state()
                 return None
             if self.human_detected_latched:
-                absence_age = max(
-                    0.0, float(now) - self.human_last_seen_ts)
-                if absence_age < self.config.human_absence_confirm_s:
-                    # A person leaving the image is ambiguous. Require one
-                    # continuous 1.5 s interval with no Human detections before
-                    # treating the scene as clear.
-                    return (
-                        STATE_SAFE_STOP,
-                        0.0,
-                        "human_absence_check",
-                        None,
-                    )
+                # A stop-line crossing starts one latched avoidance session.
+                # Do not time it out on detector loss; the car may restart only
+                # after the required left-to-right transition is observed.
+                return (
+                    STATE_SAFE_STOP,
+                    0.0,
+                    "human_absence_check",
+                    None,
+                )
             elif self._human_preline_missing_waiting(now):
                 return (
                     STATE_SAFE_STOP,
