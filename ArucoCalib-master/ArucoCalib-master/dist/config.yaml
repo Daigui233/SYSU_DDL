@@ -11,16 +11,16 @@ aruco_params:
   cornerRefinementMethod: NONE
 world_coordinates:
   1:
-  - 300.0
+  - 500.0
   - 400.0
   2:
-  - 300.0
+  - 500.0
   - 3400.0
   3:
-  - 4300.0
+  - 4500.0
   - 400.0
   4:
-  - 4300.0
+  - 4500.0
   - 3400.0
 vehicle_id: 0
 min_marker_count: 4

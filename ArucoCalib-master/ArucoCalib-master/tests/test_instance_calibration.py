@@ -79,10 +79,10 @@ class InstanceCalibrationTests(unittest.TestCase):
 
         self.assertTrue(transformer.calibrate(fixed))
         expected = {
-            (100, 100): (4300.0, 3400.0),
-            (900, 120): (300.0, 3400.0),
-            (120, 700): (4300.0, 400.0),
-            (880, 720): (300.0, 400.0),
+            (100, 100): (4500.0, 3400.0),
+            (900, 120): (500.0, 3400.0),
+            (120, 700): (4500.0, 400.0),
+            (880, 720): (500.0, 400.0),
         }
         for pixel, world in expected.items():
             actual = transformer.pixel_to_world(*pixel)

@@ -26,14 +26,14 @@ aruco_params:
 # detected tag IDs are ignored and duplicate IDs are supported.
 # Format: legacy_corner_key: [x, y]
 # Units: millimeters (mm)
-# AR world: field bottom-right reference is (X=300mm, Z=400mm), +X points left, +Z points up.
+# AR world: field bottom-right reference is (X=500mm, Z=400mm), +X points left, +Z points up.
 # The homography's second coordinate is emitted as AR Z.
 # Corner slots: 1=bottom-right, 2=top-right, 3=bottom-left, 4=top-left.
 world_coordinates:
-  1: [300.0, 400.0]
-  2: [300.0, 3400.0]
-  3: [4300.0, 400.0]
-  4: [4300.0, 3400.0]
+  1: [500.0, 400.0]
+  2: [500.0, 3400.0]
+  3: [4500.0, 400.0]
+  4: [4500.0, 3400.0]
 
 # Vehicle marker ID (unchanged; may duplicate a locked fixed-tag ID)
 vehicle_id: 0
