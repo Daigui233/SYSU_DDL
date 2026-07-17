@@ -4,6 +4,9 @@ aruco:
   dict_type: "DICT_APRILTAG_36h11"
   # Calibration tag side length in meters. Homography currently uses tag centers.
   marker_size: 0.20  # Calibration tags are 20cm x 20cm.
+  # 36h11 has an 11-bit minimum code distance. With errorCorrectionRate=0.6,
+  # this permits about 3 bad data bits while retaining a conservative margin.
+  max_correction_bits: 5
 
 # ArUco detector parameter overrides (optional).
 # Useful for far/small markers: reduce minMarkerPerimeterRate and tune adaptive threshold windows.
@@ -14,22 +17,25 @@ aruco_params:
   adaptiveThreshWinSizeMin: 3
   adaptiveThreshWinSizeMax: 23
   adaptiveThreshWinSizeStep: 10
+  # Effective correction allowance: 0.6 * 5 = about 3 data bits.
+  errorCorrectionRate: 0.6
   # Corner refinement method: NONE / SUBPIX / CONTOUR / APRILTAG
   cornerRefinementMethod: "NONE"
 
-# World coordinates for each ArUco marker
-# Format: marker_id: [x, y]
+# Four calibration-corner coordinates. Numeric keys are legacy labels only;
+# detected tag IDs are ignored and duplicate IDs are supported.
+# Format: legacy_corner_key: [x, y]
 # Units: millimeters (mm)
 # AR world: field bottom-right reference is (X=300mm, Z=400mm), +X points left, +Z points up.
 # The homography's second coordinate is emitted as AR Z.
-# Tag installation: 1=bottom-right, 2=top-right, 3=bottom-left, 4=top-left.
+# Corner slots: 1=bottom-right, 2=top-right, 3=bottom-left, 4=top-left.
 world_coordinates:
   1: [300.0, 400.0]
   2: [300.0, 3400.0]
   3: [4300.0, 400.0]
   4: [4300.0, 3400.0]
 
-# Vehicle marker ID (ArUco marker_id attached on the car)
+# Vehicle marker ID (unchanged; may duplicate a locked fixed-tag ID)
 vehicle_id: 0
 
 # Minimum number of markers required for calibration
@@ -88,4 +94,12 @@ pose_filter:
   position_alpha: 0.35
   yaw_alpha: 0.35
   reset_gap_s: 0.35
+
+# After four-corner lock, every camera frame is rectified to one uniform field
+# scale and detected once. This enlarges far/top tags without a second pass.
+vehicle_detection_rectification:
+  enabled: true
+  scale_px_per_mm: 0.30
+  margin_mm: 150.0
+  max_dimension: 1600
 

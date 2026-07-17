@@ -14,15 +14,64 @@ class CoordinateTransformer:
         self.homography_matrix = None
         self.homography_matrix_inv = None
         self.is_calibrated = False
+
+    @staticmethod
+    def _point_array(pixel_coords):
+        """Normalize legacy dict input or instance/point lists to four points."""
+        if isinstance(pixel_coords, dict):
+            values = list(pixel_coords.values())
+        else:
+            values = list(pixel_coords)
+
+        points = []
+        for value in values:
+            if isinstance(value, dict):
+                value = value.get("center")
+            point = np.asarray(value, dtype=np.float32).reshape(-1)
+            if point.size < 2:
+                return None
+            points.append([float(point[0]), float(point[1])])
+        if len(points) != 4:
+            return None
+        return np.asarray(points, dtype=np.float32)
+
+    @staticmethod
+    def _order_image_corners(points):
+        """Order image points as top-left, top-right, bottom-right, bottom-left."""
+        points = np.asarray(points, dtype=np.float32)
+        by_y = points[np.argsort(points[:, 1])]
+        top = by_y[:2][np.argsort(by_y[:2, 0])]
+        bottom = by_y[2:][np.argsort(by_y[2:, 0])]
+        ordered = np.asarray([top[0], top[1], bottom[1], bottom[0]], dtype=np.float32)
+        if len(cv2.convexHull(ordered)) != 4 or abs(cv2.contourArea(ordered)) <= 1.0:
+            return None
+        return ordered
+
+    @staticmethod
+    def _order_world_corners(world_coordinates):
+        """Match current field axes to the four visible image-corner roles.
+
+        In the existing convention +X points left and +Z points up, so image
+        left uses the larger world X and image top uses the larger world Z.
+        """
+        points = np.asarray(list(world_coordinates.values()), dtype=np.float32)
+        if points.shape != (4, 2):
+            return None
+        by_z = points[np.argsort(points[:, 1])]
+        bottom = by_z[:2][np.argsort(by_z[:2, 0])[::-1]]
+        top = by_z[2:][np.argsort(by_z[2:, 0])[::-1]]
+        return np.asarray([top[0], top[1], bottom[1], bottom[0]], dtype=np.float32)
     
     def calibrate(self, pixel_coords_dict):
         """
-        Calibrate the coordinate system using all detected ArUco markers
+        Calibrate the coordinate system from four visible fixed-tag instances.
+
+        Tag IDs are not used. The four pixel centers are assigned to the current
+        world corners by their on-screen top/left/right/bottom positions.
         
         Args:
-            pixel_coords_dict: Dictionary mapping marker ID to pixel coordinates (x, y)
-                              Must contain at least MIN_MARKER_COUNT markers that are
-                              defined in WORLD_COORDINATES
+            pixel_coords_dict: Legacy ID->center dict, a list of centers, or a
+                               list of detection-instance dictionaries.
         
         Returns:
             bool: True if calibration successful, False otherwise
@@ -30,31 +79,12 @@ class CoordinateTransformer:
         # Get configuration
         cfg = config.get_config()
         
-        # Find markers that are both detected and have known world coordinates
-        known_marker_ids = set(cfg.WORLD_COORDINATES.keys())
-        detected_marker_ids = set(pixel_coords_dict.keys())
-        valid_marker_ids = known_marker_ids.intersection(detected_marker_ids)
-        
-        # Check if we have enough markers for calibration
-        if len(valid_marker_ids) < cfg.MIN_MARKER_COUNT:
+        src_raw = self._point_array(pixel_coords_dict)
+        src_points = self._order_image_corners(src_raw) if src_raw is not None else None
+        dst_points = self._order_world_corners(cfg.WORLD_COORDINATES)
+        if src_points is None or dst_points is None:
             self.is_calibrated = False
             return False
-        
-        # Prepare source points (pixel coordinates)
-        src_points = []
-        # Prepare destination points (world coordinates)
-        dst_points = []
-        
-        # Use all valid markers in sorted order for consistency
-        for marker_id in sorted(valid_marker_ids):
-            pixel_coord = pixel_coords_dict[marker_id]
-            world_coord = cfg.WORLD_COORDINATES[marker_id]
-            
-            src_points.append([pixel_coord[0], pixel_coord[1]])
-            dst_points.append([world_coord[0], world_coord[1]])
-        
-        src_points = np.array(src_points, dtype=np.float32)
-        dst_points = np.array(dst_points, dtype=np.float32)
         
         # Calculate homography matrix
         self.homography_matrix, mask = cv2.findHomography(

@@ -2,6 +2,7 @@
 ArUco marker detection module
 """
 import cv2
+import itertools
 import numpy as np
 from . import config_loader as config
 
@@ -13,6 +14,12 @@ class ArUcoDetector:
         """Initialize ArUco detector"""
         cfg = config.get_config()
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cfg.ARUCO_DICT)
+        max_correction_bits = getattr(cfg, "ARUCO_MAX_CORRECTION_BITS", None)
+        if max_correction_bits is not None:
+            # OpenCV ships DICT_APRILTAG_36h11 with zero correction bits in
+            # this runtime. Allow a bounded amount of decode noise so the
+            # moving vehicle tag remains detectable when small or blurred.
+            self.aruco_dict.maxCorrectionBits = int(max_correction_bits)
         self.aruco_params = cv2.aruco.DetectorParameters()
         self._apply_detector_params_overrides(getattr(cfg, "ARUCO_PARAMS", {}) or {})
         # Try to use ArucoDetector (OpenCV 4.7+), fallback to old API
@@ -133,7 +140,10 @@ class ArUcoDetector:
     
     def get_marker_centers(self, corners, ids):
         """
-        Get center coordinates of detected markers
+        Get center coordinates keyed by marker ID (legacy helper).
+
+        Duplicate IDs overwrite each other; new calibration/vehicle code must
+        use get_marker_instances() instead.
         
         Args:
             corners: List of marker corners
@@ -153,31 +163,95 @@ class ArUcoDetector:
                 marker_centers[int(marker_id)] = center.astype(np.float32)
         
         return marker_centers
+
+    def get_marker_instances(self, corners, ids):
+        """Return every detection separately, including duplicate marker IDs.
+
+        A dictionary keyed by marker ID cannot represent two physical tags that
+        use the same printed ID.  Calibration and vehicle selection therefore
+        use this instance list as their source of truth.
+        """
+        marker_instances = []
+        if ids is None or corners is None:
+            return marker_instances
+
+        for detection_index, marker_id in enumerate(ids.flatten()):
+            marker_corners = np.asarray(corners[detection_index][0], dtype=np.float32)
+            if marker_corners.shape != (4, 2):
+                continue
+            marker_instances.append(
+                {
+                    "id": int(marker_id),
+                    "index": int(detection_index),
+                    "corners": marker_corners,
+                    "center": np.mean(marker_corners, axis=0).astype(np.float32),
+                }
+            )
+        return marker_instances
+
+    @staticmethod
+    def _calibration_quad_area(marker_instances):
+        """Return the convex quadrilateral area, or -1 for an invalid layout."""
+        if len(marker_instances) != 4:
+            return -1.0
+        points = np.asarray(
+            [marker["center"] for marker in marker_instances],
+            dtype=np.float32,
+        )
+        hull = cv2.convexHull(points)
+        if hull is None or len(hull) != 4:
+            return -1.0
+        return float(abs(cv2.contourArea(hull)))
+
+    def select_calibration_markers(self, marker_instances, required_count=4):
+        """Select four spatially separated fixed-tag detections for calibration.
+
+        Marker IDs are intentionally ignored.  When more than four detections
+        are present, the widest convex quadrilateral is used; this lets the four
+        field-corner tags win over an extra tag inside the field.
+        """
+        required_count = int(required_count)
+        if required_count != 4 or len(marker_instances) < required_count:
+            return None
+
+        if len(marker_instances) == required_count:
+            selected = list(marker_instances)
+            return selected if self._calibration_quad_area(selected) > 1.0 else None
+
+        # A normal frame contains only four or five tags.  Bound pathological
+        # false-positive frames before evaluating combinations.
+        candidates = list(marker_instances)
+        if len(candidates) > 12:
+            centers = np.asarray([m["center"] for m in candidates], dtype=np.float32)
+            centroid = np.mean(centers, axis=0)
+            distances = np.linalg.norm(centers - centroid, axis=1)
+            keep = np.argsort(distances)[-12:]
+            candidates = [candidates[int(i)] for i in keep]
+
+        best_markers = None
+        best_area = -1.0
+        for combination in itertools.combinations(candidates, required_count):
+            area = self._calibration_quad_area(combination)
+            if area > best_area:
+                best_area = area
+                best_markers = list(combination)
+        return best_markers if best_area > 1.0 else None
     
     def get_required_markers(self, corners, ids):
         """
-        Get all detected markers that have known world coordinates
+        Get four fixed-tag detection instances for spatial calibration.
         
         Args:
             corners: List of marker corners
             ids: Array of marker IDs
             
         Returns:
-            dict: Dictionary mapping marker ID to center pixel coordinates
-                  Returns None if fewer than MIN_MARKER_COUNT markers are detected
+            list[dict]: Four detection instances. Marker IDs may repeat.
+                        Returns None if a valid four-corner layout is unavailable.
         """
         cfg = config.get_config()
-        marker_centers = self.get_marker_centers(corners, ids)
-        
-        # Find markers that have known world coordinates
-        known_marker_ids = set(cfg.WORLD_COORDINATES.keys())
-        known_marker_ids.discard(int(getattr(cfg, "VEHICLE_ID", 0)))
-        detected_ids = set(marker_centers.keys())
-        valid_marker_ids = known_marker_ids.intersection(detected_ids)
-        
-        # Check if we have enough markers for calibration
-        if len(valid_marker_ids) >= cfg.MIN_MARKER_COUNT:
-            # Return all valid markers
-            return {marker_id: marker_centers[marker_id] for marker_id in valid_marker_ids}
-        else:
-            return None
+        marker_instances = self.get_marker_instances(corners, ids)
+        return self.select_calibration_markers(
+            marker_instances,
+            required_count=getattr(cfg, "MIN_MARKER_COUNT", 4),
+        )

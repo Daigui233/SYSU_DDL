@@ -33,6 +33,10 @@ class Config:
         # Convert string to cv2 constant
         self.ARUCO_DICT = getattr(cv2.aruco, dict_type_name)
         self.MARKER_SIZE = aruco_config.get('marker_size', 0.20)
+        max_correction_bits = aruco_config.get('max_correction_bits', None)
+        self.ARUCO_MAX_CORRECTION_BITS = (
+            None if max_correction_bits is None else max(0, int(max_correction_bits))
+        )
 
         # Optional: ArUco detector params overrides
         self.ARUCO_PARAMS = config_data.get("aruco_params", {}) or {}
@@ -94,6 +98,21 @@ class Config:
         self.POSE_FILTER_POSITION_ALPHA = float(pose_filter_config.get("position_alpha", 0.35))
         self.POSE_FILTER_YAW_ALPHA = float(pose_filter_config.get("yaw_alpha", 0.35))
         self.POSE_FILTER_RESET_GAP_S = float(pose_filter_config.get("reset_gap_s", 0.35))
+
+        rectification = config_data.get("vehicle_detection_rectification", {}) or {}
+        self.VEHICLE_RECTIFICATION_ENABLED = bool(rectification.get("enabled", True))
+        self.VEHICLE_RECTIFICATION_SCALE_PX_PER_MM = max(
+            0.05,
+            float(rectification.get("scale_px_per_mm", 0.30)),
+        )
+        self.VEHICLE_RECTIFICATION_MARGIN_MM = max(
+            0.0,
+            float(rectification.get("margin_mm", 150.0)),
+        )
+        self.VEHICLE_RECTIFICATION_MAX_DIMENSION = max(
+            320,
+            int(rectification.get("max_dimension", 1600)),
+        )
 
     @staticmethod
     def _resolve_config_path(config_file: str) -> Path:

@@ -1,11 +1,13 @@
 aruco:
   dict_type: DICT_APRILTAG_36h11
   marker_size: 0.2
+  max_correction_bits: 5
 aruco_params:
   minMarkerPerimeterRate: 0.02
   adaptiveThreshWinSizeMin: 3
   adaptiveThreshWinSizeMax: 23
   adaptiveThreshWinSizeStep: 10
+  errorCorrectionRate: 0.6
   cornerRefinementMethod: NONE
 world_coordinates:
   1:
@@ -60,3 +62,8 @@ pose_filter:
   position_alpha: 0.35
   yaw_alpha: 0.35
   reset_gap_s: 0.35
+vehicle_detection_rectification:
+  enabled: true
+  scale_px_per_mm: 0.30
+  margin_mm: 150.0
+  max_dimension: 1600

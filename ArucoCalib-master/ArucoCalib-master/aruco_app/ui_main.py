@@ -368,6 +368,7 @@ class MainWindow(QMainWindow):
         # Video capture
         self.cap = None
         self.timer = QTimer()
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self.update_frame)
         self.gamepad_timer = QTimer()
         self.gamepad_timer.timeout.connect(self._send_gamepad_control)
@@ -403,13 +404,17 @@ class MainWindow(QMainWindow):
         self.last_vehicle_center_world = None  # (wx, wy) mm
         self.last_vehicle_yaw_deg = None  # float deg
         self.last_vehicle_corners_px = None
+        self.vehicle_track_center_px = None  # persistent center used only to disambiguate candidates
         self.last_output_pose = None  # (x_m, z_m, yaw_deg)
         self.last_output_pose_ts = 0.0
         self.last_pose_live = False
         self.pose_hold_timeout_s = 0.5
         self.filtered_output_pose = None  # (x_m, z_m, yaw_deg)
         self.filtered_output_pose_ts = 0.0
-        self.locked_fixed_marker_corners_px = {}  # fixed marker_id -> (4,2) corners captured at calibration lock
+        # Keep physical detections as a list: fixed and vehicle tags may share an ID.
+        self.locked_fixed_markers = []  # [{id, center, corners, match_radius}, ...]
+        self.rectified_detection_geometry = None  # (image->rectified, rectified->image, size)
+        self.last_detection_rectified = False
         self.last_udp_ok = False
         self.pose_seq = 0
         self.pose_history = []
@@ -502,6 +507,7 @@ class MainWindow(QMainWindow):
 
         cx, cy = self.last_vehicle_center_px
         lines = [f"vehicle_id: {vid}", f"center_px: ({cx:.1f}, {cy:.1f})"]
+        lines.append(f"detection: {'rectified' if self.last_detection_rectified else 'direct'}")
 
         output_pose = self.last_output_pose if self.last_pose_live else None
         if output_pose is None:
@@ -686,6 +692,8 @@ class MainWindow(QMainWindow):
         self._set_cap_prop(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self._set_cap_prop(cv2.CAP_PROP_FRAME_HEIGHT, 1200)
         self._set_cap_prop(cv2.CAP_PROP_FPS, 60)
+        # Prefer the newest camera frame if processing ever falls behind.
+        self._set_cap_prop(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     def _current_output_pose(self):
         if self.last_vehicle_center_world is None or self.last_vehicle_yaw_deg is None:
@@ -905,13 +913,153 @@ class MainWindow(QMainWindow):
         return image_bgr
 
     @staticmethod
-    def _corner_by_id(corners, ids):
-        corner_by_id = {}
-        if ids is None or corners is None:
-            return corner_by_id
-        for i, marker_id in enumerate(ids.flatten()):
-            corner_by_id[int(marker_id)] = np.array(corners[i][0], dtype=np.float32)
-        return corner_by_id
+    def _fixed_marker_match_radius(marker_corners):
+        """Pixel gate used to recognize a still-visible locked physical tag."""
+        marker_corners = np.asarray(marker_corners, dtype=np.float32)
+        sides = np.linalg.norm(marker_corners - np.roll(marker_corners, -1, axis=0), axis=1)
+        mean_side = float(np.mean(sides)) if sides.size else 0.0
+        return max(10.0, min(50.0, mean_side * 0.6))
+
+    def _select_vehicle_marker(self, marker_instances):
+        """Select the moving vehicle instance even when a fixed tag has the same ID."""
+        candidates = [
+            marker for marker in marker_instances
+            if int(marker["id"]) == int(self.vehicle_id)
+        ]
+        if not candidates:
+            return None
+
+        locked_same_id = [
+            marker for marker in self.locked_fixed_markers
+            if int(marker["id"]) == int(self.vehicle_id)
+        ]
+        unmatched_indices = set(range(len(candidates)))
+
+        if locked_same_id:
+            pair_distances = []
+            for locked_index, locked in enumerate(locked_same_id):
+                locked_center = np.asarray(locked["center"], dtype=np.float32)
+                for candidate_index, candidate in enumerate(candidates):
+                    distance = float(
+                        np.linalg.norm(np.asarray(candidate["center"], dtype=np.float32) - locked_center)
+                    )
+                    pair_distances.append((distance, locked_index, candidate_index))
+
+            matched_locked = set()
+            matched_candidates = set()
+            always_reserve_fixed = len(candidates) > len(locked_same_id)
+            for distance, locked_index, candidate_index in sorted(pair_distances):
+                if locked_index in matched_locked or candidate_index in matched_candidates:
+                    continue
+                radius = float(locked_same_id[locked_index]["match_radius"])
+                if not always_reserve_fixed and distance > radius:
+                    continue
+                matched_locked.add(locked_index)
+                matched_candidates.add(candidate_index)
+            unmatched_indices.difference_update(matched_candidates)
+
+        remaining = [candidates[index] for index in sorted(unmatched_indices)]
+        if not remaining:
+            return None
+        if self.vehicle_track_center_px is None or len(remaining) == 1:
+            return remaining[0]
+
+        previous = np.asarray(self.vehicle_track_center_px, dtype=np.float32)
+        return min(
+            remaining,
+            key=lambda marker: float(
+                np.linalg.norm(np.asarray(marker["center"], dtype=np.float32) - previous)
+            ),
+        )
+
+    def _prepare_rectified_detection(self):
+        """Cache a uniform-scale field view derived from the four locked corners."""
+        self.rectified_detection_geometry = None
+        if not bool(getattr(self.cfg, "VEHICLE_RECTIFICATION_ENABLED", True)):
+            return False
+        if not self.transformer.get_calibration_status():
+            return False
+        image_to_world = self.transformer.homography_matrix
+        if image_to_world is None:
+            return False
+
+        world_points = np.asarray(
+            list(getattr(self.cfg, "WORLD_COORDINATES", {}).values()),
+            dtype=np.float64,
+        )
+        if world_points.shape != (4, 2) or not np.all(np.isfinite(world_points)):
+            return False
+
+        min_x, min_z = np.min(world_points, axis=0)
+        max_x, max_z = np.max(world_points, axis=0)
+        margin_mm = float(getattr(self.cfg, "VEHICLE_RECTIFICATION_MARGIN_MM", 150.0))
+        scale = float(getattr(self.cfg, "VEHICLE_RECTIFICATION_SCALE_PX_PER_MM", 0.30))
+        span_x = max(1.0, float(max_x - min_x + 2.0 * margin_mm))
+        span_z = max(1.0, float(max_z - min_z + 2.0 * margin_mm))
+        max_dimension = int(getattr(self.cfg, "VEHICLE_RECTIFICATION_MAX_DIMENSION", 1600))
+        scale = min(scale, max_dimension / max(span_x, span_z))
+        output_size = (
+            max(64, int(round(span_x * scale))),
+            max(64, int(round(span_z * scale))),
+        )
+
+        # Existing axes: +X points image-left and +Z points image-up.
+        world_to_rectified = np.asarray(
+            [
+                [-scale, 0.0, (max_x + margin_mm) * scale],
+                [0.0, -scale, (max_z + margin_mm) * scale],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        image_to_rectified = world_to_rectified @ np.asarray(image_to_world, dtype=np.float64)
+        try:
+            rectified_to_image = np.linalg.inv(image_to_rectified)
+        except np.linalg.LinAlgError:
+            return False
+        if not np.all(np.isfinite(rectified_to_image)):
+            return False
+
+        self.rectified_detection_geometry = (
+            image_to_rectified,
+            rectified_to_image,
+            output_size,
+        )
+        return True
+
+    def _detect_rectified_marker_instances(self, image):
+        """Run one synchronous detection pass on the uniform-scale field image."""
+        if self.rectified_detection_geometry is None and not self._prepare_rectified_detection():
+            return None
+        image_to_rectified, rectified_to_image, output_size = self.rectified_detection_geometry
+        rectified = cv2.warpPerspective(
+            image,
+            image_to_rectified,
+            output_size,
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
+        )
+        corners, ids, _ = self.detector.detect_markers(rectified)
+        rectified_instances = self.detector.get_marker_instances(corners, ids)
+
+        mapped_instances = []
+        for marker in rectified_instances:
+            marker_corners = cv2.perspectiveTransform(
+                np.asarray(marker["corners"], dtype=np.float32).reshape(-1, 1, 2),
+                rectified_to_image,
+            ).reshape(4, 2)
+            if not np.all(np.isfinite(marker_corners)):
+                continue
+            mapped_instances.append(
+                {
+                    "id": int(marker["id"]),
+                    "index": int(marker["index"]),
+                    "corners": marker_corners.astype(np.float32),
+                    "center": np.mean(marker_corners, axis=0).astype(np.float32),
+                }
+            )
+        return mapped_instances
 
     @staticmethod
     def _draw_marker_box(image_bgr, marker_corners, marker_id, color, suffix=""):
@@ -930,23 +1078,34 @@ class MainWindow(QMainWindow):
         return image_bgr
 
     def _draw_marker_overlays(self, image_bgr, corners, ids):
-        corner_by_id = self._corner_by_id(corners, ids)
-        fixed_ids = sorted(set(getattr(self.cfg, "WORLD_COORDINATES", {}).keys()) - {int(self.vehicle_id)})
+        marker_instances = self.detector.get_marker_instances(corners, ids)
 
-        if self.transformer.get_calibration_status() and self.locked_fixed_marker_corners_px:
-            for marker_id in fixed_ids:
-                marker_corners = self.locked_fixed_marker_corners_px.get(int(marker_id))
-                if marker_corners is not None:
-                    self._draw_marker_box(image_bgr, marker_corners, marker_id, (0, 190, 0), " lock")
+        if self.transformer.get_calibration_status() and self.locked_fixed_markers:
+            for marker in self.locked_fixed_markers:
+                self._draw_marker_box(
+                    image_bgr,
+                    marker["corners"],
+                    marker["id"],
+                    (0, 190, 0),
+                    " lock",
+                )
         else:
-            for marker_id in fixed_ids:
-                marker_corners = corner_by_id.get(int(marker_id))
-                if marker_corners is not None:
-                    self._draw_marker_box(image_bgr, marker_corners, marker_id, (0, 190, 0))
+            for marker in marker_instances:
+                self._draw_marker_box(
+                    image_bgr,
+                    marker["corners"],
+                    marker["id"],
+                    (0, 190, 0),
+                )
 
-        vehicle_corners = corner_by_id.get(int(self.vehicle_id))
-        if vehicle_corners is not None:
-            self._draw_marker_box(image_bgr, vehicle_corners, self.vehicle_id, (255, 120, 0))
+        if self.last_vehicle_corners_px is not None:
+            self._draw_marker_box(
+                image_bgr,
+                self.last_vehicle_corners_px,
+                self.vehicle_id,
+                (255, 120, 0),
+                " vehicle",
+            )
 
         return image_bgr
 
@@ -1129,7 +1288,7 @@ class MainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self,
                 "Confirm Recalibration",
-                "Clear the locked calibration and recalibrate when 4 fixed tags are visible again?",
+                "Clear the locked calibration and recalibrate when any 4 corner tags are visible again?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -1138,13 +1297,16 @@ class MainWindow(QMainWindow):
                 return
 
         self.transformer.reset_calibration()
-        self.locked_fixed_marker_corners_px = {}
+        self.locked_fixed_markers = []
+        self.vehicle_track_center_px = None
+        self.rectified_detection_geometry = None
+        self.last_detection_rectified = False
         self.last_output_pose = None
         self._reset_pose_filter()
         self.pose_seq = 0
         self.pose_history = []
         self.calib_label.setText("Calibration: Not calibrated")
-        self.status_label.setText("Status: Waiting for 4 fixed tags to recalibrate")
+        self.status_label.setText("Status: Waiting for any 4 corner tags to recalibrate")
 
     def clear_trajectory(self):
         self.pose_history = []
@@ -1217,7 +1379,9 @@ class MainWindow(QMainWindow):
 
         self._update_trace_max_len()
 
-        interval_ms = max(1, int(round(1000.0 / self.source_fps)))
+        # At 60 FPS, floor to 16 ms instead of rounding to 17 ms (58.8 FPS).
+        # VideoCapture blocks briefly until the camera's next frame is ready.
+        interval_ms = max(1, int(1000.0 / self.source_fps))
         self.timer.start(interval_ms)
         self._sync_gamepad_timer()
         actual_w = int(round(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
@@ -1404,43 +1568,61 @@ class MainWindow(QMainWindow):
 
     def detect_and_calibrate(self, image):
         """Detect ArUco markers and calibrate coordinate system"""
-        # Detect markers
-        corners, ids, image_with_markers = self.detector.detect_markers(image)
-        corner_by_id = self._corner_by_id(corners, ids)
+        # Before lock, detect the four calibration tags in the source image.
+        # After lock, run exactly one detection pass on a uniform-scale field
+        # view so far/top tags gain pixels without adding a second-pass delay.
+        corners = None
+        ids = None
+        image_with_markers = image.copy()
+        self.last_detection_rectified = False
+        marker_instances = None
+        if self.transformer.get_calibration_status():
+            marker_instances = self._detect_rectified_marker_instances(image)
+            self.last_detection_rectified = marker_instances is not None
+        if marker_instances is None:
+            corners, ids, image_with_markers = self.detector.detect_markers(image)
+            marker_instances = self.detector.get_marker_instances(corners, ids)
 
-        # Marker centers of all currently visible IDs
-        all_marker_centers = self.detector.get_marker_centers(corners, ids)
+        # Update every physical detection separately; duplicate IDs are valid.
+        self.update_tag_status(marker_instances)
 
-        # Update tag status panel (show config-defined IDs and their current detection state)
-        self.update_tag_status(all_marker_centers)
+        # IDs do not participate in calibration. Select the four widest corner instances.
+        calibration_markers = None
+        if not self.transformer.get_calibration_status():
+            calibration_markers = self.detector.select_calibration_markers(
+                marker_instances,
+                required_count=self.cfg.MIN_MARKER_COUNT,
+            )
 
-        # Required marker set for full homography re-calibration
-        required_marker_centers = self.detector.get_required_markers(corners, ids)
-
-        detected_count = len(ids) if ids is not None else 0
+        detected_count = len(marker_instances)
         if self.transformer.get_calibration_status():
             self.calib_label.setText("Calibration: Calibrated (locked)")
             self.status_label.setText("Status: Calibration locked; fixed tags held")
-        elif required_marker_centers is not None:
-            success = self.transformer.calibrate(required_marker_centers)
+        elif calibration_markers is not None:
+            success = self.transformer.calibrate(calibration_markers)
             if success:
-                fixed_ids = sorted(set(required_marker_centers.keys()) - {int(self.vehicle_id)})
-                self.locked_fixed_marker_corners_px = {
-                    int(marker_id): corner_by_id[int(marker_id)].copy()
-                    for marker_id in fixed_ids
-                    if int(marker_id) in corner_by_id
-                }
+                self.locked_fixed_markers = [
+                    {
+                        "id": int(marker["id"]),
+                        "center": np.asarray(marker["center"], dtype=np.float32).copy(),
+                        "corners": np.asarray(marker["corners"], dtype=np.float32).copy(),
+                        "match_radius": self._fixed_marker_match_radius(marker["corners"]),
+                    }
+                    for marker in calibration_markers
+                ]
+                self._prepare_rectified_detection()
                 self.calib_label.setText("Calibration: Calibrated (locked)")
-                self.status_label.setText("Status: Calibration locked")
+                locked_ids = ", ".join(str(marker["id"]) for marker in self.locked_fixed_markers)
+                self.status_label.setText(f"Status: Calibration locked (IDs: {locked_ids})")
             else:
                 self.calib_label.setText("Calibration: Failed")
                 self.status_label.setText("Status: Calibration failed")
                 self.transformer.reset_calibration()
-                self.locked_fixed_marker_corners_px = {}
+                self.locked_fixed_markers = []
         else:
             self.calib_label.setText("Calibration: Not calibrated")
             self.status_label.setText(
-                f"Status: {detected_count} markers detected, {self.cfg.MIN_MARKER_COUNT} required for calibration"
+                f"Status: {detected_count} tag instances detected, {self.cfg.MIN_MARKER_COUNT} required for calibration"
             )
 
         # Vehicle marker (single ID) pose display (based on current calibration status)
@@ -1450,35 +1632,34 @@ class MainWindow(QMainWindow):
         self.last_vehicle_center_world = None
         self.last_vehicle_yaw_deg = None
         self.last_vehicle_corners_px = None
-        if ids is not None and corners is not None:
-            flat_ids = ids.flatten()
-            matches = np.where(flat_ids == int(self.vehicle_id))[0]
-            if matches.size > 0:
-                i = int(matches[0])
-                try:
-                    marker_corners_px = np.array(corners[i][0], dtype=np.float32)  # (4,2)
-                    center_px = np.mean(marker_corners_px, axis=0)
-                    cx, cy = float(center_px[0]), float(center_px[1])
-                    self.last_vehicle_center_px = (cx, cy)
-                    self.last_vehicle_corners_px = marker_corners_px
-                    vehicle_detected = True
+        vehicle_marker = None
+        if self.transformer.get_calibration_status():
+            vehicle_marker = self._select_vehicle_marker(marker_instances)
+        if vehicle_marker is not None:
+            try:
+                marker_corners_px = np.asarray(vehicle_marker["corners"], dtype=np.float32)
+                center_px = np.asarray(vehicle_marker["center"], dtype=np.float32)
+                cx, cy = float(center_px[0]), float(center_px[1])
+                self.last_vehicle_center_px = (cx, cy)
+                self.vehicle_track_center_px = (cx, cy)
+                self.last_vehicle_corners_px = marker_corners_px
+                vehicle_detected = True
 
-                    if self.transformer.get_calibration_status():
-                        center_world = self.transformer.pixel_to_world(cx, cy, z=0.0)
-                        # Heading direction: corner 1 -> corner 2
-                        c1 = marker_corners_px[1]
-                        c2 = marker_corners_px[2]
-                        p1w = self.transformer.pixel_to_world(float(c1[0]), float(c1[1]), z=0.0)
-                        p2w = self.transformer.pixel_to_world(float(c2[0]), float(c2[1]), z=0.0)
-                        if center_world is not None and p1w is not None and p2w is not None:
-                            dx = float(p2w[0] - p1w[0])
-                            dz = float(p2w[1] - p1w[1])
-                            # Official AR convention used here: yaw=0 points +X; +90 points +Z.
-                            yaw_deg = math.degrees(math.atan2(dz, dx))
-                            self.last_vehicle_center_world = center_world
-                            self.last_vehicle_yaw_deg = self._norm_angle_deg(yaw_deg)
-                except Exception:
-                    vehicle_detected = False
+                center_world = self.transformer.pixel_to_world(cx, cy, z=0.0)
+                # Heading direction stays unchanged: ArUco corner 1 -> corner 2.
+                c1 = marker_corners_px[1]
+                c2 = marker_corners_px[2]
+                p1w = self.transformer.pixel_to_world(float(c1[0]), float(c1[1]), z=0.0)
+                p2w = self.transformer.pixel_to_world(float(c2[0]), float(c2[1]), z=0.0)
+                if center_world is not None and p1w is not None and p2w is not None:
+                    dx = float(p2w[0] - p1w[0])
+                    dz = float(p2w[1] - p1w[1])
+                    # Official AR convention used here: yaw=0 points +X; +90 points +Z.
+                    yaw_deg = math.degrees(math.atan2(dz, dx))
+                    self.last_vehicle_center_world = center_world
+                    self.last_vehicle_yaw_deg = self._norm_angle_deg(yaw_deg)
+            except Exception:
+                vehicle_detected = False
 
         if vehicle_detected and self.transformer.get_calibration_status():
             self._send_current_pose()
@@ -1486,27 +1667,25 @@ class MainWindow(QMainWindow):
 
 
         # Trajectory overlay (pixel space). Does not affect H calculation.
-        if self.enable_trace and all_marker_centers:
-            for mid, center in all_marker_centers.items():
-                mid = int(mid)
-                if mid != int(self.vehicle_id):
-                    continue
-                pt = (int(round(float(center[0]))), int(round(float(center[1]))))
-                trace = self.marker_traces.get(mid, [])
-                trace.append(pt)
-                if len(trace) > self.trace_max_len:
-                    trace = trace[-self.trace_max_len:]
-                self.marker_traces[mid] = trace
+        if self.enable_trace and vehicle_detected and self.last_vehicle_center_px is not None:
+            mid = int(self.vehicle_id)
+            center = self.last_vehicle_center_px
+            pt = (int(round(float(center[0]))), int(round(float(center[1]))))
+            trace = self.marker_traces.get(mid, [])
+            trace.append(pt)
+            if len(trace) > self.trace_max_len:
+                trace = trace[-self.trace_max_len:]
+            self.marker_traces[mid] = trace
 
-                if len(trace) >= 2:
-                    pts = np.array(trace, dtype=np.int32).reshape(-1, 1, 2)
-                    cv2.polylines(
-                        image_with_markers,
-                        [pts],
-                        isClosed=False,
-                        color=(255, 0, 0),
-                        thickness=2,
-                    )
+            if len(trace) >= 2:
+                pts = np.array(trace, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(
+                    image_with_markers,
+                    [pts],
+                    isClosed=False,
+                    color=(255, 0, 0),
+                    thickness=2,
+                )
 
         image_with_markers = self._draw_marker_overlays(image_with_markers, corners, ids)
         image_with_markers = self._draw_vehicle_arrow(image_with_markers)
@@ -1747,21 +1926,26 @@ class MainWindow(QMainWindow):
 
         return image_bgr
 
-    def update_tag_status(self, marker_centers):
+    def update_tag_status(self, marker_instances):
         """
         Update right-panel tag status view.
 
         Args:
-            marker_centers: dict[int, np.array([x,y], float32)] of current-frame centers
+            marker_instances: current-frame physical detections; IDs may repeat
         """
-        known_ids = sorted(self.cfg.WORLD_COORDINATES.keys())
-        lines = []
-        for mid in known_ids:
-            if marker_centers is None or mid not in marker_centers:
-                lines.append(f"ID {mid}: Not detected")
-                continue
-            c = marker_centers[mid]
-            lines.append(f"ID {mid}: Detected center_px=({float(c[0]):.1f}, {float(c[1]):.1f})")
+        marker_instances = marker_instances or []
+        lines = [f"Detected instances: {len(marker_instances)}"]
+        for index, marker in enumerate(marker_instances, start=1):
+            center = marker["center"]
+            lines.append(
+                f"#{index} ID {int(marker['id'])}: "
+                f"center_px=({float(center[0]):.1f}, {float(center[1]):.1f})"
+            )
+
+        if self.locked_fixed_markers:
+            locked_ids = ", ".join(str(marker["id"]) for marker in self.locked_fixed_markers)
+            lines.append(f"Locked fixed instances: [{locked_ids}]")
+        lines.append(f"Vehicle ID: {int(self.vehicle_id)} (duplicate ID supported)")
 
         self.tag_status_text.setText("\n".join(lines))
 
