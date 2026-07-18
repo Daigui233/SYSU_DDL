@@ -194,19 +194,25 @@ class VisionControlConfig:
     human_stop_line_margin_ratio: float = 0.0
     # Larger values move the human stop line upward, so braking starts sooner.
     human_stop_progress_ratio: float = 0.84
-    human_stop_line_offset_px_480: float = 35.0
-    human_preline_missing_px_480: float = 20.0
+    human_stop_line_offset_px_480: float = 55.0
+    # Strict bottom-edge contact is the only default Human stop trigger.
+    human_preline_missing_px_480: float = 0.0
     human_pass_offset_px_640: float = 38.0
-    human_speed_hold_s: float = 0.5
+    human_speed_hold_s: float = 1.5
     human_path_return_guard_s: float = 0.4
     human_absence_confirm_s: float = 1.5
     human_stop_absence_restart_s: float = 5.0
     human_stop_reverse_speed_mps: float = -0.10
     human_stop_reverse_duration_s: float = 0.3
+    car_avoid_speed_mps: float = 0.06
     car_avoid_offset_px_640: float = 55.0
-    car_avoid_steer_gain: float = 0.70
-    car_avoid_max_offset_px_640: float = 44.0
-    car_avoid_hold_s: float = 2.0
+    car_avoid_clearance_px_640: float = 16.0
+    car_avoid_steer_gain: float = 1.10
+    car_avoid_max_offset_px_640: float = 120.0
+    car_avoid_hold_s: float = 1.0
+    car_recover_right_error_px_640: float = 96.0
+    car_line_reacquire_error_px_640: float = 48.0
+    car_line_reacquire_frames: int = 3
     car_human_pass_speed_mps: float = 0.35
     car_human_pass_hold_s: float = 2.0
     human_avoid_offset_px_640: float = 75.0
@@ -406,10 +412,10 @@ class VisionControlConfig:
             human_stop_line_margin_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_LINE_MARGIN_RATIO", 0.0), 0.0, 0.5),
             human_stop_progress_ratio=_clamp(_env_float("VISION_CONTROL_HUMAN_STOP_PROGRESS_RATIO", 0.84), 0.0, 1.0),
             human_stop_line_offset_px_480=max(0.0, _env_float(
-                "VISION_CONTROL_HUMAN_STOP_LINE_OFFSET_PX_480", 35.0)),
-            human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
+                "VISION_CONTROL_HUMAN_STOP_LINE_OFFSET_PX_480", 55.0)),
+            human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 0.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
-            human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
+            human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 1.5)),
             human_path_return_guard_s=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_PATH_RETURN_GUARD_S", 0.4)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
@@ -419,14 +425,28 @@ class VisionControlConfig:
                 "VISION_CONTROL_HUMAN_STOP_REVERSE_SPEED", -0.10)),
             human_stop_reverse_duration_s=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_STOP_REVERSE_DURATION_S", 0.3)),
+            car_avoid_speed_mps=max(
+                0.0, _env_float("VISION_CONTROL_CAR_AVOID_SPEED", 0.06)),
             car_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_OFFSET_640", 55.0)),
+            car_avoid_clearance_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CAR_AVOID_CLEARANCE_640", 16.0)),
             car_avoid_steer_gain=_clamp(
-                _env_float("VISION_CONTROL_CAR_AVOID_STEER_GAIN", 0.70),
-                0.0, 1.0),
+                _env_float("VISION_CONTROL_CAR_AVOID_STEER_GAIN", 1.10),
+                0.0, 2.0),
             car_avoid_max_offset_px_640=max(
                 0.0, _env_float(
-                    "VISION_CONTROL_CAR_AVOID_MAX_OFFSET_640", 44.0)),
-            car_avoid_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_HOLD_S", 2.0)),
+                    "VISION_CONTROL_CAR_AVOID_MAX_OFFSET_640", 120.0)),
+            car_avoid_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_HOLD_S", 1.0)),
+            car_recover_right_error_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CAR_RECOVER_RIGHT_ERROR_640", 96.0)),
+            car_line_reacquire_error_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CAR_LINE_REACQUIRE_ERROR_640", 48.0)),
+            car_line_reacquire_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CAR_LINE_REACQUIRE_FRAMES", 3)),
             car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.35)),
             car_human_pass_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S", 2.0)),
             human_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_AVOID_OFFSET_640", 75.0)),
@@ -499,11 +519,18 @@ class VisionControlPlanner:
         self.car_avoid_side = 0
         self.car_avoid_offset_px_640 = 0.0
         self.car_avoid_hold_until = 0.0
+        self.car_avoid_started_ts = 0.0
+        self.car_avoid_start_speed_mps = float(self.config.normal_speed_mps)
+        self.car_recovery_active = False
+        self.car_line_reacquire_frames = 0
         self.car_human_active = False
         self.car_human_waiting_cross = False
         self.car_human_seen_avoid_side = False
         self.car_human_last_seen_ts = 0.0
         self.car_human_pass_until = 0.0
+        self.car_human_priority = "none"
+        self.car_human_bottom_avg = None
+        self.human_bottom_avg = None
         self.sign_seen_frames = 0
         self.sign_latched_since = None
         self.turnsign_control_session_id = None
@@ -1219,11 +1246,9 @@ class VisionControlPlanner:
             "human_half_lookahead_stop",
             "human_wait_cross",
             "human_absence_check",
-            "human_preline_absence_check",
             "car_human_same_side_wait",
             "car_human_right_pass_blocked",
             "car_human_absence_check",
-            "car_human_preline_absence_check",
         }
 
     def _update_human_stop_reverse(self, task_reason, now):
@@ -1618,6 +1643,17 @@ class VisionControlPlanner:
                 image_shape, path_target_y),
             "task_offset_x": float(task_offset_x),
             "task_target_applied": target_override_x is not None,
+            "car_avoid_side": int(self.car_avoid_side),
+            "car_avoid_offset_px_640": float(
+                self.car_avoid_offset_px_640),
+            "car_avoid_hold_remaining_s": max(
+                0.0, float(self.car_avoid_hold_until) - float(now)),
+            "car_recovery_active": bool(self.car_recovery_active),
+            "car_line_reacquire_frames": int(
+                self.car_line_reacquire_frames),
+            "car_human_priority": str(self.car_human_priority),
+            "car_human_bottom_avg": self.car_human_bottom_avg,
+            "human_bottom_avg": self.human_bottom_avg,
             "human_mask_constraint_available": any(
                 item["available"] for item in human_mask_constraints),
             "human_mask_constraint_applied": any(
@@ -1748,6 +1784,7 @@ class VisionControlPlanner:
             "obstacle_line_loss_masked",
             "car_in_path_bias",
             "car_avoid_hold",
+            "car_postpass_line_loss_recover",
             "car_human_preline_approach",
             "car_human_same_side_pass",
             "car_human_same_side_pass_hold",
@@ -1796,6 +1833,17 @@ class VisionControlPlanner:
             "line_loss_age_s": float(
                 now - self.last_valid_ts if self.last_valid_ts else 1e9),
             "human_stop_reverse_active": False,
+            "car_avoid_side": int(self.car_avoid_side),
+            "car_avoid_offset_px_640": float(
+                self.car_avoid_offset_px_640),
+            "car_avoid_hold_remaining_s": max(
+                0.0, float(self.car_avoid_hold_until) - float(now)),
+            "car_recovery_active": bool(self.car_recovery_active),
+            "car_line_reacquire_frames": int(
+                self.car_line_reacquire_frames),
+            "car_human_priority": str(self.car_human_priority),
+            "car_human_bottom_avg": self.car_human_bottom_avg,
+            "human_bottom_avg": self.human_bottom_avg,
         }
 
     @staticmethod
@@ -2533,6 +2581,7 @@ class VisionControlPlanner:
             self, result, selected, image_shape, lookahead_y, now,
             ocr_response=None, path_target_x=None):
         detections = result.get("detections") or []
+        line_available = selected is not None
         line_loss_obstacle_masked = False
         if selected is None:
             if not self._obstacle_line_loss_context(detections, now):
@@ -2565,7 +2614,8 @@ class VisionControlPlanner:
         if sign_action is not None:
             return sign_action
         car_action = self._car_avoidance_action(
-            detections, image_shape, lookahead_y, lookahead_path_x, now)
+            detections, selected, image_shape, lookahead_y,
+            lookahead_path_x, now, line_available=line_available)
         if car_action is not None:
             if str(car_action[2]) in {
                 "car_human_same_side_pass",
@@ -2669,6 +2719,7 @@ class VisionControlPlanner:
     def _obstacle_line_loss_context(self, detections, now):
         if (
             float(now) < self.car_avoid_hold_until
+            or self.car_recovery_active
             or self.car_human_active
             or float(now) < self.car_human_pass_until
             or self.human_detected_latched
@@ -2676,7 +2727,6 @@ class VisionControlPlanner:
             or float(now) < self.human_speed_hold_until
             or self.human_path_return_pending
             or float(now) < self.human_path_return_guard_until
-            or float(now) < self.human_preline_wait_until
         ):
             return True
         for detection in detections or ():
@@ -3107,8 +3157,9 @@ class VisionControlPlanner:
         self.sign_latched_since = None
 
     def _car_avoidance_action(
-            self, detections, image_shape, lookahead_y, path_x, now):
-        """Keep one continuous avoidance side across car and human phases."""
+            self, detections, selected, image_shape, lookahead_y, path_x,
+            now, line_available=True):
+        """Keep one left-pass car sequence active until the line is recaptured."""
         human = self._best_car_context_human(
             detections, image_shape)
         pass_session_active = self.car_human_pass_until > 0.0
@@ -3122,10 +3173,43 @@ class VisionControlPlanner:
             and float(now) - self.car_human_last_seen_ts >=
                 self.config.human_absence_confirm_s
         ):
-            self._clear_car_avoidance_state()
-        car = self._best_car(detections, image_shape, path_x)
-        # The configured two seconds is a minimum. A still-visible pedestrian
-        # keeps this pass session active beyond that minimum.
+            self.car_human_active = False
+            self.car_human_waiting_cross = False
+            self.car_human_seen_avoid_side = False
+            self.car_human_last_seen_ts = 0.0
+            self.car_human_pass_until = 0.0
+        car = self._best_car(
+            detections, image_shape, selected, path_x)
+        if car is not None and human is not None:
+            car_bottom_avg = self._average_detection_bottom(
+                detections, "car", image_shape)
+            human_bottom_avg = self._average_detection_bottom(
+                detections, "human", image_shape)
+            if car_bottom_avg is None:
+                car_bottom_avg = float(car["bottom"])
+            if human_bottom_avg is None:
+                human_bottom_avg = float(human["geom"]["bottom"])
+            self.car_human_bottom_avg = float(car_bottom_avg)
+            self.human_bottom_avg = float(human_bottom_avg)
+            if car_bottom_avg > human_bottom_avg:
+                # A larger bottom y means the object is closer.  Give the
+                # closer car priority so a simultaneous Human false positive
+                # cannot convert an otherwise valid car pass into a stop.
+                self.car_human_priority = "car"
+                human = None
+                self._clear_human_state()
+                self.human_speed_hold_until = 0.0
+                self.car_human_active = False
+                self.car_human_waiting_cross = False
+                self.car_human_seen_avoid_side = False
+                self.car_human_last_seen_ts = 0.0
+                self.car_human_pass_until = 0.0
+            else:
+                # Equal bottoms are resolved in favor of the person for
+                # safety; the person is never allowed to lose a tie.
+                self.car_human_priority = "human"
+        # The configured hold is a minimum after the last visible car frame.
+        # A still-visible pedestrian keeps its own pass session active longer.
         pass_holding = self.car_human_pass_until > 0.0
         car_holding = float(now) < self.car_avoid_hold_until
 
@@ -3133,23 +3217,30 @@ class VisionControlPlanner:
             desired_target_x = self._avoid_target_x(
                 "car", car, path_x, image_shape)
             desired_offset = float(desired_target_x) - float(path_x)
-            desired_side = self._sign(desired_offset)
             new_sequence = (
                 self.car_avoid_side == 0
-                or (not car_holding
+                or (not self.car_recovery_active
+                    and not car_holding
                     and not self.car_human_active
                     and not pass_holding)
             )
             if new_sequence:
                 self._clear_car_avoidance_state()
-                self.car_avoid_side = desired_side or 1
+                # The race strategy always passes a car on its left.
+                self.car_avoid_side = -1
+                self.car_avoid_started_ts = float(now)
+                self.car_avoid_start_speed_mps = max(
+                    float(self.config.car_avoid_speed_mps),
+                    float(self.last_forward_speed_mps),
+                )
                 self._clear_human_state()
                 self.human_pass_offset_x = 0.0
                 self.human_speed_hold_until = 0.0
 
+            self.car_recovery_active = True
+            self.car_line_reacquire_frames = 0
             # Never cross the baseline while one avoidance sequence is active.
-            # The magnitude may grow as the car box grows, but its sign remains
-            # the originally selected side away from the car.
+            # Detector jitter may increase the left offset but never shrink it.
             scale = 640.0 / float(max(1, image_shape[1]))
             desired_magnitude_640 = abs(desired_offset) * scale
             self.car_avoid_offset_px_640 = max(
@@ -3163,6 +3254,7 @@ class VisionControlPlanner:
         context_active = bool(
             car is not None
             or car_holding
+            or self.car_recovery_active
             or self.car_human_active
             or pass_holding)
         if not context_active or self.car_avoid_side == 0:
@@ -3173,6 +3265,7 @@ class VisionControlPlanner:
             path_x, image_shape, now,
             full_hold=bool(
                 car is not None or self.car_human_active or pass_holding))
+        transition_speed = self._car_avoid_transition_speed(now)
         if pass_holding:
             if self.car_avoid_side > 0:
                 self.car_human_pass_until = 0.0
@@ -3200,13 +3293,10 @@ class VisionControlPlanner:
                 if preline_side == self.car_avoid_side:
                     self.car_human_seen_avoid_side = True
                 # A visible person before the stop line does not take control
-                # away from the car route. Remember only the vertical gap so a
-                # near-line detector dropout can trigger the 1.5 s safety wait.
-                self._record_human_preline_gap(
-                    geom, image_shape, lookahead_y)
+                # away from the car route. Only bottom-edge contact can brake.
                 return (
                     STATE_AVOID_CAR,
-                    self.config.normal_speed_mps,
+                    transition_speed,
                     "car_human_preline_approach",
                     avoid_target_x,
                 )
@@ -3267,9 +3357,8 @@ class VisionControlPlanner:
                 self.config.human_stop_absence_restart_s
             ):
                 # A continuous five-second Human absence must release every
-                # pedestrian stop latch. On a prohibited right-side route,
-                # release only the Human sub-state: never pass the pedestrian
-                # on the right, but do resume car avoidance or normal tracking.
+                # pedestrian stop latch. Release only the Human sub-state and
+                # keep the fixed-left car route/recovery sequence alive.
                 if self.car_avoid_side > 0:
                     self.car_human_active = False
                     self.car_human_waiting_cross = False
@@ -3280,7 +3369,7 @@ class VisionControlPlanner:
                         return None
                     return (
                         STATE_AVOID_CAR,
-                        self.config.normal_speed_mps,
+                        transition_speed,
                         "car_in_path_bias" if car is not None
                         else "car_avoid_hold",
                         avoid_target_x,
@@ -3301,23 +3390,58 @@ class VisionControlPlanner:
                 avoid_target_x,
             )
 
-        elif self._human_preline_missing_waiting(now):
+        if car is not None or car_holding:
+            self.car_line_reacquire_frames = 0
+            reason = "car_in_path_bias" if car is not None else "car_avoid_hold"
             return (
-                STATE_SAFE_STOP,
-                0.0,
-                "car_human_preline_absence_check",
+                STATE_AVOID_CAR,
+                transition_speed,
+                reason,
                 avoid_target_x,
             )
 
-        reason = "car_in_path_bias" if car is not None else "car_avoid_hold"
+        # The car has been absent for the full hold period. Stay at the car
+        # speed until a real connected line is close enough for several frames.
+        width = float(max(1, image_shape[1]))
+        path_error_640 = (
+            (float(path_x) / width - self.config.visual_center_x) * 640.0)
+        if line_available:
+            if (
+                abs(path_error_640) <=
+                float(self.config.car_line_reacquire_error_px_640)
+            ):
+                self.car_line_reacquire_frames += 1
+            else:
+                self.car_line_reacquire_frames = 0
+            if (
+                self.car_line_reacquire_frames >=
+                int(self.config.car_line_reacquire_frames)
+            ):
+                self._clear_car_avoidance_state()
+                return None
+            return (
+                STATE_AVOID_CAR,
+                self.config.car_avoid_speed_mps,
+                "car_line_reacquire",
+                None,
+            )
+
+        self.car_line_reacquire_frames = 0
+        recover_target_x = _clamp(
+            width * (
+                self.config.visual_center_x
+                + float(self.config.car_recover_right_error_px_640) / 640.0),
+            0.0,
+            float(max(0, image_shape[1] - 1)),
+        )
         return (
-            STATE_AVOID_CAR,
-            self.config.normal_speed_mps,
-            reason,
-            avoid_target_x,
+            STATE_RECOVER_LINE,
+            self.config.car_avoid_speed_mps,
+            "car_postpass_line_loss_recover",
+            recover_target_x,
         )
 
-    def _best_car(self, detections, image_shape, path_x):
+    def _best_car(self, detections, image_shape, selected, path_x):
         hazard_limit = (
             float(image_shape[1]) * self.config.hazard_lateral_ratio)
         best = None
@@ -3329,13 +3453,23 @@ class VisionControlPlanner:
             if score < self.config.min_car_score:
                 continue
             geom = self._detection_geom(det, image_shape)
+            if geom is None:
+                continue
+            path_x_at_bottom = _interp_path_x(
+                (selected or {}).get("points_xy", ()), geom["bottom"])
+            if path_x_at_bottom is None:
+                path_x_at_bottom = float(path_x)
             if (
-                geom is None
-                or geom["bottom_ratio"] < self.config.hazard_bottom_ratio
+                geom["bottom_ratio"] < self.config.hazard_bottom_ratio
+                # Keep the original car trigger gate: the detection must be
+                # close to the lookahead path.  The path sampled at the box
+                # bottom is used below only for the avoidance-distance math.
                 or abs(float(geom["cx"]) - float(path_x))
                 > max(hazard_limit, float(geom["box_w"]) * 0.75)
             ):
                 continue
+            geom = dict(geom)
+            geom["path_x_at_bottom"] = float(path_x_at_bottom)
             rank = (
                 float(score)
                 + float(geom["bottom_ratio"])
@@ -3367,6 +3501,26 @@ class VisionControlPlanner:
                 best_rank = rank
         return best
 
+    def _average_detection_bottom(self, detections, label, image_shape):
+        """Return the mean bottom edge for valid detections of one class."""
+        normalized_label = str(label).lower()
+        score_limit = (
+            self.config.min_car_score
+            if normalized_label == "car" else self.config.min_human_score)
+        bottoms = []
+        for det in detections or ():
+            if self._normalized_label(det) != normalized_label:
+                continue
+            score = _finite_float(det.get("score"), 0.0)
+            if score < score_limit:
+                continue
+            geom = self._detection_geom(det, image_shape)
+            if geom is not None:
+                bottoms.append(float(geom["bottom"]))
+        if not bottoms:
+            return None
+        return float(sum(bottoms) / len(bottoms))
+
     def _latched_car_target_x(
             self, path_x, image_shape, now, full_hold=False):
         scale = float(max(1, image_shape[1])) / 640.0
@@ -3388,10 +3542,29 @@ class VisionControlPlanner:
             float(max(0, image_shape[1] - 1)),
         )
 
+    def _car_avoid_transition_speed(self, now):
+        """Smoothly reduce the commanded speed during the one-second latch."""
+        target = float(self.config.car_avoid_speed_mps)
+        duration = float(self.config.car_avoid_hold_s)
+        if duration <= 0.0 or self.car_avoid_started_ts <= 0.0:
+            return target
+        progress = _clamp(
+            (float(now) - float(self.car_avoid_started_ts)) / duration,
+            0.0,
+            1.0,
+        )
+        progress = progress * progress * (3.0 - 2.0 * progress)
+        start = max(target, float(self.car_avoid_start_speed_mps))
+        return float(start + (target - start) * progress)
+
     def _clear_car_avoidance_state(self):
         self.car_avoid_side = 0
         self.car_avoid_offset_px_640 = 0.0
         self.car_avoid_hold_until = 0.0
+        self.car_avoid_started_ts = 0.0
+        self.car_avoid_start_speed_mps = float(self.config.normal_speed_mps)
+        self.car_recovery_active = False
+        self.car_line_reacquire_frames = 0
         self.car_human_active = False
         self.car_human_waiting_cross = False
         self.car_human_seen_avoid_side = False
@@ -3447,13 +3620,6 @@ class VisionControlPlanner:
                     "human_absence_check",
                     None,
                 )
-            elif self._human_preline_missing_waiting(now):
-                return (
-                    STATE_SAFE_STOP,
-                    0.0,
-                    "human_preline_absence_check",
-                    None,
-                )
             self._clear_human_state()
             return None
 
@@ -3496,7 +3662,6 @@ class VisionControlPlanner:
             self.human_last_seen_ts = float(now)
             return STATE_SAFE_STOP, 0.0, "human_wait_cross", None
 
-        self._record_human_preline_gap(geom, image_shape, lookahead_y)
         return None
 
     def _human_pass_command(
@@ -3588,7 +3753,7 @@ class VisionControlPlanner:
     def _best_coin(self, detections, image_shape, path_x, lookahead_y):
         best = None
         best_rank = -1.0
-        # Human braking is intentionally shifted 35 px earlier, but coin
+        # Human braking is intentionally shifted 55 px earlier, but coin
         # collection keeps the current branch's original activation height.
         human_stop_offset = (
             float(self.config.human_stop_line_offset_px_480)
@@ -3624,15 +3789,33 @@ class VisionControlPlanner:
             if label == "human"
             else self.config.car_avoid_offset_px_640
         )
-        offset = max(
-            float(base_offset) * scale,
-            float(geom["box_w"]) * self.config.avoid_box_width_gain)
         if label == "car":
-            offset *= float(self.config.car_avoid_steer_gain)
+            distance_path_x = _finite_float(
+                geom.get("path_x_at_bottom"), float(path_x))
+            left_x = _finite_float(geom.get("left"))
+            if left_x is None:
+                left_x = float(geom["cx"]) - float(geom["box_w"]) * 0.5
+            clearance = (
+                float(self.config.car_avoid_clearance_px_640) * scale)
+            # Fixed left pass: use the path at the car-box bottom and place the
+            # target beyond the car's left edge. A farther-left edge therefore
+            # produces a larger, more aggressive offset as requested.
+            left_edge_distance = max(
+                0.0, float(distance_path_x) - float(left_x) + clearance)
+            offset = max(
+                float(base_offset) * scale,
+                float(geom["box_w"]) * self.config.avoid_box_width_gain,
+                left_edge_distance,
+            ) * float(self.config.car_avoid_steer_gain)
             offset = min(
                 offset,
                 float(self.config.car_avoid_max_offset_px_640) * scale)
-        side = 1.0 if geom["cx"] <= path_x else -1.0
+            side = -1.0
+        else:
+            offset = max(
+                float(base_offset) * scale,
+                float(geom["box_w"]) * self.config.avoid_box_width_gain)
+            side = 1.0 if geom["cx"] <= path_x else -1.0
         return _clamp(float(path_x) + side * offset, 0.0, float(max(0, image_shape[1] - 1)))
 
     def _coin_target_x(self, geom, path_x, image_shape):
