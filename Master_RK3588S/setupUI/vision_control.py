@@ -197,6 +197,13 @@ class VisionControlConfig:
     # occupied by a moving Human detection as curve support.
     centerline_ego_road_component_enabled: bool = True
     centerline_ego_road_seed_radius_px_640: float = 150.0
+    # Apply the same inexpensive close/open cleanup used by the legacy/main
+    # segmentation path before any centerline decoding.  It heals quantized
+    # gaps at a fork without allowing a remote semantic island to become road.
+    centerline_segmentation_cleanup_enabled: bool = True
+    centerline_segmentation_bridge_px_640: float = 42.0
+    centerline_segmentation_min_component_area_ratio: float = 0.0015
+    centerline_segmentation_max_components: int = 3
     centerline_dynamic_exclusion_enabled: bool = True
     centerline_dynamic_exclusion_min_score: float = 0.35
     centerline_dynamic_exclusion_dilate_px_640: float = 18.0
@@ -1275,6 +1282,14 @@ class VisionControlPlanner:
                 or road.ndim != 2 or not road.size):
             return road_mask, {"active": False, "reason": "component_disabled_or_missing"}
         binary = (road != 0).astype(np.uint8)
+        if self.config.centerline_segmentation_cleanup_enabled:
+            # Mirrors the mature segmentation post-process in main: close
+            # quantization holes first, then open isolated speckles.  This is
+            # deliberately performed before curve fitting, never afterward.
+            binary = cv2.morphologyEx(
+                binary, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
+            binary = cv2.morphologyEx(
+                binary, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
         if not np.any(binary):
             return binary, {"active": True, "reason": "empty_road"}
         # Closing only heals one-pixel quantization gaps in the low-resolution
@@ -1320,12 +1335,49 @@ class VisionControlPlanner:
                 "anchor": [int(mask_x), int(mask_y)],
             }
         selected = (labels == best_label).astype(np.uint8)
+        # A fork can be separated into two close components after INT8
+        # resizing even though it is one reachable road.  Retain only
+        # components that are geometrically adjacent to the ego component;
+        # this restores a broken branch but still rejects a remote island.
+        bridge = (float(self.config.centerline_segmentation_bridge_px_640)
+                  * float(binary.shape[1]) / 640.0)
+        min_area = max(
+            8, int(float(binary.shape[0] * binary.shape[1]) *
+                   float(self.config.centerline_segmentation_min_component_area_ratio)))
+        retained_labels = {int(best_label)}
+        changed = True
+        while changed:
+            changed = False
+            if len(retained_labels) >= int(
+                    self.config.centerline_segmentation_max_components):
+                break
+            current = np.isin(labels, list(retained_labels))
+            if not np.any(current):
+                break
+            radius = max(1, int(round(bridge)))
+            kernel = np.ones((radius * 2 + 1, radius * 2 + 1), dtype=np.uint8)
+            adjacent = cv2.dilate(current.astype(np.uint8), kernel, iterations=1)
+            for label in range(1, count):
+                if len(retained_labels) >= int(
+                        self.config.centerline_segmentation_max_components):
+                    break
+                if label in retained_labels or int(stats[label, cv2.CC_STAT_AREA]) < min_area:
+                    continue
+                # Morphological adjacency is O(HW) and substantially cheaper
+                # than a pairwise pixel-distance matrix on every video frame.
+                if np.any(adjacent[labels == label]):
+                    retained_labels.add(int(label))
+                    changed = True
+        selected = np.isin(labels, list(retained_labels)).astype(np.uint8)
         return selected, {
             "active": True,
             "reason": "ego_connected_component",
             "anchor": [int(mask_x), int(mask_y)],
             "component_area": int(stats[best_label, cv2.CC_STAT_AREA]),
             "component_count": int(count - 1),
+            "retained_component_count": int(len(retained_labels)),
+            "segmentation_cleanup": bool(
+                self.config.centerline_segmentation_cleanup_enabled),
         }
 
     def _centerline_validation_masks(self, result, road_mask, hard_road_mask, image_shape):
@@ -2128,6 +2180,22 @@ class VisionControlPlanner:
                 })
                 self.centerline_topology_debug = evidence
                 return held
+            # Shared pixels are normal at the merge/trunk of two valid lane
+            # instances.  Once a fork was confirmed, do not erase the second
+            # instance merely because this frame has no separated rows.  Its
+            # model identity stays alive and can reappear at the next split.
+            if (self.centerline_junction_state in {"FORK_CONFIRMED", "SHARED_TRUNK"}
+                    or len(self.centerline_shared_trunk_slots) == 2):
+                evidence.update({
+                    "reason": "shared_trunk_keep_instances",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(candidates),
+                    "high_overlap": True,
+                    "pair_topology": pair_topology,
+                    "pair_stats": dict(stats),
+                })
+                self.centerline_topology_debug = evidence
+                return candidates
             filtered = [preferred]
             evidence.update({
                 "reason": "overlap_dedup",

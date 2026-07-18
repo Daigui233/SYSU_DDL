@@ -534,6 +534,34 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertTrue(np.all(component[:, 70:92] == 1))
         self.assertTrue(np.all(component[:, :40] == 0))
 
+    def test_curve_road_cleanup_keeps_near_fragmented_branch_only(self):
+        planner = VisionControlPlanner(config=_config())
+        road = np.zeros((120, 160), dtype=np.uint8)
+        # Ego trunk, a branch split by a small segmentation gap, and a
+        # remote island.  Only the first two belong in curve decoding.
+        road[68:120, 70:92] = 1
+        road[18:62, 94:122] = 1
+        road[:, :22] = 1
+        component, info = planner._centerline_ego_road_component(
+            road, (480, 640, 3))
+        self.assertTrue(np.all(component[68:120, 70:92] == 1))
+        self.assertTrue(np.all(component[18:62, 94:122] == 1))
+        self.assertTrue(np.all(component[:, :22] == 0))
+        self.assertGreaterEqual(info["retained_component_count"], 2)
+
+    def test_shared_trunk_does_not_deduplicate_confirmed_instances(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.centerline_junction_state = "SHARED_TRUNK"
+        planner.centerline_shared_trunk_slots = {0, 1}
+        same = [_raw_path(0, 320.0), _raw_path(1, 320.0)]
+        filtered = planner._filter_centerline_candidates(
+            same, {"centerline": {"path_count_scores": [0.1, 0.1, 0.8]}},
+            (480, 640, 3))
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(
+            planner.centerline_topology_debug["reason"],
+            "shared_trunk_keep_instances")
+
     def test_merge_is_the_only_single_route_id_switch_point(self):
         planner = VisionControlPlanner(config=_config())
         planner.centerline_junction_state = "BRANCH_COMMITTED"
