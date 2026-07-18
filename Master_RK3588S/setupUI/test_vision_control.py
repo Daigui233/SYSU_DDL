@@ -21,6 +21,7 @@ from vision_control import (  # noqa: E402
     _FittedControlPathTracker,
     _associated_point_mask,
     _birdseye_debug_source_quad_from_road,
+    _centerline_fuse_anchors_with_heatmap,
     _centerline_refit_model_and_graph,
     _centerline_local_forward_path,
     _centerline_trim_far_tail,
@@ -231,6 +232,70 @@ class CurveConstructionTest(unittest.TestCase):
         self.assertGreaterEqual(int(np.count_nonzero(inliers)), 14)
         self.assertEqual(len(fitted), len(probabilities))
         self.assertLess(float(np.max(fitted[:, 0])), 320.0)
+
+    def test_arc_length_fitter_preserves_a_horizontal_far_section(self):
+        # A path can leave the camera vertically in the far field.  The old
+        # global x(y) regression could not represent this geometry at all.
+        points = np.asarray([
+            [470.0, 150.0], [430.0, 150.0], [390.0, 150.0],
+            [350.0, 180.0], [330.0, 240.0], [320.0, 320.0],
+        ], dtype=np.float32)
+        fitted, _probabilities, inliers = _fit_smooth_majority_curve(
+            points, np.full(len(points), 0.9, dtype=np.float32), 640,
+            trusted_points=True)
+        self.assertTrue(np.all(inliers))
+        far = fitted[fitted[:, 1] < 165.0]
+        self.assertGreater(len(far), 4)
+        self.assertGreater(float(np.ptp(far[:, 0])), 55.0)
+        self.assertLess(float(np.ptp(far[:, 1])), 16.0)
+
+    def test_heatmap_fusion_can_correct_a_weak_anchor_branch(self):
+        points = _raw_path(0, 220.0)["points_xy"]
+        probabilities = np.full(len(points), 0.6, dtype=np.float32)
+        heatmap = np.full((120, 160), 0.01, dtype=np.float32)
+        heatmap[:, 108] = 0.98
+        recovered, recovered_probabilities, info = (
+            _centerline_fuse_anchors_with_heatmap(
+                points, probabilities, heatmap,
+                np.ones((120, 160), dtype=np.uint8), (480, 640, 3),
+                _config(
+                    centerline_heatmap_anchor_weight=0.04,
+                    centerline_heatmap_transition_weight=0.02)))
+        self.assertTrue(info["accepted"])
+        self.assertEqual(info["reason"], "query_heatmap_dynamic_path")
+        self.assertGreater(len(recovered), len(points))
+        self.assertEqual(len(recovered_probabilities), len(recovered))
+        self.assertGreater(float(np.median(recovered[:, 0])), 390.0)
+
+    def test_two_query_heatmaps_prevent_left_branch_collapse(self):
+        planner = VisionControlPlanner(config=_config(
+            centerline_heatmap_anchor_weight=0.04,
+            centerline_heatmap_transition_weight=0.02))
+        # The row-classifier anchors collapse to the left branch.  The two
+        # query heatmaps still contain separate instance evidence.
+        result = _raw_result_at(220.0, 220.0)
+        heatmaps = np.full((2, 120, 160), 0.01, dtype=np.float32)
+        heatmaps[0, :, 55] = 0.98
+        heatmaps[1, :, 55] = 0.98
+        # Near to the vehicle the two routes deliberately share a trunk;
+        # only the far half separates into the second branch.
+        heatmaps[1, :60, 55] = 0.01
+        heatmaps[1, :60, 108] = 0.98
+        result["path_probabilities"] = heatmaps
+        result["centerline"].update({
+            "path_probabilities": heatmaps,
+            "path_count_scores": [0.02, 0.05, 0.93],
+        })
+        planner._extract_candidates(result, result["image_shape"], now=1.0)
+        candidates, _elapsed = planner._extract_candidates(
+            result, result["image_shape"], now=1.04)
+        self.assertEqual([item["slot"] for item in candidates], [0, 1])
+        left = float(np.median(candidates[0]["points_xy"][:, 0]))
+        right = float(np.median(candidates[1]["points_xy"][:, 0]))
+        far_left = candidates[0]["points_xy"][:30]
+        far_right = candidates[1]["points_xy"][:30]
+        self.assertGreater(
+            float(np.median(far_right[:, 0] - far_left[:, 0])), 150.0)
 
     def test_tracker_confirms_large_jump_on_second_frame(self):
         tracker = _FittedControlPathTracker()
@@ -541,7 +606,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         _command, debug = planner.update(result, now=1.0)
         self.assertEqual(len(result["paths"]), 2)
         self.assertTrue(all(
-            item["source"] == "fitted_control_curve"
+            item["source"] == "query_heatmap_arc_path"
             for item in result["paths"]))
         self.assertNotIn("curve_paths", result)
         self.assertNotIn("fitted_control_paths", result)

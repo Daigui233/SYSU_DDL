@@ -162,6 +162,12 @@ class VisionControlConfig:
     centerline_graph_smoothness: float = 2.5
     centerline_graph_min_quality: float = 0.34
     centerline_graph_join_error_px_640: float = 42.0
+    centerline_heatmap_anchor_weight: float = 0.30
+    centerline_heatmap_transition_weight: float = 0.055
+    centerline_heatmap_edge_weight: float = 0.18
+    centerline_heatmap_recovery_min_mean: float = 0.08
+    centerline_path_smoothness: float = 0.45
+    centerline_recovery_exclusion_px_640: float = 34.0
     centerline_count_two_min_probability: float = 0.40
     centerline_count_two_margin: float = 0.04
     centerline_secondary_quality_ratio: float = 0.62
@@ -378,6 +384,25 @@ class VisionControlConfig:
             centerline_graph_join_error_px_640=max(
                 1.0, _env_float(
                     "VISION_CONTROL_CENTERLINE_GRAPH_JOIN_ERROR_640", 42.0)),
+            centerline_heatmap_anchor_weight=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_HEATMAP_ANCHOR_WEIGHT", 0.30)),
+            centerline_heatmap_transition_weight=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_HEATMAP_TRANSITION_WEIGHT", 0.055)),
+            centerline_heatmap_edge_weight=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_HEATMAP_EDGE_WEIGHT", 0.18)),
+            centerline_heatmap_recovery_min_mean=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CENTERLINE_RECOVERY_MIN_MEAN", 0.08),
+                0.0, 1.0),
+            centerline_path_smoothness=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_PATH_SMOOTHNESS", 0.45)),
+            centerline_recovery_exclusion_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_RECOVERY_EXCLUSION_640", 34.0)),
             centerline_count_two_min_probability=_clamp(
                 _env_float("VISION_CONTROL_CENTERLINE_COUNT_TWO_MIN_PROB", 0.40),
                 0.20, 0.90),
@@ -1034,6 +1059,9 @@ class VisionControlPlanner:
         road_probability = road_info.get("probability")
         if road_probability is None:
             road_probability = result.get("road_probability")
+        path_probabilities = result.get("path_probabilities")
+        if path_probabilities is None:
+            path_probabilities = centerline.get("path_probabilities")
         raw_curve_paths = result.get("raw_curve_paths")
         if raw_curve_paths is None:
             raw_curve_paths = centerline.get("raw_curve_paths")
@@ -1060,7 +1088,11 @@ class VisionControlPlanner:
             raw_curve_paths = [preferred]
         candidates = self._build_fitted_control_paths(
             raw_curve_paths, road, image_shape, now=now,
-            road_probability=road_probability, hard_road_mask=hard_road)
+            road_probability=road_probability, path_probabilities=path_probabilities,
+            hard_road_mask=hard_road)
+        candidates = self._recover_collapsed_query_candidate(
+            candidates, raw_curve_paths, path_probabilities, road,
+            hard_road, image_shape, now=now, count_evidence=count_evidence)
         candidates = self._filter_centerline_candidates(
             candidates, result, image_shape, preferred_slot=preferred_slot)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
@@ -1070,7 +1102,8 @@ class VisionControlPlanner:
 
     def _build_fitted_control_paths(
             self, raw_paths, road_mask, image_shape, now=None,
-            road_probability=None, hard_road_mask=None):
+            road_probability=None, path_probabilities=None, hard_road_mask=None,
+            recovery_slot=None, exclusion_points=None, update_tracker=True):
         height, width = image_shape[:2]
         lookahead_y = float(height) * self.config.lookahead_y_ratio
         confidence_split_y = max(0.0, lookahead_y - 10.0)
@@ -1080,19 +1113,18 @@ class VisionControlPlanner:
         validation_mask = hard_road_mask
         if validation_mask is None:
             validation_mask = road_mask
-        graph_context = _centerline_probability_support(
-            road_probability, road_mask,
-            self.config.centerline_graph_min_probability,
-            hard_mask=hard_road_mask)
         for raw_path in list(raw_paths)[:2]:
             slot = int(raw_path.get("slot", len(fitted_paths)))
+            if recovery_slot in (0, 1) and slot != int(recovery_slot):
+                continue
             present_slots.add(slot)
             points = np.asarray(
                 raw_path.get("points_xy"), dtype=np.float32)
             if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
-                self.fitted_control_tracker.update(
-                    slot, np.empty((0, 2)), np.empty((0,)),
-                    image_shape, now=timestamp)
+                if update_tracker:
+                    self.fitted_control_tracker.update(
+                        slot, np.empty((0, 2)), np.empty((0,)),
+                        image_shape, now=timestamp)
                 continue
             points = points.copy()
             points[:, 0] = np.clip(points[:, 0], 0, width - 1)
@@ -1103,39 +1135,45 @@ class VisionControlPlanner:
                 probabilities = np.full(
                     len(points), float(raw_path.get("score", 1.0)),
                     dtype=np.float32)
-            inside_road = _semantic_road_point_mask(
-                points, validation_mask, image_shape)
-            associated = _associated_point_mask(
-                points, width, eligible_mask=inside_road)
-            points, probabilities = _densify_associated_lower_points(
-                points, probabilities, associated, width, height,
-                lower_boundary_y=confidence_split_y)
+            model_slot = int(raw_path.get("model_slot", slot))
+            query_heatmap = None
+            maps = np.asarray(path_probabilities) if path_probabilities is not None else None
+            if (maps is not None and maps.ndim == 3
+                    and 0 <= model_slot < maps.shape[0]):
+                query_heatmap = maps[model_slot]
+            points, probabilities, fusion_info = _centerline_fuse_anchors_with_heatmap(
+                points, probabilities, query_heatmap, validation_mask,
+                image_shape, self.config, exclusion_points=exclusion_points,
+                exclusion_above_y=confidence_split_y)
             inside_road = _semantic_road_point_mask(
                 points, road_mask, image_shape)
             points = points[inside_road]
             probabilities = probabilities[inside_road]
             points, probabilities, inliers = _fit_smooth_majority_curve(
-                points, probabilities, width, extend_to_y=lookahead_y)
-            # The polynomial fit is only a proposal. Keep one continuous
-            # in-road segment, then reject it if any rasterized edge crosses
-            # the hard semantic mask.
+                points, probabilities, width, extend_to_y=lookahead_y,
+                trusted_points=bool(fusion_info.get("accepted")))
+            # Keep only one continuous in-road segment around the control row.
+            # The fitter is arc-length based, so it does not invent a global
+            # x(y) polynomial through a sparse far endpoint.
             fitted_inside = _semantic_road_point_mask(
                 points, validation_mask, image_shape)
             points, probabilities = _select_control_curve_segment(
                 points, probabilities, fitted_inside, lookahead_y)
             if (len(points) < 3 or not _semantic_road_polyline_inside(
                     points, validation_mask, image_shape)):
-                self.fitted_control_tracker.update(
-                    slot, np.empty((0, 2)), np.empty((0,)),
-                    image_shape, now=timestamp)
+                if update_tracker:
+                    self.fitted_control_tracker.update(
+                        slot, np.empty((0, 2)), np.empty((0,)),
+                        image_shape, now=timestamp)
                 continue
-            points, probabilities, extension_info = (
-                _centerline_extend_with_graph(
-                    points, probabilities, road_probability, road_mask,
-                    image_shape, self.config, hard_mask=hard_road_mask,
-                    prepared=graph_context))
-            points, probabilities = self.fitted_control_tracker.update(
-                slot, points, probabilities, image_shape, now=timestamp)
+            extension_info = dict(fusion_info)
+            extension_info.update({
+                "road_only_extension": False,
+                "reason": str(fusion_info.get("reason") or "anchor_arc_path"),
+            })
+            if update_tracker:
+                points, probabilities = self.fitted_control_tracker.update(
+                    slot, points, probabilities, image_shape, now=timestamp)
             inside_road = _semantic_road_point_mask(
                 points, validation_mask, image_shape)
             points, probabilities = _select_control_curve_segment(
@@ -1147,10 +1185,10 @@ class VisionControlPlanner:
                 points, validation_mask, image_shape)
             fitted_paths.append({
                 "slot": slot,
-                "model_slot": int(raw_path.get("model_slot", slot)),
+                "model_slot": model_slot,
                 "role": "left" if slot == 0 else "right",
                 "identity": "left" if slot == 0 else "right",
-                "source": "fitted_control_curve",
+                "source": "query_heatmap_arc_path",
                 "score": float(raw_path.get("score", 1.0)),
                 "coverage": float(len(points)) / max(1.0, float(height)),
                 "row_support": int(np.count_nonzero(inliers)),
@@ -1163,13 +1201,73 @@ class VisionControlPlanner:
                 "spatial_prefiltered": True,
                 "fitted_control": True,
             })
-        for slot in (0, 1):
-            if slot not in present_slots:
-                self.fitted_control_tracker.update(
-                    slot, np.empty((0, 2)), np.empty((0,)),
-                    image_shape, now=timestamp)
+        if update_tracker:
+            for slot in (0, 1):
+                if slot not in present_slots:
+                    self.fitted_control_tracker.update(
+                        slot, np.empty((0, 2)), np.empty((0,)),
+                        image_shape, now=timestamp)
         fitted_paths.sort(key=lambda item: int(item.get("slot", 99)))
         return fitted_paths[:2]
+
+    def _recover_collapsed_query_candidate(
+            self, candidates, raw_paths, path_probabilities, road_mask,
+            hard_road_mask, image_shape, now=None, count_evidence=None):
+        """Retry only the weaker query when both queries collapse to one branch."""
+        candidates = list(candidates or [])
+        if len(candidates) != 2 or path_probabilities is None:
+            return candidates
+        by_slot = {int(item.get("slot", -1)): item for item in candidates}
+        if 0 not in by_slot or 1 not in by_slot:
+            return candidates
+        stats = self._path_pair_stats(
+            by_slot[0].get("points_xy", ()), by_slot[1].get("points_xy", ()),
+            image_shape)
+        if self._centerline_pair_topology(stats) != "OVERLAP":
+            return candidates
+        count_evidence = dict(count_evidence or {})
+        scores = list(count_evidence.get("scores") or [])
+        two_path_prior = bool(
+            int(count_evidence.get("model_path_count", -1)) >= 2
+            or (len(scores) >= 3 and float(scores[2]) >= 0.20))
+        if not two_path_prior:
+            return candidates
+        quality = {
+            slot: self._centerline_candidate_quality(candidate)
+            for slot, candidate in by_slot.items()}
+        stable_slot = max(quality, key=quality.get)
+        weak_slot = 1 - int(stable_slot)
+        raw = next((item for item in list(raw_paths or [])
+                    if int(item.get("slot", -1)) == weak_slot), None)
+        if raw is None:
+            return candidates
+        recovered = self._build_fitted_control_paths(
+            [raw], road_mask, image_shape, now=now,
+            path_probabilities=path_probabilities,
+            hard_road_mask=hard_road_mask, recovery_slot=weak_slot,
+            exclusion_points=by_slot[stable_slot].get("points_xy"),
+            update_tracker=False)
+        if len(recovered) != 1:
+            return candidates
+        recovered_candidate = recovered[0]
+        recovered_stats = self._path_pair_stats(
+            by_slot[stable_slot].get("points_xy", ()),
+            recovered_candidate.get("points_xy", ()), image_shape)
+        topology = self._centerline_pair_topology(recovered_stats)
+        mean_support = float((recovered_candidate.get("extension") or {}).get(
+            "mean_heatmap_support", 0.0))
+        if (topology == "OVERLAP" or mean_support <
+                float(self.config.centerline_heatmap_recovery_min_mean)):
+            return candidates
+        recovered_candidate["extension"] = dict(
+            recovered_candidate.get("extension") or {})
+        recovered_candidate["extension"].update({
+            "collapsed_query_recovery": True,
+            "stable_slot": int(stable_slot),
+            "pair_topology": topology,
+        })
+        by_slot[weak_slot] = recovered_candidate
+        return [by_slot[0], by_slot[1]]
 
     @staticmethod
     def _centerline_candidate_quality(candidate):
@@ -6032,6 +6130,68 @@ class VisionControlBirdseyeRenderer:
         return frame
 
 
+def _centerline_resample_arc_length(
+        points, probabilities, sample_step_px=4.0):
+    """Resample an ordered 2-D path without assuming x=f(y)."""
+    points = np.asarray(points, dtype=np.float64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    empty_points = np.empty((0, 2), dtype=np.float32)
+    empty_probabilities = np.empty((0,), dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+        return empty_points, empty_probabilities
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float64)
+    finite = np.all(np.isfinite(points), axis=1) & np.isfinite(probabilities)
+    points = points[finite]
+    probabilities = probabilities[finite]
+    if len(points) < 2:
+        return empty_points, empty_probabilities
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    keep = np.concatenate(([True], segment_lengths > 0.35))
+    points = points[keep]
+    probabilities = probabilities[keep]
+    if len(points) < 2:
+        return empty_points, empty_probabilities
+    arc = np.concatenate(([0.0], np.cumsum(
+        np.linalg.norm(np.diff(points, axis=0), axis=1))))
+    if float(arc[-1]) <= 1e-5:
+        return empty_points, empty_probabilities
+    sample_count = max(
+        2, int(math.ceil(float(arc[-1]) /
+                         max(1.0, float(sample_step_px)))) + 1)
+    sample_arc = np.linspace(0.0, float(arc[-1]), sample_count)
+    sampled = np.stack((
+        np.interp(sample_arc, arc, points[:, 0]),
+        np.interp(sample_arc, arc, points[:, 1])), axis=1)
+    sampled_probability = np.interp(sample_arc, arc, probabilities)
+    return (sampled.astype(np.float32),
+            np.clip(sampled_probability, 0.0, 1.0).astype(np.float32))
+
+
+def _centerline_weighted_local_smooth(
+        points, probabilities, smoothness=0.45, iterations=4):
+    """Locally smooth x(s), y(s); reliable observations remain almost fixed."""
+    points = np.asarray(points, dtype=np.float32)
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    if len(points) < 5 or smoothness <= 0.0:
+        return points.copy()
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float32)
+    original = points.copy()
+    smoothed = points.copy()
+    observation_weight = 1.5 + 8.5 * np.clip(probabilities, 0.0, 1.0)
+    regularization = max(0.0, float(smoothness)) * 5.0
+    for _iteration in range(max(1, int(iterations))):
+        neighbor = 0.5 * (smoothed[:-2] + smoothed[2:])
+        weight = observation_weight[1:-1, None]
+        smoothed[1:-1] = (
+            weight * original[1:-1] + regularization * neighbor
+        ) / (weight + regularization)
+    smoothed[0] = original[0]
+    smoothed[-1] = original[-1]
+    return smoothed.astype(np.float32)
+
+
 def _fit_smooth_majority_curve(
         points, probabilities, image_width, inlier_px_640=10.0,
         sample_step_px=4.0, extend_to_y=None,
@@ -6039,202 +6199,87 @@ def _fit_smooth_majority_curve(
         max_extension_deviation_px_640=18.0,
         max_extension_lateral_px_640=48.0,
         trusted_points=False):
-    """Fit a low-order curve, favoring maximum support then smoothness."""
+    """Build a robust ordered path without global polynomial extrapolation."""
+    del extend_to_y, max_extension_y_px_480
+    del max_extension_deviation_px_640, max_extension_lateral_px_640
     points = np.asarray(points, dtype=np.float64)
     probabilities = np.asarray(probabilities, dtype=np.float64)
     empty_points = np.empty((0, 2), dtype=np.float32)
     empty_probabilities = np.empty((0,), dtype=np.float32)
-    if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 3):
-        return empty_points, empty_probabilities, np.zeros(len(points), bool)
+    original_count = len(points)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+        return empty_points, empty_probabilities, np.zeros(original_count, bool)
     if len(probabilities) != len(points):
         probabilities = np.ones(len(points), dtype=np.float64)
-
-    order = np.argsort(points[:, 1], kind="stable")
-    sorted_points = points[order]
-    sorted_probabilities = probabilities[order]
-    center_y = float(np.mean(sorted_points[:, 1]))
-    scale_y = max(1.0, 0.5 * float(np.ptp(sorted_points[:, 1])))
-    normalized_y = (sorted_points[:, 1] - center_y) / scale_y
+    finite = np.all(np.isfinite(points), axis=1) & np.isfinite(probabilities)
+    order = np.flatnonzero(finite)
+    if len(order) < 3:
+        return empty_points, empty_probabilities, np.zeros(original_count, bool)
+    # Preserve the path's own sequence.  Row anchors usually arrive
+    # near-to-far, while a heatmap-recovered tail can contain a horizontal or
+    # side-exit section.  Sorting by y here would erase that geometry.
+    if float(points[order[0], 1]) > float(points[order[-1], 1]):
+        order = order[::-1]
+    ordered = points[order]
+    ordered_probabilities = probabilities[order]
     threshold = max(
         2.0, float(inlier_px_640) * float(max(1, image_width)) / 640.0)
-
-    # Four evenly spread anchors provide a small deterministic hypothesis set
-    # (six line and four quadratic pairs).  The semantic-road and continuity
-    # checks below reject the occasional bad fit, so a larger RANSAC-like set
-    # only burns CPU on every camera frame.
-    sample_count = min(4, len(sorted_points))
-    sample_indices = np.unique(np.rint(np.linspace(
-        0, len(sorted_points) - 1, sample_count)).astype(np.int32))
-    candidates = []
-    try:
-        candidates.append((1, np.polyfit(
-            normalized_y, sorted_points[:, 0], 1)))
-    except (ValueError, np.linalg.LinAlgError):
-        pass
-    if not trusted_points:
-        line_pairs = np.asarray([
-            (sample_indices[first], sample_indices[second])
-            for first in range(len(sample_indices) - 1)
-            for second in range(first + 1, len(sample_indices))
-        ], dtype=np.int32)
-        if len(line_pairs):
-            first_y = normalized_y[line_pairs[:, 0]]
-            second_y = normalized_y[line_pairs[:, 1]]
-            denominator = second_y - first_y
-            valid = np.abs(denominator) > 1e-6
-            slopes = (
-                sorted_points[line_pairs[valid, 1], 0] -
-                sorted_points[line_pairs[valid, 0], 0]) / denominator[valid]
-            intercepts = (
-                sorted_points[line_pairs[valid, 0], 0] -
-                slopes * first_y[valid])
-            candidates.extend(
-                (1, np.asarray([slope, intercept], dtype=np.float64))
-                for slope, intercept in zip(slopes, intercepts))
-
-    try:
-        candidates.append((2, np.polyfit(
-            normalized_y, sorted_points[:, 0], 2)))
-    except (ValueError, np.linalg.LinAlgError):
-        pass
-    if not trusted_points:
-        quadratic_groups = np.asarray([
-            (sample_indices[first], sample_indices[second],
-             sample_indices[third])
-            for first in range(len(sample_indices) - 2)
-            for second in range(first + 1, len(sample_indices) - 1)
-            for third in range(second + 1, len(sample_indices))
-        ], dtype=np.int32)
-        if len(quadratic_groups):
-            group_y = normalized_y[quadratic_groups]
-            matrices = np.stack((
-                group_y * group_y, group_y,
-                np.ones_like(group_y)), axis=2)
-            determinants = np.linalg.det(matrices)
-            valid = np.abs(determinants) > 1e-9
-            if np.any(valid):
-                coefficients = np.linalg.solve(
-                    matrices[valid],
-                    sorted_points[quadratic_groups[valid], 0])
-                candidates.extend(
-                    (2, coefficient) for coefficient in coefficients)
-
-    evaluated = []
-    if candidates:
-        degrees = np.asarray(
-            [item[0] for item in candidates], dtype=np.int32)
-        coefficient_matrix = np.zeros(
-            (len(candidates), 3), dtype=np.float64)
-        for index, (degree, coefficients) in enumerate(candidates):
-            coefficient_matrix[index, -len(coefficients):] = coefficients
-        design = np.stack((
-            normalized_y * normalized_y,
-            normalized_y,
-            np.ones_like(normalized_y)), axis=1)
-        predictions = design @ coefficient_matrix.T
-        all_residuals = np.abs(
-            sorted_points[:, 0, None] - predictions)
-        all_inliers = all_residuals <= threshold
-        counts = np.count_nonzero(all_inliers, axis=0)
-        for index, (degree, coefficients) in enumerate(candidates):
-            count = int(counts[index])
-            if count < max(3, degree + 2):
-                continue
-            inliers = all_inliers[:, index]
-            median_error = float(np.median(
-                all_residuals[inliers, index]))
-            curvature = (
-                2.0 * abs(float(coefficient_matrix[index, 0]))
-                if degree == 2 else 0.0)
-            evaluated.append({
-                "degree": degree,
-                "coefficients": coefficients,
-                "inliers": inliers,
-                "count": count,
-                "smooth_cost": (
-                    median_error + 0.04 * curvature + 0.15 * degree),
-            })
-    if not evaluated:
-        return empty_points, empty_probabilities, np.zeros(len(points), bool)
-
-    maximum_support = max(item["count"] for item in evaluated)
-    near_maximum = [
-        item for item in evaluated
-        if item["count"] >= maximum_support - 1]
-    best = min(near_maximum, key=lambda item: item["smooth_cost"])
-    degree = int(best["degree"])
-    inliers = np.asarray(best["inliers"], dtype=bool)
-    coefficients = np.asarray(best["coefficients"], dtype=np.float64)
-    for _iteration in range(2):
-        if int(np.count_nonzero(inliers)) < degree + 2:
-            break
-        coefficients = np.polyfit(
-            normalized_y[inliers], sorted_points[inliers, 0], degree)
-        residuals = np.abs(
-            sorted_points[:, 0] - np.polyval(coefficients, normalized_y))
-        refined = residuals <= threshold
-        if np.array_equal(refined, inliers):
-            break
-        inliers = refined
-
-    if int(np.count_nonzero(inliers)) < 3:
-        return empty_points, empty_probabilities, np.zeros(len(points), bool)
-    inlier_points = sorted_points[inliers]
-    inlier_probabilities = sorted_probabilities[inliers]
-    inlier_order = np.argsort(inlier_points[:, 1], kind="stable")
-    inlier_points = inlier_points[inlier_order]
-    inlier_probabilities = inlier_probabilities[inlier_order]
-    start_y = float(inlier_points[0, 1])
-    end_y = float(inlier_points[-1, 1])
-    extend_to_y = _finite_float(extend_to_y)
-    include_extension_y = False
-    if extend_to_y is not None:
-        if start_y <= extend_to_y <= end_y:
-            include_extension_y = True
-        else:
-            edge_y = start_y if extend_to_y < start_y else end_y
-            vertical_gap = abs(float(extend_to_y) - edge_y)
-            edge_count = min(6, len(inlier_points))
-            edge_points = (
-                inlier_points[:edge_count]
-                if extend_to_y < start_y else inlier_points[-edge_count:])
-            polynomial_x = float(np.polyval(
-                coefficients, (float(extend_to_y) - center_y) / scale_y))
-            tangent_coefficients = np.polyfit(
-                edge_points[:, 1], edge_points[:, 0], 1)
-            tangent_x = float(np.polyval(
-                tangent_coefficients, float(extend_to_y)))
-            edge_x = float(edge_points[0, 0] if extend_to_y < start_y
-                           else edge_points[-1, 0])
-            width_scale = float(max(1, image_width)) / 640.0
-            extension_safe = (
-                vertical_gap <= float(max_extension_y_px_480) and
-                abs(polynomial_x - tangent_x) <=
-                float(max_extension_deviation_px_640) * width_scale and
-                abs(polynomial_x - edge_x) <=
-                float(max_extension_lateral_px_640) * width_scale)
-            if extension_safe:
-                start_y = min(start_y, float(extend_to_y))
-                end_y = max(end_y, float(extend_to_y))
-                include_extension_y = True
-    sample_count = max(
-        2, int(math.ceil((end_y - start_y) /
-                         max(1.0, float(sample_step_px)))) + 1)
-    fitted_y = np.linspace(start_y, end_y, sample_count, dtype=np.float64)
-    if include_extension_y:
-        fitted_y = np.unique(np.append(fitted_y, float(extend_to_y)))
-    fitted_x = np.polyval(
-        coefficients, (fitted_y - center_y) / scale_y)
-    fitted_x = np.clip(fitted_x, 0.0, float(max(0, image_width - 1)))
-    fitted_probabilities = np.interp(
-        fitted_y, inlier_points[:, 1], inlier_probabilities)
-    fitted_points = np.stack((fitted_x, fitted_y), axis=1).astype(np.float32)
-
-    original_inliers = np.zeros(len(points), dtype=bool)
-    original_inliers[order] = inliers
-    return (fitted_points,
-            np.clip(fitted_probabilities, 0.0, 1.0).astype(np.float32),
-            original_inliers)
+    keep = np.ones(len(ordered), dtype=bool)
+    if not trusted_points and len(ordered) >= 5:
+        # One conservative pass removes an isolated jump without letting that
+        # jump make its immediate neighbours look like outliers as well.
+        for _iteration in range(1):
+            active = np.flatnonzero(keep)
+            if len(active) < 5:
+                break
+            changed = False
+            for position in range(1, len(active) - 1):
+                index = int(active[position])
+                before = int(active[position - 1])
+                after = int(active[position + 1])
+                neighborhood = active[
+                    max(0, position - 2):min(len(active), position + 3)]
+                neighborhood = neighborhood[neighborhood != index]
+                if len(neighborhood) >= 3:
+                    expected_x = float(np.median(ordered[neighborhood, 0]))
+                    residual = abs(float(ordered[index, 0]) - expected_x)
+                    local_limit = threshold * (
+                        2.2 if ordered_probabilities[index] >= 0.65 else 1.3)
+                    if residual > local_limit:
+                        keep[index] = False
+                        changed = True
+                    continue
+                dy = float(ordered[after, 1] - ordered[before, 1])
+                if abs(dy) <= 1e-5:
+                    continue
+                ratio = float(
+                    (ordered[index, 1] - ordered[before, 1]) / dy)
+                expected_x = float(
+                    ordered[before, 0] + ratio *
+                    (ordered[after, 0] - ordered[before, 0]))
+                residual = abs(float(ordered[index, 0]) - expected_x)
+                local_limit = threshold * (
+                    1.8 if ordered_probabilities[index] >= 0.65 else 1.0)
+                if residual > local_limit:
+                    keep[index] = False
+                    changed = True
+            if not changed:
+                break
+    if int(np.count_nonzero(keep)) < 3:
+        return empty_points, empty_probabilities, np.zeros(original_count, bool)
+    cleaned = ordered[keep]
+    cleaned_probabilities = ordered_probabilities[keep]
+    fitted, fitted_probabilities = _centerline_resample_arc_length(
+        cleaned, cleaned_probabilities, sample_step_px=sample_step_px)
+    if len(fitted) < 3:
+        return empty_points, empty_probabilities, np.zeros(original_count, bool)
+    fitted = _centerline_weighted_local_smooth(
+        fitted, fitted_probabilities, smoothness=0.45, iterations=4)
+    fitted[:, 0] = np.clip(
+        fitted[:, 0], 0.0, float(max(0, image_width - 1)))
+    original_inliers = np.zeros(original_count, dtype=bool)
+    original_inliers[order[keep]] = True
+    return fitted, fitted_probabilities, original_inliers
 
 
 class _FittedControlPathTracker:
@@ -6660,6 +6705,167 @@ def _centerline_image_to_grid(point, image_shape, grid_shape):
                   float(max(1, height - 1))))
     return (int(np.clip(y, 0, grid_height - 1)),
             int(np.clip(x, 0, grid_width - 1)))
+
+
+def _centerline_fuse_anchors_with_heatmap(
+        points, probabilities, path_probability, road_mask, image_shape,
+        config, exclusion_points=None, exclusion_above_y=None):
+    """Decode one query as a continuous in-road path, seeded by row anchors.
+
+    The row head remains the near-field identity/ordering prior.  The dense
+    query heatmap supplies weak evidence between anchors, so this intentionally
+    does not threshold the heatmap into isolated peaks before decoding.
+    """
+    points = np.asarray(points, dtype=np.float32)
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    empty = np.empty((0, 2), dtype=np.float32)
+    empty_p = np.empty((0,), dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+        return empty, empty_p, {"accepted": False, "reason": "short_anchor_path"}
+    heatmap = np.asarray(path_probability, dtype=np.float32)
+    if heatmap.ndim != 2 or not heatmap.size:
+        return points.copy(), probabilities.copy(), {
+            "accepted": False, "reason": "heatmap_unavailable"}
+    if len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float32)
+    finite = np.all(np.isfinite(points), axis=1) & np.isfinite(probabilities)
+    if int(np.count_nonzero(finite)) < 3:
+        return empty, empty_p, {"accepted": False, "reason": "invalid_anchor_path"}
+    points = points[finite]
+    probabilities = np.clip(probabilities[finite], 0.0, 1.0)
+    grid_height, grid_width = heatmap.shape
+    road = np.asarray(road_mask) if road_mask is not None else None
+    if road is None or road.ndim != 2 or not road.size:
+        support = np.ones((grid_height, grid_width), dtype=bool)
+    else:
+        if road.shape != heatmap.shape:
+            road = cv2.resize(
+                (road != 0).astype(np.uint8), (grid_width, grid_height),
+                interpolation=cv2.INTER_NEAREST)
+        support = road != 0
+        # Tiny holes can come from segmentation quantization.  This only
+        # bridges a one-cell break and never expands beyond the hard mask.
+        support = cv2.morphologyEx(
+            support.astype(np.uint8), cv2.MORPH_CLOSE,
+            np.ones((3, 3), dtype=np.uint8)).astype(bool)
+    if not np.any(support):
+        return points.copy(), probabilities.copy(), {
+            "accepted": False, "reason": "road_support_unavailable"}
+    distance = cv2.distanceTransform(
+        support.astype(np.uint8), cv2.DIST_L2, 3).astype(np.float32)
+    exclusion = np.zeros_like(support, dtype=np.uint8)
+    if exclusion_points is not None:
+        other = np.asarray(exclusion_points, dtype=np.float32)
+        if other.ndim == 2 and other.shape[1] == 2 and len(other) >= 2:
+            converted = np.asarray([
+                _centerline_image_to_grid(point, image_shape, heatmap.shape)[::-1]
+                for point in other], dtype=np.int32)
+            thickness = max(1, int(round(
+                float(config.centerline_recovery_exclusion_px_640) *
+                float(grid_width) / 640.0)))
+            cv2.polylines(exclusion, [converted], False, 1, thickness, cv2.LINE_8)
+
+    # Dynamic programming begins near the vehicle, where anchors are most
+    # reliable, and walks toward the far field.  It therefore cannot let an
+    # isolated far peak pull the entire path across the road.
+    order = np.argsort(points[:, 1], kind="stable")[::-1]
+    ordered = points[order]
+    ordered_probabilities = probabilities[order]
+    x_grid = np.arange(grid_width, dtype=np.float32)
+    anchor_grid = np.asarray([
+        _centerline_image_to_grid(point, image_shape, heatmap.shape)
+        for point in ordered], dtype=np.int32)
+    # Decode every supported heatmap row between the near and far anchors.
+    # The anchor head supplies identity and a local prior only; it must not
+    # flatten the curve between anchors into a sequence of straight segments.
+    near_y = int(np.max(anchor_grid[:, 0]))
+    far_y = int(np.min(anchor_grid[:, 0]))
+    decode_rows = [
+        row for row in range(near_y, far_y - 1, -1)
+        if bool(np.any(support[row]))]
+    if len(decode_rows) < 3:
+        return points.copy(), probabilities.copy(), {
+            "accepted": False, "reason": "insufficient_dense_road_rows"}
+    transition_delta = np.abs(
+        x_grid[:, None] - x_grid[None, :]).astype(np.float32)
+    previous_cost = None
+    previous_y = None
+    backtracks = []
+    row_candidates = []
+    for grid_y in decode_rows:
+        response = heatmap[grid_y]
+        allowed = support[grid_y].copy()
+        # Suppress the stable branch only after the shared near trunk.  If the
+        # suppression removes every choice, this row is still allowed to share.
+        image_y = (float(grid_y) * float(max(1, image_shape[0] - 1)) /
+                   float(max(1, grid_height - 1)))
+        if (exclusion_points is not None and exclusion_above_y is not None
+                and image_y < float(exclusion_above_y)):
+            non_duplicate = allowed & (exclusion[grid_y] == 0)
+            if np.any(non_duplicate):
+                allowed = non_duplicate
+        edge_cost = 1.0 / np.maximum(distance[grid_y], 1.0)
+        unary = (1.45 * (1.0 - np.clip(response, 0.0, 1.0))
+                 + float(config.centerline_heatmap_edge_weight) * edge_cost)
+        anchor_distance = np.abs(anchor_grid[:, 0] - int(grid_y))
+        anchor_index = int(np.argmin(anchor_distance))
+        if int(anchor_distance[anchor_index]) <= 1:
+            anchor_scale = float(config.centerline_heatmap_anchor_weight) * (
+                0.20 + 0.80 * float(ordered_probabilities[anchor_index]))
+            anchor_radius = max(3.0, 0.09 * float(grid_width))
+            unary += anchor_scale * (
+                (x_grid - float(anchor_grid[anchor_index, 1])) /
+                anchor_radius) ** 2
+        unary[~allowed] = np.inf
+        if previous_cost is None:
+            current_cost = unary
+            backtracks.append(np.full(grid_width, -1, dtype=np.int16))
+        else:
+            row_gap = max(1, int(previous_y) - int(grid_y))
+            max_step = max(3, int(round(0.045 * float(grid_width)))) * row_gap
+            transition = (
+                float(config.centerline_heatmap_transition_weight) * transition_delta
+                + 0.0015 * transition_delta * transition_delta)
+            transition[transition_delta > float(max_step)] = np.inf
+            total = previous_cost[:, None] + transition
+            previous_index = np.argmin(total, axis=0).astype(np.int16)
+            current_cost = unary + total[previous_index, np.arange(grid_width)]
+            backtracks.append(previous_index)
+        if not np.any(np.isfinite(current_cost)):
+            return points.copy(), probabilities.copy(), {
+                "accepted": False, "reason": "dynamic_path_blocked"}
+        previous_cost = current_cost
+        previous_y = int(grid_y)
+        row_candidates.append((int(grid_y), response, anchor_index,
+                               int(anchor_distance[anchor_index])))
+    current_x = int(np.argmin(previous_cost))
+    recovered = []
+    recovered_probability = []
+    for index in range(len(row_candidates) - 1, -1, -1):
+        grid_y, response, anchor_index, anchor_distance = row_candidates[index]
+        image_x = float(current_x) * float(max(1, image_shape[1] - 1)) / float(
+            max(1, grid_width - 1))
+        image_y = float(grid_y) * float(max(1, image_shape[0] - 1)) / float(
+            max(1, grid_height - 1))
+        heat_probability = float(np.clip(response[current_x], 0.0, 1.0))
+        recovered.append((image_x, image_y))
+        anchor_probability = (float(ordered_probabilities[anchor_index])
+                              if anchor_distance <= 1 else heat_probability)
+        recovered_probability.append(0.55 * anchor_probability +
+                                     0.45 * heat_probability)
+        previous_index = int(backtracks[index][current_x])
+        if previous_index >= 0:
+            current_x = previous_index
+    # The trace is far-to-near, matching existing candidate/control consumers.
+    recovered = np.asarray(recovered, dtype=np.float32)
+    recovered_probability = np.asarray(recovered_probability, dtype=np.float32)
+    return recovered, np.clip(recovered_probability, 0.0, 1.0), {
+        "accepted": True,
+        "reason": "query_heatmap_dynamic_path",
+        "mean_heatmap_support": float(np.mean(recovered_probability)),
+        "rows": int(len(recovered)),
+        "used_exclusion": bool(exclusion_points is not None),
+    }
 
 
 def _centerline_nearest_support(

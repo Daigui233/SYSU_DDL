@@ -484,6 +484,11 @@ def decode_outputs(
 
     road_probability = (
         sigmoid(pixel_logits[0]) if include_debug_probabilities else None)
+    # Channels 1 and 2 are the query-specific centerline heatmaps.  They are
+    # part of the deployed model contract, not merely debug output: the row
+    # head supplies ordered anchors while these dense maps preserve weak and
+    # non-row-monotonic evidence between anchors.
+    path_probabilities = sigmoid(pixel_logits[1:1 + MAX_PATHS])
     road_mask_raw = (
         pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
     road_mask, road_quality = clean_road_mask(
@@ -512,6 +517,7 @@ def decode_outputs(
     }
     centerline = {
         "raw_curve_paths": raw_curve_paths,
+        "path_probabilities": path_probabilities,
         "path_scores": path_scores_list,
         "path_count_scores": path_count_scores_list,
         "path_count_probabilities": path_count_scores_list,
@@ -527,6 +533,7 @@ def decode_outputs(
         "model_path_count": model_path_count,
         "path_count_scores": path_count_scores_list,
         "raw_curve_paths": raw_curve_paths,
+        "path_probabilities": path_probabilities,
         "road": road,
         "centerline": centerline,
     }

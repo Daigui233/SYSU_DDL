@@ -18,7 +18,9 @@ The RKNN must return these tensors in this exact order:
 
 1. `det_boxes [1,6300,4]`: decoded xyxy boxes in the 640x480 input space.
 2. `det_scores [1,6300,8]`: class probabilities; do not apply sigmoid.
-3. `pixel_logits [1,3,120,160]`: road, single/left, and right logits.
+3. `pixel_logits [1,3,120,160]`: road logit plus two query-specific
+   centerline heatmap logits. Channels 1 and 2 keep the two path instances
+   separate; they are decoded with sigmoid on the board.
 4. `row_path_logits [1,2,32,161]`: two fixed path queries, 32 bottom-to-top
    row anchors, 160 horizontal bins, and one final `no_path` class.
 5. `path_scores [1,2]`: sigmoid probabilities; do not apply sigmoid again.
@@ -35,11 +37,14 @@ Path slots have conditional roles:
 - count 1: slot 0 is `single`.
 - count 2: slot 0 is `left`, slot 1 is `right`.
 
-`row_path_logits` is the only path source. Post-processing first exposes all
-32 anchors for both slots as `raw_curve_paths`, without threshold filtering or
-fitting. `vision_control.py` then removes unsupported points with the semantic
-road mask and local association checks, compensates sparse lower points, fits
-the smooth majority curve, and publishes the final control curves as `paths`.
+`row_path_logits` supplies the ordered identity and near-field anchor prior;
+the corresponding `pixel_logits` query heatmap supplies the continuous path
+evidence between anchors. Post-processing exposes both as `raw_curve_paths`
+and `path_probabilities`. `vision_control.py` performs a per-query dense-row
+dynamic decode inside the semantic road mask, then applies arc-length local
+smoothing. It does not use a global polynomial or B-spline `x(y)` fit, and it
+does not invent a road-only curve outside the query heatmap. The final control
+curves are published as `paths`.
 
 ## Runtime tuning
 

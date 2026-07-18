@@ -102,6 +102,18 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(int(result["road_mask"][0, 0]), 0)
         self.assertFalse(result["road"]["valid"])
 
+    def test_decode_exposes_query_heatmaps_for_board_side_path_recovery(self):
+        outputs = list(self.make_outputs())
+        outputs[2][0, 1, 20, 30] = 0.0
+        outputs[2][0, 2, 20, 30] = 2.0
+        result = decode_outputs(outputs, (480, 640, 3))
+
+        maps = result["path_probabilities"]
+        self.assertEqual(maps.shape, (2, 120, 160))
+        self.assertAlmostEqual(float(maps[0, 20, 30]), 0.5, places=6)
+        self.assertGreater(float(maps[1, 20, 30]), 0.87)
+        self.assertIs(result["centerline"]["path_probabilities"], maps)
+
     def test_road_cleanup_fills_cracks_and_removes_islands(self):
         raw = np.zeros((40, 40), dtype=np.uint8)
         raw[10:40, 8:32] = 1
