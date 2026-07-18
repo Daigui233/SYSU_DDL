@@ -192,6 +192,18 @@ class VisionControlConfig:
     centerline_clockwise_only: bool = True
     centerline_counterclockwise_heading_px_640: float = 18.0
     centerline_counterclockwise_target_jump_px_640: float = 20.0
+    # The camera is static in the competition setup.  Decode curve evidence
+    # only on the ego-connected semantic-road component and never use pixels
+    # occupied by a moving Human detection as curve support.
+    centerline_ego_road_component_enabled: bool = True
+    centerline_ego_road_seed_radius_px_640: float = 150.0
+    centerline_dynamic_exclusion_enabled: bool = True
+    centerline_dynamic_exclusion_min_score: float = 0.35
+    centerline_dynamic_exclusion_dilate_px_640: float = 18.0
+    centerline_dynamic_exclusion_top_y_ratio: float = 0.58
+    # Query identity is model-owned, while blue/green are physical roles.
+    # A one-frame recovered ridge must not be allowed to swap those roles.
+    centerline_role_switch_confirm_frames: int = 3
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
     curve_merge_support_ratio: float = 0.70
@@ -451,6 +463,29 @@ class VisionControlConfig:
                 1.0, _env_float(
                     "VISION_CONTROL_CENTERLINE_COUNTERCLOCKWISE_TARGET_JUMP_640",
                     20.0)),
+            centerline_ego_road_component_enabled=_env_bool(
+                "VISION_CONTROL_CENTERLINE_EGO_ROAD_COMPONENT", True),
+            centerline_ego_road_seed_radius_px_640=max(
+                20.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_EGO_ROAD_SEED_RADIUS_640",
+                    150.0)),
+            centerline_dynamic_exclusion_enabled=_env_bool(
+                "VISION_CONTROL_CENTERLINE_DYNAMIC_EXCLUSION", True),
+            centerline_dynamic_exclusion_min_score=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CENTERLINE_DYNAMIC_EXCLUSION_MIN_SCORE",
+                    0.35), 0.0, 1.0),
+            centerline_dynamic_exclusion_dilate_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_DYNAMIC_EXCLUSION_DILATE_640",
+                    18.0)),
+            centerline_dynamic_exclusion_top_y_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CENTERLINE_DYNAMIC_EXCLUSION_TOP_Y_RATIO",
+                    0.58), 0.10, 0.90),
+            centerline_role_switch_confirm_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CENTERLINE_ROLE_SWITCH_CONFIRM", 3)),
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
             ocr_confirm_frames=max(1, _env_int("VISION_CONTROL_OCR_CONFIRM_FRAMES", 1)),
@@ -632,9 +667,13 @@ class VisionControlPlanner:
         # separate, frame-visible property which exists only after two paths
         # have genuinely separated.  Never swap model slots to obtain colors.
         self.centerline_physical_side_by_model_slot = {}
+        self.centerline_pending_physical_side_by_model_slot = None
+        self.centerline_pending_role_switch_frames = 0
         self.centerline_physical_association_debug = {
             "active": False, "reason": "initial"}
         self.centerline_route_association_debug = {
+            "active": False, "reason": "initial"}
+        self.centerline_curve_mask_debug = {
             "active": False, "reason": "initial"}
         self.centerline_junction_state = "NO_FORK"
         self.centerline_junction_state_frames = 0
@@ -873,6 +912,7 @@ class VisionControlPlanner:
             "centerline_direction_guard": dict(
                 self.centerline_direction_guard_debug),
             "centerline_recovery": dict(self.centerline_recovery_debug),
+            "centerline_curve_mask": dict(self.centerline_curve_mask_debug),
             "centerline_junction_state": self.centerline_junction_state,
             "centerline_junction_state_frames": int(
                 self.centerline_junction_state_frames),
@@ -1091,8 +1131,35 @@ class VisionControlPlanner:
             else (second, first))
         left_slot = int(left["model_slot"])
         right_slot = int(right["model_slot"])
-        self.centerline_physical_side_by_model_slot = {
-            left_slot: "left", right_slot: "right"}
+        observed_mapping = {left_slot: "left", right_slot: "right"}
+        current_mapping = dict(self.centerline_physical_side_by_model_slot)
+        mapping_reason = "separated_geometry_left_right"
+        # The model Query is an instance stream, but the separated geometry
+        # can be noisy for a single frame (especially after an occlusion or a
+        # recovered second ridge).  Keep blue/green stable until the reversed
+        # physical mapping persists for several frames.  Initial assignment is
+        # immediate so a genuine first fork still gets both colors.
+        if not current_mapping:
+            self.centerline_physical_side_by_model_slot = observed_mapping
+            self.centerline_pending_physical_side_by_model_slot = None
+            self.centerline_pending_role_switch_frames = 0
+        elif current_mapping == observed_mapping:
+            self.centerline_pending_physical_side_by_model_slot = None
+            self.centerline_pending_role_switch_frames = 0
+        else:
+            if self.centerline_pending_physical_side_by_model_slot == observed_mapping:
+                self.centerline_pending_role_switch_frames += 1
+            else:
+                self.centerline_pending_physical_side_by_model_slot = dict(observed_mapping)
+                self.centerline_pending_role_switch_frames = 1
+            required = max(1, int(self.config.centerline_role_switch_confirm_frames))
+            if self.centerline_pending_role_switch_frames >= required:
+                self.centerline_physical_side_by_model_slot = observed_mapping
+                self.centerline_pending_physical_side_by_model_slot = None
+                self.centerline_pending_role_switch_frames = 0
+                mapping_reason = "confirmed_physical_role_switch"
+            else:
+                mapping_reason = "retain_previous_roles_pending_switch"
         for candidate in candidates:
             model_slot = int(candidate["model_slot"])
             side = self.centerline_physical_side_by_model_slot.get(model_slot)
@@ -1102,9 +1169,12 @@ class VisionControlPlanner:
             candidate["identity"] = side
         self.centerline_physical_association_debug = {
             "active": True,
-            "reason": "separated_geometry_left_right",
+            "reason": mapping_reason,
             "left_model_slot": left_slot,
             "right_model_slot": right_slot,
+            "observed_mapping": dict(observed_mapping),
+            "mapping": dict(self.centerline_physical_side_by_model_slot),
+            "pending_switch_frames": int(self.centerline_pending_role_switch_frames),
             "separated_rows": int(end - start),
             "median_x": {str(left_slot): first_median if left is first else second_median,
                          str(right_slot): second_median if right is second else first_median},
@@ -1123,6 +1193,140 @@ class VisionControlPlanner:
         if fallback in (0, 1):
             return int(fallback)
         return 1 if side == "right" else 0
+
+    def _centerline_dynamic_exclusion_mask(
+            self, detections, road_shape, image_shape):
+        """Return a low-resolution mask of moving objects unsafe for curves.
+
+        Humans are the only moving obstacle in this course.  Their pixels
+        must not also become evidence for an ego centerline while they occlude
+        the static AR road.  Cars are fixed scene elements and intentionally
+        remain available to the road/curve decoder.  The mask is deliberately
+        local: it never changes object detection, avoidance, or the semantic
+        road result that other planner stages consume.
+        """
+        road_height, road_width = [int(value) for value in road_shape[:2]]
+        blocked = np.zeros((road_height, road_width), dtype=np.uint8)
+        if (not self.config.centerline_dynamic_exclusion_enabled
+                or road_height <= 0 or road_width <= 0):
+            return blocked
+        image_height, image_width = image_shape[:2]
+        expand = (float(self.config.centerline_dynamic_exclusion_dilate_px_640)
+                  * float(image_width) / 640.0)
+        minimum = float(self.config.centerline_dynamic_exclusion_min_score)
+        for detection in list(detections or []):
+            if self._normalized_label(detection) != "human":
+                continue
+            score = _finite_float(
+                detection.get("score", detection.get("confidence", 1.0)), 1.0)
+            if score < minimum:
+                continue
+            geometry = self._detection_geom(detection, image_shape)
+            if geometry is None:
+                continue
+            left = _clamp(geometry["left"] - expand, 0.0, image_width - 1.0)
+            right = _clamp(geometry["right"] + expand, 0.0, image_width - 1.0)
+            top = _clamp(geometry["top"] - expand, 0.0, image_height - 1.0)
+            # Do not punch a hole through the car-facing control segment.
+            # A nearby Human is handled by the dedicated stop/avoid state;
+            # this exclusion only prevents far occlusion pixels from pulling
+            # the decoded curve into a moving target.
+            bottom = min(
+                _clamp(geometry["bottom"] + expand, 0.0, image_height - 1.0),
+                float(image_height) * self.config.centerline_dynamic_exclusion_top_y_ratio)
+            if bottom <= top:
+                continue
+            x0 = int(round(left * float(road_width - 1) /
+                           float(max(1, image_width - 1))))
+            x1 = int(round(right * float(road_width - 1) /
+                           float(max(1, image_width - 1))))
+            y0 = int(round(top * float(road_height - 1) /
+                           float(max(1, image_height - 1))))
+            y1 = int(round(bottom * float(road_height - 1) /
+                           float(max(1, image_height - 1))))
+            cv2.rectangle(blocked, (x0, y0), (x1, y1), 1, thickness=-1)
+        return blocked
+
+    def _centerline_ego_road_component(self, road_mask, image_shape):
+        """Keep only road components reachable from the car-facing anchor."""
+        road = np.asarray(road_mask) if road_mask is not None else np.empty((0, 0))
+        if (not self.config.centerline_ego_road_component_enabled
+                or road.ndim != 2 or not road.size):
+            return road_mask, {"active": False, "reason": "component_disabled_or_missing"}
+        binary = (road != 0).astype(np.uint8)
+        if not np.any(binary):
+            return binary, {"active": True, "reason": "empty_road"}
+        # Closing only heals one-pixel quantization gaps in the low-resolution
+        # segmentation; it is not allowed to bridge different roads.
+        support = cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+        count, labels, stats, _centers = cv2.connectedComponentsWithStats(
+            support, connectivity=8)
+        if count <= 1:
+            return binary, {"active": True, "reason": "single_component"}
+        image_height, image_width = image_shape[:2]
+        anchor_x = (self.last_path_target_x
+                    if self.last_path_target_x is not None else
+                    float(image_width) * self.config.visual_center_x)
+        anchor_y = float(image_height) * self.config.line_anchor_y_ratio
+        mask_x = int(round(float(anchor_x) * float(binary.shape[1] - 1) /
+                           float(max(1, image_width - 1))))
+        mask_y = int(round(float(anchor_y) * float(binary.shape[0] - 1) /
+                           float(max(1, image_height - 1))))
+        radius = (float(self.config.centerline_ego_road_seed_radius_px_640)
+                  * float(binary.shape[1]) / 640.0)
+        best_label = 0
+        best_cost = float("inf")
+        for label in range(1, count):
+            left, top, width, height, area = stats[label]
+            if area <= 0:
+                continue
+            region = labels == label
+            yy, xx = np.nonzero(region)
+            if not len(xx):
+                continue
+            distance = np.min((xx.astype(np.float32) - float(mask_x)) ** 2 +
+                              (yy.astype(np.float32) - float(mask_y)) ** 2)
+            # Prefer a component around the vehicle anchor, then prefer its
+            # larger support.  A remote semantic island cannot win this score.
+            cost = float(distance) - 0.02 * float(area)
+            if distance <= radius * radius and cost < best_cost:
+                best_label = label
+                best_cost = cost
+        if best_label == 0:
+            return binary, {
+                "active": True, "reason": "no_component_near_ego_anchor",
+                "anchor": [int(mask_x), int(mask_y)],
+            }
+        selected = (labels == best_label).astype(np.uint8)
+        return selected, {
+            "active": True,
+            "reason": "ego_connected_component",
+            "anchor": [int(mask_x), int(mask_y)],
+            "component_area": int(stats[best_label, cv2.CC_STAT_AREA]),
+            "component_count": int(count - 1),
+        }
+
+    def _centerline_validation_masks(self, result, road_mask, hard_road_mask, image_shape):
+        base = hard_road_mask if hard_road_mask is not None else road_mask
+        ego_road, info = self._centerline_ego_road_component(base, image_shape)
+        if ego_road is None:
+            self.centerline_curve_mask_debug = dict(info)
+            return road_mask, hard_road_mask, np.empty((0, 0), dtype=np.uint8)
+        excluded = self._centerline_dynamic_exclusion_mask(
+            result.get("detections") or [], np.asarray(ego_road).shape, image_shape)
+        usable = np.asarray(ego_road) != 0
+        info = dict(info)
+        info.update({
+            "dynamic_excluded_pixels": int(np.count_nonzero(excluded)),
+            "usable_road_pixels": int(np.count_nonzero(usable)),
+        })
+        self.centerline_curve_mask_debug = info
+        # Keep dynamic occlusion separate from the road mask.  The curve
+        # fitter may bridge a Human-sized hole from same-instance points on
+        # both sides, but no point inside the box is allowed to vote for it.
+        return (usable.astype(np.uint8), usable.astype(np.uint8),
+                excluded.astype(np.uint8))
 
     def _extract_candidates(
             self, result, image_shape, now=None, preferred_slot=None):
@@ -1147,16 +1351,23 @@ class VisionControlPlanner:
         raw_curve_paths = self._associate_raw_curve_slots(
             list(raw_curve_paths or [])[:2], image_shape)
         count_evidence = self._centerline_count_evidence(result)
+        # Curve decoding has a stricter support mask than the rest of the
+        # planner: only the ego-connected road is eligible, and a moving
+        # Human box is a temporary unknown region rather than a curve cue.
+        curve_road, curve_hard_road, dynamic_exclusion = self._centerline_validation_masks(
+            result, road, hard_road, image_shape)
         # The count head is a confidence prior, not permission to erase a
         # decoded Query.  Keeping both raw instances here lets the weak Query
         # use its own heatmap for constrained recovery at a real fork.
         candidates = self._build_fitted_control_paths(
-            raw_curve_paths, road, image_shape, now=now,
+            raw_curve_paths, curve_road, image_shape, now=now,
             road_probability=road_probability, path_probabilities=path_probabilities,
-            hard_road_mask=hard_road)
+            hard_road_mask=curve_hard_road,
+            dynamic_exclusion_mask=dynamic_exclusion)
         candidates = self._recover_collapsed_query_candidate(
-            candidates, raw_curve_paths, path_probabilities, road,
-            hard_road, image_shape, now=now, count_evidence=count_evidence)
+            candidates, raw_curve_paths, path_probabilities, curve_road,
+            curve_hard_road, image_shape, now=now, count_evidence=count_evidence,
+            dynamic_exclusion_mask=dynamic_exclusion)
         candidates = self._assign_physical_path_roles(candidates, image_shape)
         lock_side = (
             "right" if preferred_slot == 1 else
@@ -1175,7 +1386,7 @@ class VisionControlPlanner:
             self, raw_paths, road_mask, image_shape, now=None,
             road_probability=None, path_probabilities=None, hard_road_mask=None,
             recovery_slot=None, exclusion_points=None, update_tracker=True,
-            path_probability_override=None):
+            path_probability_override=None, dynamic_exclusion_mask=None):
         height, width = image_shape[:2]
         lookahead_y = float(height) * self.config.lookahead_y_ratio
         confidence_split_y = max(0.0, lookahead_y - 10.0)
@@ -1219,6 +1430,15 @@ class VisionControlPlanner:
                 points, probabilities, query_heatmap, validation_mask,
                 image_shape, self.config, exclusion_points=exclusion_points,
                 exclusion_above_y=confidence_split_y)
+            excluded_by_dynamic_object = np.zeros(len(points), dtype=bool)
+            dynamic_mask = (np.asarray(dynamic_exclusion_mask)
+                            if dynamic_exclusion_mask is not None
+                            else np.empty((0, 0), dtype=np.uint8))
+            if dynamic_mask.ndim == 2 and dynamic_mask.size:
+                excluded_by_dynamic_object = _semantic_road_point_mask(
+                    points, dynamic_mask, image_shape)
+                points = points[~excluded_by_dynamic_object]
+                probabilities = probabilities[~excluded_by_dynamic_object]
             inside_road = _semantic_road_point_mask(
                 points, road_mask, image_shape)
             points = points[inside_road]
@@ -1244,6 +1464,8 @@ class VisionControlPlanner:
             extension_info.update({
                 "road_only_extension": False,
                 "reason": str(fusion_info.get("reason") or "anchor_arc_path"),
+                "dynamic_occlusion_points_removed": int(
+                    np.count_nonzero(excluded_by_dynamic_object)),
             })
             if update_tracker:
                 points, probabilities = self.fitted_control_tracker.update(
@@ -1287,7 +1509,8 @@ class VisionControlPlanner:
 
     def _recover_collapsed_query_candidate(
             self, candidates, raw_paths, path_probabilities, road_mask,
-            hard_road_mask, image_shape, now=None, count_evidence=None):
+            hard_road_mask, image_shape, now=None, count_evidence=None,
+            dynamic_exclusion_mask=None):
         """Recover a weak second instance without fabricating a road center.
 
         First decode the missing Query from its own heatmap.  If both Query
@@ -1344,7 +1567,8 @@ class VisionControlPlanner:
                 hard_road_mask=hard_road_mask, recovery_slot=weak_slot,
                 exclusion_points=by_slot[stable_slot].get("points_xy"),
                 update_tracker=False,
-                path_probability_override=heatmap_override)
+                path_probability_override=heatmap_override,
+                dynamic_exclusion_mask=dynamic_exclusion_mask)
             if len(recovered) != 1:
                 return None, {"mode": mode, "reason": "decode_failed"}
             candidate = recovered[0]

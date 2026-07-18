@@ -471,6 +471,50 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(selected["model_slot"], 1)
         self.assertEqual(selected["physical_side"], "left")
 
+    def test_physical_roles_do_not_swap_on_one_noisy_frame(self):
+        planner = VisionControlPlanner(config=_config())
+        image_shape = (480, 640, 3)
+        initial = planner._assign_physical_path_roles(
+            [_raw_path(0, 220.0), _raw_path(1, 420.0)], image_shape)
+        self.assertEqual(initial[0]["physical_side"], "left")
+        # A recovered/noisy frame says the two model streams crossed.  The
+        # physical blue/green assignment must require temporal confirmation.
+        noisy = planner._assign_physical_path_roles(
+            [_raw_path(0, 420.0), _raw_path(1, 220.0)], image_shape)
+        self.assertEqual(noisy[0]["physical_side"], "left")
+        self.assertEqual(noisy[1]["physical_side"], "right")
+        self.assertEqual(
+            planner.centerline_physical_association_debug["reason"],
+            "retain_previous_roles_pending_switch")
+
+    def test_curve_validation_masks_human_but_not_static_car(self):
+        planner = VisionControlPlanner(config=_config())
+        image_shape = (480, 640, 3)
+        road = np.ones((120, 160), dtype=np.uint8)
+        result = {"detections": [
+            {"label": "Human", "score": 0.9,
+             "bbox": [280.0, 180.0, 360.0, 300.0]},
+            {"label": "Car", "score": 0.9,
+             "bbox": [400.0, 180.0, 480.0, 300.0]},
+        ]}
+        curve_road, hard_road, human_occlusion = planner._centerline_validation_masks(
+            result, road, road, image_shape)
+        self.assertEqual(int(human_occlusion[60, 80]), 1)  # Human box center.
+        self.assertEqual(int(human_occlusion[60, 110]), 0) # Static car remains.
+        self.assertEqual(int(curve_road[60, 80]), 1)   # Not a road hole.
+        self.assertTrue(np.array_equal(curve_road, hard_road))
+
+    def test_curve_road_component_rejects_remote_semantic_island(self):
+        planner = VisionControlPlanner(config=_config())
+        road = np.zeros((120, 160), dtype=np.uint8)
+        road[:, 70:92] = 1
+        road[:, :40] = 1
+        component, info = planner._centerline_ego_road_component(
+            road, (480, 640, 3))
+        self.assertEqual(info["reason"], "ego_connected_component")
+        self.assertTrue(np.all(component[:, 70:92] == 1))
+        self.assertTrue(np.all(component[:, :40] == 0))
+
     def test_merge_is_the_only_single_route_id_switch_point(self):
         planner = VisionControlPlanner(config=_config())
         planner.centerline_junction_state = "BRANCH_COMMITTED"
