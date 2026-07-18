@@ -606,11 +606,13 @@ class VisionControlPlanner:
         self.centerline_branch_split_y = None
         self.centerline_fork_cache = {}
         self.centerline_fork_primary_slot = None
-        # Logical route IDs are kept independently from model output slots.
-        # This is a two-route, constant-time association (no tracking package).
-        self.centerline_route_signatures = {}
-        self.centerline_last_visible_slot = None
         self.centerline_last_pair_topology = "UNKNOWN"
+        # Model slots identify decoder instances.  Physical left/right is a
+        # separate, frame-visible property which exists only after two paths
+        # have genuinely separated.  Never swap model slots to obtain colors.
+        self.centerline_physical_side_by_model_slot = {}
+        self.centerline_physical_association_debug = {
+            "active": False, "reason": "initial"}
         self.centerline_route_association_debug = {
             "active": False, "reason": "initial"}
         self.centerline_junction_state = "NO_FORK"
@@ -743,7 +745,7 @@ class VisionControlPlanner:
             ):
                 self.turnsign_trim_pending_ocr_direction = ocr_direction
             else:
-                self._apply_ocr_direction_lock(ocr_direction)
+                self._apply_ocr_direction_lock(ocr_direction, candidates)
         else:
             ocr_lock_expired = self._expire_ocr_lock(now)
         if (
@@ -752,7 +754,7 @@ class VisionControlPlanner:
             and self.turnsign_trim_line_split_ready
         ):
             self._apply_ocr_direction_lock(
-                self.turnsign_trim_pending_ocr_direction)
+                self.turnsign_trim_pending_ocr_direction, candidates)
             self.turnsign_trim_pending_ocr_direction = None
 
         self._update_curve_merge_continuity(candidates, image_shape)
@@ -820,6 +822,8 @@ class VisionControlPlanner:
             "centerline_topology": dict(self.centerline_topology_debug),
             "centerline_route_association": dict(
                 self.centerline_route_association_debug),
+            "centerline_physical_association": dict(
+                self.centerline_physical_association_debug),
             "centerline_junction_state": self.centerline_junction_state,
             "centerline_junction_state_frames": int(
                 self.centerline_junction_state_frames),
@@ -905,145 +909,166 @@ class VisionControlPlanner:
         perception_result["vision_control"] = debug
         return command, debug
 
-    @staticmethod
-    def _centerline_route_signature(path, image_shape):
-        """Describe one route at fixed far/middle/near image rows."""
-        points = np.asarray(path.get("points_xy", ()), dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
-            return np.full(3, np.nan, dtype=np.float32)
-        rows = float(image_shape[0]) * np.asarray(
-            (0.28, 0.53, 0.78), dtype=np.float32)
-        return _interp_path_x_many(points, rows).astype(np.float32)
-
-    @staticmethod
-    def _centerline_signature_cost(first, second, image_shape):
-        first = np.asarray(first, dtype=np.float32)
-        second = np.asarray(second, dtype=np.float32)
-        valid = np.isfinite(first) & np.isfinite(second)
-        if not np.any(valid):
-            return 1e6
-        distances = np.abs(first[valid] - second[valid])
-        # The far sample changes fastest on bends, so the median of the three
-        # samples is more stable than a single endpoint comparison.
-        return float(np.median(distances) * 640.0 /
-                     float(max(1, image_shape[1])))
-
-    def _update_centerline_route_signature(self, slot, signature):
-        signature = np.asarray(signature, dtype=np.float32)
-        previous = self.centerline_route_signatures.get(int(slot))
-        if previous is None:
-            self.centerline_route_signatures[int(slot)] = signature.copy()
-            return
-        previous = np.asarray(previous, dtype=np.float32)
-        merged = previous.copy()
-        current_valid = np.isfinite(signature)
-        old_valid = np.isfinite(previous)
-        merged[current_valid & ~old_valid] = signature[current_valid & ~old_valid]
-        both = current_valid & old_valid
-        merged[both] = 0.60 * previous[both] + 0.40 * signature[both]
-        self.centerline_route_signatures[int(slot)] = merged
-
     def _associate_raw_curve_slots(self, raw_paths, image_shape):
-        """Map left/outer to blue slot 0 and right/inner to green slot 1."""
+        """Preserve the model Query identity for each raw path instance.
+
+        Query 0 and Query 1 are the model's two instance streams.  They must
+        not be reassigned from their image x coordinate: doing so makes one
+        Query borrow the other Query's rows at a fork.  Physical left/right is
+        attached later, after heatmap decoding has established a real split.
+        """
         paths = [dict(path) for path in list(raw_paths or [])[:2]]
         if not paths:
             self.centerline_route_association_debug = {
                 "active": False, "reason": "no_path"}
             return paths
-        signatures = [
-            self._centerline_route_signature(path, image_shape)
-            for path in paths
-        ]
-        previous = self.centerline_route_signatures
-        assigned_slots = [int(path.get("slot", index))
-                          for index, path in enumerate(paths)]
-        reason = "initialize_model_slots"
-        direct_cost = None
-        swapped_cost = None
+        assigned_slots = []
+        used_slots = set()
+        for index, path in enumerate(paths):
+            requested_slot = int(path.get("slot", index))
+            # A malformed caller may duplicate a slot.  Keep both instances
+            # distinct rather than silently merging their point sequences.
+            slot = requested_slot if requested_slot in (0, 1) else index
+            if slot in used_slots:
+                slot = 1 - slot
+            used_slots.add(slot)
+            assigned_slots.append(slot)
+        reason = "preserve_model_instance_slots"
         lateral_x = []
-        for path, signature in zip(paths, signatures):
-            finite_signature = signature[np.isfinite(signature)]
-            if len(finite_signature):
-                # Prefer the far sample because the two branches share their
-                # near trunk. Fall back to the path median only if necessary.
-                lateral_x.append(float(finite_signature[0]))
-            else:
-                points = np.asarray(path.get("points_xy", ()), dtype=np.float32)
-                lateral_x.append(
-                    float(np.median(points[:, 0])) if len(points) else 1e9)
-        if len(paths) == 2:
-            far_gap = abs(lateral_x[0] - lateral_x[1]) * 640.0 / float(
-                max(1, image_shape[1]))
-            # Once the two routes are close at the far end, preserve their
-            # historical IDs through the merge instead of sorting noise.
-            use_history = bool(
-                0 in previous and 1 in previous
-                and far_gap <= float(self.config.overlap_px_640) * 1.5)
-            if use_history:
-                direct_cost = (
-                    self._centerline_signature_cost(
-                        signatures[0], previous[0], image_shape)
-                    + self._centerline_signature_cost(
-                        signatures[1], previous[1], image_shape))
-                swapped_cost = (
-                    self._centerline_signature_cost(
-                        signatures[0], previous[1], image_shape)
-                    + self._centerline_signature_cost(
-                        signatures[1], previous[0], image_shape))
-                if (swapped_cost + float(
-                        self.config.centerline_route_match_margin_px_640)
-                        < direct_cost):
-                    assigned_slots = [1, 0]
-                    reason = "merge_history_swap"
-                else:
-                    assigned_slots = [0, 1]
-                    reason = "merge_history_assignment"
-            else:
-                left_index, right_index = sorted(
-                    range(2), key=lambda index: (lateral_x[index], index))
-                assigned_slots[left_index] = 0
-                assigned_slots[right_index] = 1
-                reason = "outer_inner_order_by_far_x"
-        elif (len(paths) == 1 and 0 in previous and 1 in previous):
-            costs = [
-                self._centerline_signature_cost(
-                    signatures[0], previous[slot], image_shape)
-                for slot in (0, 1)
-            ]
-            previous_slot = self.centerline_last_visible_slot
-            if previous_slot not in (0, 1):
-                previous_slot = self.centerline_junction_committed_slot
-            if previous_slot in (0, 1) and costs[int(previous_slot)] <= (
-                    self.config.centerline_route_match_max_px_640 * 1.35):
-                assigned_slots = [int(previous_slot)]
-                reason = "single_path_previous_id"
-            else:
-                best_slot = int(np.argmin(costs))
-                if costs[best_slot] <= self.config.centerline_route_match_max_px_640:
-                    assigned_slots = [best_slot]
-                    reason = "single_path_nearest_id"
-                else:
-                    reason = "single_path_assignment_ambiguous"
-        for index, (path, slot, signature) in enumerate(zip(
-                paths, assigned_slots, signatures)):
-            model_slot = int(path.get("slot", index))
-            path["model_slot"] = model_slot
+        for path in paths:
+            points = np.asarray(path.get("points_xy", ()), dtype=np.float32)
+            lateral_x.append(float(np.median(points[:, 0])) if len(points) else 1e9)
+        for index, (path, slot) in enumerate(zip(paths, assigned_slots)):
+            model_slot = int(slot)
+            path["model_slot"] = int(model_slot)
+            path["instance_id"] = int(model_slot)
             path["slot"] = int(slot)
-            path["role"] = "left" if int(slot) == 0 else "right"
+            path["role"] = "instance_{}".format(model_slot)
             path["identity"] = path["role"]
-            self._update_centerline_route_signature(slot, signature)
-        if len(paths) == 1 and assigned_slots[0] in (0, 1):
-            self.centerline_last_visible_slot = int(assigned_slots[0])
         self.centerline_route_association_debug = {
             "active": True,
             "reason": reason,
             "model_slots": [int(path.get("model_slot", -1)) for path in paths],
-            "logical_slots": [int(path.get("slot", -1)) for path in paths],
+            "instance_slots": [int(path.get("slot", -1)) for path in paths],
             "far_x": lateral_x,
-            "direct_cost_640": direct_cost,
-            "swapped_cost_640": swapped_cost,
         }
         return paths
+
+    def _assign_physical_path_roles(self, candidates, image_shape):
+        """Attach display/control roles without changing model instance slots.
+
+        Blue and green are physical roles, not model Query names.  A role is
+        assigned only when two decoded paths have a sustained separated image
+        segment; shared trunks deliberately have no new left/right decision.
+        The last reliable mapping is retained for a temporarily single branch
+        so OCR can continue following the already selected instance.
+        """
+        candidates = list(candidates or [])
+        for candidate in candidates:
+            model_slot = int(candidate.get(
+                "model_slot", candidate.get("slot", -1)))
+            candidate["model_slot"] = model_slot
+            candidate["instance_id"] = model_slot
+            candidate["slot"] = model_slot
+            side = self.centerline_physical_side_by_model_slot.get(model_slot)
+            candidate["physical_side"] = side
+            candidate["display_slot"] = (
+                0 if side == "left" else (1 if side == "right" else None))
+            candidate["role"] = side or "instance_{}".format(model_slot)
+            candidate["identity"] = candidate["role"]
+        if len(candidates) != 2:
+            self.centerline_physical_association_debug = {
+                "active": False,
+                "reason": "single_instance_retain_last_role",
+                "mapping": dict(self.centerline_physical_side_by_model_slot),
+            }
+            return candidates
+
+        first, second = candidates
+        first_points = np.asarray(first.get("points_xy", ()), dtype=np.float32)
+        second_points = np.asarray(second.get("points_xy", ()), dtype=np.float32)
+        if len(first_points) < 3 or len(second_points) < 3:
+            self.centerline_physical_association_debug = {
+                "active": False, "reason": "short_instance_pair"}
+            return candidates
+        low = max(float(np.min(first_points[:, 1])),
+                  float(np.min(second_points[:, 1])))
+        high = min(float(np.max(first_points[:, 1])),
+                   float(np.max(second_points[:, 1])))
+        if low >= high:
+            self.centerline_physical_association_debug = {
+                "active": False, "reason": "no_common_rows"}
+            return candidates
+        rows = low + (high - low) * _PAIR_FRACTIONS
+        first_x = _interp_path_x_many(first_points, rows)
+        second_x = _interp_path_x_many(second_points, rows)
+        scale = 640.0 / float(max(1, image_shape[1]))
+        separation = np.abs(first_x - second_x) * scale
+        valid = np.isfinite(first_x) & np.isfinite(second_x)
+        enough_apart = valid & (
+            separation >= float(self.config.branch_separation_px_640) * 0.72)
+        # Require a run instead of a single noisy row.  This is intentionally
+        # looser than fork admission: it only assigns a color to an already
+        # decoded instance pair and never creates a new branch.
+        run_start = None
+        best_run = None
+        for index, present in enumerate(enough_apart.tolist() + [False]):
+            if present and run_start is None:
+                run_start = index
+            elif not present and run_start is not None:
+                if index - run_start >= 2:
+                    run = (run_start, index)
+                    if best_run is None or (run[1] - run[0]) > (
+                            best_run[1] - best_run[0]):
+                        best_run = run
+                run_start = None
+        if best_run is None:
+            self.centerline_physical_association_debug = {
+                "active": False,
+                "reason": "shared_or_weak_split",
+                "mapping": dict(self.centerline_physical_side_by_model_slot),
+            }
+            return candidates
+        start, end = best_run
+        first_median = float(np.median(first_x[start:end]))
+        second_median = float(np.median(second_x[start:end]))
+        left, right = (
+            (first, second) if first_median <= second_median
+            else (second, first))
+        left_slot = int(left["model_slot"])
+        right_slot = int(right["model_slot"])
+        self.centerline_physical_side_by_model_slot = {
+            left_slot: "left", right_slot: "right"}
+        for candidate in candidates:
+            model_slot = int(candidate["model_slot"])
+            side = self.centerline_physical_side_by_model_slot.get(model_slot)
+            candidate["physical_side"] = side
+            candidate["display_slot"] = 0 if side == "left" else 1
+            candidate["role"] = side
+            candidate["identity"] = side
+        self.centerline_physical_association_debug = {
+            "active": True,
+            "reason": "separated_geometry_left_right",
+            "left_model_slot": left_slot,
+            "right_model_slot": right_slot,
+            "separated_rows": int(end - start),
+            "median_x": {str(left_slot): first_median if left is first else second_median,
+                         str(right_slot): second_median if right is second else first_median},
+        }
+        return candidates
+
+    def _preferred_model_slot_for_side(self, candidates, side, fallback=None):
+        """Resolve an OCR/default physical side to the current model instance."""
+        if side in {"left", "right"}:
+            for candidate in list(candidates or []):
+                if candidate.get("physical_side") == side:
+                    return int(candidate.get("model_slot", candidate.get("slot", -1)))
+            for slot, mapped_side in self.centerline_physical_side_by_model_slot.items():
+                if mapped_side == side:
+                    return int(slot)
+        if fallback in (0, 1):
+            return int(fallback)
+        return 1 if side == "right" else 0
 
     def _extract_candidates(
             self, result, image_shape, now=None, preferred_slot=None):
@@ -1068,24 +1093,9 @@ class VisionControlPlanner:
         raw_curve_paths = self._associate_raw_curve_slots(
             list(raw_curve_paths or [])[:2], image_shape)
         count_evidence = self._centerline_count_evidence(result)
-        if (
-            count_evidence.get("active")
-            and int(count_evidence.get("model_path_count", -1)) == 1
-            and float(count_evidence.get("count_confidence", 0.0)) >= 0.72
-            and len(count_evidence.get("scores") or []) >= 3
-            and float(count_evidence["scores"][1]) >=
-                float(count_evidence["scores"][2]) + 0.12
-            and len(raw_curve_paths) > 1
-        ):
-            preferred_slot = 1 if self.branch_lock == "right" else 0
-            preferred = next((
-                path for path in raw_curve_paths
-                if int(path.get("slot", -1)) == preferred_slot), None)
-            if preferred is None:
-                preferred = max(
-                    raw_curve_paths,
-                    key=lambda path: float(path.get("score", 0.0)))
-            raw_curve_paths = [preferred]
+        # The count head is a confidence prior, not permission to erase a
+        # decoded Query.  Keeping both raw instances here lets the weak Query
+        # use its own heatmap for constrained recovery at a real fork.
         candidates = self._build_fitted_control_paths(
             raw_curve_paths, road, image_shape, now=now,
             road_probability=road_probability, path_probabilities=path_probabilities,
@@ -1093,8 +1103,15 @@ class VisionControlPlanner:
         candidates = self._recover_collapsed_query_candidate(
             candidates, raw_curve_paths, path_probabilities, road,
             hard_road, image_shape, now=now, count_evidence=count_evidence)
+        candidates = self._assign_physical_path_roles(candidates, image_shape)
+        lock_side = (
+            "right" if preferred_slot == 1 else
+            ("left" if preferred_slot == 0 else self.branch_lock))
+        preferred_slot = self._preferred_model_slot_for_side(
+            candidates, lock_side, fallback=preferred_slot)
         candidates = self._filter_centerline_candidates(
             candidates, result, image_shape, preferred_slot=preferred_slot)
+        candidates = self._assign_physical_path_roles(candidates, image_shape)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
         self._publish_filtered_paths(result, candidates)
         elapsed = (time.perf_counter() - started) * 1000.0
@@ -1186,8 +1203,9 @@ class VisionControlPlanner:
             fitted_paths.append({
                 "slot": slot,
                 "model_slot": model_slot,
-                "role": "left" if slot == 0 else "right",
-                "identity": "left" if slot == 0 else "right",
+                "instance_id": model_slot,
+                "role": "instance_{}".format(model_slot),
+                "identity": "instance_{}".format(model_slot),
                 "source": "query_heatmap_arc_path",
                 "score": float(raw_path.get("score", 1.0)),
                 "coverage": float(len(points)) / max(1.0, float(height)),
@@ -1213,17 +1231,12 @@ class VisionControlPlanner:
     def _recover_collapsed_query_candidate(
             self, candidates, raw_paths, path_probabilities, road_mask,
             hard_road_mask, image_shape, now=None, count_evidence=None):
-        """Retry only the weaker query when both queries collapse to one branch."""
+        """Retry a missing/overlapped Query using only its own heatmap ridge."""
         candidates = list(candidates or [])
-        if len(candidates) != 2 or path_probabilities is None:
+        if len(candidates) not in {1, 2} or path_probabilities is None:
             return candidates
         by_slot = {int(item.get("slot", -1)): item for item in candidates}
-        if 0 not in by_slot or 1 not in by_slot:
-            return candidates
-        stats = self._path_pair_stats(
-            by_slot[0].get("points_xy", ()), by_slot[1].get("points_xy", ()),
-            image_shape)
-        if self._centerline_pair_topology(stats) != "OVERLAP":
+        if not by_slot or not set(by_slot).issubset({0, 1}):
             return candidates
         count_evidence = dict(count_evidence or {})
         scores = list(count_evidence.get("scores") or [])
@@ -1232,11 +1245,20 @@ class VisionControlPlanner:
             or (len(scores) >= 3 and float(scores[2]) >= 0.20))
         if not two_path_prior:
             return candidates
-        quality = {
-            slot: self._centerline_candidate_quality(candidate)
-            for slot, candidate in by_slot.items()}
-        stable_slot = max(quality, key=quality.get)
-        weak_slot = 1 - int(stable_slot)
+        if len(by_slot) == 2:
+            stats = self._path_pair_stats(
+                by_slot[0].get("points_xy", ()), by_slot[1].get("points_xy", ()),
+                image_shape)
+            if self._centerline_pair_topology(stats) != "OVERLAP":
+                return candidates
+            quality = {
+                slot: self._centerline_candidate_quality(candidate)
+                for slot, candidate in by_slot.items()}
+            stable_slot = max(quality, key=quality.get)
+            weak_slot = 1 - int(stable_slot)
+        else:
+            stable_slot = next(iter(by_slot))
+            weak_slot = 1 - int(stable_slot)
         raw = next((item for item in list(raw_paths or [])
                     if int(item.get("slot", -1)) == weak_slot), None)
         if raw is None:
@@ -1267,7 +1289,7 @@ class VisionControlPlanner:
             "pair_topology": topology,
         })
         by_slot[weak_slot] = recovered_candidate
-        return [by_slot[0], by_slot[1]]
+        return [by_slot[slot] for slot in sorted(by_slot)]
 
     @staticmethod
     def _centerline_candidate_quality(candidate):
@@ -1440,7 +1462,6 @@ class VisionControlPlanner:
         replacement_slot = int(replacement.get("slot", -1))
         if replacement_slot in (0, 1):
             self.centerline_junction_committed_slot = replacement_slot
-            self.centerline_last_visible_slot = replacement_slot
             return [replacement]
         return []
 
@@ -1737,6 +1758,14 @@ class VisionControlPlanner:
         fork_evidence = bool(count_two and geometry_split and secondary_usable)
         low_fork_evidence = bool(
             count_two_low and geometry_split and secondary_low_usable)
+        # Keep a geometrically separated, road-supported instance pair visible
+        # even before the quantity head confirms it.  It is a candidate pair,
+        # not an instruction to change steering: _select_candidate still uses
+        # the physical OCR/default side.  This prevents the common failure in
+        # which a weak inner Query is erased exactly when a fork starts.
+        geometry_branch_candidate = bool(
+            geometry_split and second_quality >=
+            self.config.centerline_graph_min_quality * 0.70)
         if low_fork_evidence:
             self.centerline_fork_pending_frames = min(
                 self.centerline_fork_pending_frames + 1,
@@ -1814,6 +1843,12 @@ class VisionControlPlanner:
                 reason = "count_single_or_weak_secondary"
                 split_info = {
                     "available": False, "reason": "fork_not_active"}
+            if (reason == "count_single_or_weak_secondary"
+                    and geometry_branch_candidate):
+                filtered = candidates
+                reason = "geometry_branch_candidate"
+                split_info = self._set_branch_preview_points(
+                    filtered, preferred_slot, image_shape)
         evidence.update({
             "reason": reason,
             "candidate_count_before": len(candidates),
@@ -1828,6 +1863,7 @@ class VisionControlPlanner:
             "secondary_low_usable": secondary_low_usable,
             "fork_evidence": fork_evidence,
             "low_fork_evidence": low_fork_evidence,
+            "geometry_branch_candidate": geometry_branch_candidate,
             "fork_active": bool(self.centerline_fork_active),
             "fork_pending_frames": int(self.centerline_fork_pending_frames),
             "fork_clear_frames": int(self.centerline_fork_clear_frames),
@@ -2090,7 +2126,7 @@ class VisionControlPlanner:
         return ROUTE_AMBIGUOUS, "weak_separation"
 
     def _update_curve_merge_continuity(self, candidates, image_shape):
-        """Temporarily follow stable slot 1 when slot 0 collapses at a merge.
+        """Temporarily follow the stable physical-right path at a merge.
 
         Curve-head slot identity is normally authoritative.  In real merge
         frames, however, slot 0 alternates between a full route and a short
@@ -2107,12 +2143,30 @@ class VisionControlPlanner:
                 "locked_right" if self.branch_lock == "right" else "inactive")
             return
 
-        by_slot = {
-            int(candidate.get("slot", -1)): candidate
-            for candidate in candidates
-        }
-        blue = by_slot.get(0)
-        green = by_slot.get(1)
+        blue = next((candidate for candidate in candidates
+                     if candidate.get("physical_side") == "left"), None)
+        green = next((candidate for candidate in candidates
+                      if candidate.get("physical_side") == "right"), None)
+        # A pair that is still shared has no new physical role.  Falling back
+        # to the retained mapping preserves the selected model instance but
+        # never swaps its rows with the other Query.
+        if blue is None or green is None:
+            by_slot = {
+                int(candidate.get("model_slot", candidate.get("slot", -1))): candidate
+                for candidate in candidates
+            }
+            left_slot = next((slot for slot, side in
+                              self.centerline_physical_side_by_model_slot.items()
+                              if side == "left"), 0)
+            right_slot = next((slot for slot, side in
+                               self.centerline_physical_side_by_model_slot.items()
+                               if side == "right"), 1)
+            blue = blue or by_slot.get(int(left_slot))
+            green = green or by_slot.get(int(right_slot))
+        blue_slot = None if blue is None else int(
+            blue.get("model_slot", blue.get("slot", -1)))
+        green_slot = None if green is None else int(
+            green.get("model_slot", green.get("slot", -1)))
         if blue is None or green is None:
             # A merge takeover is valid only while both candidates exist.
             # If green disappears during takeover, immediately return slot
@@ -2125,7 +2179,7 @@ class VisionControlPlanner:
             if self.curve_merge_override:
                 self.curve_merge_override = False
                 self.curve_merge_bad_evidence = 0
-                self.selected_slot_lock = 0
+                self.selected_slot_lock = blue_slot if blue_slot in (0, 1) else 0
                 self.curve_merge_reason = "green_missing"
             return
 
@@ -2136,7 +2190,7 @@ class VisionControlPlanner:
                 self.curve_merge_override = False
                 self.curve_merge_bad_evidence = 0
                 self.curve_merge_blue_stable_frames = 0
-                self.selected_slot_lock = 0
+                self.selected_slot_lock = blue_slot if blue_slot in (0, 1) else 0
                 self.curve_merge_reason = "merge_path_empty"
             return
         height, width = image_shape[:2]
@@ -2193,7 +2247,7 @@ class VisionControlPlanner:
                 self.curve_merge_override = False
                 self.curve_merge_bad_evidence = 0
                 self.curve_merge_blue_stable_frames = 0
-                self.selected_slot_lock = 0
+                self.selected_slot_lock = blue_slot if blue_slot in (0, 1) else 0
                 self.curve_merge_reason = "green_support_lost"
                 return
             if blue_recovered:
@@ -2206,10 +2260,10 @@ class VisionControlPlanner:
                 self.curve_merge_bad_evidence = 0
                 self.curve_merge_blue_stable_frames = 0
                 self.curve_merge_reason = "blue_recovered"
-                self.selected_slot_lock = 0
+                self.selected_slot_lock = blue_slot if blue_slot in (0, 1) else 0
             else:
                 self.curve_merge_reason = "stable_green_takeover"
-                self.selected_slot_lock = 1
+                self.selected_slot_lock = green_slot if green_slot in (0, 1) else 1
             return
 
         if bad_merge_frame:
@@ -2227,9 +2281,9 @@ class VisionControlPlanner:
             self.curve_merge_override = True
             self.curve_merge_blue_stable_frames = 0
             self.curve_merge_reason = "enter_green_takeover"
-            self.selected_slot_lock = 1
+            self.selected_slot_lock = green_slot if green_slot in (0, 1) else 1
         else:
-            self.selected_slot_lock = 0
+            self.selected_slot_lock = blue_slot if blue_slot in (0, 1) else 0
 
     @staticmethod
     def _path_covers_y(points, target_y):
@@ -2244,15 +2298,14 @@ class VisionControlPlanner:
         self.turnsign_trim_separation_640 = None
         self.turnsign_trim_lookahead_separation_640 = None
         self.turnsign_trim_separation_samples_640 = []
-        by_slot = {
-            int(item.get("slot", -1)): item
-            for item in candidates
-            if int(item.get("slot", -1)) in {0, 1}
-        }
-        if 0 not in by_slot or 1 not in by_slot:
+        blue_candidate = next((item for item in candidates
+                               if item.get("physical_side") == "left"), None)
+        green_candidate = next((item for item in candidates
+                                if item.get("physical_side") == "right"), None)
+        if blue_candidate is None or green_candidate is None:
             return
-        blue = np.asarray(by_slot[0].get("points_xy", ()), dtype=np.float32)
-        green = np.asarray(by_slot[1].get("points_xy", ()), dtype=np.float32)
+        blue = np.asarray(blue_candidate.get("points_xy", ()), dtype=np.float32)
+        green = np.asarray(green_candidate.get("points_xy", ()), dtype=np.float32)
         height, width = image_shape[:2]
         lookahead_y = float(height) * self.config.lookahead_y_ratio
         far_y = min(
@@ -2371,10 +2424,13 @@ class VisionControlPlanner:
             wanted_slot = int(self.centerline_junction_committed_slot)
             self.curve_merge_override = False
         else:
-            wanted_slot = (
-                1 if (self.branch_lock == "right" or
-                      (self.branch_lock == "left" and
-                       self.curve_merge_override)) else 0)
+            wanted_side = (
+                "right" if (self.branch_lock == "right" or
+                            (self.branch_lock == "left" and
+                             self.curve_merge_override)) else "left")
+            wanted_slot = self._preferred_model_slot_for_side(
+                candidates, wanted_side,
+                fallback=(1 if wanted_side == "right" else 0))
         self.selected_slot_lock = wanted_slot
         self.selection_reason = (
             "junction_committed_route" if
@@ -2384,7 +2440,7 @@ class VisionControlPlanner:
                   self.branch_lock == "left" and self.curve_merge_override
                   else "locked_{}".format(self.branch_lock or "left")))
         for candidate in candidates:
-            if int(candidate.get("slot", -1)) == wanted_slot:
+            if int(candidate.get("model_slot", candidate.get("slot", -1))) == wanted_slot:
                 return candidate
         return None
 
@@ -5196,12 +5252,13 @@ class VisionControlPlanner:
             return None, False
         return direction, True
 
-    def _apply_ocr_direction_lock(self, direction):
+    def _apply_ocr_direction_lock(self, direction, candidates=None):
         if direction not in {"left", "right"}:
             return
         self.branch_lock = direction
         self.branch_lock_source = "ocr"
-        self.selected_slot_lock = 0 if direction == "left" else 1
+        self.selected_slot_lock = self._preferred_model_slot_for_side(
+            candidates, direction, fallback=(0 if direction == "left" else 1))
         if self.centerline_junction_state in {
                 "FORK_CONFIRMED", "BRANCH_COMMITTED", "REARM"}:
             self.centerline_junction_committed_slot = self.selected_slot_lock
@@ -5299,6 +5356,10 @@ class VisionControlPlanner:
             "slot": int(candidate.get("slot", -1)),
             "model_slot": int(candidate.get(
                 "model_slot", candidate.get("slot", -1))),
+            "instance_id": int(candidate.get(
+                "instance_id", candidate.get("model_slot", candidate.get("slot", -1)))),
+            "physical_side": candidate.get("physical_side"),
+            "display_slot": candidate.get("display_slot"),
             "role": str(candidate.get("role") or ""),
             "source": str(candidate.get("source") or "unknown"),
             "points": int(len(points)),
@@ -5378,7 +5439,8 @@ def render_vision_control_debug(frame, result, draw_curves=True):
                 points, road_mask, frame.shape)
             _draw_identity_probability_curve(
                 frame, points, probabilities,
-                int(line.get("slot", 0)),
+                int(line.get("display_slot", line.get("slot", 0))
+                    if line.get("display_slot") is not None else 0),
                 thickness=(
                     3 if int(line.get("slot", -1)) == selected_slot else 2),
                 visible_mask=visible)
@@ -5895,7 +5957,8 @@ def render_vision_control_birdseye(
         for line in _extract_curve_preview_lines(result):
             _draw_birdseye_debug_curve(
                 panel, line["points_xy"], line.get("probabilities"),
-                int(line.get("slot", 0)), homography, source_quad,
+                int(line.get("display_slot", line.get("slot", 0))
+                    if line.get("display_slot") is not None else 0), homography, source_quad,
                 thickness=(
                     4 if int(line.get("slot", -1)) == selected_slot else 2))
 
@@ -7409,7 +7472,8 @@ def _extract_curve_preview_lines(result, max_lines=2):
                 len(points), float(path.get("score", 1.0)),
                 dtype=np.float32)
         lines.append({
-            "slot": int(path.get("slot", len(lines))),
+            "slot": int(path.get("model_slot", path.get("slot", len(lines)))),
+            "display_slot": path.get("display_slot"),
             "identity": str(path.get("identity") or path.get("role") or ""),
             "points_xy": points,
             "probabilities": probabilities,

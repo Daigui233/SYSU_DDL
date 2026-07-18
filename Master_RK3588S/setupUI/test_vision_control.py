@@ -358,16 +358,19 @@ class VisionControlPlannerTest(unittest.TestCase):
                          "overlap_dedup")
         self.assertEqual(planner.centerline_topology_debug["candidate_count_after"], 1)
 
-    def test_fork_display_waits_for_two_stable_split_frames(self):
+    def test_geometry_split_keeps_two_instance_candidates_before_confirmation(self):
         planner = VisionControlPlanner(config=_config())
         # A forward fork shares the near trunk and separates toward the top.
-        # Two parallel curves alone are no longer enough to create a fork.
+        # The quantity head may still confirm it later, but it must not erase
+        # the second decoded Query during that first visible split.
         result = _trim_result(180.0, lookahead_gap_640=10.0)
         result["centerline"]["path_count_scores"] = [0.05, 0.15, 0.80]
         planner.update(result, now=1.0)
-        self.assertEqual(planner.centerline_topology_debug["candidate_count_after"], 1)
+        self.assertEqual(planner.centerline_topology_debug["candidate_count_after"], 2)
+        self.assertFalse(planner.centerline_fork_active)
         planner.update(result, now=1.04)
         self.assertEqual(planner.centerline_topology_debug["candidate_count_after"], 2)
+        self.assertTrue(planner.centerline_fork_active)
 
     def test_parallel_pair_cannot_create_a_new_fork(self):
         planner = VisionControlPlanner(config=_config())
@@ -396,7 +399,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             planner.centerline_topology_debug["pair_topology"], "MERGE")
         self.assertFalse(planner.centerline_fork_active)
 
-    def test_low_count_confidence_primes_but_does_not_publish_fork(self):
+    def test_low_count_confidence_keeps_geometry_candidate_but_not_fork_state(self):
         planner = VisionControlPlanner(config=_config())
         candidates = _trim_result(
             180.0, lookahead_gap_640=10.0)["raw_curve_paths"]
@@ -404,7 +407,7 @@ class VisionControlPlannerTest(unittest.TestCase):
             "path_count_scores": [0.10, 0.46, 0.44]}}
         first = planner._filter_centerline_candidates(
             candidates, low, (480, 640, 3))
-        self.assertEqual(len(first), 1)
+        self.assertEqual(len(first), 2)
         self.assertEqual(planner.centerline_fork_pending_frames, 1)
         self.assertFalse(planner.centerline_fork_active)
 
@@ -415,7 +418,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(len(second), 2)
         self.assertTrue(planner.centerline_fork_active)
 
-    def test_route_identity_corrects_model_slot_swap(self):
+    def test_route_identity_preserves_model_slot_when_geometry_order_changes(self):
         planner = VisionControlPlanner(config=_config())
         image_shape = (480, 640, 3)
         planner._associate_raw_curve_slots(
@@ -423,10 +426,10 @@ class VisionControlPlannerTest(unittest.TestCase):
         associated = planner._associate_raw_curve_slots(
             [_raw_path(0, 420.0), _raw_path(1, 220.0)], image_shape)
         self.assertEqual(
-            [item["slot"] for item in associated], [1, 0])
+            [item["slot"] for item in associated], [0, 1])
         self.assertEqual(
             planner.centerline_route_association_debug["reason"],
-            "outer_inner_order_by_far_x")
+            "preserve_model_instance_slots")
 
     def test_two_search_directions_force_outer_blue_inner_green(self):
         planner = VisionControlPlanner(config=_config())
@@ -437,24 +440,36 @@ class VisionControlPlannerTest(unittest.TestCase):
         inner = _raw_path(0, 410.0)
         associated = planner._associate_raw_curve_slots(
             [inner, outer], image_shape)
+        associated = planner._assign_physical_path_roles(
+            associated, image_shape)
         by_x = sorted(
             associated,
             key=lambda item: float(np.median(item["points_xy"][:, 0])))
-        self.assertEqual(by_x[0]["slot"], 0)
-        self.assertEqual(by_x[0]["identity"], "left")
-        self.assertEqual(by_x[1]["slot"], 1)
-        self.assertEqual(by_x[1]["identity"], "right")
+        self.assertEqual(by_x[0]["display_slot"], 0)
+        self.assertEqual(by_x[0]["physical_side"], "left")
+        self.assertEqual(by_x[1]["display_slot"], 1)
+        self.assertEqual(by_x[1]["physical_side"], "right")
 
-    def test_single_curve_keeps_previous_route_identity(self):
+    def test_single_curve_keeps_its_model_instance_identity(self):
         planner = VisionControlPlanner(config=_config())
         image_shape = (480, 640, 3)
         planner._associate_raw_curve_slots(
             [_raw_path(0, 210.0), _raw_path(1, 410.0)], image_shape)
-        planner.centerline_last_visible_slot = 1
         single = planner._associate_raw_curve_slots(
             [_raw_path(0, 300.0)], image_shape)
-        self.assertEqual(single[0]["slot"], 1)
-        self.assertEqual(single[0]["identity"], "right")
+        self.assertEqual(single[0]["slot"], 0)
+        self.assertEqual(single[0]["identity"], "instance_0")
+
+    def test_physical_left_lock_selects_left_instance_even_when_query_one_is_left(self):
+        planner = VisionControlPlanner(config=_config())
+        # Query 0 is physically right; Query 1 is physically left.  The
+        # control lock must follow physical geometry, never the raw Query ID.
+        candidates = planner._assign_physical_path_roles(
+            [_raw_path(0, 420.0), _raw_path(1, 220.0)], (480, 640, 3))
+        planner.branch_lock = "left"
+        selected = planner._select_candidate(candidates)
+        self.assertEqual(selected["model_slot"], 1)
+        self.assertEqual(selected["physical_side"], "left")
 
     def test_merge_is_the_only_single_route_id_switch_point(self):
         planner = VisionControlPlanner(config=_config())
