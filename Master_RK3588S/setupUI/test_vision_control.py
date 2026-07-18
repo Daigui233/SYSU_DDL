@@ -483,7 +483,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(filtered[0]["slot"], 1)
         self.assertEqual(planner.centerline_junction_committed_slot, 1)
 
-    def test_confirmed_fork_commits_and_suppresses_reappearing_outer_route(self):
+    def test_confirmed_fork_keeps_instances_through_shared_trunk(self):
         planner = VisionControlPlanner(config=_config())
         fork = _trim_result(
             180.0, lookahead_gap_640=10.0)["raw_curve_paths"]
@@ -498,19 +498,20 @@ class VisionControlPlannerTest(unittest.TestCase):
         parallel = [_raw_path(0, 260.0), _raw_path(1, 440.0)]
         filtered = planner._filter_centerline_candidates(
             parallel, result, (480, 640, 3))
-        self.assertEqual(planner.centerline_junction_state, "BRANCH_COMMITTED")
-        self.assertEqual(len(filtered), 1)
-        self.assertEqual(filtered[0]["slot"], 0)
+        self.assertEqual(planner.centerline_junction_state, "SHARED_TRUNK")
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual({item["slot"] for item in filtered}, {0, 1})
 
-        # A later merge-shaped outer curve remains topology evidence only; it
-        # cannot reopen the old fork or replace the committed route.
+        # A merge-shaped pair retains both instance identities.  The shared
+        # portion can be drawn once, but must not erase either branch track.
         ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
         gap = 10.0 + 170.0 * np.clip((ys - 60.0) / 400.0, 0.0, 1.0)
         merge = [_raw_path(0, 260.0, ys), _raw_path(1, 260.0 + gap, ys)]
         filtered = planner._filter_centerline_candidates(
             merge, result, (480, 640, 3))
-        self.assertEqual(len(filtered), 1)
-        self.assertEqual(filtered[0]["slot"], 0)
+        self.assertEqual(planner.centerline_junction_state, "SHARED_TRUNK")
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual({item["slot"] for item in filtered}, {0, 1})
 
     def test_committed_junction_rearms_after_stable_single_route(self):
         planner = VisionControlPlanner(config=_config(
@@ -623,8 +624,9 @@ class VisionControlPlannerTest(unittest.TestCase):
             len(secondary["preview_points_xy"]),
             len(secondary["points_xy"]))
 
-    def test_stable_fork_holds_two_missing_frames_then_releases(self):
-        planner = VisionControlPlanner(config=_config())
+    def test_stable_fork_releases_cached_hold_but_keeps_current_geometry(self):
+        planner = VisionControlPlanner(config=_config(
+            centerline_fork_release_frames=3))
         result = _trim_result(180.0, lookahead_gap_640=10.0)
         result["centerline"]["path_count_scores"] = [0.05, 0.15, 0.80]
         planner.update(result, now=1.0)
@@ -641,7 +643,12 @@ class VisionControlPlannerTest(unittest.TestCase):
         planner.update(result, now=1.12)
         self.assertEqual(len(result["paths"]), 2)
         planner.update(result, now=1.16)
-        self.assertEqual(len(result["paths"]), 1)
+        self.assertEqual(len(result["paths"]), 2)
+        planner.update(result, now=1.20)
+        # The cache has released.  The two current model paths are still
+        # geometrically separated, so they remain display candidates instead
+        # of being erased only because the optional count head is weak.
+        self.assertEqual(len(result["paths"]), 2)
         self.assertFalse(planner.centerline_fork_active)
 
     def test_conflicting_control_defaults_match_e7(self):
@@ -848,6 +855,24 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(command["target_speed"], 0.04)
         self.assertAlmostEqual(
             command["track_error"], previous_command["track_error"])
+
+    def test_shared_trunk_fallback_only_uses_connected_instance(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.centerline_junction_state = "SHARED_TRUNK"
+        disconnected = _raw_path(0, 20.0)
+        connected = _raw_path(1, 400.0)
+
+        fallback, info = planner._shared_trunk_control_candidate(
+            [disconnected, connected], (480, 640, 3))
+
+        self.assertIs(fallback, connected)
+        self.assertTrue(info["active"])
+        self.assertEqual(info["slot"], 1)
+        planner.centerline_junction_state = "FORK_CONFIRMED"
+        fallback, info = planner._shared_trunk_control_candidate(
+            [disconnected, connected], (480, 640, 3))
+        self.assertIsNone(fallback)
+        self.assertEqual(info["reason"], "not_shared_topology")
 
     def test_fitted_control_large_jump_requires_confirmation(self):
         planner = VisionControlPlanner(config=_config())

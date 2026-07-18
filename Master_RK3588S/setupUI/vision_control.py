@@ -179,7 +179,11 @@ class VisionControlConfig:
     # Hysteresis for displaying a second branch; it suppresses one-frame
     # curve-head/fit jumps while keeping a real fork visible.
     centerline_fork_confirm_frames: int = 2
-    centerline_fork_release_frames: int = 3
+    # A weak inner Query commonly disappears for several frames at a merge.
+    # At the deployed 18-22 FPS, three frames is only about 0.15 s and makes
+    # a confirmed fork visibly flicker.  The cached branch is still clipped
+    # to the current hard-road mask before it can be displayed.
+    centerline_fork_release_frames: int = 10
     centerline_junction_rearm_frames: int = 5
     # The course is driven clockwise.  At a confirmed merge/overlap, reject a
     # candidate that jumps to the opposite continuation of the already
@@ -433,7 +437,7 @@ class VisionControlConfig:
             centerline_fork_confirm_frames=max(
                 1, _env_int("VISION_CONTROL_CENTERLINE_FORK_CONFIRM", 2)),
             centerline_fork_release_frames=max(
-                1, _env_int("VISION_CONTROL_CENTERLINE_FORK_RELEASE", 3)),
+                1, _env_int("VISION_CONTROL_CENTERLINE_FORK_RELEASE", 10)),
             centerline_junction_rearm_frames=max(
                 2, _env_int(
                     "VISION_CONTROL_CENTERLINE_JUNCTION_REARM", 5)),
@@ -635,6 +639,11 @@ class VisionControlPlanner:
         self.centerline_junction_state = "NO_FORK"
         self.centerline_junction_state_frames = 0
         self.centerline_junction_committed_slot = None
+        # ``SHARED_TRUNK`` means two previously confirmed instances are
+        # geometrically overlapping at the car-facing part of the road.  It
+        # is not permission to forget either instance; only the rendered and
+        # controlled geometry is shared until a later split is supported.
+        self.centerline_shared_trunk_slots = set()
         self.centerline_junction_single_frames = 0
         self.centerline_new_fork_frames = 0
         self.centerline_direction_guard_debug = {
@@ -785,11 +794,26 @@ class VisionControlPlanner:
             self._path_connection_status(raw_selected, image_shape))
         line_loss_reason = None
         selected = raw_selected
+        shared_trunk_control = {
+            "active": False, "reason": "not_required"}
         if raw_selected is not None and not line_connected:
-            line_loss_reason = line_connection_reason
-            selected = None
-            self.selection_reason = "line_loss_{}".format(
-                line_connection_reason)
+            # A visible branch suffix may begin only beyond the near anchor.
+            # It must remain display-only, but a connected common trunk (or
+            # another connected view of that same shared topology) is safe to
+            # control.  Do not apply this fallback at a live fork: that could
+            # silently switch an OCR-requested route.
+            fallback, shared_trunk_control = self._shared_trunk_control_candidate(
+                candidates, image_shape)
+            if fallback is not None:
+                selected = fallback
+                line_connected, line_connection_reason, line_connection_metrics = (
+                    self._path_connection_status(selected, image_shape))
+                self.selection_reason = "shared_trunk_connected_fallback"
+            else:
+                line_loss_reason = line_connection_reason
+                selected = None
+                self.selection_reason = "line_loss_{}".format(
+                    line_connection_reason)
         elif raw_selected is None and not candidates:
             line_loss_reason = "no_candidate"
         command, control_target = self._build_command(
@@ -854,6 +878,9 @@ class VisionControlPlanner:
                 self.centerline_junction_state_frames),
             "centerline_junction_committed_slot": (
                 self.centerline_junction_committed_slot),
+            "centerline_shared_trunk_slots": sorted(
+                int(slot) for slot in self.centerline_shared_trunk_slots),
+            "centerline_shared_trunk_control": dict(shared_trunk_control),
             "centerline_junction_single_frames": int(
                 self.centerline_junction_single_frames),
             "centerline_new_fork_frames": int(
@@ -1494,8 +1521,24 @@ class VisionControlPlanner:
             self.centerline_new_fork_frames = 0
             self.centerline_branch_split_y = None
             self._clear_stable_fork()
+            self.centerline_shared_trunk_slots.clear()
+        elif state == "SHARED_TRUNK":
+            # At a merge, retain the proven Query identities and the last
+            # valid branch shapes.  The current frame may render only a
+            # single geometric trunk, but a later separated view must not be
+            # forced to rediscover its identities from scratch.
+            self.centerline_shared_trunk_slots = set(
+                int(slot) for slot in self.centerline_fork_cache
+                if int(slot) in (0, 1))
+            if not self.centerline_shared_trunk_slots:
+                self.centerline_shared_trunk_slots = {
+                    int(slot) for slot in self.centerline_physical_side_by_model_slot
+                    if int(slot) in (0, 1)}
+            self.centerline_junction_single_frames = 0
+            self.centerline_new_fork_frames = 0
         elif state == "NO_FORK":
             self.centerline_junction_committed_slot = None
+            self.centerline_shared_trunk_slots.clear()
             self.centerline_junction_single_frames = 0
             self.centerline_new_fork_frames = 0
 
@@ -1520,13 +1563,30 @@ class VisionControlPlanner:
             else:
                 self.centerline_junction_state_frames += 1
         elif state == "FORK_CONFIRMED":
-            if topology in {"MERGE", "PARALLEL"}:
+            # A confirmed pair may become visually coincident again before
+            # the camera reaches the physical merge.  That is a shared
+            # trunk, not evidence that one instance disappeared.
+            if topology in {"MERGE", "PARALLEL", "OVERLAP"}:
                 self._set_centerline_junction_state(
-                    "BRANCH_COMMITTED", preferred_slot)
+                    "SHARED_TRUNK", preferred_slot)
             elif not self.centerline_fork_active and not low_fork_evidence:
                 self._set_centerline_junction_state(
-                    "BRANCH_COMMITTED", preferred_slot)
+                    "SHARED_TRUNK", preferred_slot)
             else:
+                self.centerline_junction_state_frames += 1
+        elif state == "SHARED_TRUNK":
+            # A trunk can be visible for several frames while the branches
+            # are occluded, weak, or genuinely overlapping.  Keep the two
+            # instance tracks alive; only re-enter fork confirmation after
+            # consecutive *geometrically separated* observations.
+            if topology == "FORK" and geometry_branch_candidate:
+                self.centerline_new_fork_frames += 1
+                if (self.centerline_new_fork_frames >=
+                        self.config.centerline_fork_confirm_frames):
+                    self._set_centerline_junction_state(
+                        "FORK_CANDIDATE", preferred_slot)
+            else:
+                self.centerline_new_fork_frames = 0
                 self.centerline_junction_state_frames += 1
         elif state == "BRANCH_COMMITTED":
             # A completed junction must suppress its *old* alternative, but
@@ -2570,7 +2630,7 @@ class VisionControlPlanner:
         merge_context = bool(
             topology in {"MERGE", "OVERLAP"}
             or self.centerline_junction_state in {
-                "BRANCH_COMMITTED", "REARM"})
+                "BRANCH_COMMITTED", "REARM", "SHARED_TRUNK"})
         target = self._path_target_on_selected(
             candidate, float(image_shape[0]) * self.config.lookahead_y_ratio)
         if (not merge_context or self.last_path_target_x is None
@@ -2694,7 +2754,7 @@ class VisionControlPlanner:
         merge_context = bool(
             topology in {"MERGE", "OVERLAP"}
             or self.centerline_junction_state in {
-                "BRANCH_COMMITTED", "REARM"})
+                "BRANCH_COMMITTED", "REARM", "SHARED_TRUNK"})
         if not merge_context:
             base.update({
                 "target_guard_active": False,
@@ -2722,6 +2782,61 @@ class VisionControlPlanner:
         })
         self.centerline_direction_guard_debug = dict(base)
         return (None if rejected else path_target), base
+
+    def _shared_trunk_control_candidate(self, candidates, image_shape):
+        """Return only a connected fallback for a shared/merged topology.
+
+        Rendering can legitimately include a distant branch suffix that does
+        not reach the car.  Steering cannot.  This method deliberately does
+        not run for a visible forward fork, and never accepts a candidate
+        outside the ordinary near-anchor gate.
+        """
+        topology = str(self.centerline_topology_debug.get(
+            "pair_topology") or self.centerline_last_pair_topology)
+        shared_context = bool(
+            self.centerline_junction_state == "SHARED_TRUNK"
+            or topology in {"OVERLAP", "MERGE"})
+        if not shared_context:
+            return None, {
+                "active": False,
+                "reason": "not_shared_topology",
+                "topology": topology,
+            }
+        connected = []
+        for candidate in list(candidates or ()):
+            is_connected, reason, metrics = self._path_connection_status(
+                candidate, image_shape)
+            if not is_connected:
+                continue
+            target = self._path_target_on_selected(
+                candidate,
+                float(image_shape[0]) * self.config.lookahead_y_ratio)
+            if target is None or bool(target[2]):
+                continue
+            if self.last_path_target_x is None:
+                continuity = 0.0
+            else:
+                continuity = abs(float(target[0]) - float(self.last_path_target_x))
+            connected.append((continuity, -self._centerline_candidate_quality(
+                candidate), candidate, reason, metrics, target))
+        if not connected:
+            return None, {
+                "active": True,
+                "reason": "no_connected_shared_trunk",
+                "topology": topology,
+            }
+        _continuity, _quality, candidate, reason, metrics, target = min(
+            connected, key=lambda item: (item[0], item[1]))
+        candidate["control_from_shared_trunk"] = True
+        return candidate, {
+            "active": True,
+            "reason": "connected_shared_trunk",
+            "topology": topology,
+            "slot": int(candidate.get("model_slot", candidate.get("slot", -1))),
+            "target_x": float(target[0]),
+            "connection_reason": str(reason),
+            "connection": dict(metrics),
+        }
 
     def _path_connection_status(self, selected, image_shape):
         """Reject a fitted path whose near end no longer reaches the car."""
@@ -5553,7 +5668,8 @@ class VisionControlPlanner:
         self.selected_slot_lock = self._preferred_model_slot_for_side(
             candidates, direction, fallback=(0 if direction == "left" else 1))
         if self.centerline_junction_state in {
-                "FORK_CONFIRMED", "BRANCH_COMMITTED", "REARM"}:
+                "FORK_CONFIRMED", "BRANCH_COMMITTED", "REARM",
+                "SHARED_TRUNK"}:
             self.centerline_junction_committed_slot = self.selected_slot_lock
 
     def _expire_ocr_lock(self, now):
@@ -5562,7 +5678,8 @@ class VisionControlPlanner:
         # Time alone must not reverse a route after the car has entered it.
         # Expiration resumes after the old junction has visually re-armed.
         if self.centerline_junction_state in {
-                "FORK_CONFIRMED", "BRANCH_COMMITTED", "REARM"}:
+                "FORK_CONFIRMED", "BRANCH_COMMITTED", "REARM",
+                "SHARED_TRUNK"}:
             return False
         if now - self.last_valid_ocr_ts < self.config.ocr_lock_lifetime_s:
             return False
