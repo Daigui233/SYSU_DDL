@@ -197,7 +197,8 @@ class VisionControlConfig:
     human_stop_line_offset_px_480: float = 35.0
     human_preline_missing_px_480: float = 20.0
     human_pass_offset_px_640: float = 38.0
-    human_speed_hold_s: float = 0.5
+    human_speed_hold_s: float = 0.4
+    human_retrigger_lock_s: float = 1.5
     human_path_return_guard_s: float = 0.4
     human_absence_confirm_s: float = 1.5
     human_stop_absence_restart_s: float = 5.0
@@ -409,7 +410,9 @@ class VisionControlConfig:
                 "VISION_CONTROL_HUMAN_STOP_LINE_OFFSET_PX_480", 35.0)),
             human_preline_missing_px_480=max(0.0, _env_float("VISION_CONTROL_HUMAN_PRELINE_MISSING_PX_480", 20.0)),
             human_pass_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_OFFSET_640", 38.0)),
-            human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.5)),
+            human_speed_hold_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_SPEED_HOLD_S", 0.4)),
+            human_retrigger_lock_s=max(0.0, _env_float(
+                "VISION_CONTROL_HUMAN_RETRIGGER_LOCK_S", 1.5)),
             human_path_return_guard_s=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_PATH_RETURN_GUARD_S", 0.4)),
             human_absence_confirm_s=max(0.0, _env_float("VISION_CONTROL_HUMAN_ABSENCE_CONFIRM_S", 1.5)),
@@ -486,6 +489,7 @@ class VisionControlPlanner:
         self.human_pass_active = False
         self.human_pass_offset_x = 0.0
         self.human_speed_hold_until = 0.0
+        self.human_retrigger_lock_until = 0.0
         self.human_path_return_guard_until = 0.0
         self.human_path_return_guard_start_x = None
         self.human_path_return_pending = False
@@ -2593,14 +2597,25 @@ class VisionControlPlanner:
                 "human_speed_hold",
                 held_target_x,
             )
-        human_action = self._human_action(
-            detections, selected, image_shape, lookahead_y,
-            lookahead_path_x, now)
-        if human_action is not None:
-            if int(human_action[0]) == STATE_AVOID_HUMAN:
-                self.human_speed_hold_until = (
-                    float(now) + self.config.human_speed_hold_s)
-            return human_action
+        human_lock_active = float(now) < self.human_retrigger_lock_until
+        if (
+            not human_lock_active
+            and self.human_retrigger_lock_until > 0.0
+        ):
+            # Release the old pass latch before accepting fresh Human events.
+            self.human_retrigger_lock_until = 0.0
+            self._clear_human_state(clear_detection=False)
+        if not human_lock_active:
+            human_action = self._human_action(
+                detections, selected, image_shape, lookahead_y,
+                lookahead_path_x, now)
+            if human_action is not None:
+                if int(human_action[0]) == STATE_AVOID_HUMAN:
+                    self.human_speed_hold_until = (
+                        float(now) + self.config.human_speed_hold_s)
+                    self.human_retrigger_lock_until = (
+                        float(now) + self.config.human_retrigger_lock_s)
+                return human_action
         if self.human_path_return_pending:
             # Keep the last physical pass target as the start of a short
             # return ramp.  The newly selected path may be noisy or sit at
@@ -3572,6 +3587,7 @@ class VisionControlPlanner:
         if clear_detection:
             self.human_detected_latched = False
             self.human_last_seen_ts = 0.0
+            self.human_retrigger_lock_until = 0.0
             self._clear_human_preline_state()
 
     def _sign_should_stop(self, geom, image_shape):

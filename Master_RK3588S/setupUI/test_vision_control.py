@@ -223,7 +223,8 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.human_stop_absence_restart_s, 5.0)
         self.assertEqual(config.human_stop_reverse_speed_mps, -0.10)
         self.assertEqual(config.human_stop_reverse_duration_s, 0.30)
-        self.assertEqual(config.human_speed_hold_s, 0.5)
+        self.assertEqual(config.human_speed_hold_s, 0.4)
+        self.assertEqual(config.human_retrigger_lock_s, 1.5)
         self.assertEqual(config.human_stop_progress_ratio, 0.84)
         self.assertEqual(config.human_stop_line_offset_px_480, 35.0)
         self.assertEqual(config.car_human_pass_speed_mps, 0.35)
@@ -1155,6 +1156,49 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(
             debug["control_target"]["task_reason"],
             "human_speed_hold")
+
+    def test_human_retrigger_lock_ignores_same_person_after_speed_hold(self):
+        planner = VisionControlPlanner(config=_config())
+        selected = _raw_path(0, 320.0)
+        image_shape = (480, 640, 3)
+        lookahead_y = 300.0
+        left = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [250.0, 330.0, 310.0, 450.0],
+        }]
+        right = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [360.0, 330.0, 420.0, 450.0],
+        }]
+        far_left = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [250.0, 170.0, 310.0, 260.0],
+        }]
+        planner._task_from_detections(
+            {"detections": left}, selected, image_shape, lookahead_y,
+            now=1.0, path_target_x=320.0)
+        planner._task_from_detections(
+            {"detections": right}, selected, image_shape, lookahead_y,
+            now=1.2, path_target_x=320.0)
+        action = planner._task_from_detections(
+            {"detections": left}, selected, image_shape, lookahead_y,
+            now=1.7, path_target_x=320.0)
+
+        self.assertEqual(action[0], STATE_TRACK)
+        self.assertAlmostEqual(action[1], 0.10)
+        self.assertEqual(action[2], "human_path_return_guard")
+
+        action = planner._task_from_detections(
+            {"detections": left}, selected, image_shape, lookahead_y,
+            now=2.2, path_target_x=320.0)
+        self.assertEqual(action[0], STATE_TRACK)
+        self.assertEqual(action[2], "track")
+
+        action = planner._task_from_detections(
+            {"detections": far_left}, selected, image_shape, lookahead_y,
+            now=2.8, path_target_x=320.0)
+        self.assertEqual(action[0], STATE_TRACK)
+        self.assertEqual(action[2], "track")
 
     def test_human_avoidance_and_final_steering_stop_at_road_mask_edge(self):
         planner = VisionControlPlanner(config=_config())
