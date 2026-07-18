@@ -323,6 +323,25 @@ class CurveConstructionTest(unittest.TestCase):
         self.assertGreater(float(np.mean(filtered[:, 0])), 320.0)
         self.assertLess(float(np.mean(filtered[:, 0])), 328.0)
 
+    def test_tracker_keeps_human_occluded_rows_on_same_instance_history(self):
+        tracker = _FittedControlPathTracker(
+            occlusion_hold_frames=8, occlusion_max_shift_px_640=0.0)
+        ys = np.asarray([220, 300, 380], dtype=np.float32)
+        base = np.stack((np.full_like(ys, 320), ys), axis=1)
+        noisy = np.stack((np.full_like(ys, 360), ys), axis=1)
+        probabilities = np.ones(3, dtype=np.float32)
+        human = np.zeros((120, 160), dtype=np.uint8)
+        # The middle anchor is covered by a moving Human. The visible rows
+        # may update, but that one row must remain on its Query history.
+        human[68:84, 70:100] = 1
+        tracker.update(0, base, probabilities, (480, 640, 3), now=1.0)
+        filtered, _ = tracker.update(
+            0, noisy, probabilities, (480, 640, 3), now=1.04,
+            occlusion_mask=human)
+        self.assertAlmostEqual(float(filtered[1, 0]), 320.0, delta=0.5)
+        self.assertGreater(float(filtered[0, 0]), 320.0)
+        self.assertGreaterEqual(tracker.slot_debug(0)["occlusion_rows"], 1)
+
     def test_tracker_accelerates_coherent_curve_motion(self):
         tracker = _FittedControlPathTracker()
         ys = np.asarray([200, 300, 400], dtype=np.float32)
@@ -638,13 +657,25 @@ class VisionControlPlannerTest(unittest.TestCase):
             if y < 72:
                 ridge_x = int(round(65 + (72 - y) * 0.80))
                 maps[0, y, min(159, ridge_x)] = 0.98
-        recovered = planner._recover_collapsed_query_candidate(
+        recovery_args = (
             raw, raw, maps, np.ones((120, 160), dtype=np.uint8),
-            np.ones((120, 160), dtype=np.uint8), image_shape,
-            count_evidence={
+            np.ones((120, 160), dtype=np.uint8), image_shape)
+        recovery_kwargs = {
+            "count_evidence": {
                 "model_path_count": 2,
                 "scores": [0.02, 0.08, 0.90],
-            })
+            }
+        }
+        # A second ridge must persist for two frames before it becomes a
+        # control path, so a single noisy frame cannot create a green path.
+        pending = planner._recover_collapsed_query_candidate(
+            *recovery_args, **recovery_kwargs)
+        self.assertEqual(
+            planner.centerline_recovery_debug["reason"],
+            "recovered_second_ridge_pending_confirmation")
+        self.assertEqual(len(pending), 2)
+        recovered = planner._recover_collapsed_query_candidate(
+            *recovery_args, **recovery_kwargs)
         self.assertEqual(len(recovered), 2)
         stats = planner._path_pair_stats(
             recovered[0]["points_xy"], recovered[1]["points_xy"],

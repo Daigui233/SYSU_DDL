@@ -201,6 +201,13 @@ class VisionControlConfig:
     centerline_dynamic_exclusion_min_score: float = 0.35
     centerline_dynamic_exclusion_dilate_px_640: float = 18.0
     centerline_dynamic_exclusion_top_y_ratio: float = 0.58
+    # Preserve only the Human-covered part of a Query from its own temporal
+    # instance track.  Outside that region current evidence remains live.
+    centerline_occlusion_hold_frames: int = 10
+    centerline_occlusion_max_shift_px_640: float = 0.0
+    # A recovered second heatmap ridge is useful at a merge, but it must be
+    # stable for more than one frame before it may change visible topology.
+    centerline_recovery_confirm_frames: int = 2
     # Query identity is model-owned, while blue/green are physical roles.
     # A one-frame recovered ridge must not be allowed to swap those roles.
     centerline_role_switch_confirm_frames: int = 3
@@ -483,6 +490,16 @@ class VisionControlConfig:
                 _env_float(
                     "VISION_CONTROL_CENTERLINE_DYNAMIC_EXCLUSION_TOP_Y_RATIO",
                     0.58), 0.10, 0.90),
+            centerline_occlusion_hold_frames=max(
+                0, _env_int(
+                    "VISION_CONTROL_CENTERLINE_OCCLUSION_HOLD_FRAMES", 10)),
+            centerline_occlusion_max_shift_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_OCCLUSION_MAX_SHIFT_640",
+                    0.0)),
+            centerline_recovery_confirm_frames=max(
+                1, _env_int(
+                    "VISION_CONTROL_CENTERLINE_RECOVERY_CONFIRM_FRAMES", 2)),
             centerline_role_switch_confirm_frames=max(
                 1, _env_int(
                     "VISION_CONTROL_CENTERLINE_ROLE_SWITCH_CONFIRM", 3)),
@@ -619,7 +636,10 @@ class VisionControlPlanner:
 
     def __init__(self, config=None):
         self.config = config or VisionControlConfig.from_env()
-        self.fitted_control_tracker = _FittedControlPathTracker()
+        self.fitted_control_tracker = _FittedControlPathTracker(
+            occlusion_hold_frames=self.config.centerline_occlusion_hold_frames,
+            occlusion_max_shift_px_640=(
+                self.config.centerline_occlusion_max_shift_px_640))
         self.last_path_target_x = None
         self.last_path_target_y = None
         self.last_path_target_slot = None
@@ -689,6 +709,7 @@ class VisionControlPlanner:
             "active": False, "reason": "initial"}
         self.centerline_recovery_debug = {
             "active": False, "reason": "initial"}
+        self.centerline_recovery_pending = {}
         self.last_valid_ocr_ts = 0.0
         self.ocr_pending_direction = None
         self.ocr_pending_frames = 0
@@ -1407,7 +1428,8 @@ class VisionControlPlanner:
                 if update_tracker:
                     self.fitted_control_tracker.update(
                         slot, np.empty((0, 2)), np.empty((0,)),
-                        image_shape, now=timestamp)
+                        image_shape, now=timestamp,
+                        occlusion_mask=dynamic_exclusion_mask)
                 continue
             points = points.copy()
             points[:, 0] = np.clip(points[:, 0], 0, width - 1)
@@ -1458,7 +1480,8 @@ class VisionControlPlanner:
                 if update_tracker:
                     self.fitted_control_tracker.update(
                         slot, np.empty((0, 2)), np.empty((0,)),
-                        image_shape, now=timestamp)
+                        image_shape, now=timestamp,
+                        occlusion_mask=dynamic_exclusion_mask)
                 continue
             extension_info = dict(fusion_info)
             extension_info.update({
@@ -1469,7 +1492,10 @@ class VisionControlPlanner:
             })
             if update_tracker:
                 points, probabilities = self.fitted_control_tracker.update(
-                    slot, points, probabilities, image_shape, now=timestamp)
+                    slot, points, probabilities, image_shape, now=timestamp,
+                    occlusion_mask=dynamic_exclusion_mask)
+                extension_info["occlusion_tracker"] = (
+                    self.fitted_control_tracker.slot_debug(slot))
             inside_road = _semantic_road_point_mask(
                 points, validation_mask, image_shape)
             points, probabilities = _select_control_curve_segment(
@@ -1503,7 +1529,8 @@ class VisionControlPlanner:
                 if slot not in present_slots:
                     self.fitted_control_tracker.update(
                         slot, np.empty((0, 2)), np.empty((0,)),
-                        image_shape, now=timestamp)
+                        image_shape, now=timestamp,
+                        occlusion_mask=dynamic_exclusion_mask)
         fitted_paths.sort(key=lambda item: int(item.get("slot", 99)))
         return fitted_paths[:2]
 
@@ -1618,6 +1645,7 @@ class VisionControlPlanner:
                     "aggregate_attempt": aggregate_info,
                 }
         if recovered_candidate is None:
+            self.centerline_recovery_pending.pop(int(weak_slot), None)
             self.centerline_recovery_debug = {
                 "active": True,
                 "reason": "no_separated_second_ridge",
@@ -1626,6 +1654,37 @@ class VisionControlPlanner:
                 "attempts": recovery_info,
             }
             return candidates
+        recovery_slot = int(weak_slot)
+        pending = self.centerline_recovery_pending.get(recovery_slot)
+        required_frames = max(
+            1, int(self.config.centerline_recovery_confirm_frames))
+        stable_recovery_frames = 1
+        if pending is not None:
+            previous_points = np.asarray(pending.get("points_xy", ()), dtype=np.float32)
+            current_points = np.asarray(
+                recovered_candidate.get("points_xy", ()), dtype=np.float32)
+            distance = _FittedControlPathTracker._median_curve_distance(
+                previous_points, current_points)
+            max_distance = 24.0 * float(max(1, image_shape[1])) / 640.0
+            if distance is not None and distance <= max_distance:
+                stable_recovery_frames = int(pending.get("frames", 0)) + 1
+        self.centerline_recovery_pending[recovery_slot] = {
+            "points_xy": np.asarray(
+                recovered_candidate.get("points_xy", ()), dtype=np.float32).copy(),
+            "frames": int(stable_recovery_frames),
+        }
+        if stable_recovery_frames < required_frames:
+            self.centerline_recovery_debug = {
+                "active": True,
+                "reason": "recovered_second_ridge_pending_confirmation",
+                "stable_slot": int(stable_slot),
+                "weak_slot": recovery_slot,
+                "frames": int(stable_recovery_frames),
+                "required_frames": int(required_frames),
+                "attempts": recovery_info,
+            }
+            return candidates
+        self.centerline_recovery_pending.pop(recovery_slot, None)
         recovered_candidate["extension"] = dict(
             recovered_candidate.get("extension") or {})
         recovered_candidate["extension"].update({
@@ -1633,6 +1692,7 @@ class VisionControlPlanner:
             "stable_slot": int(stable_slot),
             "recovery_mode": recovery_mode,
             "recovery_separated": True,
+            "recovery_confirmed_frames": int(stable_recovery_frames),
         })
         self.centerline_recovery_debug = {
             "active": True,
@@ -6991,7 +7051,9 @@ class _FittedControlPathTracker:
 
     def __init__(self, jump_threshold_px_640=48.0,
                  confirm_tolerance_px_640=16.0,
-                 hold_frames=0, timeout_s=0.5, hold_decay=0.72):
+                 hold_frames=0, timeout_s=0.5, hold_decay=0.72,
+                 occlusion_hold_frames=0,
+                 occlusion_max_shift_px_640=0.0):
         self.jump_threshold_px_640 = max(
             0.0, float(jump_threshold_px_640))
         self.confirm_tolerance_px_640 = max(
@@ -6999,6 +7061,9 @@ class _FittedControlPathTracker:
         self.hold_frames = max(0, int(hold_frames))
         self.timeout_s = max(0.0, float(timeout_s))
         self.hold_decay = _clamp(float(hold_decay), 0.0, 1.0)
+        self.occlusion_hold_frames = max(0, int(occlusion_hold_frames))
+        self.occlusion_max_shift_px_640 = max(
+            0.0, float(occlusion_max_shift_px_640))
         self._slots = {}
 
     @staticmethod
@@ -7057,7 +7122,54 @@ class _FittedControlPathTracker:
             (current_points[overlap, 0] - previous_x))
         return current_points
 
-    def update(self, slot, points, probabilities, image_shape, now=None):
+    @staticmethod
+    def _mask_hits_curve(points, mask, image_shape):
+        mask = np.asarray(mask) if mask is not None else np.empty((0, 0))
+        points = np.asarray(points, dtype=np.float32)
+        if (mask.ndim != 2 or not mask.size or len(points) == 0):
+            return np.zeros(len(points), dtype=bool)
+        return _semantic_road_point_mask(points, mask, image_shape)
+
+    def _inherit_occluded_rows(
+            self, previous_points, current_points, probabilities,
+            occlusion_mask, image_shape):
+        """Replace only Human-covered rows with the same instance history."""
+        current = np.asarray(current_points, dtype=np.float32).copy()
+        probabilities = np.asarray(probabilities, dtype=np.float32).copy()
+        previous = np.asarray(previous_points, dtype=np.float32)
+        covered = self._mask_hits_curve(current, occlusion_mask, image_shape)
+        if (not np.any(covered) or len(previous) < 2 or len(current) < 2):
+            return current, probabilities, 0, 0.0
+        y = current[:, 1]
+        overlap = (
+            (y >= float(previous[0, 1])) &
+            (y <= float(previous[-1, 1])))
+        inherited = covered & overlap
+        if not np.any(inherited):
+            return current, probabilities, 0, 0.0
+        previous_x = np.interp(y[overlap], previous[:, 1], previous[:, 0])
+        shift = 0.0
+        free = (~covered) & overlap
+        if np.any(free):
+            overlap_indices = np.flatnonzero(overlap)
+            free_previous_x = previous_x[np.isin(overlap_indices, np.flatnonzero(free))]
+            free_current_x = current[free, 0]
+            if len(free_previous_x) >= 3:
+                width_scale = float(max(1, image_shape[1])) / 640.0
+                limit = self.occlusion_max_shift_px_640 * width_scale
+                shift = _clamp(
+                    float(np.median(free_current_x - free_previous_x)),
+                    -limit, limit)
+        overlap_indices = np.flatnonzero(overlap)
+        inherited_indices = np.flatnonzero(inherited)
+        inherited_previous_x = previous_x[np.isin(
+            overlap_indices, inherited_indices)]
+        current[inherited, 0] = inherited_previous_x + float(shift)
+        probabilities[inherited] *= self.hold_decay
+        return current, probabilities, int(np.count_nonzero(inherited)), float(shift)
+
+    def update(self, slot, points, probabilities, image_shape, now=None,
+               occlusion_mask=None):
         slot = int(slot)
         now = time.monotonic() if now is None else float(now)
         points = np.asarray(points, dtype=np.float32)
@@ -7077,8 +7189,17 @@ class _FittedControlPathTracker:
         if not valid_current:
             if previous is None:
                 return self._empty()
+            occluded_previous = self._mask_hits_curve(
+                previous["points"], occlusion_mask, image_shape)
+            if np.any(occluded_previous):
+                previous["occlusion_cooldown"] = max(
+                    int(previous.get("occlusion_cooldown", 0)),
+                    self.occlusion_hold_frames)
             misses = int(previous["misses"]) + 1
-            if misses > self.hold_frames:
+            permitted_hold = max(
+                self.hold_frames,
+                (self.occlusion_hold_frames if np.any(occluded_previous) else 0))
+            if misses > permitted_hold:
                 self._slots.pop(slot, None)
                 return self._empty()
             previous["misses"] = misses
@@ -7092,6 +7213,8 @@ class _FittedControlPathTracker:
         tracked_probabilities = np.clip(
             probabilities[order], 0.0, 1.0).astype(np.float32)
         confirmed_jump = False
+        occlusion_rows = 0
+        occlusion_shift = 0.0
         if previous is not None:
             width_scale = float(max(1, shape[1])) / 640.0
             displacement = self._median_curve_distance(
@@ -7147,12 +7270,26 @@ class _FittedControlPathTracker:
                     alpha = 0.82
                 else:
                     alpha = 0.55
+                # After a moving Human leaves, the curve head often needs a
+                # few frames to recover. Do not immediately accept that
+                # rebound as a real course change.
+                if int(previous.get("occlusion_cooldown", 0)) > 0:
+                    alpha = min(alpha, 0.18)
                 # The pending branch above handles only discontinuities large
                 # enough to look like a route/slot switch.  Normal fitted
                 # movement is blended here and therefore keeps the target
                 # responsive without passing pixel noise straight through.
                 tracked_points = self._blend_with_previous(
                     previous["points"], tracked_points, alpha)
+            tracked_points, tracked_probabilities, occlusion_rows, occlusion_shift = (
+                self._inherit_occluded_rows(
+                    previous["points"], tracked_points,
+                    tracked_probabilities, occlusion_mask, image_shape))
+            if occlusion_rows:
+                previous["occlusion_cooldown"] = self.occlusion_hold_frames
+            elif int(previous.get("occlusion_cooldown", 0)) > 0:
+                previous["occlusion_cooldown"] = (
+                    int(previous["occlusion_cooldown"]) - 1)
 
         self._slots[slot] = {
             "points": tracked_points.copy(),
@@ -7167,8 +7304,24 @@ class _FittedControlPathTracker:
             "motion_frames": (
                 int(previous.get("motion_frames", 0))
                 if previous is not None else 0),
+            "occlusion_cooldown": (
+                int(previous.get("occlusion_cooldown", 0))
+                if previous is not None else 0),
+            "occlusion_rows": int(occlusion_rows),
+            "occlusion_shift": float(occlusion_shift),
         }
         return tracked_points, tracked_probabilities
+
+    def slot_debug(self, slot):
+        state = self._slots.get(int(slot))
+        if state is None:
+            return {"active": False, "reason": "missing_slot"}
+        return {
+            "active": True,
+            "occlusion_rows": int(state.get("occlusion_rows", 0)),
+            "occlusion_shift": float(state.get("occlusion_shift", 0.0)),
+            "occlusion_cooldown": int(state.get("occlusion_cooldown", 0)),
+        }
 
 
 def _adjust_point_display_confidences(
