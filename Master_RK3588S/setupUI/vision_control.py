@@ -181,6 +181,13 @@ class VisionControlConfig:
     centerline_fork_confirm_frames: int = 2
     centerline_fork_release_frames: int = 3
     centerline_junction_rearm_frames: int = 5
+    # The course is driven clockwise.  At a confirmed merge/overlap, reject a
+    # candidate that jumps to the opposite continuation of the already
+    # tracked route.  This is deliberately a temporal constraint: image-x
+    # direction alone is not reliable on a perspective right-hand curve.
+    centerline_clockwise_only: bool = True
+    centerline_counterclockwise_heading_px_640: float = 18.0
+    centerline_counterclockwise_target_jump_px_640: float = 20.0
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
     curve_merge_support_ratio: float = 0.70
@@ -430,6 +437,16 @@ class VisionControlConfig:
             centerline_junction_rearm_frames=max(
                 2, _env_int(
                     "VISION_CONTROL_CENTERLINE_JUNCTION_REARM", 5)),
+            centerline_clockwise_only=_env_bool(
+                "VISION_CONTROL_CENTERLINE_CLOCKWISE_ONLY", True),
+            centerline_counterclockwise_heading_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_COUNTERCLOCKWISE_HEADING_640",
+                    18.0)),
+            centerline_counterclockwise_target_jump_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_COUNTERCLOCKWISE_TARGET_JUMP_640",
+                    20.0)),
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
             ocr_confirm_frames=max(1, _env_int("VISION_CONTROL_OCR_CONFIRM_FRAMES", 1)),
@@ -619,6 +636,11 @@ class VisionControlPlanner:
         self.centerline_junction_state_frames = 0
         self.centerline_junction_committed_slot = None
         self.centerline_junction_single_frames = 0
+        self.centerline_new_fork_frames = 0
+        self.centerline_direction_guard_debug = {
+            "active": False, "reason": "initial"}
+        self.centerline_recovery_debug = {
+            "active": False, "reason": "initial"}
         self.last_valid_ocr_ts = 0.0
         self.ocr_pending_direction = None
         self.ocr_pending_frames = 0
@@ -758,7 +780,7 @@ class VisionControlPlanner:
             self.turnsign_trim_pending_ocr_direction = None
 
         self._update_curve_merge_continuity(candidates, image_shape)
-        raw_selected = self._select_candidate(candidates)
+        raw_selected = self._select_candidate(candidates, image_shape)
         line_connected, line_connection_reason, line_connection_metrics = (
             self._path_connection_status(raw_selected, image_shape))
         line_loss_reason = None
@@ -824,6 +846,9 @@ class VisionControlPlanner:
                 self.centerline_route_association_debug),
             "centerline_physical_association": dict(
                 self.centerline_physical_association_debug),
+            "centerline_direction_guard": dict(
+                self.centerline_direction_guard_debug),
+            "centerline_recovery": dict(self.centerline_recovery_debug),
             "centerline_junction_state": self.centerline_junction_state,
             "centerline_junction_state_frames": int(
                 self.centerline_junction_state_frames),
@@ -831,6 +856,8 @@ class VisionControlPlanner:
                 self.centerline_junction_committed_slot),
             "centerline_junction_single_frames": int(
                 self.centerline_junction_single_frames),
+            "centerline_new_fork_frames": int(
+                self.centerline_new_fork_frames),
             "raw_ocr_direction": (
                 raw_ocr_direction if raw_ocr_current else None),
             "raw_ocr_current": bool(raw_ocr_current),
@@ -1120,7 +1147,8 @@ class VisionControlPlanner:
     def _build_fitted_control_paths(
             self, raw_paths, road_mask, image_shape, now=None,
             road_probability=None, path_probabilities=None, hard_road_mask=None,
-            recovery_slot=None, exclusion_points=None, update_tracker=True):
+            recovery_slot=None, exclusion_points=None, update_tracker=True,
+            path_probability_override=None):
         height, width = image_shape[:2]
         lookahead_y = float(height) * self.config.lookahead_y_ratio
         confidence_split_y = max(0.0, lookahead_y - 10.0)
@@ -1153,11 +1181,13 @@ class VisionControlPlanner:
                     len(points), float(raw_path.get("score", 1.0)),
                     dtype=np.float32)
             model_slot = int(raw_path.get("model_slot", slot))
-            query_heatmap = None
-            maps = np.asarray(path_probabilities) if path_probabilities is not None else None
-            if (maps is not None and maps.ndim == 3
-                    and 0 <= model_slot < maps.shape[0]):
-                query_heatmap = maps[model_slot]
+            query_heatmap = path_probability_override
+            if query_heatmap is None:
+                maps = (np.asarray(path_probabilities)
+                        if path_probabilities is not None else None)
+                if (maps is not None and maps.ndim == 3
+                        and 0 <= model_slot < maps.shape[0]):
+                    query_heatmap = maps[model_slot]
             points, probabilities, fusion_info = _centerline_fuse_anchors_with_heatmap(
                 points, probabilities, query_heatmap, validation_mask,
                 image_shape, self.config, exclusion_points=exclusion_points,
@@ -1231,12 +1261,25 @@ class VisionControlPlanner:
     def _recover_collapsed_query_candidate(
             self, candidates, raw_paths, path_probabilities, road_mask,
             hard_road_mask, image_shape, now=None, count_evidence=None):
-        """Retry a missing/overlapped Query using only its own heatmap ridge."""
+        """Recover a weak second instance without fabricating a road center.
+
+        First decode the missing Query from its own heatmap.  If both Query
+        maps have collapsed onto the same trunk, retry only the missing slot
+        on their aggregate evidence while excluding the already stable path.
+        The aggregate retry is gated by the model's two-path head and must
+        yield a geometrically separated in-road curve before it is published.
+        """
         candidates = list(candidates or [])
+        self.centerline_recovery_debug = {
+            "active": False,
+            "reason": "not_required",
+        }
         if len(candidates) not in {1, 2} or path_probabilities is None:
+            self.centerline_recovery_debug["reason"] = "missing_inputs"
             return candidates
         by_slot = {int(item.get("slot", -1)): item for item in candidates}
         if not by_slot or not set(by_slot).issubset({0, 1}):
+            self.centerline_recovery_debug["reason"] = "invalid_slots"
             return candidates
         count_evidence = dict(count_evidence or {})
         scores = list(count_evidence.get("scores") or [])
@@ -1244,12 +1287,14 @@ class VisionControlPlanner:
             int(count_evidence.get("model_path_count", -1)) >= 2
             or (len(scores) >= 3 and float(scores[2]) >= 0.20))
         if not two_path_prior:
+            self.centerline_recovery_debug["reason"] = "count_head_not_two"
             return candidates
         if len(by_slot) == 2:
             stats = self._path_pair_stats(
                 by_slot[0].get("points_xy", ()), by_slot[1].get("points_xy", ()),
                 image_shape)
             if self._centerline_pair_topology(stats) != "OVERLAP":
+                self.centerline_recovery_debug["reason"] = "pair_already_separate"
                 return candidates
             quality = {
                 slot: self._centerline_candidate_quality(candidate)
@@ -1262,32 +1307,89 @@ class VisionControlPlanner:
         raw = next((item for item in list(raw_paths or [])
                     if int(item.get("slot", -1)) == weak_slot), None)
         if raw is None:
+            self.centerline_recovery_debug["reason"] = "missing_weak_raw_query"
             return candidates
-        recovered = self._build_fitted_control_paths(
-            [raw], road_mask, image_shape, now=now,
-            path_probabilities=path_probabilities,
-            hard_road_mask=hard_road_mask, recovery_slot=weak_slot,
-            exclusion_points=by_slot[stable_slot].get("points_xy"),
-            update_tracker=False)
-        if len(recovered) != 1:
-            return candidates
-        recovered_candidate = recovered[0]
-        recovered_stats = self._path_pair_stats(
-            by_slot[stable_slot].get("points_xy", ()),
-            recovered_candidate.get("points_xy", ()), image_shape)
-        topology = self._centerline_pair_topology(recovered_stats)
-        mean_support = float((recovered_candidate.get("extension") or {}).get(
-            "mean_heatmap_support", 0.0))
-        if (topology == "OVERLAP" or mean_support <
-                float(self.config.centerline_heatmap_recovery_min_mean)):
+
+        def attempt(mode, heatmap_override=None):
+            recovered = self._build_fitted_control_paths(
+                [raw], road_mask, image_shape, now=now,
+                path_probabilities=path_probabilities,
+                hard_road_mask=hard_road_mask, recovery_slot=weak_slot,
+                exclusion_points=by_slot[stable_slot].get("points_xy"),
+                update_tracker=False,
+                path_probability_override=heatmap_override)
+            if len(recovered) != 1:
+                return None, {"mode": mode, "reason": "decode_failed"}
+            candidate = recovered[0]
+            stats = self._path_pair_stats(
+                by_slot[stable_slot].get("points_xy", ()),
+                candidate.get("points_xy", ()), image_shape)
+            topology = self._centerline_pair_topology(stats)
+            mean_support = float((candidate.get("extension") or {}).get(
+                "mean_heatmap_support", 0.0))
+            min_support = float(
+                self.config.centerline_heatmap_recovery_min_mean)
+            recovery_min_rows = max(
+                3, int(math.ceil(
+                    float(self.config.branch_separation_rows) * 0.5)))
+            separated = bool(
+                topology in {"FORK", "PARALLEL"}
+                and int(stats.get("separated_rows", 0)) >= recovery_min_rows)
+            # Aggregate evidence must be stricter because it is no longer the
+            # weak Query's own score map.  It still cannot leave the semantic
+            # road mask or overlap the stable Query.
+            required_support = (
+                min_support * 1.25 if mode == "aggregate_heatmap"
+                else min_support)
+            info = {
+                "mode": mode,
+                "reason": "accepted" if separated and mean_support >= required_support
+                else "not_separated_or_low_support",
+                "pair_topology": topology,
+                "separated_rows": int(stats.get("separated_rows", 0)),
+                "recovery_min_rows": int(recovery_min_rows),
+                "mean_heatmap_support": mean_support,
+                "required_support": required_support,
+            }
+            return (candidate if info["reason"] == "accepted" else None), info
+
+        recovered_candidate, recovery_info = attempt("query_heatmap")
+        recovery_mode = "query_heatmap"
+        if recovered_candidate is None:
+            maps = np.asarray(path_probabilities, dtype=np.float32)
+            if maps.ndim == 3 and maps.shape[0] >= 2:
+                aggregate = np.max(maps[:2], axis=0)
+                recovered_candidate, aggregate_info = attempt(
+                    "aggregate_heatmap", aggregate)
+                recovery_mode = "aggregate_heatmap"
+                recovery_info = {
+                    "query_attempt": recovery_info,
+                    "aggregate_attempt": aggregate_info,
+                }
+        if recovered_candidate is None:
+            self.centerline_recovery_debug = {
+                "active": True,
+                "reason": "no_separated_second_ridge",
+                "stable_slot": int(stable_slot),
+                "weak_slot": int(weak_slot),
+                "attempts": recovery_info,
+            }
             return candidates
         recovered_candidate["extension"] = dict(
             recovered_candidate.get("extension") or {})
         recovered_candidate["extension"].update({
             "collapsed_query_recovery": True,
             "stable_slot": int(stable_slot),
-            "pair_topology": topology,
+            "recovery_mode": recovery_mode,
+            "recovery_separated": True,
         })
+        self.centerline_recovery_debug = {
+            "active": True,
+            "reason": "recovered_separated_second_ridge",
+            "stable_slot": int(stable_slot),
+            "weak_slot": int(weak_slot),
+            "recovery": recovery_info,
+        }
         by_slot[weak_slot] = recovered_candidate
         return [by_slot[slot] for slot in sorted(by_slot)]
 
@@ -1389,15 +1491,17 @@ class VisionControlPlanner:
             self.centerline_fork_active = False
             self.centerline_fork_pending_frames = 0
             self.centerline_fork_clear_frames = 0
+            self.centerline_new_fork_frames = 0
             self.centerline_branch_split_y = None
             self._clear_stable_fork()
         elif state == "NO_FORK":
             self.centerline_junction_committed_slot = None
             self.centerline_junction_single_frames = 0
+            self.centerline_new_fork_frames = 0
 
     def _advance_centerline_junction(
             self, topology, low_fork_evidence, preferred_slot,
-            selected_route_visible=True):
+            selected_route_visible=True, geometry_branch_candidate=False):
         """Advance the visual junction lifecycle without global position."""
         topology = str(topology)
         state = self.centerline_junction_state
@@ -1425,6 +1529,19 @@ class VisionControlPlanner:
             else:
                 self.centerline_junction_state_frames += 1
         elif state == "BRANCH_COMMITTED":
+            # A completed junction must suppress its *old* alternative, but
+            # must not permanently suppress a later physical fork elsewhere
+            # on the track.  The previous implementation had no exit here:
+            # every new fork was reduced to CL=1 as long as the old committed
+            # state had not first seen five single-line frames.
+            if topology == "FORK" and geometry_branch_candidate:
+                self.centerline_new_fork_frames += 1
+                if (self.centerline_new_fork_frames >=
+                        self.config.centerline_fork_confirm_frames):
+                    self._set_centerline_junction_state(
+                        "FORK_CANDIDATE", preferred_slot)
+                return
+            self.centerline_new_fork_frames = 0
             committed = self.centerline_junction_committed_slot
             if (topology in {"OVERLAP", "SINGLE"}
                     and selected_route_visible
@@ -1438,14 +1555,23 @@ class VisionControlPlanner:
                 self.centerline_junction_single_frames = 0
                 self.centerline_junction_state_frames += 1
         elif state == "REARM":
-            if topology in {"OVERLAP", "SINGLE"}:
+            if topology == "FORK" and geometry_branch_candidate:
+                self.centerline_new_fork_frames += 1
+                if (self.centerline_new_fork_frames >=
+                        self.config.centerline_fork_confirm_frames):
+                    self._set_centerline_junction_state(
+                        "FORK_CANDIDATE", preferred_slot)
+            elif topology in {"OVERLAP", "SINGLE"}:
+                self.centerline_new_fork_frames = 0
                 self._set_centerline_junction_state("NO_FORK")
             elif topology in {"MERGE", "PARALLEL"}:
+                self.centerline_new_fork_frames = 0
                 # Old-junction geometry is still visible; keep suppressing it.
                 self._set_centerline_junction_state(
                     "BRANCH_COMMITTED",
                     self.centerline_junction_committed_slot)
             else:
+                self.centerline_new_fork_frames = 0
                 self.centerline_junction_state_frames += 1
 
     def _committed_centerline_candidates(
@@ -1732,10 +1858,18 @@ class VisionControlPlanner:
             })
             self.centerline_topology_debug = evidence
             return filtered
+        # A recovered secondary ridge has already passed a stricter
+        # heatmap/road/exclusion check.  Its visible split can be shorter than
+        # the generic row-count threshold because it often starts only in the
+        # distant part of a real junction.
+        recovery_split = any(bool((item.get("extension") or {}).get(
+            "collapsed_query_recovery")) and bool(
+            (item.get("extension") or {}).get("recovery_separated"))
+            for item in candidates)
         geometry_split = bool(
             pair_topology == "FORK"
-            and stats["separated_rows"] >=
-            self.config.branch_separation_rows)
+            and (stats["separated_rows"] >=
+                 self.config.branch_separation_rows or recovery_split))
         scores = evidence["scores"]
         count_two = bool(
             int(evidence["model_path_count"]) == 2
@@ -1789,7 +1923,8 @@ class VisionControlPlanner:
                 self._clear_stable_fork()
         self._advance_centerline_junction(
             pair_topology, low_fork_evidence, preferred_slot,
-            selected_route_visible=True)
+            selected_route_visible=True,
+            geometry_branch_candidate=geometry_branch_candidate)
         if self.centerline_junction_state in {
                 "BRANCH_COMMITTED", "REARM"}:
             filtered = self._committed_centerline_candidates(
@@ -1800,6 +1935,7 @@ class VisionControlPlanner:
                 "candidate_count_after": len(filtered),
                 "model_path_count": int(evidence["model_path_count"]),
                 "geometry_split": geometry_split,
+                "recovery_split": recovery_split,
                 "pair_topology": pair_topology,
                 "count_two": count_two,
                 "count_two_low": count_two_low,
@@ -1813,6 +1949,7 @@ class VisionControlPlanner:
                     self.centerline_junction_committed_slot),
                 "junction_single_frames": int(
                     self.centerline_junction_single_frames),
+                "new_fork_frames": int(self.centerline_new_fork_frames),
                 "pair_stats": dict(stats),
             })
             self.centerline_topology_debug = evidence
@@ -1855,6 +1992,7 @@ class VisionControlPlanner:
             "candidate_count_after": len(filtered),
             "model_path_count": int(evidence["model_path_count"]),
             "geometry_split": geometry_split,
+            "recovery_split": recovery_split,
             "pair_topology": pair_topology,
             "high_overlap": False,
             "count_two": count_two,
@@ -1874,6 +2012,7 @@ class VisionControlPlanner:
                 self.centerline_junction_committed_slot),
             "junction_single_frames": int(
                 self.centerline_junction_single_frames),
+            "new_fork_frames": int(self.centerline_new_fork_frames),
             "pair_stats": dict(stats),
             "quality_by_slot": {
                 str(slot): float(item.get("centerline_quality", 0.0))
@@ -2414,10 +2553,84 @@ class VisionControlPlanner:
             self.turnsign_trim_line_split_frames = 0
             self.turnsign_trim_line_split_ready = False
 
-    def _select_candidate(self, candidates):
+    def _clockwise_candidate_allowed(self, candidate, image_shape):
+        """Reject a merge-time jump to the opposite-travel continuation.
+
+        A right-hand curve can legitimately move left in image coordinates,
+        so an absolute x-slope test is wrong.  The only reliable board-side
+        signal without a map is a sudden candidate switch away from the last
+        accepted target while the topology is a merge or shared overlap.
+        """
+        if not self.config.centerline_clockwise_only:
+            return True, {"active": False, "reason": "disabled"}
+        if candidate is None or image_shape is None:
+            return True, {"active": False, "reason": "no_candidate"}
+        topology = str(self.centerline_topology_debug.get(
+            "pair_topology") or self.centerline_last_pair_topology)
+        merge_context = bool(
+            topology in {"MERGE", "OVERLAP"}
+            or self.centerline_junction_state in {
+                "BRANCH_COMMITTED", "REARM"})
+        target = self._path_target_on_selected(
+            candidate, float(image_shape[0]) * self.config.lookahead_y_ratio)
+        if (not merge_context or self.last_path_target_x is None
+                or target is None or bool(target[2])):
+            return True, {
+                "active": False,
+                "reason": "no_merge_reference",
+                "topology": topology,
+            }
+        width = float(max(1, image_shape[1]))
+        delta_640 = (
+            (float(target[0]) - float(self.last_path_target_x))
+            * 640.0 / width)
+        allowed = bool(delta_640 >= -float(
+            self.config.centerline_counterclockwise_heading_px_640))
+        return allowed, {
+            "active": True,
+            "reason": (
+                "clockwise_merge_continuity" if allowed
+                else "counterclockwise_merge_jump_rejected"),
+            "slot": int(candidate.get("model_slot", candidate.get("slot", -1))),
+            "topology": topology,
+            "previous_x": float(self.last_path_target_x),
+            "candidate_x": float(target[0]),
+            "delta_640": float(delta_640),
+            "threshold_640": float(
+                self.config.centerline_counterclockwise_heading_px_640),
+        }
+
+    def _select_candidate(self, candidates, image_shape=None):
         if not candidates:
             self.selection_reason = "no_candidate"
+            self.centerline_direction_guard_debug = {
+                "active": False, "reason": "no_candidate"}
             return None
+        candidates = list(candidates)
+        # A single published route is a shared/merged physical segment, not a
+        # stale request to preserve an old left/right display role.  An OCR
+        # instruction is the exception: do not silently take the opposite
+        # branch while that instruction is still current.
+        if len(candidates) == 1:
+            only = candidates[0]
+            allowed, guard = self._clockwise_candidate_allowed(
+                only, image_shape)
+            self.centerline_direction_guard_debug = dict(guard)
+            if not allowed:
+                self.selection_reason = "counterclockwise_candidate_rejected"
+                return None
+            side = only.get("physical_side")
+            if (self.branch_lock_source == "ocr"
+                    and side in {"left", "right"}
+                    and side != self.branch_lock
+                    and self.centerline_topology_debug.get("pair_topology")
+                    in {"FORK", "PARALLEL"}):
+                self.selection_reason = "ocr_route_not_visible"
+                return None
+            self.selected_slot_lock = int(
+                only.get("model_slot", only.get("slot", 0)))
+            self.selection_reason = "single_visible_route"
+            return only
         if (self.centerline_junction_state in {
                 "BRANCH_COMMITTED", "REARM"}
                 and self.centerline_junction_committed_slot in (0, 1)):
@@ -2439,10 +2652,76 @@ class VisionControlPlanner:
             else ("merge_continuity_green" if
                   self.branch_lock == "left" and self.curve_merge_override
                   else "locked_{}".format(self.branch_lock or "left")))
-        for candidate in candidates:
-            if int(candidate.get("model_slot", candidate.get("slot", -1))) == wanted_slot:
-                return candidate
+        preferred = next(
+            (candidate for candidate in candidates
+             if int(candidate.get("model_slot", candidate.get("slot", -1)))
+             == wanted_slot), None)
+        if preferred is not None:
+            allowed, guard = self._clockwise_candidate_allowed(
+                preferred, image_shape)
+            self.centerline_direction_guard_debug = dict(guard)
+            if allowed:
+                return preferred
+        # The default clockwise route may use the other model Query after a
+        # real separation.  OCR-directed routing never falls back: stopping
+        # briefly is safer than entering the explicitly unrequested branch.
+        if self.branch_lock_source != "ocr":
+            for candidate in candidates:
+                allowed, guard = self._clockwise_candidate_allowed(
+                    candidate, image_shape)
+                if allowed:
+                    self.selected_slot_lock = int(candidate.get(
+                        "model_slot", candidate.get("slot", 0)))
+                    self.selection_reason = "clockwise_route_fallback"
+                    self.centerline_direction_guard_debug = dict(guard)
+                    return candidate
+        self.selection_reason = "counterclockwise_candidate_rejected"
         return None
+
+    def _guard_clockwise_target_transition(self, path_target, image_shape):
+        """Refuse a sudden leftward steering jump on shared/merged segments."""
+        base = dict(self.centerline_direction_guard_debug)
+        if (not self.config.centerline_clockwise_only or path_target is None
+                or bool(path_target[2]) or self.last_path_target_x is None):
+            base.update({"target_guard_active": False})
+            return path_target, base
+        topology = str(self.centerline_topology_debug.get(
+            "pair_topology") or self.centerline_last_pair_topology)
+        # At an explicitly visible fork the OCR/default branch policy chooses
+        # the instance.  The transition guard is for the dangerous case seen
+        # in deployment: a single/overlap output suddenly inherits the old
+        # counter-clockwise branch at a merge.
+        merge_context = bool(
+            topology in {"MERGE", "OVERLAP"}
+            or self.centerline_junction_state in {
+                "BRANCH_COMMITTED", "REARM"})
+        if not merge_context:
+            base.update({
+                "target_guard_active": False,
+                "target_guard_reason": "no_merge_reference",
+            })
+            return path_target, base
+        width = float(max(1, image_shape[1]))
+        delta_640 = (
+            (float(path_target[0]) - float(self.last_path_target_x))
+            * 640.0 / width)
+        threshold = float(
+            self.config.centerline_counterclockwise_target_jump_px_640)
+        rejected = bool(delta_640 < -threshold)
+        base.update({
+            "target_guard_active": True,
+            "target_guard_reason": (
+                "counterclockwise_target_jump_rejected" if rejected
+                else "clockwise_target_transition"),
+            "target_guard_topology": topology,
+            "target_previous_x": float(self.last_path_target_x),
+            "target_current_x": float(path_target[0]),
+            "target_delta_640": float(delta_640),
+            "target_threshold_640": threshold,
+            "target_rejected": rejected,
+        })
+        self.centerline_direction_guard_debug = dict(base)
+        return (None if rejected else path_target), base
 
     def _path_connection_status(self, selected, image_shape):
         """Reject a fitted path whose near end no longer reaches the car."""
@@ -2555,6 +2834,19 @@ class VisionControlPlanner:
                 result, selected, image_shape, lookahead_y, now,
                 ocr_response=ocr_response,
                 path_target_x=task_path_target_x))
+        clockwise_target_guard = {"target_guard_active": False}
+        if task_reason == "track":
+            path_target, clockwise_target_guard = (
+                self._guard_clockwise_target_transition(
+                    path_target, image_shape))
+            if path_target is None and bool(
+                    clockwise_target_guard.get("target_rejected")):
+                command, target = self._line_loss_hold_command(
+                    "counterclockwise_target_transition", task_reason,
+                    now, lookahead_y)
+                target["clockwise_target_guard"] = dict(
+                    clockwise_target_guard)
+                return command, target
         human_reverse_active = self._update_human_stop_reverse(
             task_reason, now)
         if (
@@ -2989,6 +3281,7 @@ class VisionControlPlanner:
             "reason": route_reason,
             "task_reason": task_reason,
             "human_stop_reverse_active": bool(human_reverse_active),
+            "clockwise_target_guard": dict(clockwise_target_guard),
         }
 
     def _line_loss_hold_command(

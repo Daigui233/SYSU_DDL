@@ -526,6 +526,90 @@ class VisionControlPlannerTest(unittest.TestCase):
             single, {}, (480, 640, 3))
         self.assertEqual(planner.centerline_junction_state, "NO_FORK")
 
+    def test_committed_junction_reopens_for_a_later_geometric_fork(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.centerline_junction_state = "BRANCH_COMMITTED"
+        planner.centerline_junction_committed_slot = 0
+        fork = _trim_result(
+            180.0, lookahead_gap_640=10.0)["raw_curve_paths"]
+        result = {"centerline": {
+            "path_count_scores": [0.05, 0.15, 0.80]}}
+
+        # One frame keeps the old route.  Two consecutive separated frames
+        # identify a new physical fork and must release the stale commit.
+        first = planner._filter_centerline_candidates(
+            fork, result, (480, 640, 3))
+        self.assertEqual(len(first), 1)
+        self.assertEqual(planner.centerline_junction_state,
+                         "BRANCH_COMMITTED")
+        second = planner._filter_centerline_candidates(
+            fork, result, (480, 640, 3))
+        self.assertEqual(len(second), 2)
+        self.assertEqual(planner.centerline_junction_state,
+                         "FORK_CANDIDATE")
+        self.assertEqual(
+            planner.centerline_topology_debug["reason"],
+            "count_two_geometry_split")
+
+    def test_counterclockwise_candidate_is_not_selected_for_control(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        planner.centerline_junction_state = "BRANCH_COMMITTED"
+        planner.last_path_target_x = 340.0
+        # At a known merge, this candidate would jump substantially left of
+        # the accepted path. It remains renderable but is not followed.
+        counterclockwise = _raw_path(
+            0, 340.0 - 0.25 * (460.0 - ys), ys)
+        selected = planner._select_candidate(
+            [counterclockwise], (480, 640, 3))
+        self.assertIsNone(selected)
+        self.assertEqual(planner.selection_reason,
+                         "counterclockwise_candidate_rejected")
+
+    def test_counterclockwise_target_jump_holds_previous_control_target(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.last_path_target_x = 340.0
+        planner.centerline_topology_debug = {"pair_topology": "MERGE"}
+        target, guard = planner._guard_clockwise_target_transition(
+            (300.0, 300.0, False), (480, 640, 3))
+        self.assertIsNone(target)
+        self.assertTrue(guard["target_rejected"])
+        self.assertEqual(
+            guard["target_guard_reason"],
+            "counterclockwise_target_jump_rejected")
+
+    def test_collapsed_query_uses_aggregate_second_ridge_only_when_separated(self):
+        planner = VisionControlPlanner(config=_config())
+        image_shape = (480, 640, 3)
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        raw = [_raw_path(0, 260.0, ys), _raw_path(1, 260.0, ys)]
+        maps = np.zeros((2, 120, 160), dtype=np.float32)
+        stable_x = 65
+        for y in range(120):
+            maps[:, y, stable_x] = 0.90
+            # The second ridge shares the near trunk, then separates only in
+            # the forward field. It exists in aggregate evidence, not in the
+            # weak Query's own map.
+            if y < 72:
+                ridge_x = int(round(65 + (72 - y) * 0.80))
+                maps[0, y, min(159, ridge_x)] = 0.98
+        recovered = planner._recover_collapsed_query_candidate(
+            raw, raw, maps, np.ones((120, 160), dtype=np.uint8),
+            np.ones((120, 160), dtype=np.uint8), image_shape,
+            count_evidence={
+                "model_path_count": 2,
+                "scores": [0.02, 0.08, 0.90],
+            })
+        self.assertEqual(len(recovered), 2)
+        stats = planner._path_pair_stats(
+            recovered[0]["points_xy"], recovered[1]["points_xy"],
+            image_shape)
+        self.assertIn(planner._centerline_pair_topology(stats),
+                      {"FORK", "PARALLEL"})
+        self.assertEqual(
+            planner.centerline_recovery_debug["reason"],
+            "recovered_separated_second_ridge")
+
     def test_fork_preview_hides_shared_overlapping_trunk(self):
         planner = VisionControlPlanner(config=_config())
         result = _trim_result(180.0, lookahead_gap_640=10.0)

@@ -984,7 +984,16 @@ def add_semantic_centerline_overlay(
                      else path.get("points_xy"))
                     if isinstance(path, dict) else None)
                 slot = int(path.get("slot", 0)) if isinstance(path, dict) else 0
-                color = final_colors[0 if slot == 0 else 1]
+                # Model slots identify Query instances.  Display slots are
+                # assigned from the actually separated physical geometry, so
+                # blue remains left/outer and green remains right/inner even
+                # when Query 0/1 cross or arrive in a different order.
+                display_slot = (
+                    path.get("display_slot") if isinstance(path, dict)
+                    else None)
+                if display_slot not in (0, 1):
+                    display_slot = slot
+                color = final_colors[0 if int(display_slot) == 0 else 1]
                 _preview_draw_path(
                     path_layer, points, (0, 0, 0), thickness=5)
                 _preview_draw_path(
@@ -1025,6 +1034,13 @@ def add_semantic_centerline_overlay(
         cv2.putText(
             frame, text, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
             (255, 255, 255), 1, cv2.LINE_AA)
+        recovery = vision_control.get("centerline_recovery") or {}
+        if bool(recovery.get("active")):
+            cv2.putText(
+                frame, "REC={}".format(
+                    str(recovery.get("reason") or "-")[:42]),
+                (10, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                (255, 255, 255), 1, cv2.LINE_AA)
     return frame
 
 
