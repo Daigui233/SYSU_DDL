@@ -22,7 +22,7 @@ ROUTE_MULTI_FORK = "MULTI_FORK"
 ROUTE_AMBIGUOUS = "AMBIGUOUS"
 
 _PAIR_FRACTIONS = np.arange(24, dtype=np.float32) / 23.0
-DEFAULT_VISUAL_CENTER_X = 0.5625
+DEFAULT_VISUAL_CENTER_X = 0.546875
 CENTERED_VISUAL_CENTER_X = 0.5
 
 
@@ -110,7 +110,7 @@ class VisionControlConfig:
     visual_center_x: float = DEFAULT_VISUAL_CENTER_X
     # Unified line tracking blend.  Curvature is weighted explicitly, while the
     # final error slew stays conservative so one mode works for straights and bends.
-    straight_position_gain: float = 0.60
+    straight_position_gain: float = 0.75
     straight_heading_feedforward_gain: float = 0.60
     straight_curve_feedforward_gain: float = 0.0
     lookahead_y_ratio: float = 0.625
@@ -208,6 +208,7 @@ class VisionControlConfig:
     human_absence_confirm_s: float = 1.5
     human_restart_ignore_bottom_ratio: float = 1.0 / 3.0
     human_same_person_distance_px_640: float = 38.0
+    human_path_release_distance_px_640: float = 5.0
     human_stop_absence_restart_s: float = 5.0
     human_stop_reverse_speed_mps: float = -0.10
     human_stop_reverse_duration_s: float = 0.3
@@ -232,7 +233,7 @@ class VisionControlConfig:
                 _env_float("VISION_CONTROL_CENTER_X", DEFAULT_VISUAL_CENTER_X),
                 0.2, 0.8),
             straight_position_gain=_clamp(
-                _env_float("VISION_CONTROL_STRAIGHT_POSITION_GAIN", 0.60),
+                _env_float("VISION_CONTROL_STRAIGHT_POSITION_GAIN", 0.75),
                 0.0, 1.0),
             straight_heading_feedforward_gain=max(
                 0.0, _env_float(
@@ -328,10 +329,10 @@ class VisionControlConfig:
             straight_edge_max_residual_640=max(
                 0.5, _env_float(
                     "VISION_CONTROL_STRAIGHT_EDGE_MAX_RESIDUAL_640", 10.0)),
-            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.10)),
+            normal_speed_mps=max(0.0, _env_float("VISION_CONTROL_NORMAL_SPEED", 0.08)),
             recover_speed_mps=max(0.031, _env_float("VISION_CONTROL_RECOVER_SPEED", 0.04)),
-            human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.35)),
-            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.10)),
+            human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_HUMAN_PASS_SPEED", 0.20)),
+            collect_speed_mps=max(0.0, _env_float("VISION_CONTROL_COLLECT_SPEED", 0.08)),
             turnsign_slow_speed_mps=max(0.0, _env_float("VISION_CONTROL_TURNSIGN_SLOW_SPEED", 0.08)),
             route_confirm_frames=max(1, _env_int("VISION_CONTROL_ROUTE_CONFIRM_FRAMES", 6)),
             branch_separation_px_640=max(1.0, _env_float("VISION_CONTROL_BRANCH_SEP_640", 70.0)),
@@ -435,6 +436,8 @@ class VisionControlConfig:
                 1.0 / 3.0), 0.0, 1.0),
             human_same_person_distance_px_640=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_SAME_PERSON_DISTANCE_640", 38.0)),
+            human_path_release_distance_px_640=max(0.0, _env_float(
+                "VISION_CONTROL_HUMAN_PATH_RELEASE_DISTANCE_640", 5.0)),
             human_stop_absence_restart_s=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_STOP_ABSENCE_RESTART_S", 5.0)),
             human_stop_reverse_speed_mps=-abs(_env_float(
@@ -449,7 +452,7 @@ class VisionControlConfig:
                 0.0, _env_float(
                     "VISION_CONTROL_CAR_AVOID_MAX_OFFSET_640", 44.0)),
             car_avoid_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_AVOID_HOLD_S", 2.0)),
-            car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.35)),
+            car_human_pass_speed_mps=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_SPEED", 0.20)),
             car_human_pass_hold_s=max(0.0, _env_float("VISION_CONTROL_CAR_HUMAN_PASS_HOLD_S", 2.0)),
             human_avoid_offset_px_640=max(0.0, _env_float("VISION_CONTROL_HUMAN_AVOID_OFFSET_640", 75.0)),
             avoid_box_width_gain=max(0.0, _env_float("VISION_CONTROL_AVOID_BOX_WIDTH_GAIN", 0.40)),
@@ -643,7 +646,8 @@ class VisionControlPlanner:
         command, control_target = self._build_command(
             selected, route_reason, perception_result,
             image_shape, now, ocr_response,
-            line_loss_reason=line_loss_reason)
+            line_loss_reason=line_loss_reason,
+            raw_selected=raw_selected)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         debug = {
             "enabled": True,
@@ -1272,7 +1276,7 @@ class VisionControlPlanner:
 
     def _build_command(
             self, selected, route_reason, result, image_shape, now,
-            ocr_response=None, line_loss_reason=None):
+            ocr_response=None, line_loss_reason=None, raw_selected=None):
         width = float(max(1, image_shape[1]))
         visual_center_x = self._active_visual_center_x(now)
         reference_line_x = float(width) * visual_center_x
@@ -1296,7 +1300,8 @@ class VisionControlPlanner:
                 ocr_response["control_phase"] = "ocr_wait_route"
             return self._line_loss_hold_command(
                 "ocr_selected_route_unavailable", "ocr_wait_route",
-                now, lookahead_y, image_shape)
+                now, lookahead_y, image_shape, result,
+                fallback_candidate=raw_selected)
         if ocr_route_locked and isinstance(ocr_response, dict):
             ocr_response["control_phase"] = "ocr_route_ready"
 
@@ -1364,7 +1369,8 @@ class VisionControlPlanner:
                     }
             command, target = self._line_loss_hold_command(
                 "adaptive_path_no_previous_target", task_reason,
-                now, lookahead_y, image_shape)
+                now, lookahead_y, image_shape, result,
+                fallback_candidate=selected)
             target.update({
                 "path_target_adaptive_y": True,
                 "path_target_held": False,
@@ -1403,11 +1409,12 @@ class VisionControlPlanner:
                     }
             return self._line_loss_hold_command(
                 line_loss_reason or route_reason or "line_unavailable",
-                task_reason, now, lookahead_y, image_shape)
+                task_reason, now, lookahead_y, image_shape, result,
+                fallback_candidate=raw_selected)
         if path_target is None:
             return self._line_loss_hold_command(
                 "missing_target_x", task_reason, now, lookahead_y,
-                image_shape)
+                image_shape, result, fallback_candidate=selected)
 
         path_target_x, path_target_y, path_target_adaptive = path_target
         unconstrained_requested_target_x = _clamp(
@@ -1666,8 +1673,8 @@ class VisionControlPlanner:
 
     def _line_loss_hold_command(
             self, reason, task_reason, now, lookahead_y,
-            image_shape=None):
-        """Hold the latest steering, but slow down until the path returns."""
+            image_shape=None, result=None, fallback_candidate=None):
+        """Recover toward any still-visible path or road mask, then slow down."""
         age = now - self.last_valid_ts if self.last_valid_ts else 1e9
         held_target = self._held_path_target(now)
         error = float(self.last_error)
@@ -1677,34 +1684,171 @@ class VisionControlPlanner:
         visual_center_x = self._active_visual_center_x(now)
         reference_line_x = (
             None if width is None else float(width) * visual_center_x)
+        recovery = self._line_loss_recovery_target(
+            result, fallback_candidate, image_shape, lookahead_y,
+            held_target, visual_center_x)
+        recovery_raw_error = None
+        recovery_target_x = None
+        recovery_source = None
+        recovery_mask_edge = None
+        recovery_mask_edge_reference_x = None
+        if recovery is not None and width is not None:
+            recovery_target_x = float(recovery["target_x"])
+            recovery_source = str(recovery["source"])
+            recovery_mask_edge = recovery.get("mask_edge")
+            recovery_mask_edge_reference_x = _finite_float(
+                recovery.get("mask_edge_reference_x"))
+            recovery_raw_error = (
+                float(recovery_target_x) / width - visual_center_x) * 640.0
+            error = self._limit_error(recovery_raw_error, adaptive=False)
+            self.last_error = float(error)
+            target_x = _clamp(
+                width * (visual_center_x + float(error) / 640.0),
+                0.0,
+                float(max(0, image_shape[1] - 1)),
+            )
+            path_target_x = (
+                recovery_target_x if bool(recovery.get("held", False))
+                else None)
+            path_target_y = float(recovery.get("target_y", lookahead_y))
+            path_target_held = bool(recovery.get("held", False))
+        else:
+            target_x = None if held_target is None else held_target[0]
+            path_target_x = None if held_target is None else held_target[0]
+            path_target_y = (
+                float(lookahead_y)
+                if held_target is None else held_target[1])
+            path_target_held = held_target is not None
         previous_speed = float(self.last_forward_speed_mps)
         if previous_speed <= 0.0:
             previous_speed = max(0.031, float(self.config.normal_speed_mps))
         recover_speed = max(0.031, float(self.config.recover_speed_mps))
         speed = min(previous_speed, recover_speed)
         return self._command(error, speed, STATE_RECOVER_LINE), {
-            "target_x": (
-                None if held_target is None else held_target[0]),
-            "path_target_x": (
-                None if held_target is None else held_target[0]),
-            "path_target_y": (
-                float(lookahead_y)
-                if held_target is None else held_target[1]),
+            "target_x": target_x,
+            "path_target_x": path_target_x,
+            "path_target_y": float(path_target_y),
             "visual_center_x": float(visual_center_x),
             "configured_visual_center_x": float(self.config.visual_center_x),
             "reference_line_x": reference_line_x,
             "ocr_right_center_latch_remaining_s": (
                 self._ocr_right_center_remaining(now)),
-            "path_target_held": held_target is not None,
+            "path_target_held": bool(path_target_held),
             "track_error_640": error,
             "reason": str(reason or "line_unavailable"),
             "task_reason": str(task_reason or "no_path"),
             "line_loss_hold": True,
             "line_loss_indefinite": True,
+            "line_loss_recovery_active": recovery is not None,
+            "line_loss_recovery_source": recovery_source,
+            "line_loss_recovery_target_x": recovery_target_x,
+            "line_loss_recovery_raw_error_640": recovery_raw_error,
+            "line_loss_recovery_mask_edge": recovery_mask_edge,
+            "line_loss_recovery_mask_edge_reference_x": (
+                recovery_mask_edge_reference_x),
             "line_loss_age_s": float(age),
             "line_loss_previous_speed_mps": float(previous_speed),
             "line_loss_held_speed_mps": float(speed),
             "line_loss_speed_reduced": bool(speed < previous_speed),
+        }
+
+    def _line_loss_recovery_target(
+            self, result, fallback_candidate, image_shape, lookahead_y,
+            held_target, visual_center_x):
+        if image_shape is None or len(image_shape) < 2:
+            return None
+        result = result if isinstance(result, dict) else {}
+        path_target = self._line_loss_path_target(
+            fallback_candidate, lookahead_y, source="candidate_path")
+        if path_target is not None:
+            return path_target
+        raw_target = self._line_loss_raw_path_target(
+            result, lookahead_y, source="raw_path")
+        if raw_target is not None:
+            return raw_target
+        mask_target = self._line_loss_mask_target(
+            result, image_shape, lookahead_y, held_target, visual_center_x)
+        if mask_target is not None:
+            return mask_target
+        if held_target is not None:
+            return {
+                "source": "held_path",
+                "target_x": float(held_target[0]),
+                "target_y": float(held_target[1]),
+                "held": True,
+            }
+        return None
+
+    def _line_loss_path_target(self, path, lookahead_y, source):
+        if not isinstance(path, dict):
+            return None
+        target = self._path_target_on_selected(path, lookahead_y)
+        if target is None:
+            return None
+        target_x, target_y, adaptive = target
+        return {
+            "source": str(source),
+            "target_x": float(target_x),
+            "target_y": float(target_y),
+            "adaptive": bool(adaptive),
+        }
+
+    def _line_loss_raw_path_target(self, result, lookahead_y, source):
+        centerline = result.get("centerline") or {}
+        raw_paths = result.get("raw_curve_paths")
+        if raw_paths is None:
+            raw_paths = centerline.get("raw_curve_paths")
+        raw_paths = list(raw_paths or ())
+        if not raw_paths:
+            return None
+        preferred_slot = int(self.selected_slot_lock or 0)
+        ordered = sorted(
+            raw_paths,
+            key=lambda item: (
+                0 if int((item or {}).get("slot", -1)) == preferred_slot
+                else 1,
+                int((item or {}).get("slot", 99)),
+            ))
+        for path in ordered:
+            target = self._line_loss_path_target(
+                path, lookahead_y, source=source)
+            if target is not None:
+                return target
+        return None
+
+    def _line_loss_mask_target(
+            self, result, image_shape, lookahead_y, held_target,
+            visual_center_x):
+        width = float(max(1, image_shape[1]))
+        last_target_x = _finite_float(self.last_path_target_x)
+        reference_x = (
+            float(held_target[0]) if held_target is not None
+            else (
+                float(last_target_x) if last_target_x is not None
+                else width * float(visual_center_x)))
+        constraint = self._road_mask_target_constraint(
+            result, image_shape, lookahead_y, reference_x, reference_x)
+        if not constraint["available"]:
+            return None
+        left_x = float(constraint["left_x"])
+        right_x = float(constraint["right_x"])
+        left_distance = abs(float(reference_x) - left_x)
+        right_distance = abs(float(reference_x) - right_x)
+        if left_distance <= right_distance:
+            target_x = left_x
+            mask_edge = "left"
+        else:
+            target_x = right_x
+            mask_edge = "right"
+        return {
+            "source": "road_mask_edge",
+            "target_x": float(target_x),
+            "target_y": float(lookahead_y),
+            "mask_edge": mask_edge,
+            "mask_edge_reference_x": float(reference_x),
+            "mask_left_x": left_x,
+            "mask_right_x": right_x,
+            "mask_row": constraint["mask_row"],
         }
 
     @staticmethod
@@ -3277,6 +3421,20 @@ class VisionControlPlanner:
             return self._human_pass_command(
                 lookahead_path_x, image_shape, 1)
 
+        if (
+            self.human_waiting_cross
+            and self._human_near_path_line(human["distance"], image_shape)
+        ):
+            self.human_waiting_cross = False
+            self.human_pass_active = True
+            self.human_detected_latched = False
+            self._remember_human_geom(geom, image_shape)
+            self.human_last_seen_ts = float(now)
+            pass_side = human["side"] or self.human_last_side or 1
+            return self._human_pass_command(
+                lookahead_path_x, image_shape, pass_side,
+                reason="human_near_path_restart")
+
         if self._human_on_stop_line(geom, image_shape, lookahead_y):
             self._clear_human_preline_state()
             self.human_detected_latched = True
@@ -3342,6 +3500,13 @@ class VisionControlPlanner:
             gap * 480.0 / float(max(1, image_shape[0])))
         # Reappearance before the line immediately releases a dropout wait.
         self.human_preline_wait_until = 0.0
+
+    def _human_near_path_line(self, distance_px, image_shape):
+        width = float(max(1, image_shape[1]))
+        distance_640 = abs(float(distance_px)) * 640.0 / width
+        return (
+            distance_640 <=
+            float(self.config.human_path_release_distance_px_640))
 
     def _human_preline_missing_waiting(self, now):
         gap = self.human_preline_last_gap_px_480

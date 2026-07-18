@@ -109,6 +109,7 @@ class VisionTelemetryLogger:
         runtime_snapshot = (
             runtime_snapshot if isinstance(runtime_snapshot, dict) else {})
         serial = runtime_snapshot.get("serial") or {}
+        serial_tx = serial.get("tx") or {}
         last_command = runtime_snapshot.get("last_command") or {}
         result = perception if isinstance(perception, dict) else {}
         temporal = result.get("temporal") or {}
@@ -231,6 +232,18 @@ class VisionTelemetryLogger:
                     target.get("line_loss_held_speed_mps")),
                 "line_loss_speed_reduced": bool(
                     target.get("line_loss_speed_reduced", False)),
+                "line_loss_recovery_active": bool(
+                    target.get("line_loss_recovery_active", False)),
+                "line_loss_recovery_source": target.get(
+                    "line_loss_recovery_source"),
+                "line_loss_recovery_target_x": _number(
+                    target.get("line_loss_recovery_target_x")),
+                "line_loss_recovery_raw_error_640": _number(
+                    target.get("line_loss_recovery_raw_error_640")),
+                "line_loss_recovery_mask_edge": target.get(
+                    "line_loss_recovery_mask_edge"),
+                "line_loss_recovery_mask_edge_reference_x": _number(
+                    target.get("line_loss_recovery_mask_edge_reference_x")),
             },
             "selection": {
                 "selected_slot": debug.get("selected_slot"),
@@ -253,7 +266,12 @@ class VisionTelemetryLogger:
                 "status": temporal.get("status"),
             },
             "runtime": {
+                "source": runtime_snapshot.get("source"),
                 "vision_age": _number(runtime_snapshot.get("vision_age")),
+                "vision_ttl": _number(runtime_snapshot.get("vision_ttl")),
+                "vision_hold_remaining": _number(
+                    runtime_snapshot.get("vision_hold_remaining")),
+                "serial_tx_ok": serial_tx.get("ok"),
                 "serial_input_error": _number(
                     serial.get("input_track_error")),
                 "serial_servo_output": serial.get("servo_output"),
@@ -263,6 +281,10 @@ class VisionTelemetryLogger:
                     serial.get("servo_limited_output")),
                 "runtime_last_track_error": _number(
                     last_command.get("track_error")),
+                "runtime_last_target_speed": _number(
+                    last_command.get("target_speed")),
+                "runtime_last_state_cmd": last_command.get("state_cmd"),
+                "runtime_last_flags": last_command.get("flags"),
             },
         }
         try:
