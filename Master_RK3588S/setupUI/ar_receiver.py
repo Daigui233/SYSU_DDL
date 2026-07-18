@@ -884,6 +884,150 @@ def add_runtime_overlay(frame, process_fps, inference_fps, ocr_response):
     return frame
 
 
+def _preview_mask_on_frame(mask, frame_shape):
+    """Resize a model-space semantic mask to the camera preview geometry."""
+    array = np.asarray(mask) if mask is not None else None
+    if array is None or array.ndim != 2 or not array.size:
+        return None
+    height, width = frame_shape[:2]
+    if array.shape != (height, width):
+        array = cv2.resize(
+            (array != 0).astype(np.float32), (width, height),
+            interpolation=cv2.INTER_LINEAR)
+    return array >= 0.50
+
+
+def _preview_blend_mask(frame, mask, color, alpha):
+    mask = _preview_mask_on_frame(mask, frame.shape)
+    if mask is None or not np.any(mask):
+        return False
+    color_layer = np.empty_like(frame)
+    color_layer[:] = np.asarray(color, dtype=np.uint8)
+    blended = cv2.addWeighted(
+        frame, 1.0 - float(alpha), color_layer, float(alpha), 0.0)
+    cv2.copyTo(blended, mask.astype(np.uint8) * 255, frame)
+    return True
+
+
+def _preview_draw_path(frame, points, color, thickness=2, dashed=False):
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+        return False
+    height, width = frame.shape[:2]
+    points = np.rint(points).astype(np.int32)
+    points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+    points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+    if dashed:
+        for index in range(0, len(points) - 1, 2):
+            cv2.line(frame, tuple(points[index]), tuple(points[index + 1]),
+                     color, max(1, int(thickness)), cv2.LINE_AA)
+    else:
+        cv2.polylines(
+            frame, [points], False, color, max(1, int(thickness)),
+            cv2.LINE_AA)
+    return True
+
+
+def add_semantic_centerline_overlay(
+        frame, result, draw_road=True, draw_paths=True, draw_status=True,
+        prepared_masks=None):
+    """Show the smoothed semantic road and finalized centerlines."""
+    if frame is None or frame.size == 0 or not isinstance(result, dict):
+        return frame
+    road = result.get("road") or {}
+    cleaned_mask = road.get("mask")
+    raw_mask = road.get("raw_mask")
+    if raw_mask is None:
+        raw_mask = result.get("road_mask_raw")
+    if raw_mask is None:
+        raw_mask = cleaned_mask
+    prepared_masks = (
+        prepared_masks if isinstance(prepared_masks, dict) else {})
+    cleaned_display = prepared_masks.get("cleaned")
+    hard_display = prepared_masks.get("hard")
+    if cleaned_display is None and cleaned_mask is not None:
+        cleaned_display = _preview_mask_on_frame(cleaned_mask, frame.shape)
+    if hard_display is None and raw_mask is not None:
+        hard_display = _preview_mask_on_frame(raw_mask, frame.shape)
+
+    centerline = result.get("centerline") or {}
+    final_paths = result.get("paths") or centerline.get("paths") or []
+
+    # The cleaned mask is the translucent road area; raw_mask is the hard
+    # semantic boundary. Connected-component cleanup already ran once in the
+    # 120x160 postprocessor, so repeating it at preview resolution is wasteful.
+    hard = None
+    if draw_road:
+        if cleaned_display is not None and np.any(cleaned_display):
+            _preview_blend_mask(
+                frame, cleaned_display, (70, 70, 210), 0.18)
+        hard = hard_display
+        if hard is not None and np.any(hard):
+            contours, _hierarchy = cv2.findContours(
+                hard.astype(np.uint8), cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(frame, contours, -1, (255, 210, 0), 1,
+                                 cv2.LINE_AA)
+
+    # Only finalized paths are shown. Raw row-head curves remain available in
+    # result data for diagnostics but are intentionally hidden from preview.
+    final_colors = ((255, 0, 0), (0, 255, 0))
+    if draw_paths:
+        visible = hard_display if hard_display is not None else cleaned_display
+        if visible is not None and np.any(visible):
+            path_layer = frame.copy()
+            for path in list(final_paths)[:2]:
+                points = (
+                    (path.get("preview_points_xy")
+                     if path.get("preview_points_xy") is not None
+                     else path.get("points_xy"))
+                    if isinstance(path, dict) else None)
+                slot = int(path.get("slot", 0)) if isinstance(path, dict) else 0
+                color = final_colors[0 if slot == 0 else 1]
+                _preview_draw_path(
+                    path_layer, points, (0, 0, 0), thickness=5)
+                _preview_draw_path(
+                    path_layer, points, color, thickness=3)
+                extension = (
+                    path.get("extension") if isinstance(path, dict) else None)
+                model_top_y = (
+                    extension.get("model_top_y")
+                    if isinstance(extension, dict) else None)
+                if model_top_y is not None:
+                    points = np.asarray(points, dtype=np.float32)
+                    if points.ndim == 2 and points.shape[1] == 2:
+                        extension_points = points[
+                            points[:, 1] <= float(model_top_y) + 6.0]
+                        _preview_draw_path(
+                            path_layer, extension_points, (255, 255, 255),
+                            thickness=2, dashed=False)
+            cv2.copyTo(
+                path_layer, visible.astype(np.uint8) * 255, frame)
+
+    vision_control = result.get("vision_control") or {}
+    topology = vision_control.get("centerline_topology") or {}
+    extension_reasons = []
+    for path in list(final_paths)[:2]:
+        extension = path.get("extension") if isinstance(path, dict) else None
+        if isinstance(extension, dict):
+            extension_reasons.append(str(extension.get("reason") or "-"))
+    hard_status = "ON" if raw_mask is not None else "NO_MASK"
+    road_status = "ON" if cleaned_mask is not None else "NO_MASK"
+    text = "ROAD={} HARD={} CL={} TOPO={} EXT={}".format(
+        road_status,
+        hard_status,
+        len(final_paths),
+        str(topology.get("reason") or "-")[:20],
+        ",".join(extension_reasons)[:30] or "-",
+    )
+    if draw_status:
+        cv2.putText(
+            frame, text, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+            (255, 255, 255), 1, cv2.LINE_AA)
+    return frame
+
+
 def add_camera_fault_overlay(
         frame, message="CAMERA FRAME INVALID"):
     height, width = frame.shape[:2]
@@ -1241,8 +1385,37 @@ def main():
                             ocr_response=latest_ocr_response):
                         if result is not None and render_perception is not None:
                             render_perception(target, result, mode=render_mode)
+                        semantic_masks = None
+                        if result is not None:
+                            road = result.get("road") or {}
+                            cleaned = road.get("mask")
+                            hard = road.get("raw_mask")
+                            if hard is None:
+                                hard = cleaned
+                            semantic_masks = {
+                                "cleaned": _preview_mask_on_frame(
+                                    cleaned, target.shape),
+                                "hard": _preview_mask_on_frame(
+                                    hard, target.shape),
+                            }
+                        if result is not None:
+                            # Draw the road first so later control/path layers
+                            # remain crisp instead of being tinted by it.
+                            add_semantic_centerline_overlay(
+                                target, result, draw_paths=False,
+                                draw_status=False,
+                                prepared_masks=semantic_masks)
                         if result is not None and render_vision_control is not None:
-                            render_vision_control(target, result)
+                            # The finalized curves are drawn once by the
+                            # clipped semantic overlay below.
+                            render_vision_control(
+                                target, result, draw_curves=False)
+                        if result is not None:
+                            # Draw only finalized/jointly-refitted centerlines
+                            # last; raw curve-head output stays hidden.
+                            add_semantic_centerline_overlay(
+                                target, result, draw_road=False,
+                                prepared_masks=semantic_masks)
                         target = add_runtime_overlay(
                             target, process_fps, inference_fps, ocr_response)
                         return target

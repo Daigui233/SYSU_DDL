@@ -62,7 +62,19 @@ ROAD_MAX_RAW_RATIO = min(
     1.0, _env_float("MULTITASK_ROAD_MAX_RAW_RATIO", 0.86))
 ROAD_MIN_COMPONENT_AREA_RATIO = max(
     0.0, _env_float("MULTITASK_ROAD_MIN_COMPONENT_AREA_RATIO", 0.0015))
-ROAD_MAX_COMPONENTS = max(1, _env_int("MULTITASK_ROAD_MAX_COMPONENTS", 3))
+ROAD_MAX_COMPONENTS = min(
+    2, max(1, _env_int("MULTITASK_ROAD_MAX_COMPONENTS", 2)))
+ROAD_SECOND_COMPONENT_MIN_AREA_RATIO = max(
+    ROAD_MIN_COMPONENT_AREA_RATIO,
+    _env_float("MULTITASK_ROAD_SECOND_COMPONENT_MIN_AREA_RATIO", 0.005))
+ROAD_SECOND_COMPONENT_MIN_LARGEST_RATIO = float(np.clip(
+    _env_float(
+        "MULTITASK_ROAD_SECOND_COMPONENT_MIN_LARGEST_RATIO", 0.15),
+    0.0, 1.0))
+ROAD_EDGE_SMOOTH_KERNEL = max(
+    1, min(9, _env_int("MULTITASK_ROAD_EDGE_SMOOTH_KERNEL", 5)))
+if ROAD_EDGE_SMOOTH_KERNEL % 2 == 0:
+    ROAD_EDGE_SMOOTH_KERNEL += 1
 ROAD_OVERLAY_ALPHA = float(np.clip(
     _env_float("MULTITASK_ROAD_OVERLAY_ALPHA", 0.28), 0.0, 1.0))
 RENDER_PATH_MIN_SCORE = float(np.clip(
@@ -116,32 +128,9 @@ def _probability_to_logit(probability):
 ROAD_LOGIT_THRESHOLD = _probability_to_logit(ROAD_THRESHOLD)
 
 
-def _road_component_score(labels, stats, label, height, width):
-    left, top, component_width, component_height, area = stats[label]
-    bottom_y = int(height * 0.72)
-    bottom_roi = labels[
-        bottom_y:, left:left + component_width] == label
-    bottom_contact = float(bottom_roi.sum()) / float(max(
-        1, component_width * max(1, height - bottom_y)))
-    xs = np.flatnonzero(bottom_roi.sum(axis=0))
-    if xs.size:
-        bottom_center = left + (xs[0] + xs[-1]) * 0.5
-        center_score = 1.0 - min(
-            1.0,
-            abs(bottom_center - width * 0.5) / max(1.0, width * 0.5),
-        )
-    else:
-        center_score = 0.0
-    area_score = float(area) / float(max(1, height * width))
-    height_score = float(component_height) / float(max(1, height))
-    return (
-        area_score * 3.0 + bottom_contact * 1.8 +
-        center_score * 0.6 + height_score * 0.35)
-
-
 def clean_road_mask(raw_mask, top_crop_ratio=ROAD_TOP_CROP_RATIO,
                     return_info=False):
-    """Adapt the main-branch road-mask cleanup to the 120x160 output."""
+    """Keep the largest road component and, conditionally, the second."""
     raw = (np.asarray(raw_mask) != 0).astype(np.uint8)
     raw_ratio = float(np.mean(raw)) if raw.size else 0.0
     mask = raw.copy()
@@ -161,17 +150,43 @@ def clean_road_mask(raw_mask, top_crop_ratio=ROAD_TOP_CROP_RATIO,
         left, top, component_width, component_height, area = stats[label]
         if area < min_area or component_width < 2 or component_height < 2:
             continue
-        score = _road_component_score(
-            labels, stats, label, height, width)
-        components.append((score, label))
-    components.sort(reverse=True)
+        components.append((int(area), int(label)))
+    # Road cleanup is deliberately based on component area rather than a
+    # bottom/centre heuristic. The latter can promote a small fragment merely
+    # because it happens to be close to the vehicle.
+    components.sort(key=lambda item: item[0], reverse=True)
+
+    retained = []
+    second_min_area = max(
+        min_area,
+        int(round(
+            height * width * ROAD_SECOND_COMPONENT_MIN_AREA_RATIO)))
+    second_relative_ratio = 0.0
+    if components:
+        retained.append(components[0])
+    if len(components) >= 2 and ROAD_MAX_COMPONENTS >= 2:
+        largest_area = max(1, int(components[0][0]))
+        second_area = int(components[1][0])
+        second_relative_ratio = float(second_area) / float(largest_area)
+        if (
+            second_area >= second_min_area
+            and second_relative_ratio >=
+                ROAD_SECOND_COMPONENT_MIN_LARGEST_RATIO
+        ):
+            retained.append(components[1])
+
     selected = np.zeros_like(mask)
-    for _score, label in components[:ROAD_MAX_COMPONENTS]:
+    for _area, label in retained:
         selected[labels == label] = 1
     if np.any(selected):
         selected = cv2.morphologyEx(
             selected, cv2.MORPH_CLOSE,
             np.ones((3, 3), dtype=np.uint8))
+        if ROAD_EDGE_SMOOTH_KERNEL >= 3:
+            softened = cv2.GaussianBlur(
+                selected.astype(np.float32),
+                (ROAD_EDGE_SMOOTH_KERNEL, ROAD_EDGE_SMOOTH_KERNEL), 0.0)
+            selected = (softened >= 0.50).astype(np.uint8)
 
     ratio = float(np.mean(selected)) if selected.size else 0.0
     if raw_ratio > ROAD_MAX_RAW_RATIO:
@@ -189,7 +204,13 @@ def clean_road_mask(raw_mask, top_crop_ratio=ROAD_TOP_CROP_RATIO,
         "reason": reason,
         "ratio": ratio if valid else 0.0,
         "raw_ratio": raw_ratio,
-        "component_count": min(len(components), ROAD_MAX_COMPONENTS),
+        "component_count": len(retained) if valid else 0,
+        "detected_component_count": len(components),
+        "component_areas": [int(area) for area, _label in retained]
+        if valid else [],
+        "second_component_kept": bool(valid and len(retained) == 2),
+        "second_component_relative_ratio": float(second_relative_ratio),
+        "second_component_min_area": int(second_min_area),
     }
     return (selected, info) if return_info else selected
 
@@ -467,6 +488,11 @@ def decode_outputs(
         pixel_logits[0] >= ROAD_LOGIT_THRESHOLD).astype(np.uint8)
     road_mask, road_quality = clean_road_mask(
         road_mask_raw, return_info=True)
+    # Use the retained connected regions as a selector on the untouched
+    # semantic pixels. This removes islands from the hard constraint without
+    # allowing morphology to invent drivable pixels outside the model mask.
+    road_constraint_mask = (
+        (road_mask_raw != 0) & (road_mask != 0)).astype(np.uint8)
     raw_curve_paths, model_path_count, count_confidence = \
         decode_raw_curve_paths(
             row_path_logits, path_scores, path_count_scores, image_shape)
@@ -478,7 +504,8 @@ def decode_outputs(
     road = {
         "probability": road_probability,
         "mask": road_mask,
-        "raw_mask": road_mask_raw,
+        "raw_mask": road_constraint_mask,
+        "model_raw_mask": road_mask_raw,
         "threshold": ROAD_THRESHOLD,
         "stride": PIXEL_STRIDE,
         **road_quality,
@@ -678,9 +705,10 @@ def finalize_inference(worker_result):
     source_frame = worker_result["source_frame"]
     result = decode_outputs(
         worker_result["outputs"], worker_result["image_shape"],
-        include_debug_probabilities=False)
-    # The realtime controller only needs the semantic road mask and raw row
-    # anchors. Do not retain logits after post-processing.
+        include_debug_probabilities=True)
+    # Keep only the existing model's low-resolution road probability map.
+    # Centerline graph completion consumes it on the CPU; the full logits are
+    # still released after this function returns.
     postprocess_ms = (time.perf_counter() - started) * 1000.0
     worker_timings = worker_result.get("timings_ms") or {}
     preprocess_ms = float(worker_timings.get("preprocess", 0.0))

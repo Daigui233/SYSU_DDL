@@ -21,11 +21,15 @@ from vision_control import (  # noqa: E402
     _FittedControlPathTracker,
     _associated_point_mask,
     _birdseye_debug_source_quad_from_road,
+    _centerline_refit_model_and_graph,
+    _centerline_local_forward_path,
+    _centerline_trim_far_tail,
     _densify_associated_lower_points,
     _extract_curve_preview_lines,
     _fit_smooth_majority_curve,
     _identity_probability_color,
     _semantic_road_point_mask,
+    _semantic_road_polyline_inside,
     render_vision_control_birdseye,
     render_vision_control_debug,
 )
@@ -108,6 +112,91 @@ def _road_mask_following_path(x_values, y_values, half_width_px=110.0):
 
 
 class CurveConstructionTest(unittest.TestCase):
+    def test_graph_extension_jointly_refits_one_smooth_curve(self):
+        model_y = np.asarray(
+            [140.0, 200.0, 280.0, 360.0, 440.0], dtype=np.float32)
+        model_x = 285.0 + 0.0008 * (model_y - 300.0) ** 2
+        model = np.stack((model_x, model_y), axis=1)
+        graph_y = np.asarray(
+            [48.0, 72.0, 96.0, 120.0, 140.0, 160.0, 180.0],
+            dtype=np.float32)
+        graph_x = np.asarray(
+            [248.0, 252.0, 258.0, 266.0, 274.0, 282.0, 288.0],
+            dtype=np.float32)
+        graph = np.stack((graph_x, graph_y), axis=1)
+        fused, _probabilities, info = _centerline_refit_model_and_graph(
+            model, np.full(len(model), 0.9, dtype=np.float32),
+            graph, np.full(len(graph), 0.7, dtype=np.float32),
+            (480, 640, 3), smoothness=2.5, join_error_px_640=42.0)
+        self.assertTrue(info["accepted"])
+        self.assertEqual(info["reason"], "graph_joint_refit")
+        self.assertTrue(info["joint_refit"])
+        self.assertLess(float(np.min(fused[:, 1])), float(np.min(model_y)))
+        model_region = fused[:, 1] >= float(np.min(model_y))
+        expected_x = np.interp(
+            fused[model_region, 1], model_y, model_x)
+        self.assertLess(float(np.median(np.abs(
+            fused[model_region, 0] - expected_x))), 8.0)
+        self.assertLess(float(np.max(np.abs(np.diff(
+            fused[:, 0], n=2)))), 1.0)
+
+    def test_polyline_constraint_rejects_segment_crossing_road_hole(self):
+        road = np.ones((120, 160), dtype=np.uint8)
+        road[68:73, 70:90] = 0
+        crossing = np.asarray(
+            [[120.0, 280.0], [520.0, 280.0]], dtype=np.float32)
+        self.assertTrue(np.all(_semantic_road_point_mask(
+            crossing, road, (480, 640, 3))))
+        self.assertFalse(_semantic_road_polyline_inside(
+            crossing, road, (480, 640, 3)))
+        contained = np.asarray(
+            [[120.0, 240.0], [120.0, 400.0]], dtype=np.float32)
+        self.assertTrue(_semantic_road_polyline_inside(
+            contained, road, (480, 640, 3)))
+
+    def test_extension_trims_only_far_tail_after_first_road_exit(self):
+        road = np.zeros((120, 160), dtype=np.uint8)
+        road[:, 50:105] = 1
+        y = np.arange(60.0, 461.0, 4.0, dtype=np.float32)
+        x = np.where(y < 200.0, 320.0 + (200.0 - y) * 1.1, 320.0)
+        points = np.stack((x.astype(np.float32), y), axis=1)
+        trimmed, _probabilities, info = _centerline_trim_far_tail(
+            points, np.ones(len(points), dtype=np.float32), road,
+            (480, 640, 3), model_top_y=200.0)
+        self.assertTrue(info["accepted"])
+        self.assertEqual(info["reason"], "extension_tail_trimmed")
+        self.assertGreater(info["trimmed_points"], 0)
+        self.assertGreater(info["remaining_extension_points"], 2)
+        self.assertTrue(_semantic_road_polyline_inside(
+            trimmed, road, (480, 640, 3)))
+        self.assertTrue(np.any(trimmed[:, 1] < 200.0))
+
+    def test_local_forward_search_follows_lateral_turn_inside_component(self):
+        support = np.zeros((30, 40), dtype=bool)
+        for y in range(30):
+            center = int(round(10.0 + (29.0 - y) * 0.30))
+            support[y, max(0, center - 1):min(40, center + 2)] = True
+        probability = np.where(support, 0.9, 0.0).astype(np.float32)
+        distance = np.where(support, 3.0, 0.0).astype(np.float32)
+        path = _centerline_local_forward_path(
+            probability, support, distance, (25, 11), 5,
+            direction=(-20.0, 6.0), lateral_radius=4)
+        self.assertGreaterEqual(len(path), 21)
+        self.assertEqual(sorted(set(point[0] for point in path)),
+                         list(range(5, 26)))
+        self.assertGreater(path[-1][1], path[0][1])
+        self.assertTrue(all(support[y, x] for y, x in path))
+
+    def test_local_forward_search_rejects_missing_row_without_global_fallback(self):
+        support = np.ones((20, 20), dtype=bool)
+        support[12, :] = False
+        probability = support.astype(np.float32)
+        distance = support.astype(np.float32)
+        path = _centerline_local_forward_path(
+            probability, support, distance, (18, 10), 2,
+            direction=(-1.0, 0.0), lateral_radius=3)
+        self.assertEqual(path, [])
+
     def test_association_rejects_isolated_outliers(self):
         points = np.asarray([
             [200, 460], [202, 440], [204, 420],
@@ -193,6 +282,204 @@ class CurveConstructionTest(unittest.TestCase):
 
 
 class VisionControlPlannerTest(unittest.TestCase):
+    def test_highly_overlapping_points_deduplicate_without_count_head(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        candidates = [_raw_path(0, 300.0, ys), _raw_path(1, 314.0, ys)]
+        filtered = planner._filter_centerline_candidates(
+            candidates, {}, (480, 640, 3))
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(planner.centerline_topology_debug["reason"],
+                         "overlap_dedup")
+        self.assertEqual(planner.centerline_topology_debug["candidate_count_after"], 1)
+
+    def test_fork_display_waits_for_two_stable_split_frames(self):
+        planner = VisionControlPlanner(config=_config())
+        # A forward fork shares the near trunk and separates toward the top.
+        # Two parallel curves alone are no longer enough to create a fork.
+        result = _trim_result(180.0, lookahead_gap_640=10.0)
+        result["centerline"]["path_count_scores"] = [0.05, 0.15, 0.80]
+        planner.update(result, now=1.0)
+        self.assertEqual(planner.centerline_topology_debug["candidate_count_after"], 1)
+        planner.update(result, now=1.04)
+        self.assertEqual(planner.centerline_topology_debug["candidate_count_after"], 2)
+
+    def test_parallel_pair_cannot_create_a_new_fork(self):
+        planner = VisionControlPlanner(config=_config())
+        result = _raw_result_at(220.0, 440.0)
+        result["centerline"]["path_count_scores"] = [0.05, 0.15, 0.80]
+        planner.update(result, now=1.0)
+        planner.update(result, now=1.04)
+        self.assertEqual(len(result["paths"]), 1)
+        self.assertEqual(
+            planner.centerline_topology_debug["pair_topology"], "PARALLEL")
+        self.assertFalse(planner.centerline_fork_active)
+
+    def test_merge_profile_cannot_create_a_new_fork(self):
+        planner = VisionControlPlanner(config=_config())
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        # Near the car the routes are separate; toward the horizon they merge.
+        gap = 10.0 + 170.0 * np.clip((ys - 60.0) / 400.0, 0.0, 1.0)
+        candidates = [_raw_path(0, 260.0, ys), _raw_path(1, 260.0 + gap, ys)]
+        result = {"centerline": {"path_count_scores": [0.05, 0.15, 0.80]}}
+        planner._filter_centerline_candidates(
+            candidates, result, (480, 640, 3))
+        filtered = planner._filter_centerline_candidates(
+            candidates, result, (480, 640, 3))
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(
+            planner.centerline_topology_debug["pair_topology"], "MERGE")
+        self.assertFalse(planner.centerline_fork_active)
+
+    def test_low_count_confidence_primes_but_does_not_publish_fork(self):
+        planner = VisionControlPlanner(config=_config())
+        candidates = _trim_result(
+            180.0, lookahead_gap_640=10.0)["raw_curve_paths"]
+        low = {"centerline": {
+            "path_count_scores": [0.10, 0.46, 0.44]}}
+        first = planner._filter_centerline_candidates(
+            candidates, low, (480, 640, 3))
+        self.assertEqual(len(first), 1)
+        self.assertEqual(planner.centerline_fork_pending_frames, 1)
+        self.assertFalse(planner.centerline_fork_active)
+
+        strong = {"centerline": {
+            "path_count_scores": [0.05, 0.15, 0.80]}}
+        second = planner._filter_centerline_candidates(
+            candidates, strong, (480, 640, 3))
+        self.assertEqual(len(second), 2)
+        self.assertTrue(planner.centerline_fork_active)
+
+    def test_route_identity_corrects_model_slot_swap(self):
+        planner = VisionControlPlanner(config=_config())
+        image_shape = (480, 640, 3)
+        planner._associate_raw_curve_slots(
+            [_raw_path(0, 220.0), _raw_path(1, 420.0)], image_shape)
+        associated = planner._associate_raw_curve_slots(
+            [_raw_path(0, 420.0), _raw_path(1, 220.0)], image_shape)
+        self.assertEqual(
+            [item["slot"] for item in associated], [1, 0])
+        self.assertEqual(
+            planner.centerline_route_association_debug["reason"],
+            "outer_inner_order_by_far_x")
+
+    def test_two_search_directions_force_outer_blue_inner_green(self):
+        planner = VisionControlPlanner(config=_config())
+        image_shape = (480, 640, 3)
+        # Even malformed/equal model slot labels cannot make both directions
+        # blue: geometry is authoritative whenever both paths are present.
+        outer = _raw_path(0, 210.0)
+        inner = _raw_path(0, 410.0)
+        associated = planner._associate_raw_curve_slots(
+            [inner, outer], image_shape)
+        by_x = sorted(
+            associated,
+            key=lambda item: float(np.median(item["points_xy"][:, 0])))
+        self.assertEqual(by_x[0]["slot"], 0)
+        self.assertEqual(by_x[0]["identity"], "left")
+        self.assertEqual(by_x[1]["slot"], 1)
+        self.assertEqual(by_x[1]["identity"], "right")
+
+    def test_single_curve_keeps_previous_route_identity(self):
+        planner = VisionControlPlanner(config=_config())
+        image_shape = (480, 640, 3)
+        planner._associate_raw_curve_slots(
+            [_raw_path(0, 210.0), _raw_path(1, 410.0)], image_shape)
+        planner.centerline_last_visible_slot = 1
+        single = planner._associate_raw_curve_slots(
+            [_raw_path(0, 300.0)], image_shape)
+        self.assertEqual(single[0]["slot"], 1)
+        self.assertEqual(single[0]["identity"], "right")
+
+    def test_merge_is_the_only_single_route_id_switch_point(self):
+        planner = VisionControlPlanner(config=_config())
+        planner.centerline_junction_state = "BRANCH_COMMITTED"
+        planner.centerline_junction_committed_slot = 0
+        planner.centerline_last_pair_topology = "MERGE"
+        candidate = [_raw_path(1, 300.0)]
+        filtered = planner._filter_centerline_candidates(
+            candidate, {}, (480, 640, 3))
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["slot"], 1)
+        self.assertEqual(planner.centerline_junction_committed_slot, 1)
+
+    def test_confirmed_fork_commits_and_suppresses_reappearing_outer_route(self):
+        planner = VisionControlPlanner(config=_config())
+        fork = _trim_result(
+            180.0, lookahead_gap_640=10.0)["raw_curve_paths"]
+        result = {"centerline": {
+            "path_count_scores": [0.05, 0.15, 0.80]}}
+        planner._filter_centerline_candidates(
+            fork, result, (480, 640, 3))
+        planner._filter_centerline_candidates(
+            fork, result, (480, 640, 3))
+        self.assertEqual(planner.centerline_junction_state, "FORK_CONFIRMED")
+
+        parallel = [_raw_path(0, 260.0), _raw_path(1, 440.0)]
+        filtered = planner._filter_centerline_candidates(
+            parallel, result, (480, 640, 3))
+        self.assertEqual(planner.centerline_junction_state, "BRANCH_COMMITTED")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["slot"], 0)
+
+        # A later merge-shaped outer curve remains topology evidence only; it
+        # cannot reopen the old fork or replace the committed route.
+        ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
+        gap = 10.0 + 170.0 * np.clip((ys - 60.0) / 400.0, 0.0, 1.0)
+        merge = [_raw_path(0, 260.0, ys), _raw_path(1, 260.0 + gap, ys)]
+        filtered = planner._filter_centerline_candidates(
+            merge, result, (480, 640, 3))
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["slot"], 0)
+
+    def test_committed_junction_rearms_after_stable_single_route(self):
+        planner = VisionControlPlanner(config=_config(
+            centerline_junction_rearm_frames=3))
+        planner.centerline_junction_state = "BRANCH_COMMITTED"
+        planner.centerline_junction_committed_slot = 0
+        single = [_raw_path(0, 260.0)]
+        for _ in range(3):
+            planner._filter_centerline_candidates(
+                single, {}, (480, 640, 3))
+        self.assertEqual(planner.centerline_junction_state, "REARM")
+        planner._filter_centerline_candidates(
+            single, {}, (480, 640, 3))
+        self.assertEqual(planner.centerline_junction_state, "NO_FORK")
+
+    def test_fork_preview_hides_shared_overlapping_trunk(self):
+        planner = VisionControlPlanner(config=_config())
+        result = _trim_result(180.0, lookahead_gap_640=10.0)
+        result["centerline"]["path_count_scores"] = [0.05, 0.15, 0.80]
+        planner.update(result, now=1.0)
+        planner.update(result, now=1.04)
+        self.assertEqual(len(result["paths"]), 2)
+        secondary = result["paths"][1]
+        self.assertGreater(len(secondary["preview_points_xy"]), 2)
+        self.assertLess(
+            len(secondary["preview_points_xy"]),
+            len(secondary["points_xy"]))
+
+    def test_stable_fork_holds_two_missing_frames_then_releases(self):
+        planner = VisionControlPlanner(config=_config())
+        result = _trim_result(180.0, lookahead_gap_640=10.0)
+        result["centerline"]["path_count_scores"] = [0.05, 0.15, 0.80]
+        planner.update(result, now=1.0)
+        planner.update(result, now=1.04)
+        self.assertEqual(len(result["paths"]), 2)
+
+        result["centerline"]["path_count_scores"] = [0.02, 0.90, 0.08]
+        planner.update(result, now=1.08)
+        self.assertEqual(len(result["paths"]), 2)
+        self.assertEqual(
+            planner.centerline_topology_debug["reason"],
+            "stable_fork_hold")
+        self.assertTrue(result["paths"][1]["fork_hold"])
+        planner.update(result, now=1.12)
+        self.assertEqual(len(result["paths"]), 2)
+        planner.update(result, now=1.16)
+        self.assertEqual(len(result["paths"]), 1)
+        self.assertFalse(planner.centerline_fork_active)
+
     def test_conflicting_control_defaults_match_e7(self):
         config = VisionControlConfig()
         self.assertEqual(config.lookahead_y_ratio, 0.625)
@@ -402,8 +689,8 @@ class VisionControlPlannerTest(unittest.TestCase):
         planner = VisionControlPlanner(config=_config())
         planner.update(_raw_result_at(220.0, 420.0), now=1.0)
         _command, pending = planner.update(
-            _raw_result_at(500.0, 420.0), now=1.04)
-        confirmed_result = _raw_result_at(500.0, 420.0)
+            _raw_result_at(500.0, 600.0), now=1.04)
+        confirmed_result = _raw_result_at(500.0, 600.0)
         _command, confirmed = planner.update(confirmed_result, now=1.08)
         self.assertAlmostEqual(
             pending["control_target"]["path_target_x"], 220.0, delta=1.0)
@@ -651,7 +938,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         planner.road_shape_valid = True
         ys = np.linspace(460.0, 60.0, 32, dtype=np.float32)
         xs = 400.0 + 0.0015 * (ys - 300.0) ** 2
-        result = _raw_result_at(400.0, 430.0)
+        result = _raw_result_at(400.0, 600.0)
         result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
         result["centerline"]["raw_curve_paths"][0] = result[
             "raw_curve_paths"][0]
@@ -753,7 +1040,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         centered_y = ys - 300.0
         xs = 260.0 + 0.00520833 * centered_y ** 2 - (
             0.45833333 * centered_y)
-        result = _raw_result_at(260.0, 430.0)
+        result = _raw_result_at(260.0, 760.0)
         result["raw_curve_paths"][0] = _raw_path(0, xs, ys)
         result["centerline"]["raw_curve_paths"][0] = result[
             "raw_curve_paths"][0]
@@ -1474,14 +1761,14 @@ class VisionControlPlannerTest(unittest.TestCase):
             "human_speed_hold")
 
         command, debug = planner.update(
-            _raw_result_at(500.0, 430.0), now=2.8)
+            _raw_result_at(500.0, 600.0), now=2.8)
         target = debug["control_target"]
         self.assertEqual(target["task_reason"], "human_path_return_guard")
         self.assertAlmostEqual(target["base_target_x"], 282.0, delta=1.0)
         self.assertLess(abs(command["track_error"]), 50.0)
 
         command, debug = planner.update(
-            _raw_result_at(500.0, 430.0), now=3.0)
+            _raw_result_at(500.0, 600.0), now=3.0)
         self.assertEqual(
             debug["control_target"]["task_reason"],
             "human_path_return_guard")
@@ -1489,7 +1776,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertLess(debug["control_target"]["base_target_x"], 450.0)
 
         command, debug = planner.update(
-            _raw_result_at(500.0, 430.0), now=3.3)
+            _raw_result_at(500.0, 600.0), now=3.3)
         self.assertEqual(debug["control_target"]["task_reason"], "track")
         self.assertAlmostEqual(
             debug["control_target"]["base_target_x"], 500.0, delta=1.0)

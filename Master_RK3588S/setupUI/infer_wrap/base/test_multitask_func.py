@@ -113,6 +113,43 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         self.assertEqual(int(cleaned[24, 18]), 1)
         self.assertEqual(int(cleaned[5, 5]), 0)
 
+    def test_road_cleanup_keeps_at_most_two_largest_components(self):
+        raw = np.zeros((100, 120), dtype=np.uint8)
+        raw[10:90, 5:40] = 1
+        raw[25:90, 55:82] = 1
+        raw[55:90, 100:116] = 1
+        cleaned, info = clean_road_mask(
+            raw, top_crop_ratio=0.0, return_info=True)
+        self.assertTrue(info["valid"])
+        self.assertEqual(info["detected_component_count"], 3)
+        self.assertEqual(info["component_count"], 2)
+        self.assertTrue(info["second_component_kept"])
+        self.assertEqual(int(cleaned[60, 20]), 1)
+        self.assertEqual(int(cleaned[60, 65]), 1)
+        self.assertEqual(int(cleaned[60, 108]), 0)
+
+    def test_road_cleanup_drops_small_second_component(self):
+        raw = np.zeros((100, 120), dtype=np.uint8)
+        raw[10:90, 5:45] = 1
+        raw[65:90, 95:107] = 1
+        cleaned, info = clean_road_mask(
+            raw, top_crop_ratio=0.0, return_info=True)
+        self.assertTrue(info["valid"])
+        self.assertEqual(info["detected_component_count"], 2)
+        self.assertEqual(info["component_count"], 1)
+        self.assertFalse(info["second_component_kept"])
+        self.assertLess(info["second_component_relative_ratio"], 0.15)
+        self.assertEqual(int(cleaned[75, 100]), 0)
+
+    def test_decode_hard_road_mask_excludes_raw_semantic_island(self):
+        outputs = list(self.make_outputs())
+        outputs[2][0, 0, 65:72, 2:9] = 8.0
+        result = decode_outputs(outputs, (480, 640, 3))
+        self.assertEqual(int(result["road_mask_raw"][68, 5]), 1)
+        self.assertEqual(int(result["road"]["model_raw_mask"][68, 5]), 1)
+        self.assertEqual(int(result["road"]["raw_mask"][68, 5]), 0)
+        self.assertEqual(int(result["road"]["raw_mask"][80, 80]), 1)
+
     def test_road_cleanup_rejects_full_frame_mask(self):
         cleaned, info = clean_road_mask(
             np.ones((120, 160), dtype=np.uint8),
@@ -256,7 +293,9 @@ class MultiTaskPostprocessTest(unittest.TestCase):
         np.testing.assert_array_equal(
             runtime.model_input[0, 0, 0], [30, 20, 10])
         self.assertIs(result["_source_frame"], image)
-        self.assertIsNone(result["road_probability"])
+        self.assertEqual(result["road_probability"].shape, (120, 160))
+        self.assertIs(
+            result["road_probability"], result["road"]["probability"])
         self.assertEqual(len(result["raw_curve_paths"]), 2)
         self.assertNotIn("paths", result)
         self.assertNotIn("path_heatmaps", result)

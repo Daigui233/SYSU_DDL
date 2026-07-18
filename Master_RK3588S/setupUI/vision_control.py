@@ -152,6 +152,29 @@ class VisionControlConfig:
     branch_separation_px_640: float = 70.0
     branch_separation_rows: int = 8
     overlap_px_640: float = 28.0
+    # Centerline-only post-processing.  These parameters operate on the
+    # existing semantic road output; they do not change the driving planner.
+    centerline_graph_min_probability: float = 0.35
+    centerline_graph_top_ratio: float = 0.18
+    centerline_graph_endpoint_band_rows: int = 3
+    centerline_graph_min_progress_rows: int = 3
+    centerline_graph_seed_radius: int = 4
+    centerline_graph_smoothness: float = 2.5
+    centerline_graph_min_quality: float = 0.34
+    centerline_graph_join_error_px_640: float = 42.0
+    centerline_count_two_min_probability: float = 0.40
+    centerline_count_two_margin: float = 0.04
+    centerline_secondary_quality_ratio: float = 0.62
+    # A low-confidence fork may prime temporal confirmation, but it cannot
+    # create a visible branch without one strong count-head frame.
+    centerline_count_two_low_probability: float = 0.24
+    centerline_route_match_margin_px_640: float = 14.0
+    centerline_route_match_max_px_640: float = 110.0
+    # Hysteresis for displaying a second branch; it suppresses one-frame
+    # curve-head/fit jumps while keeping a real fork visible.
+    centerline_fork_confirm_frames: int = 2
+    centerline_fork_release_frames: int = 3
+    centerline_junction_rearm_frames: int = 5
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
     curve_merge_support_ratio: float = 0.70
@@ -331,6 +354,57 @@ class VisionControlConfig:
             branch_separation_px_640=max(1.0, _env_float("VISION_CONTROL_BRANCH_SEP_640", 70.0)),
             branch_separation_rows=max(1, _env_int("VISION_CONTROL_BRANCH_SEP_ROWS", 8)),
             overlap_px_640=max(1.0, _env_float("VISION_CONTROL_OVERLAP_640", 28.0)),
+            centerline_graph_min_probability=_clamp(
+                _env_float("VISION_CONTROL_CENTERLINE_GRAPH_MIN_PROB", 0.35),
+                0.10, 0.90),
+            centerline_graph_top_ratio=_clamp(
+                _env_float("VISION_CONTROL_CENTERLINE_GRAPH_TOP_RATIO", 0.18),
+                0.05, 0.45),
+            centerline_graph_endpoint_band_rows=max(
+                1, _env_int(
+                    "VISION_CONTROL_CENTERLINE_GRAPH_ENDPOINT_BAND", 3)),
+            centerline_graph_min_progress_rows=max(
+                2, _env_int(
+                    "VISION_CONTROL_CENTERLINE_GRAPH_MIN_PROGRESS", 3)),
+            centerline_graph_seed_radius=max(
+                1, _env_int(
+                    "VISION_CONTROL_CENTERLINE_GRAPH_SEED_RADIUS", 4)),
+            centerline_graph_smoothness=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_GRAPH_SMOOTHNESS", 2.5)),
+            centerline_graph_min_quality=_clamp(
+                _env_float("VISION_CONTROL_CENTERLINE_MIN_QUALITY", 0.34),
+                0.0, 1.0),
+            centerline_graph_join_error_px_640=max(
+                1.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_GRAPH_JOIN_ERROR_640", 42.0)),
+            centerline_count_two_min_probability=_clamp(
+                _env_float("VISION_CONTROL_CENTERLINE_COUNT_TWO_MIN_PROB", 0.40),
+                0.20, 0.90),
+            centerline_count_two_margin=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_COUNT_TWO_MARGIN", 0.04)),
+            centerline_secondary_quality_ratio=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CENTERLINE_SECONDARY_QUALITY_RATIO", 0.62),
+                0.20, 1.0),
+            centerline_count_two_low_probability=_clamp(
+                _env_float(
+                    "VISION_CONTROL_CENTERLINE_COUNT_TWO_LOW_PROB", 0.24),
+                0.10, 0.60),
+            centerline_route_match_margin_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_ROUTE_MATCH_MARGIN_640", 14.0)),
+            centerline_route_match_max_px_640=max(
+                20.0, _env_float(
+                    "VISION_CONTROL_CENTERLINE_ROUTE_MATCH_MAX_640", 110.0)),
+            centerline_fork_confirm_frames=max(
+                1, _env_int("VISION_CONTROL_CENTERLINE_FORK_CONFIRM", 2)),
+            centerline_fork_release_frames=max(
+                1, _env_int("VISION_CONTROL_CENTERLINE_FORK_RELEASE", 3)),
+            centerline_junction_rearm_frames=max(
+                2, _env_int(
+                    "VISION_CONTROL_CENTERLINE_JUNCTION_REARM", 5)),
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
             ocr_confirm_frames=max(1, _env_int("VISION_CONTROL_OCR_CONFIRM_FRAMES", 1)),
@@ -497,6 +571,27 @@ class VisionControlPlanner:
         self.curve_merge_reason = "inactive"
         self.curve_merge_metrics = {}
         self.selection_reason = "initial"
+        self.centerline_topology_debug = {
+            "active": False,
+            "reason": "initial",
+        }
+        self.centerline_fork_active = False
+        self.centerline_fork_pending_frames = 0
+        self.centerline_fork_clear_frames = 0
+        self.centerline_branch_split_y = None
+        self.centerline_fork_cache = {}
+        self.centerline_fork_primary_slot = None
+        # Logical route IDs are kept independently from model output slots.
+        # This is a two-route, constant-time association (no tracking package).
+        self.centerline_route_signatures = {}
+        self.centerline_last_visible_slot = None
+        self.centerline_last_pair_topology = "UNKNOWN"
+        self.centerline_route_association_debug = {
+            "active": False, "reason": "initial"}
+        self.centerline_junction_state = "NO_FORK"
+        self.centerline_junction_state_frames = 0
+        self.centerline_junction_committed_slot = None
+        self.centerline_junction_single_frames = 0
         self.last_valid_ocr_ts = 0.0
         self.ocr_pending_direction = None
         self.ocr_pending_frames = 0
@@ -568,11 +663,20 @@ class VisionControlPlanner:
         perception_result = (
             perception_result if isinstance(perception_result, dict) else {})
         image_shape = self._image_shape(perception_result)
+        response = ocr_response if isinstance(ocr_response, dict) else {}
+        # A current OCR direction is available before candidate filtering.
+        # Use it only as the tie-breaker for geometrically overlapping slots;
+        # the normal confirmation/lock state is still updated below.
+        raw_preview_direction, raw_preview_current = (
+            self._extract_ocr_direction(response))
+        preferred_slot = None
+        if raw_preview_current:
+            preferred_slot = 1 if raw_preview_direction == "right" else 0
         candidates, search_ms = self._extract_candidates(
-            perception_result, image_shape, now=now)
+            perception_result, image_shape, now=now,
+            preferred_slot=preferred_slot)
         self._update_turnsign_curve_separation(candidates, image_shape)
 
-        response = ocr_response if isinstance(ocr_response, dict) else {}
         incoming_session_id = response.get("session_id")
         if (
             bool(response.get("session_active"))
@@ -644,6 +748,12 @@ class VisionControlPlanner:
             image_shape, now, ocr_response,
             line_loss_reason=line_loss_reason)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        detected_path_count = perception_result.get("detected_path_count")
+        if detected_path_count is None:
+            detected_path_count = self.centerline_topology_debug.get(
+                "model_path_count")
+        if detected_path_count is None:
+            detected_path_count = 2 if len(candidates) >= 2 else 1
         debug = {
             "enabled": True,
             "route_state": route_state,
@@ -682,6 +792,16 @@ class VisionControlPlanner:
             "curve_merge_blue_stable_frames": (
                 self.curve_merge_blue_stable_frames),
             "curve_merge_metrics": dict(self.curve_merge_metrics),
+            "centerline_topology": dict(self.centerline_topology_debug),
+            "centerline_route_association": dict(
+                self.centerline_route_association_debug),
+            "centerline_junction_state": self.centerline_junction_state,
+            "centerline_junction_state_frames": int(
+                self.centerline_junction_state_frames),
+            "centerline_junction_committed_slot": (
+                self.centerline_junction_committed_slot),
+            "centerline_junction_single_frames": int(
+                self.centerline_junction_single_frames),
             "raw_ocr_direction": (
                 raw_ocr_direction if raw_ocr_current else None),
             "raw_ocr_current": bool(raw_ocr_current),
@@ -739,8 +859,7 @@ class VisionControlPlanner:
             "selected_slot": (
                 None if selected is None else int(selected.get("slot", -1))),
             "candidate_count": len(candidates),
-            "detected_path_count": int(perception_result.get(
-                "detected_path_count", 2 if len(candidates) >= 2 else 1)),
+            "detected_path_count": int(detected_path_count),
             "valid_path_count": len(candidates),
             "candidates": [
                 self._summarize_candidate(item, image_shape)
@@ -761,30 +880,210 @@ class VisionControlPlanner:
         perception_result["vision_control"] = debug
         return command, debug
 
-    def _extract_candidates(self, result, image_shape, now=None):
+    @staticmethod
+    def _centerline_route_signature(path, image_shape):
+        """Describe one route at fixed far/middle/near image rows."""
+        points = np.asarray(path.get("points_xy", ()), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+            return np.full(3, np.nan, dtype=np.float32)
+        rows = float(image_shape[0]) * np.asarray(
+            (0.28, 0.53, 0.78), dtype=np.float32)
+        return _interp_path_x_many(points, rows).astype(np.float32)
+
+    @staticmethod
+    def _centerline_signature_cost(first, second, image_shape):
+        first = np.asarray(first, dtype=np.float32)
+        second = np.asarray(second, dtype=np.float32)
+        valid = np.isfinite(first) & np.isfinite(second)
+        if not np.any(valid):
+            return 1e6
+        distances = np.abs(first[valid] - second[valid])
+        # The far sample changes fastest on bends, so the median of the three
+        # samples is more stable than a single endpoint comparison.
+        return float(np.median(distances) * 640.0 /
+                     float(max(1, image_shape[1])))
+
+    def _update_centerline_route_signature(self, slot, signature):
+        signature = np.asarray(signature, dtype=np.float32)
+        previous = self.centerline_route_signatures.get(int(slot))
+        if previous is None:
+            self.centerline_route_signatures[int(slot)] = signature.copy()
+            return
+        previous = np.asarray(previous, dtype=np.float32)
+        merged = previous.copy()
+        current_valid = np.isfinite(signature)
+        old_valid = np.isfinite(previous)
+        merged[current_valid & ~old_valid] = signature[current_valid & ~old_valid]
+        both = current_valid & old_valid
+        merged[both] = 0.60 * previous[both] + 0.40 * signature[both]
+        self.centerline_route_signatures[int(slot)] = merged
+
+    def _associate_raw_curve_slots(self, raw_paths, image_shape):
+        """Map left/outer to blue slot 0 and right/inner to green slot 1."""
+        paths = [dict(path) for path in list(raw_paths or [])[:2]]
+        if not paths:
+            self.centerline_route_association_debug = {
+                "active": False, "reason": "no_path"}
+            return paths
+        signatures = [
+            self._centerline_route_signature(path, image_shape)
+            for path in paths
+        ]
+        previous = self.centerline_route_signatures
+        assigned_slots = [int(path.get("slot", index))
+                          for index, path in enumerate(paths)]
+        reason = "initialize_model_slots"
+        direct_cost = None
+        swapped_cost = None
+        lateral_x = []
+        for path, signature in zip(paths, signatures):
+            finite_signature = signature[np.isfinite(signature)]
+            if len(finite_signature):
+                # Prefer the far sample because the two branches share their
+                # near trunk. Fall back to the path median only if necessary.
+                lateral_x.append(float(finite_signature[0]))
+            else:
+                points = np.asarray(path.get("points_xy", ()), dtype=np.float32)
+                lateral_x.append(
+                    float(np.median(points[:, 0])) if len(points) else 1e9)
+        if len(paths) == 2:
+            far_gap = abs(lateral_x[0] - lateral_x[1]) * 640.0 / float(
+                max(1, image_shape[1]))
+            # Once the two routes are close at the far end, preserve their
+            # historical IDs through the merge instead of sorting noise.
+            use_history = bool(
+                0 in previous and 1 in previous
+                and far_gap <= float(self.config.overlap_px_640) * 1.5)
+            if use_history:
+                direct_cost = (
+                    self._centerline_signature_cost(
+                        signatures[0], previous[0], image_shape)
+                    + self._centerline_signature_cost(
+                        signatures[1], previous[1], image_shape))
+                swapped_cost = (
+                    self._centerline_signature_cost(
+                        signatures[0], previous[1], image_shape)
+                    + self._centerline_signature_cost(
+                        signatures[1], previous[0], image_shape))
+                if (swapped_cost + float(
+                        self.config.centerline_route_match_margin_px_640)
+                        < direct_cost):
+                    assigned_slots = [1, 0]
+                    reason = "merge_history_swap"
+                else:
+                    assigned_slots = [0, 1]
+                    reason = "merge_history_assignment"
+            else:
+                left_index, right_index = sorted(
+                    range(2), key=lambda index: (lateral_x[index], index))
+                assigned_slots[left_index] = 0
+                assigned_slots[right_index] = 1
+                reason = "outer_inner_order_by_far_x"
+        elif (len(paths) == 1 and 0 in previous and 1 in previous):
+            costs = [
+                self._centerline_signature_cost(
+                    signatures[0], previous[slot], image_shape)
+                for slot in (0, 1)
+            ]
+            previous_slot = self.centerline_last_visible_slot
+            if previous_slot not in (0, 1):
+                previous_slot = self.centerline_junction_committed_slot
+            if previous_slot in (0, 1) and costs[int(previous_slot)] <= (
+                    self.config.centerline_route_match_max_px_640 * 1.35):
+                assigned_slots = [int(previous_slot)]
+                reason = "single_path_previous_id"
+            else:
+                best_slot = int(np.argmin(costs))
+                if costs[best_slot] <= self.config.centerline_route_match_max_px_640:
+                    assigned_slots = [best_slot]
+                    reason = "single_path_nearest_id"
+                else:
+                    reason = "single_path_assignment_ambiguous"
+        for index, (path, slot, signature) in enumerate(zip(
+                paths, assigned_slots, signatures)):
+            model_slot = int(path.get("slot", index))
+            path["model_slot"] = model_slot
+            path["slot"] = int(slot)
+            path["role"] = "left" if int(slot) == 0 else "right"
+            path["identity"] = path["role"]
+            self._update_centerline_route_signature(slot, signature)
+        if len(paths) == 1 and assigned_slots[0] in (0, 1):
+            self.centerline_last_visible_slot = int(assigned_slots[0])
+        self.centerline_route_association_debug = {
+            "active": True,
+            "reason": reason,
+            "model_slots": [int(path.get("model_slot", -1)) for path in paths],
+            "logical_slots": [int(path.get("slot", -1)) for path in paths],
+            "far_x": lateral_x,
+            "direct_cost_640": direct_cost,
+            "swapped_cost_640": swapped_cost,
+        }
+        return paths
+
+    def _extract_candidates(
+            self, result, image_shape, now=None, preferred_slot=None):
         started = time.perf_counter()
         centerline = result.get("centerline") or {}
-        road = (result.get("road") or {}).get("mask")
+        road_info = result.get("road") or {}
+        road = road_info.get("mask")
         if road is None:
             road = result.get("road_mask")
+        hard_road = road_info.get("raw_mask")
+        if hard_road is None:
+            hard_road = road
+        road_probability = road_info.get("probability")
+        if road_probability is None:
+            road_probability = result.get("road_probability")
         raw_curve_paths = result.get("raw_curve_paths")
         if raw_curve_paths is None:
             raw_curve_paths = centerline.get("raw_curve_paths")
+        raw_curve_paths = self._associate_raw_curve_slots(
+            list(raw_curve_paths or [])[:2], image_shape)
+        count_evidence = self._centerline_count_evidence(result)
+        if (
+            count_evidence.get("active")
+            and int(count_evidence.get("model_path_count", -1)) == 1
+            and float(count_evidence.get("count_confidence", 0.0)) >= 0.72
+            and len(count_evidence.get("scores") or []) >= 3
+            and float(count_evidence["scores"][1]) >=
+                float(count_evidence["scores"][2]) + 0.12
+            and len(raw_curve_paths) > 1
+        ):
+            preferred_slot = 1 if self.branch_lock == "right" else 0
+            preferred = next((
+                path for path in raw_curve_paths
+                if int(path.get("slot", -1)) == preferred_slot), None)
+            if preferred is None:
+                preferred = max(
+                    raw_curve_paths,
+                    key=lambda path: float(path.get("score", 0.0)))
+            raw_curve_paths = [preferred]
         candidates = self._build_fitted_control_paths(
-            raw_curve_paths or [], road, image_shape, now=now)
+            raw_curve_paths, road, image_shape, now=now,
+            road_probability=road_probability, hard_road_mask=hard_road)
+        candidates = self._filter_centerline_candidates(
+            candidates, result, image_shape, preferred_slot=preferred_slot)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
         self._publish_filtered_paths(result, candidates)
         elapsed = (time.perf_counter() - started) * 1000.0
         return candidates, elapsed
 
     def _build_fitted_control_paths(
-            self, raw_paths, road_mask, image_shape, now=None):
+            self, raw_paths, road_mask, image_shape, now=None,
+            road_probability=None, hard_road_mask=None):
         height, width = image_shape[:2]
         lookahead_y = float(height) * self.config.lookahead_y_ratio
         confidence_split_y = max(0.0, lookahead_y - 10.0)
         timestamp = time.monotonic() if now is None else float(now)
         fitted_paths = []
         present_slots = set()
+        validation_mask = hard_road_mask
+        if validation_mask is None:
+            validation_mask = road_mask
+        graph_context = _centerline_probability_support(
+            road_probability, road_mask,
+            self.config.centerline_graph_min_probability,
+            hard_mask=hard_road_mask)
         for raw_path in list(raw_paths)[:2]:
             slot = int(raw_path.get("slot", len(fitted_paths)))
             present_slots.add(slot)
@@ -805,7 +1104,7 @@ class VisionControlPlanner:
                     len(points), float(raw_path.get("score", 1.0)),
                     dtype=np.float32)
             inside_road = _semantic_road_point_mask(
-                points, road_mask, image_shape)
+                points, validation_mask, image_shape)
             associated = _associated_point_mask(
                 points, width, eligible_mask=inside_road)
             points, probabilities = _densify_associated_lower_points(
@@ -817,16 +1116,38 @@ class VisionControlPlanner:
             probabilities = probabilities[inside_road]
             points, probabilities, inliers = _fit_smooth_majority_curve(
                 points, probabilities, width, extend_to_y=lookahead_y)
+            # The polynomial fit is only a proposal. Keep one continuous
+            # in-road segment, then reject it if any rasterized edge crosses
+            # the hard semantic mask.
+            fitted_inside = _semantic_road_point_mask(
+                points, validation_mask, image_shape)
+            points, probabilities = _select_control_curve_segment(
+                points, probabilities, fitted_inside, lookahead_y)
+            if (len(points) < 3 or not _semantic_road_polyline_inside(
+                    points, validation_mask, image_shape)):
+                self.fitted_control_tracker.update(
+                    slot, np.empty((0, 2)), np.empty((0,)),
+                    image_shape, now=timestamp)
+                continue
+            points, probabilities, extension_info = (
+                _centerline_extend_with_graph(
+                    points, probabilities, road_probability, road_mask,
+                    image_shape, self.config, hard_mask=hard_road_mask,
+                    prepared=graph_context))
             points, probabilities = self.fitted_control_tracker.update(
                 slot, points, probabilities, image_shape, now=timestamp)
             inside_road = _semantic_road_point_mask(
-                points, road_mask, image_shape)
+                points, validation_mask, image_shape)
             points, probabilities = _select_control_curve_segment(
                 points, probabilities, inside_road, lookahead_y)
-            if len(points) < 3:
+            if (len(points) < 3 or not _semantic_road_polyline_inside(
+                    points, validation_mask, image_shape)):
                 continue
+            inside_road = _semantic_road_point_mask(
+                points, validation_mask, image_shape)
             fitted_paths.append({
                 "slot": slot,
+                "model_slot": int(raw_path.get("model_slot", slot)),
                 "role": "left" if slot == 0 else "right",
                 "identity": "left" if slot == 0 else "right",
                 "source": "fitted_control_curve",
@@ -834,6 +1155,10 @@ class VisionControlPlanner:
                 "coverage": float(len(points)) / max(1.0, float(height)),
                 "row_support": int(np.count_nonzero(inliers)),
                 "point_confidences": probabilities.astype(np.float32),
+                "road_support": float(np.mean(inside_road))
+                if len(inside_road) else 0.0,
+                "hard_road_constraint": validation_mask is not None,
+                "extension": dict(extension_info),
                 "points_xy": points.astype(np.float32),
                 "spatial_prefiltered": True,
                 "fitted_control": True,
@@ -845,6 +1170,762 @@ class VisionControlPlanner:
                     image_shape, now=timestamp)
         fitted_paths.sort(key=lambda item: int(item.get("slot", 99)))
         return fitted_paths[:2]
+
+    @staticmethod
+    def _centerline_candidate_quality(candidate):
+        points = np.asarray(candidate.get("points_xy", ()), dtype=np.float32)
+        probabilities = np.asarray(
+            candidate.get("point_confidences", ()), dtype=np.float32)
+        score = _clamp(_finite_float(candidate.get("score"), 0.0), 0.0, 1.0)
+        point_quality = (
+            float(np.median(np.clip(probabilities, 0.0, 1.0)))
+            if len(probabilities) else 0.0)
+        road_support = _clamp(
+            _finite_float(candidate.get("road_support"), 0.0), 0.0, 1.0)
+        row_support = min(
+            1.0, float(candidate.get("row_support", 0)) / 16.0)
+        coverage = min(
+            1.0, float(len(points)) / 80.0) if len(points) else 0.0
+        return float(
+            0.38 * score + 0.30 * point_quality
+            + 0.20 * road_support + 0.08 * max(row_support, coverage))
+
+    def _centerline_count_evidence(self, result):
+        centerline = result.get("centerline") or {}
+        scores = centerline.get("path_count_scores")
+        if scores is None:
+            scores = centerline.get("path_count_probabilities")
+        if scores is None:
+            scores = result.get("path_count_scores")
+        try:
+            scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            scores = np.empty((0,), dtype=np.float32)
+        if len(scores) < 3 or not np.all(np.isfinite(scores)):
+            return {
+                "active": False,
+                "reason": "count_head_unavailable",
+                "scores": [],
+                "model_path_count": None,
+                "count_confidence": 0.0,
+            }
+        scores = np.clip(scores[:3], 0.0, 1.0)
+        total = float(np.sum(scores))
+        if total > 1e-6:
+            scores = scores / total
+        model_count = int(np.argmax(scores))
+        return {
+            "active": True,
+            "reason": "count_head",
+            "scores": [float(value) for value in scores],
+            "model_path_count": model_count,
+            "count_confidence": float(scores[model_count]),
+        }
+
+    def _centerline_pair_topology(self, stats):
+        """Classify how two routes change from the car toward the horizon."""
+        if int(stats.get("valid_rows", 0)) < 6:
+            return "AMBIGUOUS"
+        mean_distance = float(stats.get("mean_distance_640", 1e9))
+        far = float(stats.get("far_mean_distance_640", 1e9))
+        near = float(stats.get("near_mean_distance_640", 1e9))
+        separation = float(self.config.branch_separation_px_640)
+        overlap = float(self.config.overlap_px_640)
+        trend_min = max(18.0, overlap * 0.65)
+        close_limit = max(overlap * 1.50, separation * 0.65)
+        if mean_distance <= overlap:
+            return "OVERLAP"
+        # A real forward fork shares its near trunk and opens toward the top.
+        if (far >= separation and near <= close_limit
+                and far - near >= trend_min):
+            return "FORK"
+        # The reverse profile is a merge/exit view, not a new junction.
+        if (near >= separation and far <= close_limit
+                and near - far >= trend_min):
+            return "MERGE"
+        if (far >= separation * 0.75 and near >= separation * 0.75
+                and abs(far - near) <= max(28.0, separation * 0.45)):
+            return "PARALLEL"
+        if far >= separation * 0.80 and far - near >= trend_min:
+            return "FORK"
+        if near >= separation * 0.80 and near - far >= trend_min:
+            return "MERGE"
+        return "AMBIGUOUS"
+
+    def _set_centerline_junction_state(self, state, preferred_slot=None):
+        state = str(state)
+        if state == self.centerline_junction_state:
+            self.centerline_junction_state_frames += 1
+            return
+        self.centerline_junction_state = state
+        self.centerline_junction_state_frames = 1
+        if state == "BRANCH_COMMITTED":
+            self.centerline_junction_committed_slot = int(
+                preferred_slot if preferred_slot in (0, 1)
+                else (1 if self.branch_lock == "right" else 0))
+            self.centerline_junction_single_frames = 0
+            # A committed route must not resurrect the old alternative from
+            # the short fork cache when an outer/merging road reappears.
+            self.centerline_fork_active = False
+            self.centerline_fork_pending_frames = 0
+            self.centerline_fork_clear_frames = 0
+            self.centerline_branch_split_y = None
+            self._clear_stable_fork()
+        elif state == "NO_FORK":
+            self.centerline_junction_committed_slot = None
+            self.centerline_junction_single_frames = 0
+
+    def _advance_centerline_junction(
+            self, topology, low_fork_evidence, preferred_slot,
+            selected_route_visible=True):
+        """Advance the visual junction lifecycle without global position."""
+        topology = str(topology)
+        state = self.centerline_junction_state
+        if state == "NO_FORK":
+            if low_fork_evidence:
+                self._set_centerline_junction_state(
+                    "FORK_CANDIDATE", preferred_slot)
+            else:
+                self.centerline_junction_state_frames += 1
+        elif state == "FORK_CANDIDATE":
+            if self.centerline_fork_active:
+                self._set_centerline_junction_state(
+                    "FORK_CONFIRMED", preferred_slot)
+            elif not low_fork_evidence:
+                self._set_centerline_junction_state("NO_FORK")
+            else:
+                self.centerline_junction_state_frames += 1
+        elif state == "FORK_CONFIRMED":
+            if topology in {"MERGE", "PARALLEL"}:
+                self._set_centerline_junction_state(
+                    "BRANCH_COMMITTED", preferred_slot)
+            elif not self.centerline_fork_active and not low_fork_evidence:
+                self._set_centerline_junction_state(
+                    "BRANCH_COMMITTED", preferred_slot)
+            else:
+                self.centerline_junction_state_frames += 1
+        elif state == "BRANCH_COMMITTED":
+            committed = self.centerline_junction_committed_slot
+            if (topology in {"OVERLAP", "SINGLE"}
+                    and selected_route_visible
+                    and committed in (0, 1)):
+                self.centerline_junction_single_frames += 1
+                if (self.centerline_junction_single_frames >=
+                        self.config.centerline_junction_rearm_frames):
+                    self._set_centerline_junction_state(
+                        "REARM", committed)
+            else:
+                self.centerline_junction_single_frames = 0
+                self.centerline_junction_state_frames += 1
+        elif state == "REARM":
+            if topology in {"OVERLAP", "SINGLE"}:
+                self._set_centerline_junction_state("NO_FORK")
+            elif topology in {"MERGE", "PARALLEL"}:
+                # Old-junction geometry is still visible; keep suppressing it.
+                self._set_centerline_junction_state(
+                    "BRANCH_COMMITTED",
+                    self.centerline_junction_committed_slot)
+            else:
+                self.centerline_junction_state_frames += 1
+
+    def _committed_centerline_candidates(
+            self, candidates, preferred_slot, allow_merge_switch=False):
+        slot = self.centerline_junction_committed_slot
+        if slot not in (0, 1):
+            slot = int(preferred_slot if preferred_slot in (0, 1)
+                       else (1 if self.branch_lock == "right" else 0))
+        selected = [candidate for candidate in candidates
+                    if int(candidate.get("slot", -1)) == int(slot)][:1]
+        if selected or not allow_merge_switch or len(candidates) != 1:
+            return selected
+        replacement = candidates[0]
+        replacement_slot = int(replacement.get("slot", -1))
+        if replacement_slot in (0, 1):
+            self.centerline_junction_committed_slot = replacement_slot
+            self.centerline_last_visible_slot = replacement_slot
+            return [replacement]
+        return []
+
+    def _filter_centerline_candidates(
+            self, candidates, result, image_shape, preferred_slot=None):
+        evidence = self._centerline_count_evidence(result)
+        candidates = list(candidates or [])
+        for candidate in candidates:
+            candidate["centerline_quality"] = self._centerline_candidate_quality(
+                candidate)
+        preferred_slot = (
+            int(preferred_slot) if preferred_slot in (0, 1)
+            else (self.centerline_junction_committed_slot
+                  if self.centerline_junction_committed_slot in (0, 1)
+                  else (1 if self.branch_lock == "right" else 0)))
+        if len(candidates) <= 1:
+            self.centerline_fork_pending_frames = 0
+            self.centerline_fork_clear_frames = min(
+                self.centerline_fork_clear_frames + 1,
+                self.config.centerline_fork_release_frames)
+            if (self.centerline_fork_clear_frames >=
+                    self.config.centerline_fork_release_frames):
+                self.centerline_fork_active = False
+                self.centerline_branch_split_y = None
+                self._clear_stable_fork()
+            selected_visible = any(
+                int(item.get("slot", -1)) == int(preferred_slot)
+                for item in candidates)
+            self._advance_centerline_junction(
+                "SINGLE", False, preferred_slot,
+                selected_route_visible=selected_visible)
+            if self.centerline_junction_state in {
+                    "BRANCH_COMMITTED", "REARM"}:
+                filtered = self._committed_centerline_candidates(
+                    candidates, preferred_slot,
+                    allow_merge_switch=(self.centerline_last_pair_topology
+                                         in {"MERGE", "OVERLAP"}))
+                evidence.update({
+                    "reason": "junction_committed_single",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(filtered),
+                    "pair_topology": "SINGLE",
+                    "junction_state": self.centerline_junction_state,
+                    "junction_committed_slot": (
+                        self.centerline_junction_committed_slot),
+                    "junction_single_frames": int(
+                        self.centerline_junction_single_frames),
+                })
+                self.centerline_topology_debug = evidence
+                return filtered
+            hold_preferred_slot = (
+                int(preferred_slot) if preferred_slot in (0, 1)
+                else (self.centerline_fork_primary_slot
+                      if self.centerline_fork_primary_slot in (0, 1)
+                      else (1 if self.branch_lock == "right" else 0)))
+            held, hold_info = self._held_fork_candidates(
+                candidates, result, image_shape, hold_preferred_slot)
+            if held is not None:
+                evidence.update({
+                    "reason": "stable_fork_hold",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(held),
+                    "fork_active": True,
+                    "fork_hold": dict(hold_info),
+                    "fork_clear_frames": int(
+                        self.centerline_fork_clear_frames),
+                })
+                self.centerline_topology_debug = evidence
+                return held
+            evidence["candidate_count_before"] = len(candidates)
+            evidence["candidate_count_after"] = len(candidates)
+            self.centerline_topology_debug = evidence
+            return candidates
+
+        by_slot = {
+            int(item.get("slot", -1)): item for item in candidates
+        }
+        first = by_slot.get(0)
+        second = by_slot.get(1)
+        if first is None or second is None:
+            self.centerline_fork_pending_frames = 0
+            self.centerline_fork_clear_frames = min(
+                self.centerline_fork_clear_frames + 1,
+                self.config.centerline_fork_release_frames)
+            if (self.centerline_fork_clear_frames >=
+                    self.config.centerline_fork_release_frames):
+                self.centerline_fork_active = False
+                self.centerline_branch_split_y = None
+                self._clear_stable_fork()
+            selected_visible = any(
+                int(item.get("slot", -1)) == int(preferred_slot)
+                for item in candidates)
+            self._advance_centerline_junction(
+                "SINGLE", False, preferred_slot,
+                selected_route_visible=selected_visible)
+            if self.centerline_junction_state in {
+                    "BRANCH_COMMITTED", "REARM"}:
+                filtered = self._committed_centerline_candidates(
+                    candidates, preferred_slot,
+                    allow_merge_switch=(self.centerline_last_pair_topology
+                                         in {"MERGE", "OVERLAP"}))
+                evidence.update({
+                    "reason": "junction_committed_one_slot",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(filtered),
+                    "pair_topology": "SINGLE",
+                    "junction_state": self.centerline_junction_state,
+                    "junction_committed_slot": (
+                        self.centerline_junction_committed_slot),
+                })
+                self.centerline_topology_debug = evidence
+                return filtered
+            hold_preferred_slot = (
+                int(preferred_slot) if preferred_slot in (0, 1)
+                else (self.centerline_fork_primary_slot
+                      if self.centerline_fork_primary_slot in (0, 1)
+                      else (1 if self.branch_lock == "right" else 0)))
+            held, hold_info = self._held_fork_candidates(
+                candidates, result, image_shape, hold_preferred_slot)
+            if held is not None:
+                evidence.update({
+                    "reason": "stable_fork_hold",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(held),
+                    "fork_active": True,
+                    "fork_hold": dict(hold_info),
+                    "fork_clear_frames": int(
+                        self.centerline_fork_clear_frames),
+                })
+                self.centerline_topology_debug = evidence
+                return held
+            evidence["candidate_count_before"] = len(candidates)
+            evidence["candidate_count_after"] = len(candidates)
+            evidence["reason"] = "one_slot_missing"
+            self.centerline_topology_debug = evidence
+            return candidates
+        first_quality = float(first.get("centerline_quality", 0.0))
+        second_quality = float(second.get("centerline_quality", 0.0))
+        stats = self._path_pair_stats(
+            first.get("points_xy", ()), second.get("points_xy", ()),
+            image_shape)
+        pair_topology = self._centerline_pair_topology(stats)
+        self.centerline_last_pair_topology = pair_topology
+        high_overlap = bool(
+            pair_topology == "OVERLAP")
+        preferred = by_slot.get(preferred_slot)
+        if preferred is None:
+            preferred = max(candidates, key=lambda item: float(
+                item.get("centerline_quality", 0.0)))
+        # Curve-head count is only a prior.  When the fitted point sets occupy
+        # the same geometric route, publish one route even if the count head is
+        # absent or temporarily predicts two.
+        if high_overlap:
+            self.centerline_fork_pending_frames = 0
+            self.centerline_fork_clear_frames = min(
+                self.centerline_fork_clear_frames + 1,
+                self.config.centerline_fork_release_frames)
+            if (self.centerline_fork_clear_frames >=
+                    self.config.centerline_fork_release_frames):
+                self.centerline_fork_active = False
+                self.centerline_branch_split_y = None
+                self._clear_stable_fork()
+            self._advance_centerline_junction(
+                pair_topology, False, preferred_slot,
+                selected_route_visible=True)
+            if self.centerline_junction_state in {
+                    "BRANCH_COMMITTED", "REARM"}:
+                filtered = self._committed_centerline_candidates(
+                    candidates, preferred_slot)
+                evidence.update({
+                    "reason": "junction_committed_overlap",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(filtered),
+                    "high_overlap": True,
+                    "pair_topology": pair_topology,
+                    "junction_state": self.centerline_junction_state,
+                    "junction_committed_slot": (
+                        self.centerline_junction_committed_slot),
+                    "pair_stats": dict(stats),
+                })
+                self.centerline_topology_debug = evidence
+                return filtered
+            held, hold_info = self._held_fork_candidates(
+                candidates, result, image_shape, preferred_slot)
+            if held is not None:
+                evidence.update({
+                    "reason": "stable_fork_hold",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(held),
+                    "high_overlap": True,
+                    "fork_active": True,
+                    "fork_hold": dict(hold_info),
+                    "pair_stats": dict(stats),
+                })
+                self.centerline_topology_debug = evidence
+                return held
+            filtered = [preferred]
+            evidence.update({
+                "reason": "overlap_dedup",
+                "candidate_count_before": len(candidates),
+                "candidate_count_after": 1,
+                "high_overlap": True,
+                "pair_topology": pair_topology,
+                "pair_stats": dict(stats),
+                "quality_by_slot": {
+                    str(slot): float(item.get("centerline_quality", 0.0))
+                    for slot, item in by_slot.items()
+                },
+            })
+            self.centerline_topology_debug = evidence
+            return filtered
+        if not evidence["active"]:
+            self.centerline_fork_pending_frames = 0
+            self.centerline_fork_clear_frames = min(
+                self.centerline_fork_clear_frames + 1,
+                self.config.centerline_fork_release_frames)
+            if (self.centerline_fork_clear_frames >=
+                    self.config.centerline_fork_release_frames):
+                self.centerline_fork_active = False
+                self.centerline_branch_split_y = None
+                self._clear_stable_fork()
+            self._advance_centerline_junction(
+                pair_topology, False, preferred_slot,
+                selected_route_visible=True)
+            if self.centerline_junction_state in {
+                    "BRANCH_COMMITTED", "REARM"}:
+                filtered = self._committed_centerline_candidates(
+                    candidates, preferred_slot)
+                evidence.update({
+                    "reason": "junction_committed_no_count_head",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(filtered),
+                    "high_overlap": False,
+                    "pair_topology": pair_topology,
+                    "junction_state": self.centerline_junction_state,
+                    "junction_committed_slot": (
+                        self.centerline_junction_committed_slot),
+                    "pair_stats": dict(stats),
+                })
+                self.centerline_topology_debug = evidence
+                return filtered
+            held, hold_info = self._held_fork_candidates(
+                candidates, result, image_shape, preferred_slot)
+            if held is not None:
+                evidence.update({
+                    "reason": "stable_fork_hold",
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(held),
+                    "high_overlap": False,
+                    "fork_active": True,
+                    "fork_hold": dict(hold_info),
+                    "pair_stats": dict(stats),
+                })
+                self.centerline_topology_debug = evidence
+                return held
+            # Without the optional quantity head there is no confidence basis
+            # for deleting a valid semantic-road curve. Keep the legacy pair;
+            # topology/lifecycle still prevents it from creating a committed
+            # fork or overriding an already selected route.
+            filtered = candidates
+            evidence.update({
+                "reason": "count_head_unavailable",
+                "candidate_count_before": len(candidates),
+                "candidate_count_after": len(filtered),
+                "high_overlap": False,
+                "pair_topology": pair_topology,
+                "pair_stats": dict(stats),
+            })
+            self.centerline_topology_debug = evidence
+            return filtered
+        geometry_split = bool(
+            pair_topology == "FORK"
+            and stats["separated_rows"] >=
+            self.config.branch_separation_rows)
+        scores = evidence["scores"]
+        count_two = bool(
+            int(evidence["model_path_count"]) == 2
+            and scores[2] >= self.config.centerline_count_two_min_probability
+            and scores[2] >= scores[1] + self.config.centerline_count_two_margin
+            and scores[2] >= scores[0])
+        count_two_low = bool(
+            scores[2] >= self.config.centerline_count_two_low_probability
+            and scores[2] >= scores[1] - 0.10
+            and scores[2] >= scores[0] - 0.05)
+        secondary_usable = bool(
+            second_quality >= self.config.centerline_graph_min_quality
+            and second_quality >= first_quality *
+            self.config.centerline_secondary_quality_ratio)
+        secondary_low_usable = bool(
+            second_quality >=
+            self.config.centerline_graph_min_quality * 0.76
+            and second_quality >= first_quality *
+            self.config.centerline_secondary_quality_ratio * 0.82)
+        fork_evidence = bool(count_two and geometry_split and secondary_usable)
+        low_fork_evidence = bool(
+            count_two_low and geometry_split and secondary_low_usable)
+        if low_fork_evidence:
+            self.centerline_fork_pending_frames = min(
+                self.centerline_fork_pending_frames + 1,
+                self.config.centerline_fork_confirm_frames)
+            self.centerline_fork_clear_frames = 0
+            # Low confidence may fill the first confirmation frame. At least
+            # one current strong frame is still required to publish a fork.
+            if (fork_evidence
+                    and self.centerline_fork_pending_frames >=
+                    self.config.centerline_fork_confirm_frames):
+                self.centerline_fork_active = True
+        else:
+            self.centerline_fork_pending_frames = 0
+            self.centerline_fork_clear_frames = min(
+                self.centerline_fork_clear_frames + 1,
+                self.config.centerline_fork_release_frames)
+            if (self.centerline_fork_clear_frames >=
+                    self.config.centerline_fork_release_frames):
+                self.centerline_fork_active = False
+                self.centerline_branch_split_y = None
+                self._clear_stable_fork()
+        self._advance_centerline_junction(
+            pair_topology, low_fork_evidence, preferred_slot,
+            selected_route_visible=True)
+        if self.centerline_junction_state in {
+                "BRANCH_COMMITTED", "REARM"}:
+            filtered = self._committed_centerline_candidates(
+                candidates, preferred_slot)
+            evidence.update({
+                "reason": "junction_committed_suppress_alternative",
+                "candidate_count_before": len(candidates),
+                "candidate_count_after": len(filtered),
+                "model_path_count": int(evidence["model_path_count"]),
+                "geometry_split": geometry_split,
+                "pair_topology": pair_topology,
+                "count_two": count_two,
+                "count_two_low": count_two_low,
+                "secondary_usable": secondary_usable,
+                "secondary_low_usable": secondary_low_usable,
+                "fork_evidence": fork_evidence,
+                "low_fork_evidence": low_fork_evidence,
+                "fork_active": bool(self.centerline_fork_active),
+                "junction_state": self.centerline_junction_state,
+                "junction_committed_slot": (
+                    self.centerline_junction_committed_slot),
+                "junction_single_frames": int(
+                    self.centerline_junction_single_frames),
+                "pair_stats": dict(stats),
+            })
+            self.centerline_topology_debug = evidence
+            return filtered
+        # Current evidence establishes or refreshes the cache. During a short
+        # miss, the stable cached fork may remain visible after current-mask
+        # validation until the release counter expires.
+        fork = bool(low_fork_evidence and self.centerline_fork_active)
+        if fork:
+            filtered = candidates
+            reason = (
+                "count_two_geometry_split" if fork_evidence
+                else "low_confidence_fork_update")
+            split_info = self._set_branch_preview_points(
+                filtered, preferred_slot, image_shape)
+            if split_info.get("available") and fork_evidence:
+                self._remember_stable_fork(filtered, preferred_slot)
+            hold_info = {"available": False, "reason": "current_fork"}
+        else:
+            held, hold_info = self._held_fork_candidates(
+                candidates, result, image_shape, preferred_slot)
+            if held is not None:
+                filtered = held
+                reason = "stable_fork_hold"
+                split_info = dict(hold_info.get("branch_preview") or {})
+            else:
+                filtered = [preferred]
+                reason = "count_single_or_weak_secondary"
+                split_info = {
+                    "available": False, "reason": "fork_not_active"}
+        evidence.update({
+            "reason": reason,
+            "candidate_count_before": len(candidates),
+            "candidate_count_after": len(filtered),
+            "model_path_count": int(evidence["model_path_count"]),
+            "geometry_split": geometry_split,
+            "pair_topology": pair_topology,
+            "high_overlap": False,
+            "count_two": count_two,
+            "count_two_low": count_two_low,
+            "secondary_usable": secondary_usable,
+            "secondary_low_usable": secondary_low_usable,
+            "fork_evidence": fork_evidence,
+            "low_fork_evidence": low_fork_evidence,
+            "fork_active": bool(self.centerline_fork_active),
+            "fork_pending_frames": int(self.centerline_fork_pending_frames),
+            "fork_clear_frames": int(self.centerline_fork_clear_frames),
+            "fork_hold": dict(hold_info),
+            "branch_preview": dict(split_info),
+            "junction_state": self.centerline_junction_state,
+            "junction_committed_slot": (
+                self.centerline_junction_committed_slot),
+            "junction_single_frames": int(
+                self.centerline_junction_single_frames),
+            "pair_stats": dict(stats),
+            "quality_by_slot": {
+                str(slot): float(item.get("centerline_quality", 0.0))
+                for slot, item in by_slot.items()
+            },
+        })
+        self.centerline_topology_debug = evidence
+        return filtered
+
+    def _set_branch_preview_points(
+            self, candidates, preferred_slot, image_shape):
+        """Hide the duplicate trunk and preview only the separated branch."""
+        by_slot = {
+            int(item.get("slot", -1)): item for item in candidates
+        }
+        primary = by_slot.get(int(preferred_slot))
+        if primary is None and candidates:
+            primary = candidates[0]
+        secondary = next(
+            (item for item in candidates if item is not primary), None)
+        if primary is None or secondary is None:
+            return {"available": False, "reason": "missing_branch_pair"}
+        primary_points = np.asarray(
+            primary.get("points_xy", ()), dtype=np.float32)
+        secondary_points = np.asarray(
+            secondary.get("points_xy", ()), dtype=np.float32)
+        if len(primary_points) < 3 or len(secondary_points) < 3:
+            return {"available": False, "reason": "short_branch_pair"}
+        order = np.argsort(secondary_points[:, 1], kind="stable")
+        secondary_points = secondary_points[order]
+        primary_x = _interp_path_x_many(
+            primary_points, secondary_points[:, 1])
+        distances = np.abs(primary_x - secondary_points[:, 0])
+        separated = (
+            np.isfinite(primary_x)
+            & (distances >= float(self.config.overlap_px_640)
+               * float(max(1, image_shape[1]))
+               / 640.0))
+        runs = []
+        start = None
+        for index, value in enumerate(separated.tolist() + [False]):
+            if value and start is None:
+                start = index
+            elif not value and start is not None:
+                if index - start >= 3:
+                    runs.append((start, index))
+                start = None
+        if not runs:
+            return {"available": False, "reason": "no_stable_split_segment"}
+        run_start, run_end = max(
+            runs, key=lambda item: (item[1] - item[0], -item[0]))
+        measured_split_y = float(secondary_points[run_end - 1, 1])
+        if self.centerline_branch_split_y is None:
+            self.centerline_branch_split_y = measured_split_y
+        else:
+            self.centerline_branch_split_y = (
+                0.65 * float(self.centerline_branch_split_y)
+                + 0.35 * measured_split_y)
+        split_y = float(self.centerline_branch_split_y)
+        preview_mask = (
+            (secondary_points[:, 1] >=
+             float(secondary_points[run_start, 1]) - 1e-3)
+            & (secondary_points[:, 1] <= split_y + 1e-3))
+        preview_points = secondary_points[preview_mask]
+        if run_end < len(secondary_points):
+            preview_points = np.concatenate((
+                preview_points,
+                secondary_points[run_end:run_end + 1]), axis=0)
+        if len(preview_points) < 2:
+            return {"available": False, "reason": "branch_preview_short"}
+        secondary["preview_points_xy"] = preview_points.astype(np.float32)
+        secondary["branch_split_y"] = split_y
+        return {
+            "available": True,
+            "reason": "separated_branch_only",
+            "primary_slot": int(primary.get("slot", -1)),
+            "secondary_slot": int(secondary.get("slot", -1)),
+            "split_y": split_y,
+            "preview_points": int(len(preview_points)),
+        }
+
+    @staticmethod
+    def _copy_centerline_candidate(candidate):
+        copied = dict(candidate)
+        for key in ("points_xy", "point_confidences", "preview_points_xy"):
+            value = candidate.get(key)
+            if value is not None:
+                copied[key] = np.asarray(value).copy()
+        copied["extension"] = dict(candidate.get("extension") or {})
+        return copied
+
+    def _remember_stable_fork(self, candidates, primary_slot):
+        self.centerline_fork_cache = {
+            int(candidate.get("slot", -1)):
+                self._copy_centerline_candidate(candidate)
+            for candidate in candidates
+            if int(candidate.get("slot", -1)) in (0, 1)
+        }
+        self.centerline_fork_primary_slot = int(primary_slot)
+
+    def _clear_stable_fork(self):
+        self.centerline_fork_cache = {}
+        self.centerline_fork_primary_slot = None
+
+    def _held_fork_candidates(
+            self, candidates, result, image_shape, preferred_slot):
+        """Restore a short-lived stable fork, clipped to the current road."""
+        if (not self.centerline_fork_active
+                or len(self.centerline_fork_cache) < 2
+                or self.centerline_fork_clear_frames >=
+                    self.config.centerline_fork_release_frames):
+            return None, {"available": False, "reason": "hold_unavailable"}
+        road_info = result.get("road") or {}
+        hard_road = road_info.get("raw_mask")
+        if hard_road is None:
+            hard_road = road_info.get("mask")
+        if hard_road is None:
+            hard_road = result.get("road_mask")
+        primary_slot = (
+            int(preferred_slot) if preferred_slot in (0, 1)
+            else int(self.centerline_fork_primary_slot))
+        secondary_slot = 1 - primary_slot
+        current_by_slot = {
+            int(candidate.get("slot", -1)): candidate
+            for candidate in candidates
+        }
+        restored = []
+        held_slots = []
+        lookahead_y = float(image_shape[0]) * self.config.lookahead_y_ratio
+        decay = float(0.72 ** max(1, self.centerline_fork_clear_frames))
+        for slot in (primary_slot, secondary_slot):
+            current = current_by_slot.get(slot)
+            # The current primary remains authoritative. The secondary comes
+            # from the last stable fork so a collapsed/weak current head does
+            # not overwrite it during the short hold window.
+            if slot == primary_slot and current is not None:
+                restored.append(current)
+                continue
+            cached = self.centerline_fork_cache.get(slot)
+            if cached is None:
+                return None, {
+                    "available": False, "reason": "cached_slot_missing"}
+            held = self._copy_centerline_candidate(cached)
+            points = np.asarray(held.get("points_xy", ()), dtype=np.float32)
+            probabilities = np.asarray(
+                held.get("point_confidences", ()), dtype=np.float32)
+            if len(probabilities) != len(points):
+                probabilities = np.ones(len(points), dtype=np.float32)
+            inside = _semantic_road_point_mask(
+                points, hard_road, image_shape)
+            points, probabilities = _select_control_curve_segment(
+                points, probabilities, inside, lookahead_y)
+            if (len(points) < 3 or not _semantic_road_polyline_inside(
+                    points, hard_road, image_shape)):
+                return None, {
+                    "available": False,
+                    "reason": "cached_branch_outside_current_road",
+                    "slot": int(slot),
+                }
+            held["points_xy"] = points.astype(np.float32)
+            held["point_confidences"] = np.clip(
+                probabilities * decay, 0.0, 1.0).astype(np.float32)
+            held["score"] = float(held.get("score", 1.0)) * decay
+            held["source"] = "held_stable_fork"
+            held["fork_hold"] = True
+            held["fork_hold_frames"] = int(self.centerline_fork_clear_frames)
+            held.pop("preview_points_xy", None)
+            restored.append(held)
+            held_slots.append(int(slot))
+        restored.sort(key=lambda item: int(item.get("slot", 99)))
+        split_info = self._set_branch_preview_points(
+            restored, primary_slot, image_shape)
+        if not split_info.get("available"):
+            return None, {
+                "available": False,
+                "reason": "held_branch_no_longer_split",
+                "branch_preview": dict(split_info),
+            }
+        return restored, {
+            "available": True,
+            "reason": "stable_fork_hold",
+            "held_slots": held_slots,
+            "hold_frames": int(self.centerline_fork_clear_frames),
+            "confidence_decay": decay,
+            "branch_preview": dict(split_info),
+        }
 
     def _publish_filtered_paths(self, result, candidates):
         # From this point on ``paths`` has one meaning only: the fitted curves
@@ -1186,15 +2267,24 @@ class VisionControlPlanner:
         if not candidates:
             self.selection_reason = "no_candidate"
             return None
-        wanted_slot = (
-            1 if (self.branch_lock == "right" or
-                  (self.branch_lock == "left" and
-                   self.curve_merge_override)) else 0)
+        if (self.centerline_junction_state in {
+                "BRANCH_COMMITTED", "REARM"}
+                and self.centerline_junction_committed_slot in (0, 1)):
+            wanted_slot = int(self.centerline_junction_committed_slot)
+            self.curve_merge_override = False
+        else:
+            wanted_slot = (
+                1 if (self.branch_lock == "right" or
+                      (self.branch_lock == "left" and
+                       self.curve_merge_override)) else 0)
         self.selected_slot_lock = wanted_slot
         self.selection_reason = (
-            "merge_continuity_green" if
-            self.branch_lock == "left" and self.curve_merge_override
-            else "locked_{}".format(self.branch_lock or "left"))
+            "junction_committed_route" if
+            self.centerline_junction_state in {
+                "BRANCH_COMMITTED", "REARM"}
+            else ("merge_continuity_green" if
+                  self.branch_lock == "left" and self.curve_merge_override
+                  else "locked_{}".format(self.branch_lock or "left")))
         for candidate in candidates:
             if int(candidate.get("slot", -1)) == wanted_slot:
                 return candidate
@@ -4014,9 +5104,17 @@ class VisionControlPlanner:
         self.branch_lock = direction
         self.branch_lock_source = "ocr"
         self.selected_slot_lock = 0 if direction == "left" else 1
+        if self.centerline_junction_state in {
+                "FORK_CONFIRMED", "BRANCH_COMMITTED", "REARM"}:
+            self.centerline_junction_committed_slot = self.selected_slot_lock
 
     def _expire_ocr_lock(self, now):
         if self.branch_lock_source != "ocr" or self.last_valid_ocr_ts <= 0.0:
+            return False
+        # Time alone must not reverse a route after the car has entered it.
+        # Expiration resumes after the old junction has visually re-armed.
+        if self.centerline_junction_state in {
+                "FORK_CONFIRMED", "BRANCH_COMMITTED", "REARM"}:
             return False
         if now - self.last_valid_ocr_ts < self.config.ocr_lock_lifetime_s:
             return False
@@ -4056,23 +5154,43 @@ class VisionControlPlanner:
         first = np.asarray(first_points, dtype=np.float32)
         second = np.asarray(second_points, dtype=np.float32)
         if len(first) == 0 or len(second) == 0:
-            return {"mean_distance_640": 1e9, "separated_rows": 0}
+            return {
+                "mean_distance_640": 1e9, "separated_rows": 0,
+                "valid_rows": 0, "far_mean_distance_640": 1e9,
+                "near_mean_distance_640": 1e9,
+                "far_to_near_delta_640": 0.0}
         low = max(float(np.min(first[:, 1])), float(np.min(second[:, 1])))
         high = min(float(np.max(first[:, 1])), float(np.max(second[:, 1])))
         if low > high:
-            return {"mean_distance_640": 1e9, "separated_rows": 0}
+            return {
+                "mean_distance_640": 1e9, "separated_rows": 0,
+                "valid_rows": 0, "far_mean_distance_640": 1e9,
+                "near_mean_distance_640": 1e9,
+                "far_to_near_delta_640": 0.0}
         rows = low + (high - low) * _PAIR_FRACTIONS
         first_x = _interp_path_x_many(first, rows)
         second_x = _interp_path_x_many(second, rows)
         valid = np.isfinite(first_x) & np.isfinite(second_x)
         if not np.any(valid):
-            return {"mean_distance_640": 1e9, "separated_rows": 0}
+            return {
+                "mean_distance_640": 1e9, "separated_rows": 0,
+                "valid_rows": 0, "far_mean_distance_640": 1e9,
+                "near_mean_distance_640": 1e9,
+                "far_to_near_delta_640": 0.0}
         distances = (
             np.abs(first_x[valid] - second_x[valid]) * 640.0 /
             float(max(1, image_shape[1])))
+        # Rows are sampled from the common top (far) toward bottom (near).
+        band = max(2, int(math.ceil(len(distances) / 3.0)))
+        far_mean = float(np.mean(distances[:band]))
+        near_mean = float(np.mean(distances[-band:]))
         return {
             "mean_distance_640": float(np.mean(distances)),
             "separated_rows": int(np.count_nonzero(distances >= self.config.branch_separation_px_640)),
+            "valid_rows": int(len(distances)),
+            "far_mean_distance_640": far_mean,
+            "near_mean_distance_640": near_mean,
+            "far_to_near_delta_640": float(far_mean - near_mean),
         }
 
     @staticmethod
@@ -4081,12 +5199,19 @@ class VisionControlPlanner:
         road_support = _finite_float(candidate.get("road_support"))
         return {
             "slot": int(candidate.get("slot", -1)),
+            "model_slot": int(candidate.get(
+                "model_slot", candidate.get("slot", -1))),
             "role": str(candidate.get("role") or ""),
             "source": str(candidate.get("source") or "unknown"),
             "points": int(len(points)),
             "score": float(candidate.get("score", 0.0)),
             "coverage": float(candidate.get("coverage", 0.0)),
             "road_support": road_support,
+            "centerline_quality": float(candidate.get(
+                "centerline_quality", 0.0)),
+            "hard_road_constraint": bool(candidate.get(
+                "hard_road_constraint", False)),
+            "extension": dict(candidate.get("extension") or {}),
             "exit_type": str(candidate.get("exit_type") or ""),
             "occlusion_bridge_rows": int(candidate.get(
                 "occlusion_bridge_rows", 0)),
@@ -4112,7 +5237,7 @@ class VisionControlPlanner:
         return [[float(x), float(y)] for x, y in points[::stride]]
 
 
-def render_vision_control_debug(frame, result):
+def render_vision_control_debug(frame, result, draw_curves=True):
     if frame is None or result is None:
         return frame
     debug = (result.get("vision_control") if isinstance(result, dict) else None) or {}
@@ -4136,27 +5261,29 @@ def render_vision_control_debug(frame, result):
     upper_confidence_decay = _clamp(_env_float(
         "VISION_CONTROL_POINT_UPPER_CONFIDENCE_DECAY", 0.55), 0.0, 1.0)
 
-    road_mask = (result.get("road") or {}).get("mask")
-    if road_mask is None:
-        road_mask = result.get("road_mask")
-    for line in _extract_curve_preview_lines(result):
-        points = np.rint(line["points_xy"]).astype(np.int32)
-        if len(points) < 2:
-            continue
-        points[:, 0] = np.clip(points[:, 0], 0, w - 1)
-        points[:, 1] = np.clip(points[:, 1], 0, h - 1)
-        probabilities = _adjust_point_display_confidences(
-            points, line.get("probabilities"), confidence_split_y,
-            lower_confidence_boost, upper_confidence_decay)
-        if len(points) < 2:
-            continue
-        visible = _semantic_road_point_mask(
-            points, road_mask, frame.shape)
-        _draw_identity_probability_curve(
-            frame, points, probabilities,
-            int(line.get("slot", 0)),
-            thickness=3 if int(line.get("slot", -1)) == selected_slot else 2,
-            visible_mask=visible)
+    if draw_curves:
+        road_mask = (result.get("road") or {}).get("mask")
+        if road_mask is None:
+            road_mask = result.get("road_mask")
+        for line in _extract_curve_preview_lines(result):
+            points = np.rint(line["points_xy"]).astype(np.int32)
+            if len(points) < 2:
+                continue
+            points[:, 0] = np.clip(points[:, 0], 0, w - 1)
+            points[:, 1] = np.clip(points[:, 1], 0, h - 1)
+            probabilities = _adjust_point_display_confidences(
+                points, line.get("probabilities"), confidence_split_y,
+                lower_confidence_boost, upper_confidence_decay)
+            if len(points) < 2:
+                continue
+            visible = _semantic_road_point_mask(
+                points, road_mask, frame.shape)
+            _draw_identity_probability_curve(
+                frame, points, probabilities,
+                int(line.get("slot", 0)),
+                thickness=(
+                    3 if int(line.get("slot", -1)) == selected_slot else 2),
+                visible_mask=visible)
 
     split_y = int(round(confidence_split_y))
     cv2.line(
@@ -4910,7 +6037,8 @@ def _fit_smooth_majority_curve(
         sample_step_px=4.0, extend_to_y=None,
         max_extension_y_px_480=64.0,
         max_extension_deviation_px_640=18.0,
-        max_extension_lateral_px_640=48.0):
+        max_extension_lateral_px_640=48.0,
+        trusted_points=False):
     """Fit a low-order curve, favoring maximum support then smoothness."""
     points = np.asarray(points, dtype=np.float64)
     probabilities = np.asarray(probabilities, dtype=np.float64)
@@ -4930,10 +6058,11 @@ def _fit_smooth_majority_curve(
     threshold = max(
         2.0, float(inlier_px_640) * float(max(1, image_width)) / 640.0)
 
-    # Six evenly spread anchors provide 35 deterministic line/quadratic
-    # hypotheses, enough for minority-outlier rejection without burdening
-    # every preview frame with an exhaustive fit.
-    sample_count = min(6, len(sorted_points))
+    # Four evenly spread anchors provide a small deterministic hypothesis set
+    # (six line and four quadratic pairs).  The semantic-road and continuity
+    # checks below reject the occasional bad fit, so a larger RANSAC-like set
+    # only burns CPU on every camera frame.
+    sample_count = min(4, len(sorted_points))
     sample_indices = np.unique(np.rint(np.linspace(
         0, len(sorted_points) - 1, sample_count)).astype(np.int32))
     candidates = []
@@ -4942,51 +6071,53 @@ def _fit_smooth_majority_curve(
             normalized_y, sorted_points[:, 0], 1)))
     except (ValueError, np.linalg.LinAlgError):
         pass
-    line_pairs = np.asarray([
-        (sample_indices[first], sample_indices[second])
-        for first in range(len(sample_indices) - 1)
-        for second in range(first + 1, len(sample_indices))
-    ], dtype=np.int32)
-    if len(line_pairs):
-        first_y = normalized_y[line_pairs[:, 0]]
-        second_y = normalized_y[line_pairs[:, 1]]
-        denominator = second_y - first_y
-        valid = np.abs(denominator) > 1e-6
-        slopes = (
-            sorted_points[line_pairs[valid, 1], 0] -
-            sorted_points[line_pairs[valid, 0], 0]) / denominator[valid]
-        intercepts = (
-            sorted_points[line_pairs[valid, 0], 0] -
-            slopes * first_y[valid])
-        candidates.extend(
-            (1, np.asarray([slope, intercept], dtype=np.float64))
-            for slope, intercept in zip(slopes, intercepts))
+    if not trusted_points:
+        line_pairs = np.asarray([
+            (sample_indices[first], sample_indices[second])
+            for first in range(len(sample_indices) - 1)
+            for second in range(first + 1, len(sample_indices))
+        ], dtype=np.int32)
+        if len(line_pairs):
+            first_y = normalized_y[line_pairs[:, 0]]
+            second_y = normalized_y[line_pairs[:, 1]]
+            denominator = second_y - first_y
+            valid = np.abs(denominator) > 1e-6
+            slopes = (
+                sorted_points[line_pairs[valid, 1], 0] -
+                sorted_points[line_pairs[valid, 0], 0]) / denominator[valid]
+            intercepts = (
+                sorted_points[line_pairs[valid, 0], 0] -
+                slopes * first_y[valid])
+            candidates.extend(
+                (1, np.asarray([slope, intercept], dtype=np.float64))
+                for slope, intercept in zip(slopes, intercepts))
 
     try:
         candidates.append((2, np.polyfit(
             normalized_y, sorted_points[:, 0], 2)))
     except (ValueError, np.linalg.LinAlgError):
         pass
-    quadratic_groups = np.asarray([
-        (sample_indices[first], sample_indices[second],
-         sample_indices[third])
-        for first in range(len(sample_indices) - 2)
-        for second in range(first + 1, len(sample_indices) - 1)
-        for third in range(second + 1, len(sample_indices))
-    ], dtype=np.int32)
-    if len(quadratic_groups):
-        group_y = normalized_y[quadratic_groups]
-        matrices = np.stack((
-            group_y * group_y, group_y,
-            np.ones_like(group_y)), axis=2)
-        determinants = np.linalg.det(matrices)
-        valid = np.abs(determinants) > 1e-9
-        if np.any(valid):
-            coefficients = np.linalg.solve(
-                matrices[valid],
-                sorted_points[quadratic_groups[valid], 0])
-            candidates.extend(
-                (2, coefficient) for coefficient in coefficients)
+    if not trusted_points:
+        quadratic_groups = np.asarray([
+            (sample_indices[first], sample_indices[second],
+             sample_indices[third])
+            for first in range(len(sample_indices) - 2)
+            for second in range(first + 1, len(sample_indices) - 1)
+            for third in range(second + 1, len(sample_indices))
+        ], dtype=np.int32)
+        if len(quadratic_groups):
+            group_y = normalized_y[quadratic_groups]
+            matrices = np.stack((
+                group_y * group_y, group_y,
+                np.ones_like(group_y)), axis=2)
+            determinants = np.linalg.det(matrices)
+            valid = np.abs(determinants) > 1e-9
+            if np.any(valid):
+                coefficients = np.linalg.solve(
+                    matrices[valid],
+                    sorted_points[quadratic_groups[valid], 0])
+                candidates.extend(
+                    (2, coefficient) for coefficient in coefficients)
 
     evaluated = []
     if candidates:
@@ -5337,6 +6468,44 @@ def _associated_point_mask(
     maximum_line_error = float(max_line_error_px_640) * width_scale
     minimum_cosine = _clamp(float(min_direction_cosine), -1.0, 1.0)
     for first in range(count - 2 * anchor_step):
+        # The normal path uses adjacent anchors.  Evaluate all triplets in
+        # one vector operation; the old Python loop repeatedly allocated
+        # tiny arrays and called linalg.norm for every candidate.
+        if anchor_step == 1:
+            triplet_eligible = (
+                eligible[:-2] & eligible[1:-1] & eligible[2:])
+            first_vectors = points[1:-1] - points[:-2]
+            second_vectors = points[2:] - points[1:-1]
+            first_lengths = np.sqrt(np.sum(first_vectors * first_vectors, axis=1))
+            second_lengths = np.sqrt(np.sum(second_vectors * second_vectors, axis=1))
+            valid_lengths = (first_lengths > 1e-6) & (second_lengths > 1e-6)
+            valid_dx = (
+                (np.abs(first_vectors[:, 0]) <= maximum_dx)
+                & (np.abs(second_vectors[:, 0]) <= maximum_dx))
+            cosine = np.zeros_like(first_lengths)
+            denominator = first_lengths * second_lengths
+            valid_denominator = denominator > 1e-6
+            cosine[valid_denominator] = (
+                np.sum(first_vectors[valid_denominator]
+                       * second_vectors[valid_denominator], axis=1)
+                / denominator[valid_denominator])
+            chords = points[2:] - points[:-2]
+            chord_lengths = np.sqrt(np.sum(chords * chords, axis=1))
+            valid_chords = chord_lengths > 1e-6
+            middle_offsets = points[1:-1] - points[:-2]
+            line_error = np.full(len(chord_lengths), np.inf, dtype=np.float32)
+            line_error[valid_chords] = np.abs(
+                chords[valid_chords, 0] * middle_offsets[valid_chords, 1]
+                - chords[valid_chords, 1] * middle_offsets[valid_chords, 0]
+            ) / chord_lengths[valid_chords]
+            valid = (triplet_eligible & valid_lengths & valid_dx
+                     & valid_denominator & valid_chords
+                     & (cosine >= minimum_cosine)
+                     & (line_error <= maximum_line_error))
+            keep[:-2] |= valid
+            keep[1:-1] |= valid
+            keep[2:] |= valid
+            return keep
         indices = np.asarray([
             first, first + anchor_step, first + 2 * anchor_step],
             dtype=np.int32)
@@ -5427,6 +6596,520 @@ def _densify_associated_lower_points(
             np.asarray(display_probabilities, dtype=np.float32))
 
 
+def _centerline_probability_support(
+        road_probability, road_mask, minimum_probability, hard_mask=None):
+    """Prepare a low-resolution soft road graph without changing the mask."""
+    probability = np.asarray(road_probability) if road_probability is not None else None
+    if probability is None or probability.ndim != 2 or not probability.size:
+        return None
+    probability = np.nan_to_num(
+        probability.astype(np.float32, copy=False), nan=0.0,
+        posinf=1.0, neginf=0.0)
+    probability = np.clip(probability, 0.0, 1.0)
+    support = probability >= float(minimum_probability)
+    mask = np.asarray(road_mask) if road_mask is not None else None
+    hard = np.asarray(hard_mask) if hard_mask is not None else None
+    if hard is not None and hard.ndim == 2 and hard.size:
+        if hard.shape != probability.shape:
+            hard = cv2.resize(
+                (hard != 0).astype(np.uint8),
+                (probability.shape[1], probability.shape[0]),
+                interpolation=cv2.INTER_NEAREST)
+        # This is deliberately an intersection.  The probability graph may
+        # never invent a road pixel outside the supplied semantic mask.
+        support &= hard != 0
+    if mask is not None and mask.ndim == 2 and mask.size:
+        if mask.shape != probability.shape:
+            mask = cv2.resize(
+                (mask != 0).astype(np.uint8),
+                (probability.shape[1], probability.shape[0]),
+                interpolation=cv2.INTER_NEAREST)
+        if hard is None:
+            support |= mask != 0
+    support = support.astype(np.uint8)
+    # Close only small holes. This bridges a thin moving-object occlusion
+    # without reusing the large top-crop/component policy of road_mask.
+    support = cv2.morphologyEx(
+        support, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+    if hard is not None:
+        support &= hard != 0
+    if not np.any(support):
+        return None
+    support = support.astype(bool)
+    distance = cv2.distanceTransform(
+        support.astype(np.uint8), cv2.DIST_L2, 3).astype(np.float32)
+    component_count, labels, stats, _centroids = (
+        cv2.connectedComponentsWithStats(
+            support.astype(np.uint8), connectivity=8))
+    return {
+        "probability": probability,
+        "support": support,
+        "distance": distance,
+        "component_count": int(component_count),
+        "labels": labels,
+        "stats": stats,
+    }
+
+
+def _centerline_image_to_grid(point, image_shape, grid_shape):
+    height, width = image_shape[:2]
+    grid_height, grid_width = grid_shape[:2]
+    x = int(round(float(point[0]) * (grid_width - 1) /
+                  float(max(1, width - 1))))
+    y = int(round(float(point[1]) * (grid_height - 1) /
+                  float(max(1, height - 1))))
+    return (int(np.clip(y, 0, grid_height - 1)),
+            int(np.clip(x, 0, grid_width - 1)))
+
+
+def _centerline_nearest_support(
+        support, probability, seed, radius):
+    height, width = support.shape[:2]
+    seed_y, seed_x = [int(value) for value in seed]
+    best = None
+    for y in range(max(0, seed_y - radius), min(height, seed_y + radius + 1)):
+        for x in range(max(0, seed_x - radius), min(width, seed_x + radius + 1)):
+            if not support[y, x]:
+                continue
+            distance = float((y - seed_y) ** 2 + (x - seed_x) ** 2)
+            score = distance - 0.15 * float(probability[y, x])
+            if best is None or score < best[0]:
+                best = (score, y, x)
+    if best is None:
+        return None
+    return int(best[1]), int(best[2])
+
+
+def _centerline_local_forward_path(
+        probability, support, distance, start, target_y, direction,
+        lateral_radius=4):
+    """Follow only the local up/right neighbors of the fitted centerline.
+
+    The road graph is already restricted to one semantic connected component.
+    Keeping the traversal to two ordered neighbors makes this a cheap local
+    recovery step instead of another path planner: up is always preferred;
+    right is used only when the pixel above is unavailable.  A short bounded
+    retry prevents spending time at a dead end.
+    """
+    del probability, distance, direction
+    height, width = support.shape[:2]
+    start_y, start_x = [int(value) for value in start]
+    target_y = int(np.clip(target_y, 0, height - 1))
+    if (target_y >= start_y or not support[start_y, start_x]):
+        return []
+    max_right_steps = max(1, min(int(lateral_radius), 6))
+    max_retries = 3
+    path = [(start_y, start_x)]
+    current_y = int(start_y)
+    current_x = int(start_x)
+    right_steps = 0
+    retries = 0
+    while current_y > target_y:
+        # Primary move: one row upward at the current lateral position.
+        if support[current_y - 1, current_x]:
+            current_y -= 1
+            right_steps = 0
+            retries = 0
+            path.append((current_y, current_x))
+            continue
+        # Secondary move: walk right on the current row, then retry upward.
+        if (right_steps < max_right_steps and current_x + 1 < width
+                and support[current_y, current_x + 1]):
+            current_x += 1
+            right_steps += 1
+            retries = 0
+            path.append((current_y, current_x))
+            continue
+        retries += 1
+        if retries >= max_retries:
+            return []
+    return path
+
+
+def _centerline_unique_y_curve(points, probabilities=None):
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) == 0:
+        return (np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+    if probabilities is None or len(probabilities) != len(points):
+        probabilities = np.ones(len(points), dtype=np.float32)
+    order = np.argsort(points[:, 1], kind="stable")
+    points = points[order]
+    probabilities = np.asarray(probabilities, dtype=np.float32)[order]
+    # Model fits and graph paths normally have one point per row. Avoid a
+    # Python median loop for the overwhelmingly common already-unique case.
+    if len(points) <= 1 or np.all(np.diff(points[:, 1]) > 1e-5):
+        return points.copy(), probabilities.copy()
+    unique_y, first_indices, counts = np.unique(
+        points[:, 1], return_index=True, return_counts=True)
+    unique_points = []
+    unique_probabilities = []
+    for y, first, count in zip(
+            unique_y.tolist(), first_indices.tolist(), counts.tolist()):
+        same = slice(int(first), int(first + count))
+        unique_points.append([
+            float(np.median(points[same, 0])), float(y)])
+        unique_probabilities.append(float(np.mean(probabilities[same])))
+    return (np.asarray(unique_points, dtype=np.float32),
+            np.asarray(unique_probabilities, dtype=np.float32))
+
+
+def _centerline_shape_preserving_curve(
+        points, probabilities, sample_step_px=4.0):
+    """Return a light local Hermite/PCHIP curve through cleaned anchors."""
+    points, probabilities = _centerline_unique_y_curve(
+        points, probabilities)
+    if len(points) < 3:
+        return (np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+    y = points[:, 1].astype(np.float64)
+    x = points[:, 0].astype(np.float64)
+    h = np.diff(y)
+    if np.any(h <= 1e-5):
+        return (np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+
+    # Suppress a one-anchor staircase spike without globally moving the
+    # already fitted model curve.
+    if len(x) >= 5:
+        filtered = x.copy()
+        filtered[1:-1] = np.median(np.stack(
+            (x[:-2], x[1:-1], x[2:]), axis=1), axis=1)
+        x = filtered
+    delta = np.diff(x) / h
+    slopes = np.zeros_like(x)
+    if len(x) == 3:
+        slopes[1] = 0.0 if delta[0] * delta[1] <= 0.0 else (
+            2.0 / (1.0 / delta[0] + 1.0 / delta[1]))
+    else:
+        same_direction = delta[:-1] * delta[1:] > 0.0
+        previous_h = h[:-1]
+        next_h = h[1:]
+        weight_previous = 2.0 * next_h + previous_h
+        weight_next = next_h + 2.0 * previous_h
+        interior = np.zeros(len(x) - 2, dtype=np.float64)
+        interior[same_direction] = (
+            (weight_previous[same_direction] + weight_next[same_direction])
+            / (weight_previous[same_direction] / delta[:-1][same_direction]
+               + weight_next[same_direction] / delta[1:][same_direction]))
+        slopes[1:-1] = interior
+
+    def endpoint_slope(h0, h1, delta0, delta1):
+        slope = ((2.0 * h0 + h1) * delta0 - h0 * delta1) / (h0 + h1)
+        if slope * delta0 <= 0.0:
+            return 0.0
+        if delta0 * delta1 < 0.0 and abs(slope) > 3.0 * abs(delta0):
+            return 3.0 * delta0
+        return slope
+
+    slopes[0] = endpoint_slope(h[0], h[min(1, len(h) - 1)],
+                               delta[0], delta[min(1, len(delta) - 1)])
+    slopes[-1] = endpoint_slope(
+        h[-1], h[max(0, len(h) - 2)], delta[-1],
+        delta[max(0, len(delta) - 2)])
+
+    sample_count = max(
+        2, int(math.ceil((float(y[-1]) - float(y[0]))
+                         / max(1.0, float(sample_step_px)))) + 1)
+    sample_y = np.linspace(y[0], y[-1], sample_count, dtype=np.float64)
+    interval = np.clip(
+        np.searchsorted(y, sample_y, side="right") - 1,
+        0, len(y) - 2)
+    interval_h = h[interval]
+    t = (sample_y - y[interval]) / interval_h
+    t2 = t * t
+    t3 = t2 * t
+    sample_x = (
+        (2.0 * t3 - 3.0 * t2 + 1.0) * x[interval]
+        + (t3 - 2.0 * t2 + t) * interval_h * slopes[interval]
+        + (-2.0 * t3 + 3.0 * t2) * x[interval + 1]
+        + (t3 - t2) * interval_h * slopes[interval + 1])
+    if len(sample_x) >= 9:
+        # A short box smoother removes the small curvature impulse at the
+        # model/graph join. It is local, bounded by nearby samples and much
+        # cheaper than another global least-squares fit.
+        original_start = float(sample_x[0])
+        original_end = float(sample_x[-1])
+        sample_x = np.convolve(
+            np.pad(sample_x, (4, 4), mode="edge"),
+            np.full(9, 1.0 / 9.0, dtype=np.float64), mode="valid")
+        sample_x[0] = original_start
+        sample_x[-1] = original_end
+    sample_probability = np.interp(
+        sample_y, y, np.asarray(probabilities, dtype=np.float64))
+    return (np.stack((sample_x, sample_y), axis=1).astype(np.float32),
+            np.clip(sample_probability, 0.0, 1.0).astype(np.float32))
+
+
+def _centerline_refit_model_and_graph(
+        model_points, model_probabilities, graph_points, graph_probabilities,
+        image_shape, smoothness, join_error_px_640):
+    """Refit model and newly found far points as one continuous curve."""
+    del smoothness  # The established curve fitter owns smoothing parameters.
+    model, model_p = _centerline_unique_y_curve(
+        model_points, model_probabilities)
+    graph, graph_p = _centerline_unique_y_curve(
+        graph_points, graph_probabilities)
+    if len(model) < 3 or len(graph) < 3:
+        return model, model_p, {"accepted": False, "reason": "short_graph"}
+    height, width = image_shape[:2]
+    overlap_low = max(float(np.min(model[:, 1])), float(np.min(graph[:, 1])))
+    overlap_high = min(float(np.max(model[:, 1])), float(np.max(graph[:, 1])))
+    if overlap_low > overlap_high:
+        return model, model_p, {"accepted": False, "reason": "no_overlap"}
+    overlap_y = np.linspace(overlap_low, overlap_high, 8, dtype=np.float32)
+    model_x = _interp_path_x_many(model, overlap_y)
+    graph_x = _interp_path_x_many(graph, overlap_y)
+    valid = np.isfinite(model_x) & np.isfinite(graph_x)
+    join_error = 1e9
+    if np.any(valid):
+        join_error = float(np.median(np.abs(model_x[valid] - graph_x[valid]))
+                           * 640.0 / float(max(1, width)))
+    if join_error > float(join_error_px_640):
+        return model, model_p, {
+            "accepted": False,
+            "reason": "join_error",
+            "join_error_640": join_error,
+        }
+    model_top_y = float(np.min(model[:, 1]))
+    extension_mask = graph[:, 1] < model_top_y
+    extension = graph[extension_mask]
+    extension_p = graph_p[extension_mask]
+    if len(extension) < 3:
+        return model, model_p, {
+            "accepted": False,
+            "reason": "no_new_graph_points",
+            "join_error_640": float(join_error),
+        }
+
+    joint_points = np.concatenate((extension, model), axis=0)
+    joint_probabilities = np.concatenate((extension_p, model_p), axis=0)
+    refitted, refitted_probabilities = _centerline_shape_preserving_curve(
+        joint_points, joint_probabilities, sample_step_px=4.0)
+    graph_top_y = float(np.min(extension[:, 1]))
+    if len(refitted) < 3:
+        return model, model_p, {
+            "accepted": False,
+            "reason": "joint_refit_failed",
+            "join_error_640": float(join_error),
+        }
+    sample_tolerance = max(8.0, float(height) / 60.0)
+    if float(np.min(refitted[:, 1])) > graph_top_y + sample_tolerance:
+        return model, model_p, {
+            "accepted": False,
+            "reason": "joint_refit_dropped_extension",
+            "join_error_640": float(join_error),
+        }
+    return refitted, refitted_probabilities, {
+        "accepted": True,
+        "reason": "graph_joint_refit",
+        "join_error_640": float(join_error),
+        "joint_refit": True,
+        "joint_points": int(len(joint_points)),
+        "joint_inliers": int(len(joint_points)),
+        "joint_fit": "shape_preserving_hermite",
+        "model_top_y": float(model_top_y),
+        "graph_top_y": float(graph_top_y),
+        "model_points": int(len(model)),
+        "graph_points": int(len(extension)),
+    }
+
+
+def _centerline_trim_far_tail(
+        points, probabilities, road_mask, image_shape, model_top_y):
+    """Keep the in-road prefix from the model join and trim only the far tail."""
+    points, probabilities = _centerline_unique_y_curve(
+        points, probabilities)
+    if len(points) < 3:
+        return points, probabilities, {
+            "accepted": False, "reason": "trim_input_short"}
+    join_index = int(np.searchsorted(
+        points[:, 1], float(model_top_y), side="left"))
+    join_index = int(np.clip(join_index, 0, len(points) - 1))
+    base = points[join_index:]
+    if len(base) < 2 or not _semantic_road_polyline_inside(
+            base, road_mask, image_shape):
+        return points, probabilities, {
+            "accepted": False, "reason": "refitted_base_outside_road"}
+
+    keep_start = join_index
+    boundary = None
+    first_invalid = None
+    for index in range(join_index - 1, -1, -1):
+        segment = points[index:index + 2]
+        point_inside = bool(_semantic_road_point_mask(
+            points[index:index + 1], road_mask, image_shape)[0])
+        if point_inside and _semantic_road_polyline_inside(
+                segment, road_mask, image_shape):
+            keep_start = index
+            continue
+        first_invalid = index
+        # Find a conservative final in-road point between the last valid
+        # point and the first invalid far point. Six iterations are sub-pixel
+        # at the 120x160 road-mask scale and remain very cheap.
+        valid_point = points[index + 1].astype(np.float32).copy()
+        invalid_point = points[index].astype(np.float32).copy()
+        for _iteration in range(6):
+            midpoint = 0.5 * (valid_point + invalid_point)
+            midpoint_inside = bool(_semantic_road_point_mask(
+                midpoint[None, :], road_mask, image_shape)[0])
+            if midpoint_inside and _semantic_road_polyline_inside(
+                    np.stack((midpoint, valid_point)),
+                    road_mask, image_shape):
+                valid_point = midpoint
+            else:
+                invalid_point = midpoint
+        if float(np.linalg.norm(valid_point - points[index + 1])) > 0.75:
+            boundary = valid_point
+        break
+
+    kept_points = points[keep_start:].copy()
+    kept_probabilities = probabilities[keep_start:].copy()
+    if first_invalid is not None:
+        kept_points = points[first_invalid + 1:].copy()
+        kept_probabilities = probabilities[first_invalid + 1:].copy()
+        if boundary is not None:
+            kept_points = np.concatenate((boundary[None, :], kept_points), axis=0)
+            boundary_probability = float(probabilities[first_invalid + 1])
+            kept_probabilities = np.concatenate((
+                np.asarray([boundary_probability], dtype=np.float32),
+                kept_probabilities.astype(np.float32)), axis=0)
+    extension_points = int(np.count_nonzero(
+        kept_points[:, 1] < float(model_top_y) - 1e-3))
+    if extension_points < 2:
+        return kept_points, kept_probabilities, {
+            "accepted": False,
+            "reason": "trimmed_extension_too_short",
+            "trimmed_points": int(
+                0 if first_invalid is None else first_invalid + 1),
+            "remaining_extension_points": extension_points,
+        }
+    if not _semantic_road_polyline_inside(
+            kept_points, road_mask, image_shape):
+        return kept_points, kept_probabilities, {
+            "accepted": False, "reason": "trim_result_outside_road"}
+    return kept_points, kept_probabilities, {
+        "accepted": True,
+        "reason": (
+            "extension_tail_trimmed" if first_invalid is not None
+            else "extension_inside_road"),
+        "trimmed_points": int(
+            0 if first_invalid is None else first_invalid + 1),
+        "remaining_extension_points": extension_points,
+    }
+
+
+def _centerline_extend_with_graph(
+        points, probabilities, road_probability, road_mask, image_shape,
+        config, hard_mask=None, prepared=None):
+    """Extend a fitted centerline through the soft road graph, if compatible."""
+    original_points = np.asarray(points, dtype=np.float32)
+    original_probabilities = np.asarray(probabilities, dtype=np.float32)
+    empty_info = {"accepted": False, "reason": "unavailable"}
+    if prepared is None:
+        prepared = _centerline_probability_support(
+            road_probability, road_mask,
+            config.centerline_graph_min_probability,
+            hard_mask=hard_mask)
+    if prepared is None or len(original_points) < 6:
+        return original_points, original_probabilities, empty_info
+    probability = prepared["probability"]
+    support = prepared["support"]
+    distance = prepared["distance"]
+    order = np.argsort(original_points[:, 1], kind="stable")
+    model = original_points[order]
+    model_probabilities = original_probabilities[order]
+    seed_index = min(4, len(model) - 1)
+    seed_point = model[seed_index]
+    top_point = model[0]
+    start_unclipped = _centerline_image_to_grid(
+        seed_point, image_shape, support.shape)
+    start = _centerline_nearest_support(
+        support, probability, start_unclipped,
+        config.centerline_graph_seed_radius)
+    if start is None:
+        return original_points, original_probabilities, {
+            "accepted": False, "reason": "seed_outside_road"
+        }
+    component_count = int(prepared["component_count"])
+    labels = prepared["labels"]
+    component_stats = prepared["stats"]
+    component_label = int(labels[start[0], start[1]])
+    if component_label <= 0 or component_label >= component_count:
+        return original_points, original_probabilities, {
+            "accepted": False, "reason": "seed_component_missing"
+        }
+    minimum_component_y = int(component_stats[component_label, cv2.CC_STAT_TOP])
+    target_y = max(
+        minimum_component_y,
+        int(round(float(support.shape[0] - 1) *
+                  float(config.centerline_graph_top_ratio))),
+    )
+    if int(start[0]) - target_y < int(config.centerline_graph_min_progress_rows):
+        return original_points, original_probabilities, {
+            "accepted": False, "reason": "no_far_support"
+        }
+    component_support = labels == component_label
+    graph_path = _centerline_local_forward_path(
+        probability, component_support, distance, start, target_y, None,
+        lateral_radius=config.centerline_graph_seed_radius)
+    if len(graph_path) < int(config.centerline_graph_min_progress_rows) + 1:
+        return original_points, original_probabilities, {
+            "accepted": False, "reason": "local_search_failed"
+        }
+    graph_path = np.asarray(graph_path, dtype=np.float32)
+    graph_points = np.stack((
+        graph_path[:, 1] * float(max(1, image_shape[1] - 1)) /
+        float(max(1, support.shape[1] - 1)),
+        graph_path[:, 0] * float(max(1, image_shape[0] - 1)) /
+        float(max(1, support.shape[0] - 1)),
+    ), axis=1).astype(np.float32)
+    graph_probabilities = np.asarray([
+        float(probability[int(y), int(x)])
+        for y, x in graph_path.tolist()
+    ], dtype=np.float32)
+    # Local search returns seed-to-far; the controller uses increasing y.
+    graph_points = graph_points[::-1]
+    graph_probabilities = np.clip(
+        graph_probabilities[::-1] * 0.70, 0.12, 0.70)
+    hard_validation_mask = hard_mask if hard_mask is not None else road_mask
+    if not _semantic_road_polyline_inside(
+            graph_points, hard_validation_mask, image_shape):
+        return original_points, original_probabilities, {
+            "accepted": False,
+            "reason": "graph_points_outside_road",
+        }
+    refitted, refitted_probabilities, fusion_info = (
+        _centerline_refit_model_and_graph(
+            model, model_probabilities, graph_points, graph_probabilities,
+            image_shape, config.centerline_graph_smoothness,
+            config.centerline_graph_join_error_px_640))
+    if not fusion_info.get("accepted"):
+        fusion_info.update({
+            "graph_path_points": int(len(graph_points)),
+            "target_y_grid": int(target_y),
+        })
+        return original_points, original_probabilities, fusion_info
+    refitted, refitted_probabilities, trim_info = (
+        _centerline_trim_far_tail(
+            refitted, refitted_probabilities, hard_validation_mask,
+            image_shape, fusion_info.get("model_top_y", top_point[1])))
+    if not trim_info.get("accepted"):
+        fusion_info.update(trim_info)
+        return original_points, original_probabilities, fusion_info
+    if trim_info.get("trimmed_points", 0):
+        fusion_info["reason"] = "graph_joint_refit_trimmed"
+    fusion_info["tail_trim"] = dict(trim_info)
+    fusion_info.update({
+        "graph_path_points": int(len(graph_points)),
+        "target_y_grid": int(target_y),
+        "seed_y": float(seed_point[1]),
+        "model_top_y": float(top_point[1]),
+        "graph_top_y": float(np.min(graph_points[:, 1])),
+    })
+    return refitted, refitted_probabilities, fusion_info
+
+
 def _semantic_road_point_mask(points, road_mask, image_shape):
     """Return points that land inside the semantic road segmentation."""
     points = np.asarray(points, dtype=np.float32)
@@ -5444,6 +7127,30 @@ def _semantic_road_point_mask(points, road_mask, image_shape):
         np.rint(points[:, 1] * float(road_height - 1) /
                float(max(height - 1, 1))), 0, road_height - 1).astype(np.int32)
     return np.asarray(road[y, x]) != 0
+
+
+def _semantic_road_polyline_inside(points, road_mask, image_shape):
+    """Require every rasterized centerline segment to stay in road pixels."""
+    points = np.asarray(points, dtype=np.float32)
+    road = np.asarray(road_mask) if road_mask is not None else np.empty((0, 0))
+    if road.ndim != 2 or not road.size:
+        return True
+    if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 2
+            or not np.all(np.isfinite(points))):
+        return False
+    height, width = image_shape[:2]
+    road_height, road_width = road.shape
+    pixels = np.empty_like(points, dtype=np.int32)
+    pixels[:, 0] = np.clip(np.rint(
+        points[:, 0] * float(road_width - 1) /
+        float(max(width - 1, 1))), 0, road_width - 1).astype(np.int32)
+    pixels[:, 1] = np.clip(np.rint(
+        points[:, 1] * float(road_height - 1) /
+        float(max(height - 1, 1))), 0, road_height - 1).astype(np.int32)
+    raster = np.zeros((road_height, road_width), dtype=np.uint8)
+    cv2.polylines(
+        raster, [pixels], False, 1, 1, cv2.LINE_8)
+    return not np.any((raster != 0) & (road == 0))
 
 
 def _select_control_curve_segment(
