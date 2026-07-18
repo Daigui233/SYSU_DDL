@@ -22,6 +22,8 @@ ROUTE_MULTI_FORK = "MULTI_FORK"
 ROUTE_AMBIGUOUS = "AMBIGUOUS"
 
 _PAIR_FRACTIONS = np.arange(24, dtype=np.float32) / 23.0
+DEFAULT_VISUAL_CENTER_X = 0.5625
+CENTERED_VISUAL_CENTER_X = 0.5
 
 
 def _env_float(name, default):
@@ -105,7 +107,7 @@ def _interp_path_x_many(points, target_ys):
 
 @dataclass
 class VisionControlConfig:
-    visual_center_x: float = 0.59375
+    visual_center_x: float = DEFAULT_VISUAL_CENTER_X
     # Unified line tracking blend.  Curvature is weighted explicitly, while the
     # final error slew stays conservative so one mode works for straights and bends.
     straight_position_gain: float = 0.60
@@ -156,6 +158,7 @@ class VisionControlConfig:
     overlap_px_640: float = 28.0
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
+    ocr_right_center_latch_s: float = 5.0
     curve_merge_support_ratio: float = 0.70
     curve_merge_near_px_640: float = 36.0
     curve_merge_enter_evidence: int = 4
@@ -225,7 +228,9 @@ class VisionControlConfig:
     @classmethod
     def from_env(cls):
         return cls(
-            visual_center_x=_clamp(_env_float("VISION_CONTROL_CENTER_X", 0.59375), 0.2, 0.8),
+            visual_center_x=_clamp(
+                _env_float("VISION_CONTROL_CENTER_X", DEFAULT_VISUAL_CENTER_X),
+                0.2, 0.8),
             straight_position_gain=_clamp(
                 _env_float("VISION_CONTROL_STRAIGHT_POSITION_GAIN", 0.60),
                 0.0, 1.0),
@@ -335,6 +340,9 @@ class VisionControlConfig:
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
             ocr_confirm_frames=max(1, _env_int("VISION_CONTROL_OCR_CONFIRM_FRAMES", 1)),
+            ocr_right_center_latch_s=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_OCR_RIGHT_CENTER_LATCH_S", 5.0)),
             curve_merge_support_ratio=_clamp(
                 _env_float("VISION_CONTROL_CURVE_MERGE_SUPPORT_RATIO", 0.70),
                 0.25, 1.0),
@@ -495,6 +503,7 @@ class VisionControlPlanner:
         self.ocr_pending_direction = None
         self.ocr_pending_frames = 0
         self.ocr_confirmed_current = False
+        self.ocr_right_center_until = 0.0
         self.human_waiting_cross = False
         self.human_last_side = None
         self.human_pass_active = False
@@ -596,6 +605,8 @@ class VisionControlPlanner:
         ocr_lock_expired = False
         if ocr_current:
             self.last_valid_ocr_ts = now
+            if ocr_direction == "right":
+                self._latch_ocr_right_center(now)
             self.turnsign_trim_api_ready = True
             if (
                 self.config.turnsign_trim_enabled
@@ -619,7 +630,7 @@ class VisionControlPlanner:
         self._update_curve_merge_continuity(candidates, image_shape)
         raw_selected = self._select_candidate(candidates)
         line_connected, line_connection_reason, line_connection_metrics = (
-            self._path_connection_status(raw_selected, image_shape))
+            self._path_connection_status(raw_selected, image_shape, now))
         line_loss_reason = None
         selected = raw_selected
         if raw_selected is not None and not line_connected:
@@ -683,6 +694,8 @@ class VisionControlPlanner:
             "ocr_lock_expired": bool(ocr_lock_expired),
             "ocr_lock_age_s": self._ocr_lock_age(now),
             "ocr_lock_remaining_s": self._ocr_lock_remaining(now),
+            "ocr_right_center_latch_remaining_s": (
+                self._ocr_right_center_remaining(now)),
             "turnsign_trim_separation_640": self.turnsign_trim_separation_640,
             "turnsign_trim_enabled": bool(
                 self.config.turnsign_trim_enabled),
@@ -1190,7 +1203,7 @@ class VisionControlPlanner:
                 return candidate
         return None
 
-    def _path_connection_status(self, selected, image_shape):
+    def _path_connection_status(self, selected, image_shape, now=None):
         """Reject a fitted path whose near end no longer reaches the car."""
         if selected is None:
             return False, "no_selected_route", {}
@@ -1207,7 +1220,8 @@ class VisionControlPlanner:
         near_band = max(18.0, 0.05 * float(height))
         near_points = points[points[:, 1] >= maximum_y - near_band]
         near_x = float(np.median(near_points[:, 0]))
-        visual_center = float(width) * self.config.visual_center_x
+        visual_center_x = self._active_visual_center_x(now)
+        visual_center = float(width) * visual_center_x
         near_offset_640 = (
             (near_x - visual_center) * 640.0 / float(max(1, width)))
         reaches_vehicle = bool(
@@ -1220,6 +1234,8 @@ class VisionControlPlanner:
             "maximum_y": maximum_y,
             "maximum_y_ratio": maximum_y / float(max(1, height)),
             "near_x": near_x,
+            "visual_center_x": float(visual_center_x),
+            "reference_line_x": float(visual_center),
             "near_offset_640": near_offset_640,
             "reaches_vehicle": reaches_vehicle,
             "inside_anchor_gate": inside_anchor_gate,
@@ -1257,6 +1273,9 @@ class VisionControlPlanner:
     def _build_command(
             self, selected, route_reason, result, image_shape, now,
             ocr_response=None, line_loss_reason=None):
+        width = float(max(1, image_shape[1]))
+        visual_center_x = self._active_visual_center_x(now)
+        reference_line_x = float(width) * visual_center_x
         lookahead_y = image_shape[0] * self.config.lookahead_y_ratio
         path_geometry = self._path_geometry_metrics(
             selected, lookahead_y, image_shape)
@@ -1277,7 +1296,7 @@ class VisionControlPlanner:
                 ocr_response["control_phase"] = "ocr_wait_route"
             return self._line_loss_hold_command(
                 "ocr_selected_route_unavailable", "ocr_wait_route",
-                now, lookahead_y)
+                now, lookahead_y, image_shape)
         if ocr_route_locked and isinstance(ocr_response, dict):
             ocr_response["control_phase"] = "ocr_route_ready"
 
@@ -1328,6 +1347,12 @@ class VisionControlPlanner:
                         "target_x": None,
                         "path_target_x": None,
                         "path_target_y": float(lookahead_y),
+                        "visual_center_x": float(visual_center_x),
+                        "configured_visual_center_x": float(
+                            self.config.visual_center_x),
+                        "reference_line_x": float(reference_line_x),
+                        "ocr_right_center_latch_remaining_s": (
+                            self._ocr_right_center_remaining(now)),
                         "path_target_adaptive_y": True,
                         "path_target_held": False,
                         "track_error_640": float(self.last_error),
@@ -1339,7 +1364,7 @@ class VisionControlPlanner:
                     }
             command, target = self._line_loss_hold_command(
                 "adaptive_path_no_previous_target", task_reason,
-                now, lookahead_y)
+                now, lookahead_y, image_shape)
             target.update({
                 "path_target_adaptive_y": True,
                 "path_target_held": False,
@@ -1362,6 +1387,12 @@ class VisionControlPlanner:
                         "target_x": None,
                         "path_target_x": None,
                         "path_target_y": float(lookahead_y),
+                        "visual_center_x": float(visual_center_x),
+                        "configured_visual_center_x": float(
+                            self.config.visual_center_x),
+                        "reference_line_x": float(reference_line_x),
+                        "ocr_right_center_latch_remaining_s": (
+                            self._ocr_right_center_remaining(now)),
                         "path_target_held": False,
                         "track_error_640": float(self.last_error),
                         "reason": "line_loss_human_stop",
@@ -1372,10 +1403,11 @@ class VisionControlPlanner:
                     }
             return self._line_loss_hold_command(
                 line_loss_reason or route_reason or "line_unavailable",
-                task_reason, now, lookahead_y)
+                task_reason, now, lookahead_y, image_shape)
         if path_target is None:
             return self._line_loss_hold_command(
-                "missing_target_x", task_reason, now, lookahead_y)
+                "missing_target_x", task_reason, now, lookahead_y,
+                image_shape)
 
         path_target_x, path_target_y, path_target_adaptive = path_target
         unconstrained_requested_target_x = _clamp(
@@ -1401,7 +1433,6 @@ class VisionControlPlanner:
             if task_mask_constraint["available"]:
                 requested_target_x = float(
                     task_mask_constraint["constrained_x"])
-        width = float(max(1, image_shape[1]))
         requested_task_adjustment_640 = (
             (float(requested_target_x) - float(path_target_x))
             * 640.0 / width)
@@ -1424,7 +1455,7 @@ class VisionControlPlanner:
         task_offset_x = float(target_x) - float(path_target_x)
         path_raw_error = (
             float(target_x) / width
-            - self.config.visual_center_x) * 640.0
+            - visual_center_x) * 640.0
         heading_feedforward = 0.0
         curve_feedforward = 0.0
         right_circle_trim = 0.0
@@ -1468,7 +1499,7 @@ class VisionControlPlanner:
         if constrain_human_target_to_road:
             raw_target_x = _clamp(
                 width * (
-                    self.config.visual_center_x
+                    visual_center_x
                     + float(raw_error) / 640.0),
                 0.0,
                 float(max(0, image_shape[1] - 1)),
@@ -1480,7 +1511,7 @@ class VisionControlPlanner:
             if raw_mask_constraint["available"]:
                 raw_error = (
                     float(raw_mask_constraint["constrained_x"]) / width
-                    - self.config.visual_center_x) * 640.0
+                    - visual_center_x) * 640.0
         applied_steering_feedforward = (
             float(raw_error) - float(weighted_path_error))
         control_target_x = _clamp(
@@ -1506,7 +1537,7 @@ class VisionControlPlanner:
         if constrain_human_target_to_road:
             limited_target_x = _clamp(
                 width * (
-                    self.config.visual_center_x
+                    visual_center_x
                     + float(error) / 640.0),
                 0.0,
                 float(max(0, image_shape[1] - 1)),
@@ -1518,7 +1549,7 @@ class VisionControlPlanner:
             if final_mask_constraint["available"]:
                 error = (
                     float(final_mask_constraint["constrained_x"]) / width
-                    - self.config.visual_center_x) * 640.0
+                    - visual_center_x) * 640.0
                 control_target_x = float(
                     final_mask_constraint["constrained_x"])
         self.last_error = error
@@ -1539,8 +1570,11 @@ class VisionControlPlanner:
             "base_target_x": float(target_x),
             "path_target_x": float(path_target_x),
             "path_target_y": float(path_target_y),
-            "visual_center_x": float(self.config.visual_center_x),
-            "reference_line_x": float(width * self.config.visual_center_x),
+            "visual_center_x": float(visual_center_x),
+            "configured_visual_center_x": float(self.config.visual_center_x),
+            "reference_line_x": float(reference_line_x),
+            "ocr_right_center_latch_remaining_s": (
+                self._ocr_right_center_remaining(now)),
             "path_target_held": bool(path_target_held),
             "path_target_adaptive_y": bool(path_target_adaptive),
             "lookahead_y": float(path_target_y),
@@ -1631,11 +1665,18 @@ class VisionControlPlanner:
         }
 
     def _line_loss_hold_command(
-            self, reason, task_reason, now, lookahead_y):
+            self, reason, task_reason, now, lookahead_y,
+            image_shape=None):
         """Hold the latest steering, but slow down until the path returns."""
         age = now - self.last_valid_ts if self.last_valid_ts else 1e9
         held_target = self._held_path_target(now)
         error = float(self.last_error)
+        width = (
+            float(max(1, image_shape[1]))
+            if image_shape is not None and len(image_shape) >= 2 else None)
+        visual_center_x = self._active_visual_center_x(now)
+        reference_line_x = (
+            None if width is None else float(width) * visual_center_x)
         previous_speed = float(self.last_forward_speed_mps)
         if previous_speed <= 0.0:
             previous_speed = max(0.031, float(self.config.normal_speed_mps))
@@ -1649,6 +1690,11 @@ class VisionControlPlanner:
             "path_target_y": (
                 float(lookahead_y)
                 if held_target is None else held_target[1]),
+            "visual_center_x": float(visual_center_x),
+            "configured_visual_center_x": float(self.config.visual_center_x),
+            "reference_line_x": reference_line_x,
+            "ocr_right_center_latch_remaining_s": (
+                self._ocr_right_center_remaining(now)),
             "path_target_held": held_target is not None,
             "track_error_640": error,
             "reason": str(reason or "line_unavailable"),
@@ -1682,17 +1728,19 @@ class VisionControlPlanner:
             image_shape, lookahead_y, now):
         """Run the active car/human task without applying line-loss recovery."""
         width = float(max(1, image_shape[1]))
+        visual_center_x = self._active_visual_center_x(now)
+        reference_line_x = float(width) * visual_center_x
         target_x = _finite_float(target_override_x)
         if target_x is None:
             error = float(self.last_error)
             target_x = width * (
-                self.config.visual_center_x + error / 640.0)
+                visual_center_x + error / 640.0)
         else:
             target_x = _clamp(
                 target_x, 0.0, float(max(0, image_shape[1] - 1)))
             raw_error = (
                 float(target_x) / width
-                - self.config.visual_center_x) * 640.0
+                - visual_center_x) * 640.0
             error = self._limit_error(raw_error, adaptive=False)
             self.last_error = float(error)
         target_x = _clamp(
@@ -1706,6 +1754,11 @@ class VisionControlPlanner:
             "target_x": float(target_x),
             "path_target_x": path_target_x,
             "path_target_y": float(path_target_y),
+            "visual_center_x": float(visual_center_x),
+            "configured_visual_center_x": float(self.config.visual_center_x),
+            "reference_line_x": float(reference_line_x),
+            "ocr_right_center_latch_remaining_s": (
+                self._ocr_right_center_remaining(now)),
             "path_target_held": path_target_x is not None,
             "track_error_640": float(error),
             "reason": "obstacle_line_loss_masked",
@@ -2427,9 +2480,10 @@ class VisionControlPlanner:
                     STATE_RECOVER_LINE, self.config.recover_speed_mps,
                     "no_path", None)
             line_loss_obstacle_masked = True
+            visual_center_x = self._active_visual_center_x(now)
             fallback_path_x = _finite_float(
                 self.last_path_target_x,
-                float(image_shape[1]) * self.config.visual_center_x)
+                float(image_shape[1]) * visual_center_x)
             selected = {
                 "slot": int(self.last_path_target_slot or 0),
                 "points_xy": np.asarray([
@@ -2443,7 +2497,8 @@ class VisionControlPlanner:
             target_path_x = _interp_path_x(
                 selected["points_xy"], lookahead_y)
         if target_path_x is None:
-            target_path_x = image_shape[1] * self.config.visual_center_x
+            target_path_x = (
+                image_shape[1] * self._active_visual_center_x(now))
         target_path_x = self._apply_path_left_bias(
             target_path_x, image_shape)
         lookahead_path_x = float(target_path_x)
@@ -2602,7 +2657,7 @@ class VisionControlPlanner:
             and self.turnsign_new_session_pending)
         if new_session:
             self.turnsign_new_session_pending = False
-        self._remember_turnsign_position(response, phase, image_shape)
+        self._remember_turnsign_position(response, phase, image_shape, now)
         if self.turnsign_trim_session_adaptive:
             self._update_turnsign_line_history(now)
         api_result_ready = bool(
@@ -2700,7 +2755,7 @@ class VisionControlPlanner:
                         STATE_SAFE_STOP, 0.0,
                         "turnsign_missing_stop", None)
                 width = float(max(1, image_shape[1]))
-                visual_center = width * self.config.visual_center_x
+                visual_center = width * self._active_visual_center_x(now)
                 sign_delta = float(sign_center_x) - visual_center
                 target_x = _clamp(
                     float(path_x) +
@@ -2828,7 +2883,8 @@ class VisionControlPlanner:
             float(path_x) + correction_640 * width / 640.0,
             0.0, float(max(0, image_shape[1] - 1)))
 
-    def _remember_turnsign_position(self, response, phase, image_shape):
+    def _remember_turnsign_position(
+            self, response, phase, image_shape, now=None):
         center_x = _finite_float(response.get("bbox_center_x"))
         if center_x is None:
             geom = self._detection_geom(
@@ -2842,7 +2898,7 @@ class VisionControlPlanner:
         is_fresh = bool(center_x is not None and fresh_marker)
         if is_fresh:
             width = float(max(1, image_shape[1]))
-            visual_center = width * self.config.visual_center_x
+            visual_center = width * self._active_visual_center_x(now)
             self.turnsign_last_seen_delta_640 = (
                 (float(center_x) - visual_center) * 640.0 / width)
             try:
@@ -3565,6 +3621,24 @@ class VisionControlPlanner:
         self.branch_lock_source = "ocr"
         self.selected_slot_lock = 0 if direction == "left" else 1
 
+    def _latch_ocr_right_center(self, now):
+        duration = float(self.config.ocr_right_center_latch_s)
+        if duration <= 0.0:
+            self.ocr_right_center_until = 0.0
+            return
+        self.ocr_right_center_until = float(now) + duration
+
+    def _active_visual_center_x(self, now=None):
+        if (
+            now is not None
+            and float(now) < float(self.ocr_right_center_until)
+        ):
+            return CENTERED_VISUAL_CENTER_X
+        return float(self.config.visual_center_x)
+
+    def _ocr_right_center_remaining(self, now):
+        return max(0.0, float(self.ocr_right_center_until) - float(now))
+
     def _expire_ocr_lock(self, now):
         if self.branch_lock_source != "ocr" or self.last_valid_ocr_ts <= 0.0:
             return False
@@ -3673,7 +3747,7 @@ def render_vision_control_debug(frame, result):
     target = debug.get("control_target") or {}
     visual_center_x = _finite_float(
         target.get("visual_center_x"),
-        _env_float("VISION_CONTROL_CENTER_X", 0.59375))
+        _env_float("VISION_CONTROL_CENTER_X", DEFAULT_VISUAL_CENTER_X))
     center_x = int(round(w * _clamp(visual_center_x, 0.2, 0.8)))
     cv2.line(frame, (center_x, int(h * 0.45)), (center_x, h - 1), (210, 210, 210), 1, cv2.LINE_AA)
 
@@ -4254,7 +4328,7 @@ def render_vision_control_birdseye(
     target = debug.get("control_target") or {}
     visual_center_x = _finite_float(
         target.get("visual_center_x"),
-        _env_float("VISION_CONTROL_CENTER_X", 0.59375))
+        _env_float("VISION_CONTROL_CENTER_X", DEFAULT_VISUAL_CENTER_X))
     center_x = float(width) * _clamp(visual_center_x, 0.2, 0.8)
     car_source = np.asarray([
         [center_x, source_quad[2, 1]],

@@ -196,7 +196,7 @@ class CurveConstructionTest(unittest.TestCase):
 class VisionControlPlannerTest(unittest.TestCase):
     def test_conflicting_control_defaults_match_e7(self):
         config = VisionControlConfig()
-        self.assertEqual(config.visual_center_x, 0.59375)
+        self.assertEqual(config.visual_center_x, 0.5625)
         self.assertEqual(config.lookahead_y_ratio, 0.625)
         self.assertEqual(config.straight_position_gain, 0.60)
         self.assertEqual(config.straight_heading_feedforward_gain, 0.60)
@@ -234,13 +234,14 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.human_stop_progress_ratio, 0.84)
         self.assertEqual(config.human_stop_line_offset_px_480, 35.0)
         self.assertEqual(config.car_human_pass_speed_mps, 0.20)
+        self.assertEqual(config.ocr_right_center_latch_s, 5.0)
 
     def test_from_env_uses_eighteen_pixel_path_bias_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VISION_CONTROL_PATH_LEFT_BIAS_PX_640", None)
             os.environ.pop("VISION_CONTROL_CENTER_X", None)
             config = VisionControlConfig.from_env()
-        self.assertEqual(config.visual_center_x, 0.59375)
+        self.assertEqual(config.visual_center_x, 0.5625)
         self.assertEqual(config.path_left_bias_px_640, 18.0)
 
     def test_default_human_stop_line_is_shifted_up_thirty_five_pixels(self):
@@ -551,7 +552,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         command, target = planner._build_command(
             selected, "test", {"detections": []},
             (480, 640, 3), now=1.0)
-        self.assertAlmostEqual(command["track_error"], 3.7125)
+        self.assertAlmostEqual(command["track_error"], 6.3)
         self.assertEqual(target["track_error_response"], "straight_damping")
         self.assertFalse(target["road_shape_valid"])
 
@@ -772,6 +773,33 @@ class VisionControlPlannerTest(unittest.TestCase):
             _raw_result_at(), response, now=1.0)
         self.assertEqual(debug["branch_lock"], "right")
         self.assertEqual(debug["selected_slot"], 1)
+
+    def test_current_ocr_right_recenters_reference_line_for_five_seconds(self):
+        planner = VisionControlPlanner(config=_config(visual_center_x=0.5625))
+        response = {
+            "instruction_current": True,
+            "instruction": {"direction": "right"},
+        }
+
+        _command, latched = planner.update(
+            _raw_result_at(), response, now=1.0)
+        _command, still_centered = planner.update(_raw_result_at(), now=5.9)
+        _command, expired = planner.update(_raw_result_at(), now=6.1)
+
+        self.assertEqual(latched["branch_lock"], "right")
+        self.assertAlmostEqual(
+            latched["control_target"]["visual_center_x"], 0.5)
+        self.assertAlmostEqual(
+            latched["control_target"]["reference_line_x"], 320.0)
+        self.assertGreater(
+            latched["control_target"][
+                "ocr_right_center_latch_remaining_s"], 4.9)
+        self.assertAlmostEqual(
+            still_centered["control_target"]["visual_center_x"], 0.5)
+        self.assertAlmostEqual(
+            expired["control_target"]["visual_center_x"], 0.5625)
+        self.assertAlmostEqual(
+            expired["control_target"]["reference_line_x"], 360.0)
 
     def test_ocr_branch_lock_expires_to_blue_after_ten_seconds(self):
         planner = VisionControlPlanner(config=_config())
@@ -1550,7 +1578,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(_identity_probability_color(0, 1.0), (255, 0, 0))
         self.assertEqual(_identity_probability_color(1, 1.0), (0, 255, 0))
 
-    def test_preview_draws_default_reference_line_sixty_px_right(self):
+    def test_preview_draws_default_reference_line_forty_px_right(self):
         planner = VisionControlPlanner(config=VisionControlConfig())
         result = _raw_result_at()
         planner.update(result, now=1.0)
@@ -1558,7 +1586,7 @@ class VisionControlPlannerTest(unittest.TestCase):
 
         rendered = render_vision_control_debug(frame, result)
 
-        self.assertGreater(int(rendered[470, 380].sum()), 0)
+        self.assertGreater(int(rendered[470, 360].sum()), 0)
 
     def test_birdseye_preview_projects_actual_path_and_target(self):
         planner = VisionControlPlanner(config=_config())
