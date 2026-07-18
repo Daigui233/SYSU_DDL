@@ -898,14 +898,27 @@ def _preview_mask_on_frame(mask, frame_shape):
 
 
 def _preview_blend_mask(frame, mask, color, alpha):
+    """Tint only mask pixels without allocating two full-frame images.
+
+    This is presentation-only.  The road mask used by control remains the
+    original low-resolution semantic result.  The previous implementation
+    created both a solid-color frame and a blended frame for every preview
+    image, which competes with RKNN post-processing for memory bandwidth.
+    """
     mask = _preview_mask_on_frame(mask, frame.shape)
     if mask is None or not np.any(mask):
         return False
-    color_layer = np.empty_like(frame)
-    color_layer[:] = np.asarray(color, dtype=np.uint8)
-    blended = cv2.addWeighted(
-        frame, 1.0 - float(alpha), color_layer, float(alpha), 0.0)
-    cv2.copyTo(blended, mask.astype(np.uint8) * 255, frame)
+    alpha_u8 = int(np.clip(round(float(alpha) * 255.0), 0, 255))
+    if alpha_u8 <= 0:
+        return False
+    selected = frame[mask]
+    inverse_alpha = 255 - alpha_u8
+    tint = np.asarray(color, dtype=np.uint16).reshape(1, 3)
+    mixed = (
+        selected.astype(np.uint16) * inverse_alpha
+        + tint * alpha_u8
+        + 127) // 255
+    frame[mask] = mixed.astype(np.uint8)
     return True
 
 
@@ -930,7 +943,7 @@ def _preview_draw_path(frame, points, color, thickness=2, dashed=False):
 
 def add_semantic_centerline_overlay(
         frame, result, draw_road=True, draw_paths=True, draw_status=True,
-        prepared_masks=None):
+        prepared_masks=None, fast_preview=True):
     """Show the smoothed semantic road and finalized centerlines."""
     if frame is None or frame.size == 0 or not isinstance(result, dict):
         return frame
@@ -962,7 +975,9 @@ def add_semantic_centerline_overlay(
             _preview_blend_mask(
                 frame, cleaned_display, (70, 70, 210), 0.18)
         hard = hard_display
-        if hard is not None and np.any(hard):
+        # A contour is useful for a local debug session but is not needed by
+        # the controller.  Skip it in the default fast preview path.
+        if (not fast_preview) and hard is not None and np.any(hard):
             contours, _hierarchy = cv2.findContours(
                 hard.astype(np.uint8), cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE)
@@ -976,7 +991,6 @@ def add_semantic_centerline_overlay(
     if draw_paths:
         visible = hard_display if hard_display is not None else cleaned_display
         if visible is not None and np.any(visible):
-            path_layer = frame.copy()
             for path in list(final_paths)[:2]:
                 points = (
                     (path.get("preview_points_xy")
@@ -994,10 +1008,13 @@ def add_semantic_centerline_overlay(
                 if display_slot not in (0, 1):
                     display_slot = slot
                 color = final_colors[0 if int(display_slot) == 0 else 1]
+                # ``points_xy`` has already passed semantic-road clipping in
+                # VisionControlPlanner.  Drawing it directly avoids a full
+                # frame copy and a second copyTo for every preview frame.
                 _preview_draw_path(
-                    path_layer, points, (0, 0, 0), thickness=5)
+                    frame, points, (0, 0, 0), thickness=5)
                 _preview_draw_path(
-                    path_layer, points, color, thickness=3)
+                    frame, points, color, thickness=3)
                 extension = (
                     path.get("extension") if isinstance(path, dict) else None)
                 model_top_y = (
@@ -1009,10 +1026,8 @@ def add_semantic_centerline_overlay(
                         extension_points = points[
                             points[:, 1] <= float(model_top_y) + 6.0]
                         _preview_draw_path(
-                            path_layer, extension_points, (255, 255, 255),
+                            frame, extension_points, (255, 255, 255),
                             thickness=2, dashed=False)
-            cv2.copyTo(
-                path_layer, visible.astype(np.uint8) * 255, frame)
 
     vision_control = result.get("vision_control") or {}
     topology = vision_control.get("centerline_topology") or {}
@@ -1120,7 +1135,10 @@ def main():
         print(f"[PERCEPTION] unavailable; preview-only mode: {exc}")
 
     state = RuntimeState(preview_enabled=env_flag("AR_LOCAL_PREVIEW", True))
-    preview = FfplayPreview(state, fps=env_float("AR_PREVIEW_FPS", 60.0))
+    # Preview is diagnostic.  A 30 Hz cap is smooth enough for inspection and
+    # leaves a CPU core available for inference/post-processing; set
+    # AR_PREVIEW_FPS explicitly when recording a high-rate debug video.
+    preview = FfplayPreview(state, fps=env_float("AR_PREVIEW_FPS", 30.0))
     web = PreviewControlServer(
         state,
         host=os.environ.get("AR_PREVIEW_CONTROL_HOST", "0.0.0.0"),
@@ -1141,7 +1159,10 @@ def main():
         0.02, env_float(
             "AR_CAMERA_STALE_SECONDS", CAMERA_STALE_SECONDS))
     telemetry_logger = None
-    if env_flag("AR_VISION_TELEMETRY", True):
+    # Per-frame JSONL telemetry is intentionally opt-in.  It can be enabled
+    # for an investigation, but synchronous disk writes must not be part of
+    # the normal race-time frame budget.
+    if env_flag("AR_VISION_TELEMETRY", False):
         try:
             from vision_telemetry import VisionTelemetryLogger
 
@@ -1420,7 +1441,8 @@ def main():
                             add_semantic_centerline_overlay(
                                 target, result, draw_paths=False,
                                 draw_status=False,
-                                prepared_masks=semantic_masks)
+                                prepared_masks=semantic_masks,
+                                fast_preview=True)
                         if result is not None and render_vision_control is not None:
                             # The finalized curves are drawn once by the
                             # clipped semantic overlay below.
@@ -1431,7 +1453,8 @@ def main():
                             # last; raw curve-head output stays hidden.
                             add_semantic_centerline_overlay(
                                 target, result, draw_road=False,
-                                prepared_masks=semantic_masks)
+                                prepared_masks=semantic_masks,
+                                fast_preview=True)
                         target = add_runtime_overlay(
                             target, process_fps, inference_fps, ocr_response)
                         return target

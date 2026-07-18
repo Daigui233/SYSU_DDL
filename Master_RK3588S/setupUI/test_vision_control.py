@@ -22,6 +22,7 @@ from vision_control import (  # noqa: E402
     _associated_point_mask,
     _birdseye_debug_source_quad_from_road,
     _centerline_fuse_anchors_with_heatmap,
+    _centerline_transition_cost,
     _centerline_refit_model_and_graph,
     _centerline_local_forward_path,
     _centerline_trim_far_tail,
@@ -113,6 +114,15 @@ def _road_mask_following_path(x_values, y_values, half_width_px=110.0):
 
 
 class CurveConstructionTest(unittest.TestCase):
+    def test_heatmap_transition_cost_is_cached_and_bounded(self):
+        first = _centerline_transition_cost(8, 2, 0.055)
+        second = _centerline_transition_cost(8, 2, 0.055)
+        self.assertIs(first, second)
+        self.assertEqual(first.shape, (8, 8))
+        self.assertEqual(float(first[0, 0]), 0.0)
+        self.assertTrue(np.isinf(first[0, 3]))
+        self.assertTrue(np.isfinite(first[0, 2]))
+
     def test_graph_extension_jointly_refits_one_smooth_curve(self):
         model_y = np.asarray(
             [140.0, 200.0, 280.0, 360.0, 440.0], dtype=np.float32)
@@ -504,7 +514,26 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(noisy[1]["physical_side"], "right")
         self.assertEqual(
             planner.centerline_physical_association_debug["reason"],
-            "retain_previous_roles_pending_switch")
+            "retain_previous_roles_fixed_course")
+
+    def test_role_reapply_does_not_consume_switch_confirmation(self):
+        planner = VisionControlPlanner(config=_config(
+            centerline_role_switch_enabled=True,
+            centerline_role_switch_confirm_frames=3))
+        image_shape = (480, 640, 3)
+        planner._assign_physical_path_roles(
+            [_raw_path(0, 220.0), _raw_path(1, 420.0)], image_shape)
+        # This represents the post-filter role annotation in the same frame.
+        # It must not become a second temporal observation of a crossed pair.
+        reannotated = planner._assign_physical_path_roles(
+            [_raw_path(0, 420.0), _raw_path(1, 220.0)], image_shape,
+            update_mapping=False)
+        self.assertEqual(reannotated[0]["physical_side"], "left")
+        self.assertEqual(reannotated[1]["physical_side"], "right")
+        self.assertEqual(
+            planner.centerline_physical_association_debug["reason"],
+            "retain_previous_roles_same_frame")
+        self.assertEqual(planner.centerline_pending_role_switch_frames, 0)
 
     def test_curve_validation_masks_human_but_not_static_car(self):
         planner = VisionControlPlanner(config=_config())

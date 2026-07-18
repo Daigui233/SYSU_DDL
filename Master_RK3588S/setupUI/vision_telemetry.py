@@ -57,7 +57,11 @@ class VisionTelemetryLogger:
 
     @classmethod
     def from_env(cls):
-        if not _env_flag("AR_VISION_TELEMETRY", True):
+        # A JSON encode + flush for every inference frame costs measurable
+        # board CPU time and produces tens of MB per run.  Telemetry is a
+        # diagnostic mode, not part of the driving loop.  Enable it only when
+        # investigating a run with AR_VISION_TELEMETRY=1.
+        if not _env_flag("AR_VISION_TELEMETRY", False):
             return None
         return cls(os.environ.get("AR_VISION_TELEMETRY_DIR"))
 

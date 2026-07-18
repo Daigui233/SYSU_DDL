@@ -12,6 +12,7 @@ from .ar_receiver import (
     add_camera_fault_overlay,
     camera_frame_is_blank,
     FfplayPreview,
+    _preview_blend_mask,
 )
 
 
@@ -84,6 +85,17 @@ class ArReceiverSingletonTest(unittest.TestCase):
         self.assertIs(queued_frame, frame)
         self.assertIsNone(queued_renderer)
         self.assertEqual(queued_size, (1280, 480))
+
+    def test_preview_mask_blend_changes_only_selected_pixels(self):
+        frame = np.full((4, 4, 3), 100, dtype=np.uint8)
+        original = frame.copy()
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[1:3, 1:3] = True
+
+        self.assertTrue(_preview_blend_mask(
+            frame, mask, (0, 0, 200), 0.5))
+        self.assertTrue(np.array_equal(frame[~mask], original[~mask]))
+        self.assertFalse(np.array_equal(frame[mask], original[mask]))
 
 
 if __name__ == "__main__":

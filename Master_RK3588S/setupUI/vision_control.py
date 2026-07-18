@@ -23,6 +23,13 @@ ROUTE_AMBIGUOUS = "AMBIGUOUS"
 
 _PAIR_FRACTIONS = np.arange(24, dtype=np.float32) / 23.0
 
+# Dense-query decoding evaluates the same lateral transition cost for every
+# heatmap row and for both path instances.  The matrix depends only on the
+# grid width, allowed step, and weight, so keeping a very small cache removes
+# repeated O(W^2) allocations without changing any decoded path.
+_CENTERLINE_TRANSITION_CACHE = {}
+_CENTERLINE_TRANSITION_CACHE_LIMIT = 16
+
 
 def _env_float(name, default):
     try:
@@ -55,6 +62,26 @@ def _finite_float(value, default=None):
 
 def _clamp(value, low, high):
     return max(float(low), min(float(high), float(value)))
+
+
+def _centerline_transition_cost(grid_width, max_step, transition_weight):
+    """Return a cached dense-DP lateral transition cost matrix."""
+    width = max(1, int(grid_width))
+    step = max(0, int(max_step))
+    weight = float(transition_weight)
+    key = (width, step, weight)
+    cached = _CENTERLINE_TRANSITION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    coordinates = np.arange(width, dtype=np.float32)
+    delta = np.abs(coordinates[:, None] - coordinates[None, :]).astype(
+        np.float32, copy=False)
+    transition = weight * delta + 0.0015 * delta * delta
+    transition[delta > float(step)] = np.inf
+    if len(_CENTERLINE_TRANSITION_CACHE) >= _CENTERLINE_TRANSITION_CACHE_LIMIT:
+        _CENTERLINE_TRANSITION_CACHE.pop(next(iter(_CENTERLINE_TRANSITION_CACHE)))
+    _CENTERLINE_TRANSITION_CACHE[key] = transition
+    return transition
 
 
 def _soft_limit(value, limit, margin):
@@ -216,8 +243,13 @@ class VisionControlConfig:
     # stable for more than one frame before it may change visible topology.
     centerline_recovery_confirm_frames: int = 2
     # Query identity is model-owned, while blue/green are physical roles.
-    # A one-frame recovered ridge must not be allowed to swap those roles.
+    # This course has a fixed clockwise direction: after a reliable split,
+    # blue must remain the left/outer role and green the right/inner role.
+    # Do not infer a new role mapping from a temporary crossed/merged Query.
+    # The optional switch flag is intentionally off for board deployment; it
+    # exists only for a genuinely reconfigured camera/course.
     centerline_role_switch_confirm_frames: int = 3
+    centerline_role_switch_enabled: bool = False
     ocr_lock_lifetime_s: float = 10.0
     ocr_confirm_frames: int = 1
     curve_merge_support_ratio: float = 0.70
@@ -510,6 +542,8 @@ class VisionControlConfig:
             centerline_role_switch_confirm_frames=max(
                 1, _env_int(
                     "VISION_CONTROL_CENTERLINE_ROLE_SWITCH_CONFIRM", 3)),
+            centerline_role_switch_enabled=_env_bool(
+                "VISION_CONTROL_CENTERLINE_ROLE_SWITCH_ENABLED", False),
             ocr_lock_lifetime_s=max(
                 0.1, _env_float("VISION_CONTROL_OCR_LOCK_LIFETIME_S", 10.0)),
             ocr_confirm_frames=max(1, _env_int("VISION_CONTROL_OCR_CONFIRM_FRAMES", 1)),
@@ -1076,7 +1110,8 @@ class VisionControlPlanner:
         }
         return paths
 
-    def _assign_physical_path_roles(self, candidates, image_shape):
+    def _assign_physical_path_roles(
+            self, candidates, image_shape, update_mapping=True):
         """Attach display/control roles without changing model instance slots.
 
         Blue and green are physical roles, not model Query names.  A role is
@@ -1174,6 +1209,20 @@ class VisionControlPlanner:
         elif current_mapping == observed_mapping:
             self.centerline_pending_physical_side_by_model_slot = None
             self.centerline_pending_role_switch_frames = 0
+        elif not update_mapping:
+            # Candidate filtering below calls this method a second time in
+            # the same frame.  Re-applying roles must not count as another
+            # temporal observation, otherwise a three-frame confirmation
+            # turns into a one-or-two-frame color swap.
+            mapping_reason = "retain_previous_roles_same_frame"
+        elif not self.config.centerline_role_switch_enabled:
+            # The competition course is direction-fixed.  A reversed image
+            # ordering here is overwhelmingly a Query/fit failure at a merge
+            # or an occlusion, not a real exchange of outer and inner roads.
+            # Keep the verified physical identity until the runtime resets.
+            self.centerline_pending_physical_side_by_model_slot = None
+            self.centerline_pending_role_switch_frames = 0
+            mapping_reason = "retain_previous_roles_fixed_course"
         else:
             if self.centerline_pending_physical_side_by_model_slot == observed_mapping:
                 self.centerline_pending_role_switch_frames += 1
@@ -1449,7 +1498,8 @@ class VisionControlPlanner:
             candidates, lock_side, fallback=preferred_slot)
         candidates = self._filter_centerline_candidates(
             candidates, result, image_shape, preferred_slot=preferred_slot)
-        candidates = self._assign_physical_path_roles(candidates, image_shape)
+        candidates = self._assign_physical_path_roles(
+            candidates, image_shape, update_mapping=False)
         candidates.sort(key=lambda item: int(item.get("slot", 99)))
         self._publish_filtered_paths(result, candidates)
         elapsed = (time.perf_counter() - started) * 1000.0
@@ -1555,8 +1605,6 @@ class VisionControlPlanner:
             if (len(points) < 3 or not _semantic_road_polyline_inside(
                     points, validation_mask, image_shape)):
                 continue
-            inside_road = _semantic_road_point_mask(
-                points, validation_mask, image_shape)
             fitted_paths.append({
                 "slot": slot,
                 "model_slot": model_slot,
@@ -1568,8 +1616,10 @@ class VisionControlPlanner:
                 "coverage": float(len(points)) / max(1.0, float(height)),
                 "row_support": int(np.count_nonzero(inliers)),
                 "point_confidences": probabilities.astype(np.float32),
-                "road_support": float(np.mean(inside_road))
-                if len(inside_road) else 0.0,
+                # _select_control_curve_segment only returns points whose
+                # semantic-road mask was true.  Avoid sampling that same
+                # mask for a third time merely to recompute this diagnostic.
+                "road_support": 1.0,
                 "hard_road_constraint": validation_mask is not None,
                 "extension": dict(extension_info),
                 "points_xy": points.astype(np.float32),
@@ -7704,8 +7754,6 @@ def _centerline_fuse_anchors_with_heatmap(
     if len(decode_rows) < 3:
         return points.copy(), probabilities.copy(), {
             "accepted": False, "reason": "insufficient_dense_road_rows"}
-    transition_delta = np.abs(
-        x_grid[:, None] - x_grid[None, :]).astype(np.float32)
     previous_cost = None
     previous_y = None
     backtracks = []
@@ -7741,10 +7789,9 @@ def _centerline_fuse_anchors_with_heatmap(
         else:
             row_gap = max(1, int(previous_y) - int(grid_y))
             max_step = max(3, int(round(0.045 * float(grid_width)))) * row_gap
-            transition = (
-                float(config.centerline_heatmap_transition_weight) * transition_delta
-                + 0.0015 * transition_delta * transition_delta)
-            transition[transition_delta > float(max_step)] = np.inf
+            transition = _centerline_transition_cost(
+                grid_width, max_step,
+                config.centerline_heatmap_transition_weight)
             total = previous_cost[:, None] + transition
             previous_index = np.argmin(total, axis=0).astype(np.int16)
             current_cost = unary + total[previous_index, np.arange(grid_width)]
