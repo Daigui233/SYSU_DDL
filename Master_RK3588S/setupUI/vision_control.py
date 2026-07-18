@@ -141,6 +141,8 @@ class VisionControlConfig:
     curve_task_adjust_limit_ratio: float = 0.50
     curve_task_adjust_soft_margin_ratio: float = 0.25
     straight_min_span_ratio: float = 0.50
+    # Positive values shift the fitted path target left in image space.
+    path_left_bias_px_640: float = 0.0
     straight_path_max_residual_640: float = 6.0
     straight_edge_max_residual_640: float = 10.0
     normal_speed_mps: float = 0.10
@@ -311,6 +313,9 @@ class VisionControlConfig:
                 _env_float(
                     "VISION_CONTROL_STRAIGHT_MIN_SPAN_RATIO", 0.50),
                 0.10, 0.95),
+            path_left_bias_px_640=max(
+                0.0, _env_float(
+                    "VISION_CONTROL_PATH_LEFT_BIAS_PX_640", 18.0)),
             straight_path_max_residual_640=max(
                 0.5, _env_float(
                     "VISION_CONTROL_STRAIGHT_PATH_MAX_RESIDUAL_640", 6.0)),
@@ -2533,6 +2538,21 @@ class VisionControlPlanner:
         return (float(self.last_path_target_x),
                 float(self.last_path_target_y))
 
+    def _apply_path_left_bias(self, path_x, image_shape):
+        path_x = _finite_float(path_x)
+        if path_x is None:
+            return None
+        bias_640 = float(self.config.path_left_bias_px_640)
+        if bias_640 <= 0.0:
+            return float(path_x)
+        width = float(max(1, image_shape[1]))
+        bias_px = bias_640 * width / 640.0
+        return _clamp(
+            float(path_x) - bias_px,
+            0.0,
+            float(max(0, image_shape[1] - 1)),
+        )
+
     def _task_from_detections(
             self, result, selected, image_shape, lookahead_y, now,
             ocr_response=None, path_target_x=None):
@@ -2561,6 +2581,8 @@ class VisionControlPlanner:
                 selected["points_xy"], lookahead_y)
         if target_path_x is None:
             target_path_x = image_shape[1] * self.config.visual_center_x
+        target_path_x = self._apply_path_left_bias(
+            target_path_x, image_shape)
         lookahead_path_x = float(target_path_x)
 
         sign_action = self._turnsign_action(

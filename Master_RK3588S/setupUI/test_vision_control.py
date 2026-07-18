@@ -218,6 +218,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.curve_task_adjust_limit_ratio, 0.50)
         self.assertEqual(config.curve_task_adjust_soft_margin_ratio, 0.25)
         self.assertEqual(config.straight_min_span_ratio, 0.50)
+        self.assertEqual(config.path_left_bias_px_640, 0.0)
         self.assertEqual(config.human_pass_speed_mps, 0.35)
         self.assertEqual(config.human_path_return_guard_s, 0.40)
         self.assertEqual(config.human_stop_absence_restart_s, 5.0)
@@ -228,6 +229,12 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.human_stop_progress_ratio, 0.84)
         self.assertEqual(config.human_stop_line_offset_px_480, 35.0)
         self.assertEqual(config.car_human_pass_speed_mps, 0.35)
+
+    def test_from_env_uses_eighteen_pixel_path_bias_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VISION_CONTROL_PATH_LEFT_BIAS_PX_640", None)
+            config = VisionControlConfig.from_env()
+        self.assertEqual(config.path_left_bias_px_640, 18.0)
 
     def test_default_human_stop_line_is_shifted_up_thirty_five_pixels(self):
         planner = VisionControlPlanner(config=VisionControlConfig())
@@ -1199,6 +1206,16 @@ class VisionControlPlannerTest(unittest.TestCase):
             now=2.8, path_target_x=320.0)
         self.assertEqual(action[0], STATE_TRACK)
         self.assertEqual(action[2], "track")
+
+    def test_path_left_bias_helper_shifts_lookahead_point(self):
+        planner = VisionControlPlanner(config=_config(
+            path_left_bias_px_640=18.0))
+        self.assertAlmostEqual(
+            planner._apply_path_left_bias(320.0, (480, 640, 3)),
+            302.0)
+        self.assertAlmostEqual(
+            planner._apply_path_left_bias(320.0, (480, 1280, 3)),
+            284.0)
 
     def test_human_avoidance_and_final_steering_stop_at_road_mask_edge(self):
         planner = VisionControlPlanner(config=_config())
