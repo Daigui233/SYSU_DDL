@@ -1201,19 +1201,19 @@ class VisionControlPlannerTest(unittest.TestCase):
             debug["control_target"]["base_target_x"],
             debug["control_target"]["path_target_x"])
 
-    def test_waiting_human_restarts_when_five_pixels_from_path(self):
+    def test_waiting_human_restarts_from_left_side_when_five_pixels_from_path(self):
         planner = VisionControlPlanner(config=_config())
-        left = [{
+        right = [{
             "label": "Human", "score": 0.95,
-            "bbox": [250.0, 330.0, 310.0, 450.0],
+            "bbox": [360.0, 330.0, 420.0, 450.0],
         }]
         near_path = [{
             "label": "Human", "score": 0.95,
-            "bbox": [285.0, 330.0, 345.0, 450.0],
+            "bbox": [295.0, 330.0, 355.0, 450.0],
         }]
 
         planner.update(
-            _raw_result_at(320.0, 430.0, detections=left), now=1.0)
+            _raw_result_at(320.0, 430.0, detections=right), now=1.0)
         command, debug = planner.update(
             _raw_result_at(320.0, 430.0, detections=near_path), now=1.2)
 
@@ -1222,6 +1222,30 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(
             debug["control_target"]["task_reason"],
             "human_near_path_restart")
+        self.assertLess(
+            debug["control_target"]["base_target_x"],
+            debug["control_target"]["path_target_x"])
+
+    def test_waiting_human_timeout_passes_from_left_side(self):
+        planner = VisionControlPlanner(config=_config())
+        human = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [360.0, 330.0, 420.0, 450.0],
+        }]
+
+        planner.update(
+            _raw_result_at(320.0, 430.0, detections=human), now=1.0)
+        command, debug = planner.update(
+            _raw_result_at(320.0, 430.0, detections=human), now=7.0)
+
+        self.assertEqual(command["state_cmd"], STATE_AVOID_HUMAN)
+        self.assertAlmostEqual(command["target_speed"], 0.08)
+        self.assertEqual(
+            debug["control_target"]["task_reason"],
+            "human_cross_wait_timeout")
+        self.assertLess(
+            debug["control_target"]["base_target_x"],
+            debug["control_target"]["path_target_x"])
 
     def test_waiting_human_passes_after_six_second_timeout(self):
         planner = VisionControlPlanner(config=_config())

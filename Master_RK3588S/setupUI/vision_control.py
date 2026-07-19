@@ -3475,9 +3475,8 @@ class VisionControlPlanner:
             self.human_detected_latched = False
             self._remember_human_geom(geom, image_shape)
             self.human_last_seen_ts = float(now)
-            pass_side = human["side"] or self.human_last_side or 1
             return self._human_pass_command(
-                lookahead_path_x, image_shape, pass_side,
+                lookahead_path_x, image_shape, 1,
                 reason="human_cross_wait_timeout")
 
         crossed_left_to_right = (
@@ -3503,9 +3502,8 @@ class VisionControlPlanner:
             self.human_detected_latched = False
             self._remember_human_geom(geom, image_shape)
             self.human_last_seen_ts = float(now)
-            pass_side = human["side"] or self.human_last_side or 1
             return self._human_pass_command(
-                lookahead_path_x, image_shape, pass_side,
+                lookahead_path_x, image_shape, 1,
                 reason="human_near_path_restart")
 
         if self._human_on_stop_line(geom, image_shape, lookahead_y):
