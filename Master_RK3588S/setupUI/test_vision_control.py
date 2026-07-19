@@ -224,6 +224,7 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(config.human_pass_speed_mps, 0.20)
         self.assertEqual(config.human_path_return_guard_s, 0.40)
         self.assertEqual(config.human_stop_absence_restart_s, 5.0)
+        self.assertEqual(config.human_cross_wait_timeout_s, 6.0)
         self.assertEqual(config.human_stop_reverse_speed_mps, -0.10)
         self.assertEqual(config.human_stop_reverse_duration_s, 0.30)
         self.assertEqual(config.human_speed_hold_s, 0.4)
@@ -826,20 +827,32 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(debug["branch_lock"], "right")
         self.assertEqual(debug["selected_slot"], 1)
 
-    def test_current_ocr_right_recenters_reference_line_for_five_seconds(self):
+    def test_ocr_result_recenters_until_car_or_human_then_ocr_recenters_again(self):
         planner = VisionControlPlanner(config=_config(
             visual_center_x=0.546875))
-        response = {
+        left_response = {
+            "instruction_current": True,
+            "instruction": {"direction": "left"},
+        }
+        right_response = {
             "instruction_current": True,
             "instruction": {"direction": "right"},
         }
+        car = {
+            "label": "Car",
+            "score": 0.95,
+            "bbox": [280.0, 320.0, 360.0, 450.0],
+        }
 
         _command, latched = planner.update(
-            _raw_result_at(), response, now=1.0)
-        _command, still_centered = planner.update(_raw_result_at(), now=5.9)
-        _command, expired = planner.update(_raw_result_at(), now=6.1)
+            _raw_result_at(), left_response, now=1.0)
+        _command, still_centered = planner.update(_raw_result_at(), now=60.0)
+        _command, released = planner.update(
+            _raw_result_at(detections=[car]), now=61.0)
+        _command, recentered = planner.update(
+            _raw_result_at(), right_response, now=62.0)
 
-        self.assertEqual(latched["branch_lock"], "right")
+        self.assertEqual(latched["branch_lock"], "left")
         self.assertAlmostEqual(
             latched["control_target"]["visual_center_x"], 0.5)
         self.assertAlmostEqual(
@@ -850,9 +863,37 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(
             still_centered["control_target"]["visual_center_x"], 0.5)
         self.assertAlmostEqual(
-            expired["control_target"]["visual_center_x"], 0.546875)
+            released["control_target"]["visual_center_x"], 0.546875)
         self.assertAlmostEqual(
-            expired["control_target"]["reference_line_x"], 350.0)
+            released["control_target"]["reference_line_x"], 350.0)
+        self.assertEqual(recentered["branch_lock"], "right")
+        self.assertAlmostEqual(
+            recentered["control_target"]["visual_center_x"], 0.5)
+        self.assertAlmostEqual(
+            recentered["control_target"]["reference_line_x"], 320.0)
+
+    def test_ocr_center_reference_releases_on_human_detection(self):
+        planner = VisionControlPlanner(config=_config(
+            visual_center_x=0.546875))
+        response = {
+            "instruction_current": True,
+            "instruction": {"direction": "right"},
+        }
+        human = {
+            "label": "Human",
+            "score": 0.95,
+            "bbox": [280.0, 320.0, 360.0, 450.0],
+        }
+
+        _command, centered = planner.update(
+            _raw_result_at(), response, now=1.0)
+        _command, released = planner.update(
+            _raw_result_at(detections=[human]), now=2.0)
+
+        self.assertAlmostEqual(
+            centered["control_target"]["visual_center_x"], 0.5)
+        self.assertAlmostEqual(
+            released["control_target"]["visual_center_x"], 0.546875)
 
     def test_ocr_branch_lock_expires_to_blue_after_ten_seconds(self):
         planner = VisionControlPlanner(config=_config())
@@ -1111,6 +1152,29 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertFalse(
             debug["control_target"]["human_stop_reverse_active"])
 
+    def test_human_disappearing_inside_car_box_returns_to_track(self):
+        planner = VisionControlPlanner(config=_config())
+        human = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [250.0, 330.0, 310.0, 450.0],
+        }]
+        covering_car = [{
+            "label": "Car", "score": 0.95,
+            "bbox": [240.0, 300.0, 330.0, 430.0],
+        }]
+
+        planner.update(
+            _raw_result_at(320.0, 430.0, detections=human), now=1.0)
+        command, debug = planner.update(
+            _raw_result_at(
+                320.0, 430.0, detections=covering_car), now=1.2)
+
+        self.assertEqual(command["state_cmd"], STATE_TRACK)
+        self.assertAlmostEqual(command["target_speed"], 0.08)
+        self.assertEqual(debug["control_target"]["task_reason"], "track")
+        self.assertFalse(planner.human_detected_latched)
+        self.assertFalse(planner.human_waiting_cross)
+
     def test_human_crossing_uses_e7_pass_speed(self):
         planner = VisionControlPlanner(config=_config())
         left = [{
@@ -1158,6 +1222,30 @@ class VisionControlPlannerTest(unittest.TestCase):
         self.assertEqual(
             debug["control_target"]["task_reason"],
             "human_near_path_restart")
+
+    def test_waiting_human_passes_after_six_second_timeout(self):
+        planner = VisionControlPlanner(config=_config())
+        human = [{
+            "label": "Human", "score": 0.95,
+            "bbox": [250.0, 330.0, 310.0, 450.0],
+        }]
+
+        planner.update(
+            _raw_result_at(320.0, 430.0, detections=human), now=1.0)
+        before_timeout, before_debug = planner.update(
+            _raw_result_at(320.0, 430.0, detections=human), now=6.99)
+        restarted, restarted_debug = planner.update(
+            _raw_result_at(320.0, 430.0, detections=human), now=7.0)
+
+        self.assertEqual(before_timeout["state_cmd"], STATE_SAFE_STOP)
+        self.assertEqual(
+            before_debug["control_target"]["task_reason"],
+            "human_half_lookahead_stop")
+        self.assertEqual(restarted["state_cmd"], STATE_AVOID_HUMAN)
+        self.assertAlmostEqual(restarted["target_speed"], 0.08)
+        self.assertEqual(
+            restarted_debug["control_target"]["task_reason"],
+            "human_cross_wait_timeout")
 
     def test_human_crossing_from_right_to_left_keeps_waiting(self):
         planner = VisionControlPlanner(config=_config())
@@ -1456,11 +1544,11 @@ class VisionControlPlannerTest(unittest.TestCase):
         with_car, car = blocked_planner()
         car_command, car_debug = with_car.update(
             _raw_result_at(320.0, 430.0, detections=[car]), now=6.4)
-        self.assertEqual(car_command["state_cmd"], STATE_AVOID_HUMAN)
+        self.assertEqual(car_command["state_cmd"], STATE_TRACK)
         self.assertAlmostEqual(car_command["target_speed"], 0.08)
         self.assertEqual(
             car_debug["control_target"]["task_reason"],
-            "human_absence_restart")
+            "track")
 
         without_path, _car = blocked_planner()
         line_command, line_debug = without_path.update(

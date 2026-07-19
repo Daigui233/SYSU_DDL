@@ -210,6 +210,7 @@ class VisionControlConfig:
     human_same_person_distance_px_640: float = 38.0
     human_path_release_distance_px_640: float = 5.0
     human_stop_absence_restart_s: float = 5.0
+    human_cross_wait_timeout_s: float = 6.0
     human_stop_reverse_speed_mps: float = -0.10
     human_stop_reverse_duration_s: float = 0.3
     car_avoid_offset_px_640: float = 55.0
@@ -440,6 +441,8 @@ class VisionControlConfig:
                 "VISION_CONTROL_HUMAN_PATH_RELEASE_DISTANCE_640", 5.0)),
             human_stop_absence_restart_s=max(0.0, _env_float(
                 "VISION_CONTROL_HUMAN_STOP_ABSENCE_RESTART_S", 5.0)),
+            human_cross_wait_timeout_s=max(0.0, _env_float(
+                "VISION_CONTROL_HUMAN_CROSS_WAIT_TIMEOUT_S", 6.0)),
             human_stop_reverse_speed_mps=-abs(_env_float(
                 "VISION_CONTROL_HUMAN_STOP_REVERSE_SPEED", -0.10)),
             human_stop_reverse_duration_s=max(0.0, _env_float(
@@ -506,6 +509,7 @@ class VisionControlPlanner:
         self.ocr_pending_direction = None
         self.ocr_pending_frames = 0
         self.ocr_confirmed_current = False
+        self.ocr_center_reference_active = False
         self.ocr_right_center_until = 0.0
         self.human_waiting_cross = False
         self.human_last_side = None
@@ -521,6 +525,7 @@ class VisionControlPlanner:
         self.human_last_person_y_480 = None
         self.human_detected_latched = False
         self.human_last_seen_ts = 0.0
+        self.human_cross_wait_started_ts = 0.0
         self.human_preline_last_gap_px_480 = None
         self.human_preline_wait_until = 0.0
         self.human_stop_reverse_until = 0.0
@@ -570,6 +575,8 @@ class VisionControlPlanner:
         perception_result = (
             perception_result if isinstance(perception_result, dict) else {})
         image_shape = self._image_shape(perception_result)
+        self._release_ocr_center_reference_on_obstacle(
+            perception_result.get("detections") or ())
         candidates, search_ms = self._extract_candidates(
             perception_result, image_shape, now=now)
         self._update_turnsign_curve_separation(candidates, image_shape)
@@ -603,12 +610,14 @@ class VisionControlPlanner:
             raw_route_state, raw_route_reason)
         raw_ocr_direction, raw_ocr_current = self._extract_ocr_direction(
             ocr_response)
+        if raw_ocr_current and raw_ocr_direction in {"left", "right"}:
+            self._latch_ocr_right_center(now)
         ocr_direction, ocr_current = self._confirm_ocr_direction(
             raw_ocr_direction, raw_ocr_current)
         ocr_lock_expired = False
         if ocr_current:
             self.last_valid_ocr_ts = now
-            if ocr_direction == "right":
+            if ocr_direction in {"left", "right"}:
                 self._latch_ocr_right_center(now)
             self.turnsign_trim_api_ready = True
             if (
@@ -2762,6 +2771,20 @@ class VisionControlPlanner:
                 return True
         return False
 
+    def _release_ocr_center_reference_on_obstacle(self, detections):
+        if not self.ocr_center_reference_active:
+            return
+        for detection in detections or ():
+            label = self._normalized_label(detection)
+            score = _finite_float(detection.get("score"), 0.0)
+            if (
+                (label == "car" and score >= self.config.min_car_score)
+                or (label == "human" and score >= self.config.min_human_score)
+            ):
+                self.ocr_center_reference_active = False
+                self.ocr_right_center_until = 0.0
+                return
+
     def _turnsign_action(
             self, detections, image_shape, ocr_response, now,
             path_x):
@@ -3295,6 +3318,32 @@ class VisionControlPlanner:
             0.0, float(self.config.human_same_person_distance_px_640))
         return math.hypot(dx, dy) <= threshold
 
+    def _human_last_center_inside_car_box(self, detections, image_shape):
+        if (
+            self.human_last_person_x_640 is None
+            or self.human_last_person_y_480 is None
+        ):
+            return False
+        width = float(max(1, image_shape[1]))
+        height = float(max(1, image_shape[0]))
+        center_x = float(self.human_last_person_x_640) * width / 640.0
+        center_y = float(self.human_last_person_y_480) * height / 480.0
+        for det in detections or ():
+            if self._normalized_label(det) != "car":
+                continue
+            score = _finite_float(det.get("score"), 0.0)
+            if score < self.config.min_car_score:
+                continue
+            geom = self._detection_geom(det, image_shape)
+            if geom is None:
+                continue
+            if (
+                float(geom["left"]) <= center_x <= float(geom["right"])
+                and float(geom["top"]) <= center_y <= float(geom["bottom"])
+            ):
+                return True
+        return False
+
     def _ignore_human_after_restart(
             self, geom, image_shape, now):
         if not (
@@ -3342,6 +3391,10 @@ class VisionControlPlanner:
                 "side": side,
             })
         if not humans:
+            if self._human_last_center_inside_car_box(
+                    detections, image_shape):
+                self._clear_human_state()
+                return None
             if self.human_pass_active:
                 absence_reference_ts = max(
                     float(self.human_last_seen_ts),
@@ -3359,11 +3412,20 @@ class VisionControlPlanner:
             if self.human_detected_latched:
                 if self.human_last_seen_ts <= 0.0:
                     self.human_last_seen_ts = float(now)
+                if self._human_cross_wait_timed_out(now):
+                    self._clear_human_cross_wait()
+                    self.human_pass_active = True
+                    self.human_detected_latched = False
+                    self.human_last_seen_ts = float(now)
+                    return self._human_pass_command(
+                        lookahead_path_x, image_shape,
+                        self.human_last_side or 1,
+                        reason="human_cross_wait_timeout")
                 if (
                     float(now) - self.human_last_seen_ts >=
                     self.config.human_stop_absence_restart_s
                 ):
-                    self.human_waiting_cross = False
+                    self._clear_human_cross_wait()
                     self.human_pass_active = True
                     self.human_detected_latched = False
                     self.human_last_seen_ts = float(now)
@@ -3407,13 +3469,24 @@ class VisionControlPlanner:
                 return self._human_pass_command(
                     lookahead_path_x, image_shape, 1)
 
+        if self._human_cross_wait_timed_out(now):
+            self._clear_human_cross_wait()
+            self.human_pass_active = True
+            self.human_detected_latched = False
+            self._remember_human_geom(geom, image_shape)
+            self.human_last_seen_ts = float(now)
+            pass_side = human["side"] or self.human_last_side or 1
+            return self._human_pass_command(
+                lookahead_path_x, image_shape, pass_side,
+                reason="human_cross_wait_timeout")
+
         crossed_left_to_right = (
             self.human_waiting_cross
             and self.human_last_side == -1
             and human["side"] == 1
         )
         if crossed_left_to_right:
-            self.human_waiting_cross = False
+            self._clear_human_cross_wait()
             self.human_pass_active = True
             self.human_detected_latched = False
             self._remember_human_geom(geom, image_shape)
@@ -3425,7 +3498,7 @@ class VisionControlPlanner:
             self.human_waiting_cross
             and self._human_near_path_line(human["distance"], image_shape)
         ):
-            self.human_waiting_cross = False
+            self._clear_human_cross_wait()
             self.human_pass_active = True
             self.human_detected_latched = False
             self._remember_human_geom(geom, image_shape)
@@ -3440,7 +3513,7 @@ class VisionControlPlanner:
             self.human_detected_latched = True
             self.human_last_seen_ts = float(now)
             self._remember_human_geom(geom, image_shape)
-            self.human_waiting_cross = True
+            self._start_human_cross_wait(now)
             if human["side"] != 0:
                 self.human_last_side = human["side"]
             return STATE_SAFE_STOP, 0.0, "human_half_lookahead_stop", None
@@ -3508,6 +3581,23 @@ class VisionControlPlanner:
             distance_640 <=
             float(self.config.human_path_release_distance_px_640))
 
+    def _start_human_cross_wait(self, now):
+        self.human_waiting_cross = True
+        if self.human_cross_wait_started_ts <= 0.0:
+            self.human_cross_wait_started_ts = float(now)
+
+    def _clear_human_cross_wait(self):
+        self.human_waiting_cross = False
+        self.human_cross_wait_started_ts = 0.0
+
+    def _human_cross_wait_timed_out(self, now):
+        return (
+            self.human_waiting_cross
+            and self.human_cross_wait_started_ts > 0.0
+            and self.config.human_cross_wait_timeout_s > 0.0
+            and float(now) - self.human_cross_wait_started_ts >=
+            self.config.human_cross_wait_timeout_s)
+
     def _human_preline_missing_waiting(self, now):
         gap = self.human_preline_last_gap_px_480
         if gap is None or gap > self.config.human_preline_missing_px_480:
@@ -3526,7 +3616,7 @@ class VisionControlPlanner:
         self.human_preline_wait_until = 0.0
 
     def _clear_human_state(self, clear_detection=True):
-        self.human_waiting_cross = False
+        self._clear_human_cross_wait()
         self.human_last_side = None
         self.human_pass_active = False
         if clear_detection:
@@ -3787,6 +3877,7 @@ class VisionControlPlanner:
         self.selected_slot_lock = 0 if direction == "left" else 1
 
     def _latch_ocr_right_center(self, now):
+        self.ocr_center_reference_active = True
         duration = float(self.config.ocr_right_center_latch_s)
         if duration <= 0.0:
             self.ocr_right_center_until = 0.0
@@ -3795,13 +3886,18 @@ class VisionControlPlanner:
 
     def _active_visual_center_x(self, now=None):
         if (
-            now is not None
-            and float(now) < float(self.ocr_right_center_until)
+            self.ocr_center_reference_active
+            or (
+                now is not None
+                and float(now) < float(self.ocr_right_center_until)
+            )
         ):
             return CENTERED_VISUAL_CENTER_X
         return float(self.config.visual_center_x)
 
     def _ocr_right_center_remaining(self, now):
+        if self.ocr_center_reference_active:
+            return float(max(0.0, self.config.ocr_right_center_latch_s))
         return max(0.0, float(self.ocr_right_center_until) - float(now))
 
     def _expire_ocr_lock(self, now):
