@@ -1,0 +1,26 @@
+; MSPM0G3507: 128 KiB flash, 32 KiB SRAM
+
+LR_IROM1 0x00000000 0x00020000  {
+  ER_IROM1 0x00000000 ALIGNALL 8 0x00020000  {
+   *.o (RESET, +First)
+   *(InRoot$$Sections)
+   .ANY (+RO)
+   .ANY (+XO)
+  }
+  RW_IRAM2 0x20200000 0x00008000  {
+   .ANY (+RW +ZI)
+   .ANY (.ramfunc)
+  }
+}
+
+LR_BCR 0x41C00000 0x00000100  {
+  BCR_CONFIG 0x41C00000 0x00000080 {
+    .ANY (.BCRConfig)
+  }
+}
+
+LR_BSL 0x41C00100 0x00000100  {
+  BSL_CONFIG 0x41C00100 0x00000080 {
+    .ANY (.BSLConfig)
+  }
+}

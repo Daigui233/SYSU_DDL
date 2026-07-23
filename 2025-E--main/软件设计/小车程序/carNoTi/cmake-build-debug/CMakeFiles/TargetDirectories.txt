@@ -1,0 +1,3 @@
+D:/STM32cube/carNoTi/cmake-build-debug/CMakeFiles/carNoTi.elf.dir
+D:/STM32cube/carNoTi/cmake-build-debug/CMakeFiles/edit_cache.dir
+D:/STM32cube/carNoTi/cmake-build-debug/CMakeFiles/rebuild_cache.dir
