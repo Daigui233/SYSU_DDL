@@ -4,6 +4,7 @@
 /* T5X parameters taken from the STM32 reference project. */
 #define APP_CONTROL_HZ                 100U
 #define APP_TELEMETRY_HZ                20U
+#define APP_DISPLAY_HZ                  10U
 #define APP_COMMAND_TIMEOUT_TICKS       30U
 #define APP_WHEEL_DIAMETER_M          0.065f
 #define APP_WHEEL_SPACING_M           0.143f

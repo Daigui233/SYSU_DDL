@@ -77,6 +77,7 @@ SYSCONFIG_WEAK void SYSCFG_DL_init(void)
     /* Motor inputs remain GPIO-low. board_port selects PWM only when moving. */
     SYSCFG_DL_TIMER_0_init();
     SYSCFG_DL_MPU_I2C_init();
+    SYSCFG_DL_OLED_I2C_init();
     SYSCFG_DL_ESP_init();
     SYSCFG_DL_ADC_init();
     SYSCFG_DL_ccdADC_init();
@@ -124,6 +125,7 @@ SYSCONFIG_WEAK void SYSCFG_DL_initPower(void)
     DL_TimerG_reset(car2N_INST);
     DL_TimerG_reset(TIMER_0_INST);
     DL_I2C_reset(MPU_I2C_INST);
+    DL_I2C_reset(OLED_I2C_INST);
     DL_UART_Main_reset(ESP_INST);
     DL_ADC12_reset(ADC_INST);
     DL_ADC12_reset(ccdADC_INST);
@@ -136,6 +138,7 @@ SYSCONFIG_WEAK void SYSCFG_DL_initPower(void)
     DL_TimerG_enablePower(car2N_INST);
     DL_TimerG_enablePower(TIMER_0_INST);
     DL_I2C_enablePower(MPU_I2C_INST);
+    DL_I2C_enablePower(OLED_I2C_INST);
     DL_UART_Main_enablePower(ESP_INST);
     DL_ADC12_enablePower(ADC_INST);
     DL_ADC12_enablePower(ccdADC_INST);
@@ -173,6 +176,17 @@ SYSCONFIG_WEAK void SYSCFG_DL_GPIO_init(void)
         DL_GPIO_WAKEUP_DISABLE);
     DL_GPIO_enableHiZ(GPIO_MPU_I2C_IOMUX_SDA);
     DL_GPIO_enableHiZ(GPIO_MPU_I2C_IOMUX_SCL);
+
+    DL_GPIO_initPeripheralInputFunctionFeatures(GPIO_OLED_I2C_IOMUX_SDA,
+        GPIO_OLED_I2C_IOMUX_SDA_FUNC, DL_GPIO_INVERSION_DISABLE,
+        DL_GPIO_RESISTOR_NONE, DL_GPIO_HYSTERESIS_DISABLE,
+        DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_initPeripheralInputFunctionFeatures(GPIO_OLED_I2C_IOMUX_SCL,
+        GPIO_OLED_I2C_IOMUX_SCL_FUNC, DL_GPIO_INVERSION_DISABLE,
+        DL_GPIO_RESISTOR_NONE, DL_GPIO_HYSTERESIS_DISABLE,
+        DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_enableHiZ(GPIO_OLED_I2C_IOMUX_SDA);
+    DL_GPIO_enableHiZ(GPIO_OLED_I2C_IOMUX_SCL);
 
     DL_GPIO_initDigitalInputFeatures(encoder_RightA_IOMUX,
 		 DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_DOWN,
@@ -503,6 +517,27 @@ SYSCONFIG_WEAK void SYSCFG_DL_MPU_I2C_init(void)
         MPU_I2C_INST, DL_I2C_RX_FIFO_LEVEL_BYTES_1);
     DL_I2C_enableControllerClockStretching(MPU_I2C_INST);
     DL_I2C_enableController(MPU_I2C_INST);
+}
+
+static const DL_I2C_ClockConfig gOLED_I2CClockConfig = {
+    .clockSel = DL_I2C_CLOCK_BUSCLK,
+    .divideRatio = DL_I2C_CLOCK_DIVIDE_1,
+};
+
+SYSCONFIG_WEAK void SYSCFG_DL_OLED_I2C_init(void)
+{
+    DL_I2C_setClockConfig(OLED_I2C_INST,
+        (DL_I2C_ClockConfig *) &gOLED_I2CClockConfig);
+    DL_I2C_disableAnalogGlitchFilter(OLED_I2C_INST);
+    DL_I2C_resetControllerTransfer(OLED_I2C_INST);
+    /* BUSCLK is 40 MHz: (9 + 1) * 10 gives a 400 kHz I2C clock. */
+    DL_I2C_setTimerPeriod(OLED_I2C_INST, 9U);
+    DL_I2C_setControllerTXFIFOThreshold(
+        OLED_I2C_INST, DL_I2C_TX_FIFO_LEVEL_EMPTY);
+    DL_I2C_setControllerRXFIFOThreshold(
+        OLED_I2C_INST, DL_I2C_RX_FIFO_LEVEL_BYTES_1);
+    DL_I2C_enableControllerClockStretching(OLED_I2C_INST);
+    DL_I2C_enableController(OLED_I2C_INST);
 }
 
 

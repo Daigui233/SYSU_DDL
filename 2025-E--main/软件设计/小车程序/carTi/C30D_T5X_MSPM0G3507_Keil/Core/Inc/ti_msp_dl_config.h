@@ -151,6 +151,20 @@ extern "C" {
 #define GPIO_MPU_I2C_IOMUX_SCL                                    (IOMUX_PINCM6)
 #define GPIO_MPU_I2C_IOMUX_SCL_FUNC                     IOMUX_PINCM6_PF_I2C0_SCL
 
+/* Defines for SSD1306 OLED hardware I2C1: PB3=SDA, PB2=SCL */
+#define OLED_I2C_INST                                                        I2C1
+#define OLED_I2C_INST_IRQHandler                                  I2C1_IRQHandler
+#define OLED_I2C_INST_INT_IRQN                                      I2C1_INT_IRQn
+#define OLED_I2C_BUS_SPEED_HZ                                              400000
+#define GPIO_OLED_I2C_SDA_PORT                                              GPIOB
+#define GPIO_OLED_I2C_SDA_PIN                                       DL_GPIO_PIN_3
+#define GPIO_OLED_I2C_IOMUX_SDA                                   (IOMUX_PINCM16)
+#define GPIO_OLED_I2C_IOMUX_SDA_FUNC                    IOMUX_PINCM16_PF_I2C1_SDA
+#define GPIO_OLED_I2C_SCL_PORT                                              GPIOB
+#define GPIO_OLED_I2C_SCL_PIN                                       DL_GPIO_PIN_2
+#define GPIO_OLED_I2C_IOMUX_SCL                                   (IOMUX_PINCM15)
+#define GPIO_OLED_I2C_IOMUX_SCL_FUNC                    IOMUX_PINCM15_PF_I2C1_SCL
+
 
 /* Defines for ESP */
 #define ESP_INST                                                           UART1
@@ -327,6 +341,7 @@ void SYSCFG_DL_car1N_init(void);
 void SYSCFG_DL_car2N_init(void);
 void SYSCFG_DL_TIMER_0_init(void);
 void SYSCFG_DL_MPU_I2C_init(void);
+void SYSCFG_DL_OLED_I2C_init(void);
 void SYSCFG_DL_ESP_init(void);
 void SYSCFG_DL_ADC_init(void);
 void SYSCFG_DL_ccdADC_init(void);

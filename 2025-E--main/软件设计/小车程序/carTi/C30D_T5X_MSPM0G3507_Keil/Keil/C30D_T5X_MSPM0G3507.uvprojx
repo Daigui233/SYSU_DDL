@@ -409,6 +409,26 @@
               <FileType>1</FileType>
               <FilePath>..\App\Src\protocol.c</FilePath>
             </File>
+            <File>
+              <FileName>app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Src\app.c</FilePath>
+            </File>
+            <File>
+              <FileName>line_follow.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Src\line_follow.c</FilePath>
+            </File>
+            <File>
+              <FileName>attitude.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Src\attitude.c</FilePath>
+            </File>
+            <File>
+              <FileName>oled.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Src\oled.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

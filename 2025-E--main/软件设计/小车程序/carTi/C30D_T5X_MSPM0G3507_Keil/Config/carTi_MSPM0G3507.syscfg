@@ -21,6 +21,7 @@ const GPIO6  = GPIO.addInstance();
 const GPIO7  = GPIO.addInstance();
 const I2C    = scripting.addModule("/ti/driverlib/I2C", {}, false);
 const I2C1   = I2C.addInstance();
+const I2C2   = I2C.addInstance();
 const MCAN   = scripting.addModule("/ti/driverlib/MCAN", {}, false);
 const MCAN1  = MCAN.addInstance();
 const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
@@ -185,6 +186,14 @@ I2C1.advAnalogGlitchFilter     = "DISABLED";
 I2C1.peripheral.$assign        = "I2C0";
 I2C1.peripheral.sclPin.$assign = "PA31";
 I2C1.peripheral.sdaPin.$assign = "PA28";
+
+I2C2.$name                     = "OLED_I2C";
+I2C2.basicEnableController     = true;
+I2C2.basicControllerBusSpeed   = 400000;
+I2C2.advAnalogGlitchFilter     = "DISABLED";
+I2C2.peripheral.$assign        = "I2C1";
+I2C2.peripheral.sclPin.$assign = "PB2";
+I2C2.peripheral.sdaPin.$assign = "PB3";
 
 MCAN1.$name                    = "MCAN0";
 MCAN1.peripheral.rxPin.$assign = "PA13";

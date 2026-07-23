@@ -1,5 +1,6 @@
 #include "protocol.h"
 
+#include "app.h"
 #include "app_config.h"
 #include "board_port.h"
 #include "car_control.h"
@@ -70,11 +71,7 @@ void protocol_rx_byte_isr(uint8_t value)
 
 static void accept_motion(float vx, float wz, uint32_t tick)
 {
-    g_protocol_command.vx_mps = vx;
-    g_protocol_command.wz_radps = wz;
-    g_protocol_command.requested_mode = APP_MODE_REMOTE;
-    g_protocol_command.last_command_tick = tick;
-    g_protocol_command.command_ready = true;
+    app_request_motion(vx, wz, tick);
 }
 
 static void parse_binary(uint32_t tick)
@@ -144,17 +141,16 @@ static void parse_ascii(uint32_t tick)
 
     g_ascii[g_ascii_count] = '\0';
     if ((strncmp(cursor, "STOP", 4U) == 0) && (cursor[4] == '\0')) {
-        g_protocol_command.requested_mode = APP_MODE_STOP;
-        g_protocol_command.command_ready = true;
+        app_request_stop();
     } else if (strncmp(cursor, "LINE", 4U) == 0) {
         cursor += 4;
         if (parse_small_float(&cursor, &first)) {
             if (first < 1.0f) first = 1.0f;
             if (first > 9.0f) first = 9.0f;
-            g_protocol_command.line_laps = (uint8_t)first;
+        } else {
+            first = 1.0f;
         }
-        g_protocol_command.requested_mode = APP_MODE_LINE;
-        g_protocol_command.command_ready = true;
+        app_request_line((uint8_t)first);
     } else if ((cursor[0] == '[') || (strncmp(cursor, "MOVE", 4U) == 0)) {
         if (cursor[0] == '[') cursor++;
         else cursor += 4;
