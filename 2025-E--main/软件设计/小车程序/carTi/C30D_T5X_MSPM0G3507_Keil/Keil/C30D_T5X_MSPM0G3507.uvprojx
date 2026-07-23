@@ -394,6 +394,21 @@
               <FileType>1</FileType>
               <FilePath>..\App\Src\mpu6050.c</FilePath>
             </File>
+            <File>
+              <FileName>board_port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Src\board_port.c</FilePath>
+            </File>
+            <File>
+              <FileName>car_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Src\car_control.c</FilePath>
+            </File>
+            <File>
+              <FileName>protocol.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Src\protocol.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
